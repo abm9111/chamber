@@ -147,11 +147,22 @@ import {
 import { scanForSecrets, skillSecretScanRefuse } from "../src/secret_scan.ts";
 import { formatErrorChain } from "../src/error_chain.ts";
 import { assertSpendBudget } from "../src/spend.ts";
-import { ingestDirectory, splitFrontmatter } from "../src/ingest.ts";
+import {
+  ingestDirectory,
+  parseIngestArgs,
+  splitFrontmatter,
+  type IngestReport,
+} from "../src/ingest.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isAsyncFunction } from "node:util/types";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import type { DatabaseSync } from "node:sqlite";
 
@@ -1574,10 +1585,25 @@ test(
     mkdirSync(join(dir, "private-notes"));
     writeFileSync(join(dir, "private-notes", "keep.md"), "not actually private\n");
 
-    const r = ingestDirectory(db, dir, { exclude: ["private"] });
+    // `requireExcludeMatch: false` only disables the separate "a pattern that
+    // pruned nothing aborts the run" guard, which would otherwise fire here
+    // *because* the substring correctly failed to match. The segment-equality
+    // assertion below is unchanged.
+    const r = ingestDirectory(db, dir, {
+      exclude: ["private"],
+      requireExcludeMatch: false,
+    });
     assert(
       r.ingested === 1,
       `"private-notes" must not be excluded by an exact "private" pattern, got ${r.ingested}`,
+    );
+
+    // And with the guard at its default, the same non-matching pattern is a
+    // hard failure rather than a silent no-op.
+    const guarded = ingestDirectory(freshDb(), dir, { exclude: ["private"] });
+    assert(
+      guarded.aborted && guarded.ingested === 0,
+      `a pattern that matches nothing must abort the run, got ${JSON.stringify(guarded)}`,
     );
   },
 );
@@ -1597,10 +1623,26 @@ test(
     mkdirSync(root);
     writeFileSync(join(root, "keep.md"), "keep me\n");
 
-    const r = ingestDirectory(db, root, { exclude: ["private"] });
+    // `requireExcludeMatch: false` only disables the separate "a pattern that
+    // pruned nothing aborts the run" guard, which fires here *because* the
+    // root itself is correctly not vetoed and nothing under it matches. The
+    // root-is-not-vetoed assertion below is unchanged.
+    const r = ingestDirectory(db, root, {
+      exclude: ["private"],
+      requireExcludeMatch: false,
+    });
     assert(
       r.ingested === 1,
       `a root named "private" must still ingest its own contents, got ${r.ingested}`,
+    );
+
+    // With the guard at its default, pointing ingest at a folder while also
+    // excluding that name is a contradiction worth failing on rather than
+    // resolving silently in either direction.
+    const guarded = ingestDirectory(freshDb(), root, { exclude: ["private"] });
+    assert(
+      guarded.aborted && guarded.ingested === 0,
+      `the unmatched-pattern guard must still fire here, got ${JSON.stringify(guarded)}`,
     );
   },
 );
@@ -1694,6 +1736,495 @@ test(
     assert(
       body.includes("must not be silently dropped"),
       `expected the rest of the document to survive too: ${JSON.stringify(body)}`,
+    );
+  },
+);
+
+// ─── INGEST: --exclude is a privacy control, not a filter ────────────────────
+//
+// `chamber ingest` is pointed at a personal vault holding folders that are
+// deny-listed precisely because they must never be bulk-read, and `--exclude`
+// is the only thing between the command and those folders. Every test below
+// pins a way the control used to leak at exit 0 with no diagnostic.
+
+/** Fixture root with a deny-listed folder and one ordinary note. */
+function excludeFixture(tag: string): string {
+  const dir = mkdtempSync(join(tmpdir(), `chamber-ingest-${tag}-`));
+  mkdirSync(join(dir, "Private"));
+  writeFileSync(join(dir, "keep.md"), "keep me\n");
+  writeFileSync(join(dir, "Private", "secret.md"), "deny-listed content\n");
+  return dir;
+}
+
+function ingestedRefs(db: DatabaseSync): string[] {
+  return (
+    db
+      .prepare(`SELECT source_ref FROM vector_document ORDER BY source_ref`)
+      .all() as { source_ref: string }[]
+  ).map((r) => r.source_ref);
+}
+
+test(
+  "pins",
+  "C1: a flag value can never be mistaken for the positional ingest path",
+  () => {
+    // `chamber ingest --exclude Private fakevault` used to pick `Private` as
+    // the target — the first argument not starting with `--` — and ingest the
+    // very folder it was told to exclude: "ingested 1 file(s) from Private",
+    // exit 0. Flags and their values must be consumed together.
+    const parsed = parseIngestArgs(["--exclude", "Private", "fakevault"]);
+    assert(parsed.ok, `expected a parse, got ${JSON.stringify(parsed)}`);
+    assert(
+      parsed.path === "fakevault",
+      `the positional path must be "fakevault", got ${JSON.stringify(parsed.path)}`,
+    );
+    assert(
+      parsed.exclude.length === 1 && parsed.exclude[0] === "Private",
+      `"Private" must be consumed as the --exclude value, got ${JSON.stringify(parsed.exclude)}`,
+    );
+
+    // …and the parse actually protects the folder end to end.
+    const db = freshDb();
+    const dir = excludeFixture("c1");
+    const r = ingestDirectory(db, dir, { exclude: parsed.exclude });
+    assert(r.ingested === 1, `expected only keep.md, got ${r.ingested}`);
+    assert(
+      !ingestedRefs(db).some((ref) => ref.startsWith("Private/")),
+      `deny-listed content reached the corpus: ${JSON.stringify(ingestedRefs(db))}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "C2: exclude forms that used to be silently inert all prune the folder",
+  () => {
+    // Each of these ingested the folder it named, exit 0, no warning:
+    // the GNU equals form, a shell-completed trailing slash, a shell-completed
+    // "./" prefix, an absolute path, and a case mismatch against a folder on a
+    // case-insensitive filesystem.
+    const cases: { label: string; pattern: (dir: string) => string }[] = [
+      { label: "trailing slash", pattern: () => "Private/" },
+      { label: "./ prefix", pattern: () => "./Private" },
+      { label: "absolute path", pattern: (dir) => join(dir, "Private") },
+      { label: "case mismatch", pattern: () => "private" },
+      { label: "multi-segment path", pattern: () => "./Private/" },
+    ];
+    for (const c of cases) {
+      const db = freshDb();
+      const dir = excludeFixture("c2");
+      const r = ingestDirectory(db, dir, { exclude: [c.pattern(dir)] });
+      assert(
+        !r.aborted && r.ingested === 1,
+        `${c.label}: expected 1 ingested, got ${JSON.stringify({ aborted: r.aborted, ingested: r.ingested, reason: r.abortReason })}`,
+      );
+      assert(
+        !ingestedRefs(db).some((ref) => ref.startsWith("Private/")),
+        `${c.label}: deny-listed content reached the corpus: ${JSON.stringify(ingestedRefs(db))}`,
+      );
+      assert(
+        r.excludes[0]?.matched === 1,
+        `${c.label}: the pattern must be recorded as having pruned something, got ${JSON.stringify(r.excludes)}`,
+      );
+    }
+
+    // The GNU equals form and a dangling --exclude are parser-level.
+    const eq = parseIngestArgs(["vault", "--exclude=Private"]);
+    assert(
+      eq.ok && eq.exclude[0] === "Private" && eq.path === "vault",
+      `--exclude=Private must parse, got ${JSON.stringify(eq)}`,
+    );
+    const dangling = parseIngestArgs(["vault", "--exclude"]);
+    assert(
+      !dangling.ok,
+      `a dangling --exclude must be rejected, got ${JSON.stringify(dangling)}`,
+    );
+    const emptyEq = parseIngestArgs(["vault", "--exclude="]);
+    assert(
+      !emptyEq.ok,
+      `--exclude= with no value must be rejected, got ${JSON.stringify(emptyEq)}`,
+    );
+
+    // An unquoted multi-word folder name silently became the pattern "06".
+    const unquoted = parseIngestArgs(["--exclude", "06", "-", "Private", "vault"]);
+    assert(
+      !unquoted.ok,
+      `an unquoted multi-word pattern must be rejected, not truncated to "06": ${JSON.stringify(unquoted)}`,
+    );
+    const quoted = parseIngestArgs(["--exclude", "06 - Private", "vault"]);
+    assert(
+      quoted.ok && quoted.exclude[0] === "06 - Private" && quoted.path === "vault",
+      `a quoted multi-word pattern must survive intact, got ${JSON.stringify(quoted)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "C2: a multi-segment exclude path prunes exactly that path, not every same-named folder",
+  () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-segpath-"));
+    mkdirSync(join(dir, "a", "Private"), { recursive: true });
+    mkdirSync(join(dir, "b", "Private"), { recursive: true });
+    writeFileSync(join(dir, "a", "Private", "x.md"), "a secret\n");
+    writeFileSync(join(dir, "b", "Private", "y.md"), "b secret\n");
+
+    const r = ingestDirectory(db, dir, { exclude: ["a/Private"] });
+    assert(!r.aborted, `expected the run to proceed, got ${r.abortReason}`);
+    const refs = ingestedRefs(db);
+    assert(
+      refs.length === 1 && refs[0] === "b/Private/y.md",
+      `"a/Private" must prune only a/Private, got ${JSON.stringify(refs)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "C2: an exclude pattern that matched nothing fails the run and stores nothing",
+  () => {
+    // The single highest-value safeguard: a pattern matching nothing is far
+    // more likely a typo or a quoting mistake than a deliberate no-op, and it
+    // catches every inert-pattern shape at once. It must be a hard failure
+    // before anything is written, not a warning buried in output.
+    const db = freshDb();
+    const dir = excludeFixture("c2-nomatch");
+    const r = ingestDirectory(db, dir, { exclude: ["Privte"] });
+    assert(r.aborted, `a typo'd pattern must abort the run: ${JSON.stringify(r)}`);
+    assert(
+      r.ingested === 0 && countDocuments(db) === 0,
+      `nothing may be stored when an exclude did not match: ${countDocuments(db)} row(s)`,
+    );
+    assert(
+      r.unmatchedExcludes.includes("Privte"),
+      `the offending pattern must be named, got ${JSON.stringify(r.unmatchedExcludes)}`,
+    );
+
+    // An absolute pattern pointing outside the root can never match, so it is
+    // rejected up front rather than silently ingesting everything.
+    const outside = ingestDirectory(freshDb(), dir, { exclude: [tmpdir()] });
+    assert(
+      outside.aborted && outside.ingested === 0,
+      `an absolute pattern outside the root must abort, got ${JSON.stringify(outside)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "I3: a symlink pointing outside the ingest root cannot smuggle content in",
+  () => {
+    // The deny-listed folder's real name never appears as a walked entry, so
+    // --exclude is structurally unable to stop this. Symlinks are resolved and
+    // required to be contained under the resolved root.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-symout-"));
+    const outside = mkdtempSync(join(tmpdir(), "chamber-ingest-outside-"));
+    mkdirSync(join(outside, "Private"));
+    writeFileSync(join(outside, "Private", "leak.md"), "content outside the root\n");
+    writeFileSync(join(dir, "keep.md"), "keep me\n");
+    symlinkSync(outside, join(dir, "linked"));
+
+    const r = ingestDirectory(db, dir);
+    assert(r.ingested === 1, `only keep.md may be ingested, got ${r.ingested}`);
+    assert(
+      !ingestedRefs(db).some((ref) => ref.includes("linked")),
+      `content outside the root was ingested: ${JSON.stringify(ingestedRefs(db))}`,
+    );
+    assert(
+      r.skipped.some((s) => s.kind === "symlink_escape" && s.path === "linked"),
+      `the escaping symlink must be reported, got ${JSON.stringify(r.skipped)}`,
+    );
+
+    // A symlink that stays inside the root still works — and is still subject
+    // to --exclude by its *target*, so it cannot launder a deny-listed folder.
+    const db2 = freshDb();
+    const dir2 = excludeFixture("i3-inside");
+    mkdirSync(join(dir2, "shared"));
+    writeFileSync(join(dir2, "shared", "note.md"), "shared note\n");
+    symlinkSync(join(dir2, "shared"), join(dir2, "alias"));
+    symlinkSync(join(dir2, "Private"), join(dir2, "backdoor"));
+
+    const r2 = ingestDirectory(db2, dir2, { exclude: ["Private"] });
+    const refs2 = ingestedRefs(db2);
+    assert(
+      refs2.includes("alias/note.md") || refs2.includes("shared/note.md"),
+      `an in-root symlink must still be followed, got ${JSON.stringify(refs2)}`,
+    );
+    assert(
+      !refs2.some((ref) => ref.startsWith("backdoor/") || ref.startsWith("Private/")),
+      `a symlink to an excluded folder must not launder it: ${JSON.stringify(refs2)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "I4: an unreadable directory, a dangling symlink and a symlink loop are reported, not fatal",
+  () => {
+    // All three used to throw out of ingestDirectory before anything was
+    // ingested and before `skipped` was populated: one dangling link anywhere
+    // in a large vault meant zero progress and no partial report.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-resilient-"));
+    writeFileSync(join(dir, "keep.md"), "keep me\n");
+    symlinkSync(join(dir, "does-not-exist.md"), join(dir, "dangling.md"));
+    symlinkSync(join(dir, "loop-b"), join(dir, "loop-a"));
+    symlinkSync(join(dir, "loop-a"), join(dir, "loop-b"));
+    symlinkSync(dir, join(dir, "self"));
+
+    const locked = join(dir, "locked");
+    mkdirSync(locked);
+    writeFileSync(join(locked, "inner.md"), "unreachable\n");
+    const canTestPermissions = (process.getuid?.() ?? 0) !== 0;
+    if (canTestPermissions) chmodSync(locked, 0o000);
+
+    let r: IngestReport;
+    try {
+      r = ingestDirectory(db, dir);
+    } finally {
+      if (canTestPermissions) chmodSync(locked, 0o755);
+    }
+
+    assert(
+      r.ingested === 1,
+      `the run must make progress past the broken entries, got ${r.ingested}`,
+    );
+    assert(
+      r.skipped.some((s) => s.path === "dangling.md" && s.kind === "unreadable"),
+      `a dangling symlink must land in skipped, got ${JSON.stringify(r.skipped)}`,
+    );
+    assert(
+      r.skipped.some((s) => s.path === "loop-a" && s.kind === "unreadable"),
+      `a symlink loop must land in skipped, got ${JSON.stringify(r.skipped)}`,
+    );
+    assert(
+      r.skipped.some((s) => s.path === "self" && s.kind === "cycle"),
+      `a self-referential directory link must land in skipped, got ${JSON.stringify(r.skipped)}`,
+    );
+    if (canTestPermissions) {
+      assert(
+        r.skipped.some((s) => s.path === "locked" && s.kind === "unreadable"),
+        `an unreadable directory must land in skipped, got ${JSON.stringify(r.skipped)}`,
+      );
+    }
+  },
+);
+
+test(
+  "pins",
+  "I5: markdown that is not literally .md is ingested, and anything skipped is named",
+  () => {
+    // `UPPER.MD`, `long.markdown` and `mdx.mdx` used to vanish with no record
+    // at all — the exact "operator believes everything was ingested" failure.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-ext-"));
+    writeFileSync(join(dir, "plain.md"), "plain\n");
+    writeFileSync(join(dir, "UPPER.MD"), "upper\n");
+    writeFileSync(join(dir, "long.markdown"), "long\n");
+    writeFileSync(join(dir, "mdx.mdx"), "mdx\n");
+    writeFileSync(join(dir, "notes.txt"), "not markdown\n");
+    writeFileSync(join(dir, "image.png"), "binary-ish\n");
+
+    const r = ingestDirectory(db, dir);
+    assert(r.ingested === 4, `expected 4 markdown files, got ${r.ingested}`);
+    const refs = ingestedRefs(db);
+    for (const want of ["plain.md", "UPPER.MD", "long.markdown", "mdx.mdx"]) {
+      assert(refs.includes(want), `${want} must be ingested, got ${JSON.stringify(refs)}`);
+    }
+    for (const want of ["notes.txt", "image.png"]) {
+      assert(
+        r.skipped.some((s) => s.path === want && s.kind === "unsupported_extension"),
+        `${want} must appear in the report rather than vanishing: ${JSON.stringify(r.skipped)}`,
+      );
+    }
+  },
+);
+
+test(
+  "pins",
+  "I6: dot-directories are skipped by default so .trash is not resurrected",
+  () => {
+    // Obsidian's .trash holds notes the user *deleted*; ingesting it puts
+    // deleted content back into a queryable corpus.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-dot-"));
+    mkdirSync(join(dir, ".trash"));
+    mkdirSync(join(dir, ".obsidian"));
+    writeFileSync(join(dir, "keep.md"), "keep me\n");
+    writeFileSync(join(dir, ".trash", "deleted-note.md"), "the user deleted this\n");
+    writeFileSync(join(dir, ".hidden.md"), "hidden note\n");
+
+    const r = ingestDirectory(db, dir);
+    assert(r.ingested === 1, `only keep.md may be ingested by default, got ${r.ingested}`);
+    assert(
+      !ingestedRefs(db).some((ref) => ref.startsWith(".trash")),
+      `deleted notes were resurrected: ${JSON.stringify(ingestedRefs(db))}`,
+    );
+    assert(
+      r.skipped.some((s) => s.path === ".trash" && s.kind === "dotted"),
+      `the dotted skip must be reported, got ${JSON.stringify(r.skipped)}`,
+    );
+
+    // Opt-in flag brings them back.
+    const db2 = freshDb();
+    const r2 = ingestDirectory(db2, dir, { includeDotted: true });
+    assert(
+      r2.ingested === 3,
+      `--include-dotted must ingest dotted entries, got ${r2.ingested}`,
+    );
+    assert(
+      parseIngestArgs(["vault", "--include-dotted"]).ok,
+      "--include-dotted must be an accepted flag",
+    );
+  },
+);
+
+test(
+  "pins",
+  "I7: the same relative path under two roots does not silently overwrite one document",
+  () => {
+    // Keyed on source_ref alone, the first root's document id ended up holding
+    // the second root's body and hash — both runs reporting success — so every
+    // citation pinned to that id then verified against different content.
+    const db = freshDb();
+    const rootA = mkdtempSync(join(tmpdir(), "chamber-ingest-rootA-"));
+    const rootB = mkdtempSync(join(tmpdir(), "chamber-ingest-rootB-"));
+    mkdirSync(join(rootA, "notes"));
+    mkdirSync(join(rootB, "notes"));
+    writeFileSync(join(rootA, "notes", "index.md"), "alpha body\n");
+    writeFileSync(join(rootB, "notes", "index.md"), "beta body\n");
+
+    const a = ingestDirectory(db, rootA);
+    const b = ingestDirectory(db, rootB);
+    assert(
+      a.documentIds[0] !== b.documentIds[0],
+      `two roots must not share one document id: ${a.documentIds[0]}`,
+    );
+    assert(
+      countDocuments(db) === 2,
+      `both documents must survive, got ${countDocuments(db)} row(s)`,
+    );
+    const rowA = db
+      .prepare(`SELECT body FROM vector_document WHERE id = ?`)
+      .get(a.documentIds[0]) as { body: string };
+    assert(
+      rowA.body === "alpha body\n",
+      `the first root's id must still hold the first root's body, got ${JSON.stringify(rowA.body)}`,
+    );
+    assert(
+      b.collisions.some((c) => c.sourceRef === "notes/index.md"),
+      `the collision must be visible in the report, got ${JSON.stringify(b.collisions)}`,
+    );
+
+    // Re-ingesting the first root still updates its own row in place — the
+    // collision handling must not cost idempotence.
+    writeFileSync(join(rootA, "notes", "index.md"), "alpha body, edited\n");
+    const a2 = ingestDirectory(db, rootA);
+    assert(
+      a2.documentIds[0] === a.documentIds[0] && a2.collisions.length === 0,
+      `re-ingesting the same root must reuse its id with no collision, got ${JSON.stringify(a2)}`,
+    );
+    assert(
+      countDocuments(db) === 2,
+      `re-ingest must not add a row, got ${countDocuments(db)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "I8: an opening paragraph whose first line ends in a colon is not swallowed as frontmatter",
+  () => {
+    // A document opening with `---` and a blank line, whose first prose line
+    // ends in a colon (`Note:`, `TODO:`, `Source:`), had that whole paragraph
+    // consumed as frontmatter and dropped. Real YAML frontmatter never opens
+    // with a blank line, so the first line inside the fence — not the first
+    // non-blank one — is what decides.
+    for (const lead of ["Note:", "TODO:", "Source:"]) {
+      const raw = `---\n\n${lead} the opening paragraph.\n\n---\n\nAnd the rest.\n`;
+      const { title, body } = splitFrontmatter(raw);
+      assert(
+        title === undefined,
+        `${lead} expected no title, got ${JSON.stringify(title)}`,
+      );
+      assert(
+        body.includes(`${lead} the opening paragraph.`),
+        `${lead} opening paragraph was swallowed: ${JSON.stringify(body)}`,
+      );
+      assert(body.includes("And the rest."), `${lead} tail lost: ${JSON.stringify(body)}`);
+    }
+
+    // No regression on real frontmatter shapes.
+    const tagsFirst = splitFrontmatter("---\ntags: [a, b]\ntitle: Alpha\n---\nbody\n");
+    assert(
+      tagsFirst.title === "Alpha" && tagsFirst.body === "body\n",
+      `tags-first frontmatter must still parse: ${JSON.stringify(tagsFirst)}`,
+    );
+    const crlf = splitFrontmatter("---\r\ntitle: Alpha\r\n---\r\nbody\r\n");
+    assert(
+      crlf.title === "Alpha" && crlf.body === "body\r\n",
+      `CRLF frontmatter must still parse: ${JSON.stringify(crlf)}`,
+    );
+    const none = splitFrontmatter("Note: just prose, no fence.\n");
+    assert(
+      none.title === undefined && none.body === "Note: just prose, no fence.\n",
+      `a file with no frontmatter must pass through: ${JSON.stringify(none)}`,
+    );
+
+    // And end to end: the paragraph reaches the corpus.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-colon-"));
+    writeFileSync(
+      join(dir, "note.md"),
+      "---\n\nNote: this paragraph must survive.\n\n---\n\nTail.\n",
+    );
+    const r = ingestDirectory(db, dir);
+    assert(r.ingested === 1, `expected the note to be ingested, got ${r.ingested}`);
+    const row = db
+      .prepare(`SELECT body FROM vector_document WHERE id = ?`)
+      .get(r.documentIds[0]) as { body: string };
+    assert(
+      row.body.includes("this paragraph must survive"),
+      `the stored body lost the opening paragraph: ${JSON.stringify(row.body)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "M9: unknown flags and extra positionals are rejected, not silently accepted",
+  () => {
+    // `--dry-run` was ignored rather than rejected. A silently-ignored flag on
+    // a privacy control is how people believe they are protected when they
+    // are not.
+    for (const bad of [
+      ["vault", "--dry-run"],
+      ["vault", "-x"],
+      ["vault", "--exclude", "Private", "--verbose"],
+      ["vault", "second-vault"],
+      [],
+    ]) {
+      const parsed = parseIngestArgs(bad);
+      assert(
+        !parsed.ok,
+        `${JSON.stringify(bad)} must be rejected, got ${JSON.stringify(parsed)}`,
+      );
+    }
+    const good = parseIngestArgs([
+      "vault",
+      "--exclude",
+      "Private",
+      "--include-dotted",
+      "--allow-unmatched-exclude",
+    ]);
+    assert(
+      good.ok &&
+        good.path === "vault" &&
+        good.includeDotted &&
+        good.allowUnmatchedExclude,
+      `the documented flags must still parse, got ${JSON.stringify(good)}`,
     );
   },
 );

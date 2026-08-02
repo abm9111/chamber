@@ -38,6 +38,20 @@ export interface PinVerdict {
    * what a verdict was reached against instead of trusting the claim it made.
    */
   sourceKind?: string;
+  /**
+   * `title` of the row that was actually matched — for a vault passage this is
+   * the heading breadcrumb (`policy › Access`), i.e. what occupies that
+   * position in the note *now*.
+   *
+   * Surfaced for the same reason as `sourceKind`: on a `hash_mismatch` the
+   * only thing a caller could previously report was the position, and a
+   * position is exactly the thing an edit above it silently reassigns. Inserting
+   * a section at the top of a note leaves `policy.md#p1` naming a different
+   * section than the one the pin was minted against, so a message built from
+   * the ref alone points the operator at content they never cited. Absent on
+   * `not_found`, because there is no row to have read it from.
+   */
+  title?: string | null;
 }
 
 export interface PinnedSource {
@@ -166,6 +180,7 @@ export function verifyPin(db: DatabaseSync, source: PinnedSource): PinVerdict {
       actualHash,
       sourceRef: row.source_ref,
       sourceKind: row.source_kind,
+      title: row.title,
     };
   }
   return {
@@ -173,6 +188,7 @@ export function verifyPin(db: DatabaseSync, source: PinnedSource): PinVerdict {
     actualHash,
     sourceRef: row.source_ref,
     sourceKind: row.source_kind,
+    title: row.title,
   };
 }
 
@@ -185,6 +201,14 @@ export interface BeliefDrift {
     refId: string;
     reason: BeliefSourceFailure;
     sourceRef?: string | null;
+    /**
+     * Breadcrumb title of the row as it stands *now* — see `PinVerdict.title`.
+     * Carried alongside `sourceRef` because the pair is what makes a drift
+     * report actionable: the ref is the position the pin was committed
+     * against, the title is what occupies that position today, and an edit
+     * above the passage is precisely the case where the two disagree.
+     */
+    title?: string | null;
   }[];
 }
 
@@ -281,6 +305,7 @@ export function verifyBeliefSources(
         refId: r.ref_id,
         reason: verdict.reason!,
         sourceRef: verdict.sourceRef,
+        title: verdict.title,
       });
     }
   }

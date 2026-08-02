@@ -140,7 +140,7 @@ The pin written to `belief_source` at commit time is the value that later goes s
 
 ## Error handling
 
-**Stale pins are not fabrications.** `hash_mismatch` on an existing row means the note changed since ingest; the message says so and suggests re-ingesting. `not_found` means a hallucinated or deleted reference. Both fail to count as verified support — a pin that does not match cannot back a load-bearing claim — but they read completely differently.
+**Stale pins are not fabrications.** `hash_mismatch` on an existing row means the note changed under the citation; the message names the passage ref the pin was committed against *and* the breadcrumb of whatever occupies that position now, because an edit above the passage silently reassigns the ordinal and the ref alone would then point at content the belief never cited. It does not suggest re-ingesting: re-ingest is what produced the state, so running it again is a no-op — the message says to open the note and re-check instead. `not_found` means a hallucinated reference, or a cited passage that has left the corpus. Both fail to count as verified support — a pin that does not match cannot back a load-bearing claim — but they read completely differently.
 
 **Fail before spending.** Zero hits skips the model entirely (step 2 above).
 

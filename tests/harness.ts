@@ -4751,6 +4751,95 @@ test(
 
 test(
   "pins",
+  "a drift failure carries what occupies the pinned position now, not only the position",
+  () => {
+    // Inserting a section at the *top* of a note shifts every passage below it
+    // down one ordinal. The pin still resolves — the document id is stable —
+    // but `policy.md#p1` is now a different section than the one the belief was
+    // committed against, and the section actually cited sits intact at `#p2`.
+    // A drift line built from the ref alone therefore names content the belief
+    // never cited, which is why `verifyPin` surfaces the row's current
+    // breadcrumb title: the ref is where the pin was committed, the title is
+    // what holds that position today, and this is the case where they diverge.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-verify-shifted-"));
+    const file = join(dir, "policy.md");
+    const access = "## Access\n\nAccess requests go to the operations desk.\n\n";
+    const retention =
+      "## Retention\n\nRecords are retained for seven years after the account closes.\n";
+    writeFileSync(file, `# Policy\n\n${access}${retention}`);
+    ingestDirectory(db, dir);
+
+    const pinned = db
+      .prepare(
+        `SELECT id, title, snapshot_hash FROM vector_document WHERE source_ref = 'policy.md#p1'`,
+      )
+      .get() as { id: string; title: string; snapshot_hash: string } | undefined;
+    assert(
+      pinned !== undefined && pinned.title.includes("Retention"),
+      `setup: expected #p1 to be the Retention section, got ${JSON.stringify(pinned)}`,
+    );
+    const committed = commitBelief(db, {
+      text: "Records are retained for seven years after the account closes.",
+      type: "belief",
+      path: "deep",
+      authorFamily: "test",
+      sources: [
+        {
+          kind: "vault_page",
+          refId: pinned!.id,
+          snapshotHash: pinned!.snapshot_hash,
+        },
+      ],
+    });
+    assert(committed.ok, `setup: commit failed: ${JSON.stringify(committed)}`);
+
+    writeFileSync(
+      file,
+      `# Policy\n\n## Onboarding\n\nNew operators are enrolled by the desk lead.\n\n${access}${retention}`,
+    );
+    ingestDirectory(db, dir);
+
+    const entry = verifyBeliefSources(db).find(
+      (b) => b.beliefId === committed.beliefId,
+    );
+    assert(
+      entry !== undefined && entry.failures.length === 1,
+      `expected exactly one failure, got ${JSON.stringify(entry)}`,
+    );
+    const f = entry!.failures[0]!;
+    assert(
+      f.reason === "hash_mismatch",
+      `expected hash_mismatch, got ${f.reason}`,
+    );
+    assert(
+      f.sourceRef === "policy.md#p1",
+      `expected the committed-against ref, got ${JSON.stringify(f.sourceRef)}`,
+    );
+    assert(
+      typeof f.title === "string" && f.title.includes("Access"),
+      `the failure must name what occupies the pinned position now, got ${JSON.stringify(f.title)}`,
+    );
+    assert(
+      !f.title!.includes("Retention"),
+      `the drifted position must not still be reported as the cited section: ${JSON.stringify(f.title)}`,
+    );
+
+    // The evidence moved rather than vanished — which is exactly why the old
+    // "re-run `chamber ingest`" remedy was a no-op: re-ingest is what produced
+    // this state, and the section is already indexed, one ordinal lower.
+    const moved = db
+      .prepare(`SELECT title FROM vector_document WHERE source_ref = 'policy.md#p2'`)
+      .get() as { title: string } | undefined;
+    assert(
+      moved !== undefined && moved.title.includes("Retention"),
+      `the cited section should be intact one ordinal lower, got ${JSON.stringify(moved)}`,
+    );
+  },
+);
+
+test(
+  "pins",
   "verify reports a belief with zero surviving support as broken; a fully-drifted belief zeroes out",
   () => {
     const db = freshDb();

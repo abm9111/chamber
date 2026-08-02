@@ -16,7 +16,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { claimHash, newId } from "./hash.ts";
-import { verifyPin, type PinFailure } from "./pins.ts";
+import { verifyPin, type BeliefSourceFailure } from "./pins.ts";
 import type {
   CommitBeliefInput,
   CommitResult,
@@ -139,7 +139,7 @@ export function commitBelief(
    */
   const rejectedSources: {
     refId: string;
-    reason: PinFailure | "belief_not_found";
+    reason: BeliefSourceFailure;
   }[] = [];
 
   /**

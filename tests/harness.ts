@@ -3977,6 +3977,146 @@ test(
   },
 );
 
+test(
+  "pins",
+  "verify: a belief citing a belief that still exists counts as verified — a healthy chain reports clean",
+  () => {
+    // Task 7b regression. verifyBeliefSources used to route every stored
+    // source through verifyPin uniformly, and verifyPin only registers a
+    // formula for vault_page. A `belief`-kind source — a belief citing
+    // another belief, committed and tested as a legitimate pattern in "a
+    // real belief cited as a source still counts as support" above — always
+    // came back kind_unregistered from that call, so a chain that had never
+    // drifted at all still reported a failure and made `chamber verify` exit
+    // 1 on perfectly healthy data. Same setup as that commit-time test, one
+    // layer up: this one asks whether the *drift scan*, not the *gate*,
+    // agrees the citation is fine.
+    const db = freshDb();
+    const parentText = "Compound X is safe at 400mg daily.";
+    const parent = commitBelief(db, {
+      text: parentText,
+      type: "belief",
+      path: "deep",
+      authorFamily: "test",
+      sources: [seedPinnedDoc(db, "Compound X: 400mg daily is within tolerance.")],
+    });
+    assert(parent.ok, `setup: parent belief must commit: ${JSON.stringify(parent)}`);
+
+    const childText = "Compound X can be recommended at the studied dose.";
+    const child = commitBelief(db, {
+      text: childText,
+      type: "belief",
+      path: "deep",
+      stakes: "consequential",
+      authorFamily: "test",
+      sources: [
+        {
+          kind: "belief",
+          refId: parent.beliefId,
+          snapshotHash: claimHash("belief", parentText),
+        },
+      ],
+    });
+    assert(child.ok, `setup: child belief must commit: ${JSON.stringify(child)}`);
+    assert(
+      (child.rejectedSources?.length ?? 0) === 0,
+      `setup: the belief-kind citation must be accepted at commit time: ${JSON.stringify(child.rejectedSources)}`,
+    );
+
+    const report = verifyBeliefSources(db);
+    const childEntry = report.find((b) => b.beliefId === child.beliefId);
+    assert(childEntry, `expected a report entry for ${child.beliefId}`);
+    assert(
+      childEntry!.total === 1 && childEntry!.verified === 1,
+      `a belief-kind source whose belief still exists must verify, got ${JSON.stringify(childEntry)}`,
+    );
+    assert(
+      childEntry!.failures.length === 0,
+      `expected no failures on an undrifted belief-kind source, got ${JSON.stringify(childEntry!.failures)}`,
+    );
+
+    // Reproduce the CLI's exit-code rule directly against the report shape,
+    // the same way the partial- and full-drift tests above this one already
+    // do — nothing else in this suite spawns the CLI as a subprocess.
+    // `broken` is exactly what `chamber verify` counts before deciding
+    // process.exitCode; zero here is what "exits 0" means for this belief.
+    const broken = report.filter(
+      (b) => b.failures.length > 0 && b.verified === 0,
+    ).length;
+    assert(
+      broken === 0,
+      `a healthy belief chain must not make chamber verify exit non-zero, got ${broken} broken`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "verify: a belief-kind source naming a belief that no longer exists fails as belief_not_found, not kind_unregistered",
+  () => {
+    // The complement of the test above, and the thing the fix must not
+    // over-correct into: verifyBeliefSources must still catch a genuinely
+    // missing belief row, and must report it under the same distinct reason
+    // commitBelief already uses for this case ("a belief-kind source naming
+    // no belief row buys nothing", above) — not silently accept it, and not
+    // mislabel it kind_unregistered, which would make it indistinguishable
+    // from a source kind that was never checked at all.
+    //
+    // commitBelief refuses to ever *write* a belief-kind source that fails
+    // its own existence check, so the only way a stored belief_source row
+    // can name a belief that does not exist is the ledger moving after the
+    // pin was written — inserted directly here to isolate exactly that
+    // shape, the same way the hash-drift tests above simulate a moved corpus
+    // with a raw UPDATE instead of re-running ingest against a deleted file.
+    const db = freshDb();
+    const citing = commitBelief(db, {
+      text: "An observation, so no citation debt is at stake in this test.",
+      type: "observation",
+      path: "deep",
+      authorFamily: "test",
+      sources: [],
+    });
+    assert(citing.ok, `setup: citing belief must commit: ${JSON.stringify(citing)}`);
+
+    db.prepare(
+      `INSERT INTO belief_source (id, belief_id, kind, ref_id, snapshot_hash, provenance)
+       VALUES (?, ?, 'belief', ?, ?, 'direct')`,
+    ).run(
+      newId("src"),
+      citing.beliefId,
+      "blf_totally_made_up",
+      claimHash("belief", "a belief that was never actually committed"),
+    );
+
+    const report = verifyBeliefSources(db);
+    const entry = report.find((b) => b.beliefId === citing.beliefId);
+    assert(entry, `expected a report entry for ${citing.beliefId}`);
+    assert(
+      entry!.total === 1 && entry!.verified === 0,
+      `expected the dangling belief-kind source to fail verification, got ${JSON.stringify(entry)}`,
+    );
+    assert(
+      entry!.failures.length === 1 &&
+        entry!.failures[0]!.refId === "blf_totally_made_up",
+      `expected exactly one failure naming the missing belief, got ${JSON.stringify(entry!.failures)}`,
+    );
+    assert(
+      entry!.failures[0]!.reason === "belief_not_found",
+      `expected the distinct belief_not_found reason (matching commitBelief's own reason for this case), got ${entry!.failures[0]!.reason}`,
+    );
+
+    // Zero surviving support: this belief must count toward the CLI's broken
+    // tally, i.e. `chamber verify` must exit non-zero for it.
+    const broken = report.filter(
+      (b) => b.failures.length > 0 && b.verified === 0,
+    ).length;
+    assert(
+      broken >= 1,
+      "a belief with only a dangling belief-kind source must count as broken",
+    );
+  },
+);
+
 // ─── report ──────────────────────────────────────────────────────────────────
 
 // Drain the async queue sequentially: invoke a thunk, await it fully,

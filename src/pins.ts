@@ -14,6 +14,19 @@ import { sha256 } from "./hash.ts";
 
 export type PinFailure = "not_found" | "hash_mismatch" | "kind_unregistered";
 
+/**
+ * Failure reasons a *stored belief source* can carry, which is a superset of
+ * what `verifyPin` itself can return. A `belief`-kind source never reaches
+ * verifyPin (see `verifyBeliefSources`) — it fails its own existence check
+ * instead, with its own reason, so a caller can tell "this pin's formula
+ * disagreed" from "this citation points at a belief row that is gone."
+ * commitBelief's own rejection list (src/commit_belief.ts) uses this same
+ * union for the identical reason: one definition, so the gate that writes a
+ * belief-kind source and the scan that re-checks it later cannot drift apart
+ * on what counts as valid.
+ */
+export type BeliefSourceFailure = PinFailure | "belief_not_found";
+
 export interface PinVerdict {
   ok: boolean;
   reason?: PinFailure;
@@ -116,7 +129,11 @@ export interface BeliefDrift {
   content: string;
   total: number;
   verified: number;
-  failures: { refId: string; reason: PinFailure; sourceRef?: string | null }[];
+  failures: {
+    refId: string;
+    reason: BeliefSourceFailure;
+    sourceRef?: string | null;
+  }[];
 }
 
 /**
@@ -128,8 +145,18 @@ export interface BeliefDrift {
  * just read from — this is the check that can actually fail, because the row
  * it reads now may not be the row a source pin was minted against.
  *
- * Read-only: every row visited here is a SELECT, and verifyPin itself never
- * writes. Calling this does not change what any future call to it reports.
+ * A `belief`-kind source is the one exception to "every source goes through
+ * verifyPin": a belief citing another belief is not a corpus document, so
+ * there is no formula to recompute — verifyPin correctly has none, and this
+ * function must not paper over that by calling it anyway. It is checked for
+ * existence instead, mirroring the same rule commitBelief already applies
+ * when the source is first written (src/commit_belief.ts), so a citation
+ * that was valid enough to commit is never later reported broken by a scan
+ * that quietly disagrees about what "valid" means for that kind.
+ *
+ * Read-only: every row visited here is a SELECT — by verifyPin or by the
+ * belief-existence check below — and neither one ever writes. Calling this
+ * does not change what any future call to it reports.
  */
 export function verifyBeliefSources(
   db: DatabaseSync,
@@ -166,6 +193,31 @@ export function verifyBeliefSources(
       byBelief.set(r.belief_id, entry);
     }
     entry.total += 1;
+
+    if (r.kind === "belief") {
+      // A belief citing another belief is an internal ledger edge, not a
+      // corpus document: there is no body to recompute a hash from, so
+      // routing it through verifyPin always landed on kind_unregistered —
+      // correct for a kind with no formula, but "no formula" is not "never
+      // verified this drifted." That conflation made a belief-kind source
+      // report broken forever, even freshly committed and never touched,
+      // which made `chamber verify` exit non-zero on a perfectly healthy
+      // chain and taught operators to ignore its failures. A belief's
+      // claim_hash is immutable once committed, so nothing about a
+      // belief-kind source can drift — it can only vanish — and existence is
+      // therefore the whole check, exactly as commitBelief already applies
+      // it when the source is first written (src/commit_belief.ts).
+      const cited = db
+        .prepare(`SELECT id FROM belief WHERE id = ?`)
+        .get(r.ref_id) as { id: string } | undefined;
+      if (cited) {
+        entry.verified += 1;
+      } else {
+        entry.failures.push({ refId: r.ref_id, reason: "belief_not_found" });
+      }
+      continue;
+    }
+
     const verdict = verifyPin(db, {
       kind: r.kind,
       refId: r.ref_id,

@@ -816,6 +816,21 @@ async function main(): Promise<void> {
       break;
     }
     case "verify": {
+      // A typo'd flag must not be silently treated as "no filter": the same
+      // rule `ingest` and `ask` already apply to their own flags. `--since`'s
+      // value is a date and is never itself `--`-prefixed (guarded below), so
+      // it is unambiguous to exclude only the literal `--since` token here —
+      // anything else starting with `--` (e.g. a mistyped `--sinse`) is an
+      // unrecognized flag and must be refused before it ever reaches
+      // verifyBeliefSources, which cannot tell "no --since given" from "you
+      // meant --since but misspelled it" — both look like an absent filter.
+      const unknown = rest.filter((a) => a.startsWith("--") && a !== "--since");
+      if (unknown.length > 0) {
+        console.error(`verify: unknown flag(s): ${unknown.join(", ")}`);
+        console.error("usage: chamber verify [--since <date>]");
+        process.exitCode = 1;
+        break;
+      }
       const i = rest.indexOf("--since");
       let since: string | undefined;
       if (i >= 0) {

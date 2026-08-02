@@ -42,6 +42,7 @@ import {
 } from "./ingest.ts";
 import { completeSync } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
+import { runAsk } from "./ask.ts";
 import { runExpiryJob } from "./expiry.ts";
 import { indexCodeTree, searchCode } from "./code_index.ts";
 import {
@@ -590,6 +591,12 @@ Usage:
       (.trash, .obsidian) and symlinks leaving the root are skipped.
   chamber search <query>           Local vector search
   chamber search --hybrid <query>  Vector + FTS5 hybrid
+  chamber ask "<question>" [--strict]        answer from the corpus with verified pins
+      The model is shown passages numbered [1]..[k] and cites those numbers;
+      index→document and document→hash mapping happen locally, so it can
+      neither invent a document id nor supply a snapshot hash. Each claim is
+      gated on its own citations. --strict refuses an unsourced assertion
+      instead of committing it with citation debt.
   chamber expiry                   Run belief expiry job
 
 Env:
@@ -751,6 +758,52 @@ async function main(): Promise<void> {
         return;
       }
       cmdSearch(db, q, hybrid);
+      break;
+    }
+    case "ask": {
+      const strict = rest.includes("--strict");
+      // A mistyped `--stict` must not silently answer in lax mode: --strict is
+      // the control that turns an unsourced assertion from minted debt into a
+      // refusal, so swallowing an unrecognised flag disables a gate quietly.
+      // Same rule `ingest` already applies to its own flags.
+      const unknown = rest.filter((a) => a.startsWith("--") && a !== "--strict");
+      if (unknown.length > 0) {
+        console.error(`ask: unknown flag(s): ${unknown.join(", ")}`);
+        console.error('usage: chamber ask "<question>" [--strict]');
+        process.exitCode = 1;
+        break;
+      }
+      const q = rest
+        .filter((a) => !a.startsWith("--"))
+        .join(" ")
+        .trim();
+      if (!q) {
+        console.error('usage: chamber ask "<question>" [--strict]');
+        process.exitCode = 1;
+        break;
+      }
+      const r = await runAsk(db, q, { strict });
+      if (!r.modelCalled) {
+        console.log(r.note ?? "no passages retrieved");
+        break;
+      }
+      console.log(`\n${r.answer}\n`);
+      const refToPath = new Map(
+        r.passages.map((p) => [p.documentId, p.sourceRef ?? p.documentId]),
+      );
+      for (const c of r.claims) {
+        if (c.kind === "chatter") continue;
+        const cites = c.citedRefs.map((id) => refToPath.get(id) ?? id).join(", ");
+        console.log(`  [${c.status}] ${c.text.slice(0, 70)}`);
+        if (cites) console.log(`     sources: ${cites}`);
+        for (const rj of c.rejected) {
+          console.log(`     rejected ${rj.refId}: ${rj.reason}`);
+        }
+        if (c.debtIds.length) {
+          console.log(`     debt: ${c.debtIds.join(", ")}`);
+        }
+      }
+      console.log(`\n${formatSpendFooter(spendLastHours(db, 24))}`);
       break;
     }
     case "expiry": {

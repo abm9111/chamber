@@ -46,6 +46,7 @@ import {
   countDocuments,
 } from "../src/vector.ts";
 import { verifyPin } from "../src/pins.ts";
+import { runAsk, citedIndices } from "../src/ask.ts";
 import {
   minilmAvailable,
   embedLocal,
@@ -3327,6 +3328,404 @@ test("vector", "V5_minilm_semantic", () => {
     hits[0]!.body.toLowerCase().includes("aed") ||
       hits[0]!.title === "Currency",
     `semantic top should be currency, got ${hits[0]!.score} ${hits[0]!.title}`,
+  );
+});
+
+// ─── ASK (src/ask.ts — retrieve, number, cite, verify, commit) ───────────────
+//
+// The pipeline exists to make citation forgery structurally impossible: the
+// model is shown passages numbered [1]..[k] and emits only those numbers.
+// Index→document-id and id→snapshot-hash mapping happen locally from the
+// retrieval results, so no model-produced string can reach verifyPin as a
+// refId or a snapshotHash. Every test below injects its own completion
+// function — nothing here may call a live model.
+//
+// `model: "local-hash-v1"` on the extra tests keeps them hermetic and fast:
+// the default embedder spawns Python/MiniLM (~250ms per call) only when the
+// ONNX model happens to be on disk, and a gate test must not change behaviour
+// based on that. The three tests carried over from the task brief deliberately
+// leave the model unset, which exercises the same "auto" resolution that
+// `chamber ingest` uses on both the document and the query side.
+
+test("pins", "runAsk maps cited passage numbers to verified sources", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/decision.md",
+    title: "Decision",
+    body: "We decided to use SQLite for the audit store.",
+  });
+  // The brief's fake answer was "We decided to use SQLite for the audit store.
+  // [1]", which classifyClaims scores as an *observation*: none of
+  // is/are/was/were/will/must/always/never/fact: appears in it. The assertion
+  // filter below therefore found nothing and the test failed against a correct
+  // implementation. Same fact, phrased in the tense the heuristic reads as
+  // load-bearing; the observation wording is covered by the test right below.
+  const fake = async () => "The audit store is SQLite. [1]";
+  const r = await runAsk(db, "what did we decide about the audit store", {
+    complete: fake,
+  });
+  assert(r.modelCalled, "model should have been called");
+  const assertions = r.claims.filter((c) => c.kind === "assertion");
+  assert(assertions.length > 0, "expected at least one assertion claim");
+  assert(
+    assertions[0]!.citedRefs.length === 1,
+    `expected 1 cited ref, got ${assertions[0]!.citedRefs.length}`,
+  );
+  assert(
+    assertions[0]!.rejected.length === 0,
+    `expected no rejected citations, got ${JSON.stringify(assertions[0]!.rejected)}`,
+  );
+  assert(
+    assertions[0]!.citedRefs[0] === r.passages[0]!.documentId,
+    "the cited ref must be the retrieved document's id, not anything the model wrote",
+  );
+  assert(
+    assertions[0]!.status === "ALLOWED",
+    `a verified citation must commit clean, got ${assertions[0]!.status} debts=${JSON.stringify(assertions[0]!.debtIds)}`,
+  );
+});
+
+test("pins", "runAsk credits a cited observation, not only an assertion", async () => {
+  // The brief's original wording for the test above. classifyClaims reads a
+  // past-tense narrative line as an observation, which still commits and still
+  // carries the pin — the citation gate is not assertion-only.
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/decision.md",
+    title: "Decision",
+    body: "We decided to use SQLite for the audit store.",
+    model: "local-hash-v1",
+  });
+  const fake = async () => "We decided to use SQLite for the audit store. [1]";
+  const r = await runAsk(db, "what did we decide about the audit store", {
+    complete: fake,
+    model: "local-hash-v1",
+  });
+  const obs = r.claims.filter((c) => c.kind === "observation");
+  assert(obs.length === 1, `expected one observation, got ${JSON.stringify(r.claims)}`);
+  assert(
+    obs[0]!.citedRefs.length === 1 && obs[0]!.citedRefs[0] === r.passages[0]!.documentId,
+    `observation must carry the retrieved pin, got ${JSON.stringify(obs[0]!.citedRefs)}`,
+  );
+  const src = db
+    .prepare(
+      `SELECT ref_id, provenance FROM belief_source WHERE ref_id = ?`,
+    )
+    .all(r.passages[0]!.documentId) as { ref_id: string; provenance: string | null }[];
+  assert(src.length === 1, `expected one belief_source row, got ${src.length}`);
+  assert(
+    src[0]!.provenance === "vector",
+    `provenance must survive the contract layer, got ${String(src[0]!.provenance)}`,
+  );
+});
+
+test("pins", "runAsk does not call the model on an empty corpus", async () => {
+  const db = freshDb();
+  let called = false;
+  const fake = async () => {
+    called = true;
+    return "should never run";
+  };
+  const r = await runAsk(db, "anything at all", { complete: fake });
+  assert(!called, "the model must not be called with zero retrieved passages");
+  assert(!r.modelCalled, "modelCalled must be false");
+  assert(!!r.note, "a note explaining why must be returned");
+  assert(
+    r.note!.includes("nothing ingested yet"),
+    `an empty corpus must say so, got ${JSON.stringify(r.note)}`,
+  );
+  assert(r.claims.length === 0 && r.passages.length === 0, JSON.stringify(r));
+});
+
+test("pins", "runAsk distinguishes an empty corpus from a corpus with no match", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/cats.md",
+    title: "Cats",
+    body: "zzzz",
+    model: "local-hash-v1",
+  });
+  let called = false;
+  const fake = async () => {
+    called = true;
+    return "should never run";
+  };
+  const r = await runAsk(db, "qqqqqqqqqq", {
+    complete: fake,
+    model: "local-hash-v1",
+  });
+  assert(!called, "still no model call when retrieval comes back empty");
+  assert(
+    r.note === "nothing in the corpus matches this question",
+    `a populated corpus must not claim nothing was ingested, got ${JSON.stringify(r.note)}`,
+  );
+});
+
+test("pins", "runAsk rejects a citation to a passage it never retrieved", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/one.md",
+    title: "One",
+    body: "Only one passage exists in this corpus.",
+  });
+  const fake = async () => "This claim is supported by nothing real. [7]";
+  const r = await runAsk(db, "one passage", { complete: fake });
+  const assertions = r.claims.filter((c) => c.kind === "assertion");
+  assert(assertions.length > 0, "expected an assertion");
+  assert(
+    assertions[0]!.citedRefs.length === 0,
+    "an out-of-range index must not become a source",
+  );
+  assert(
+    assertions[0]!.rejected.some((x) => x.reason === "index_out_of_range"),
+    `the drop must be reported, got ${JSON.stringify(assertions[0]!.rejected)}`,
+  );
+  assert(
+    assertions[0]!.rejected[0]!.refId === "[7]",
+    "an out-of-range citation has no document id — report the index the model wrote",
+  );
+  assert(
+    assertions[0]!.status === "DEBT" && assertions[0]!.debtIds.length === 1,
+    `an unsupported assertion must mint debt, got ${assertions[0]!.status}`,
+  );
+});
+
+test(
+  "pins",
+  "runAsk never lets a model-produced identifier or hash reach the pin gate",
+  async () => {
+    // The forgery routes this pipeline closes, exercised directly: the model
+    // emits a plausible document id and a plausible 64-hex snapshot hash in
+    // its answer. Neither is a passage number, so neither is read; the only
+    // model-derived value that survives into the gate is the integer index,
+    // used solely as a Map key against the retrieval results.
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/decision.md",
+      title: "Decision",
+      body: "We decided to use SQLite for the audit store.",
+      model: "local-hash-v1",
+    });
+    const forgedId = "vdoc_forged_by_the_model";
+    const forgedHash = "a".repeat(64);
+    const fake = async () =>
+      `The audit store is SQLite. [1] refId=${forgedId} snapshotHash=${forgedHash}`;
+    const r = await runAsk(db, "audit store", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    const real = r.passages[0]!.documentId;
+    for (const c of r.claims) {
+      assert(
+        c.citedRefs.every((id) => id === real),
+        `only retrieved ids may be cited, got ${JSON.stringify(c.citedRefs)}`,
+      );
+    }
+    const forgedRows = count(
+      db,
+      `SELECT count(*) AS c FROM belief_source WHERE ref_id = ? OR snapshot_hash = ?`,
+      forgedId,
+      forgedHash,
+    );
+    assert(forgedRows === 0, `a forged pin reached belief_source ${forgedRows} time(s)`);
+    const realRows = count(
+      db,
+      `SELECT count(*) AS c FROM belief_source WHERE ref_id = ?`,
+      real,
+    );
+    assert(realRows >= 1, "the real retrieved pin should still have committed");
+  },
+);
+
+test("pins", "runAsk counts a passage cited twice in one claim once", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/decision.md",
+    title: "Decision",
+    body: "We decided to use SQLite for the audit store.",
+    model: "local-hash-v1",
+  });
+  const fake = async () => "The audit store is SQLite [1], as recorded in [1].";
+  const r = await runAsk(db, "audit store", {
+    complete: fake,
+    model: "local-hash-v1",
+  });
+  const a = r.claims.filter((c) => c.kind === "assertion")[0]!;
+  assert(
+    a.citedRefs.length === 1,
+    `a repeated citation must not double-count, got ${JSON.stringify(a.citedRefs)}`,
+  );
+  const rows = count(
+    db,
+    `SELECT count(*) AS c FROM belief_source WHERE ref_id = ?`,
+    r.passages[0]!.documentId,
+  );
+  assert(rows === 1, `expected one belief_source row, got ${rows}`);
+});
+
+test("pins", "runAsk mints debt for an uncited assertion and refuses it under strict", async () => {
+  const seed = (): DatabaseSync => {
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/decision.md",
+      title: "Decision",
+      body: "We decided to use SQLite for the audit store.",
+      model: "local-hash-v1",
+    });
+    return db;
+  };
+  const fake = async () => "The audit store is a distributed ledger.";
+
+  const lax = seed();
+  const r1 = await runAsk(lax, "audit store", {
+    complete: fake,
+    model: "local-hash-v1",
+  });
+  const a1 = r1.claims.filter((c) => c.kind === "assertion")[0]!;
+  assert(
+    a1.status === "DEBT" && a1.debtIds.length === 1,
+    `expected blocking debt, got ${a1.status} ${JSON.stringify(a1.debtIds)}`,
+  );
+  assert(a1.rejected.length === 0, "nothing was cited, so nothing was rejected");
+
+  const strict = seed();
+  const r2 = await runAsk(strict, "audit store", {
+    complete: fake,
+    strict: true,
+    model: "local-hash-v1",
+  });
+  const a2 = r2.claims.filter((c) => c.kind === "assertion")[0]!;
+  assert(a2.status === "REFUSED", `strict must refuse, got ${a2.status}`);
+  assert(
+    count(strict, `SELECT count(*) AS c FROM belief WHERE epistemic_type = 'belief'`) === 0,
+    "a refused assertion must not have committed a belief row",
+  );
+});
+
+test("pins", "runAsk records an I-don't-know answer as aporia, not an error", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/decision.md",
+    title: "Decision",
+    body: "We decided to use SQLite for the audit store.",
+    model: "local-hash-v1",
+  });
+  const fake = async () => "I don't know.";
+  const r = await runAsk(db, "audit store", {
+    complete: fake,
+    model: "local-hash-v1",
+  });
+  assert(r.claims.length === 1, JSON.stringify(r.claims));
+  assert(r.claims[0]!.kind === "aporia", `expected aporia, got ${r.claims[0]!.kind}`);
+  assert(r.claims[0]!.status === "APORIA", `expected APORIA, got ${r.claims[0]!.status}`);
+  assert(r.claims[0]!.citedRefs.length === 0, "an aporia cites nothing");
+  assert(
+    count(db, `SELECT count(*) AS c FROM citation_debt WHERE status = 'pending'`) === 0,
+    "an aporia must not mint debt",
+  );
+});
+
+test("pins", "runAsk returns an empty answer coherently", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/decision.md",
+    title: "Decision",
+    body: "We decided to use SQLite for the audit store.",
+    model: "local-hash-v1",
+  });
+  const fake = async () => "   \n\n  ";
+  const r = await runAsk(db, "audit store", {
+    complete: fake,
+    model: "local-hash-v1",
+  });
+  assert(r.modelCalled, "the model did run");
+  assert(r.claims.length === 1 && r.claims[0]!.kind === "chatter", JSON.stringify(r.claims));
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief`) === 0,
+    "an empty answer must commit nothing",
+  );
+});
+
+test(
+  "pins",
+  "runAsk splits an answer per line: bullets, numbering, and a bare citation line",
+  async () => {
+    // classifyClaims is line-based, so this pins down exactly what that means
+    // for model output shapes that show up in practice. A claim spanning two
+    // lines is two claims, and only the line carrying the bracket gets the
+    // pin — the other one is unsupported and mints debt. That is the
+    // fail-closed direction, but it is a real limitation, not a nicety.
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/decision.md",
+      title: "Decision",
+      body: "We decided to use SQLite for the audit store, indexed locally.",
+      model: "local-hash-v1",
+    });
+    const fake = async () =>
+      [
+        "1. The audit store is SQLite. [1]",
+        "- The index is local to the process. [1]",
+        "[1]",
+        "The retriever is in-process,",
+        "and needs no server. [1]",
+      ].join("\n");
+    const r = await runAsk(db, "audit store", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    const doc = r.passages[0]!.documentId;
+    assert(r.claims.length === 5, `expected 5 line-claims, got ${r.claims.length}`);
+
+    // A numbered prefix is NOT stripped (only -, * and • are), but it is
+    // harmless: citedIndices only reads bracketed numbers, so "1." is text.
+    assert(
+      r.claims[0]!.text.startsWith("1. ") && r.claims[0]!.citedRefs[0] === doc,
+      JSON.stringify(r.claims[0]),
+    );
+    // A "-" bullet is stripped before classification.
+    assert(
+      r.claims[1]!.text.startsWith("The index") && r.claims[1]!.citedRefs[0] === doc,
+      JSON.stringify(r.claims[1]),
+    );
+    // A citation alone on its line becomes its own claim and carries the pin.
+    assert(
+      r.claims[2]!.text === "[1]" && r.claims[2]!.citedRefs[0] === doc,
+      JSON.stringify(r.claims[2]),
+    );
+    // A wrapped claim: the first half has no bracket, so it is unsupported.
+    assert(
+      r.claims[3]!.citedRefs.length === 0 && r.claims[3]!.status === "DEBT",
+      `a wrapped claim's uncited half must mint debt, got ${JSON.stringify(r.claims[3])}`,
+    );
+    assert(
+      r.claims[4]!.citedRefs[0] === doc,
+      JSON.stringify(r.claims[4]),
+    );
+  },
+);
+
+test("pins", "citedIndices dedupes, preserves order, and ignores non-citations", () => {
+  assert(JSON.stringify(citedIndices("a [2] b [1] c [2]")) === "[2,1]", "dedupe + order");
+  assert(JSON.stringify(citedIndices("no citations here")) === "[]", "none");
+  assert(JSON.stringify(citedIndices("array[0] and [3]")) === "[0,3]", "bare [0] is read and later rejected as out of range");
+  assert(
+    JSON.stringify(citedIndices("see [1][2][3]")) === "[1,2,3]",
+    "adjacent citations",
+  );
+  assert(
+    JSON.stringify(citedIndices("footnote [1a] and [ 2 ] and [] and [1]")) === "[1]",
+    "only bare bracketed integers count",
   );
 });
 

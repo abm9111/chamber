@@ -179,6 +179,18 @@ Explicitly out of scope, to keep this to one plan:
 - Session FTS as a pinnable source. Only `vector_document` is verifiable in this iteration.
 - Telegram or any surface other than the CLI.
 
+## Known limitations
+
+These are shipped, not fixed. Each one is a sharp edge a user can hit today.
+
+- **The corpus has no notion of deletion.** Deleting or renaming a note in your vault leaves the old row behind — it is still retrieved, still cited, and still verifies, because the row's content is intact even though the file it came from is gone; only `chamber index`'s explicit delete path removes anything.
+- **A corpus written before this branch reports total drift.** The snapshot formula changed from `[title, body, ref].join("\n")` to `JSON.stringify([title, body, ref])` and there is no migration, so every pin minted by an older build now fails as `hash_mismatch` and the corpus has to be re-ingested.
+- **A typo'd `CHAMBER_MODEL` answers you anyway.** `ask` calls `complete()` directly rather than going through `getHarness` (which throws on an unknown id), and `complete()` treats anything that is not exactly `openai` as `stub` — so `CHAMBER_MODEL=openia` silently returns canned stub prose, and that prose gets classified, gated, and committed as if it were a real answer.
+- **There is no request timeout.** `src/model.ts` calls `fetch` with no deadline, so an endpoint that accepts the connection and then stalls hangs `chamber ask` until you kill it.
+- **Mixed embedding spaces silently shrink the corpus.** `searchVector` filters on `e.model` and `e.dims`, so a corpus half-ingested with MiniLM present and half without splits into two spaces of which any one query sees only one — with no warning, no count, and no way to tell "no match" from "wrong half".
+- **`ingest` has no default exclude list.** Pointing it at a vault root ingests every non-dotted folder under it — drafts, clippings, exports, anything private that is not behind a leading dot — unless you pass `--exclude` for each one yourself.
+- **Only `vault_page` can be cited.** Documents indexed as `note`, `skill`, `x_tweet`, `transcript` or `other` are searchable but have no registered pin formula and cannot be stored in `belief_source`, so `chamber ask` will not retrieve them at all and no claim can ever be supported by one.
+
 ## Open risks
 
 - **Retrieval quality is unmeasured.** If `searchVector` at `k=8` returns weak passages, answers will be poor for reasons unrelated to governance. First real use will show this; the fix would be chunking strategy, not gate design.

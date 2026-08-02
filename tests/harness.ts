@@ -154,6 +154,13 @@ import {
   splitFrontmatter,
   type IngestReport,
 } from "../src/ingest.ts";
+import {
+  PASSAGE_MAX_TOKENS,
+  estimateTokens,
+  passagePathOf,
+  passageSourceRef,
+  splitPassages,
+} from "../src/chunk.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isAsyncFunction } from "node:util/types";
@@ -1649,8 +1656,11 @@ test(
     const row = db
       .prepare(`SELECT body FROM vector_document WHERE id = ?`)
       .get(second.documentIds[0]) as { body: string };
+    // Passages are assembled from paragraphs, so a body arrives without the
+    // file's incidental trailing newline. The claim under test is that the
+    // *same id* now holds the *new content*, which is what this checks.
     assert(
-      row.body === "version two, edited\n",
+      row.body === "version two, edited",
       `expected the row to hold the re-ingested body, got ${JSON.stringify(row.body)}`,
     );
   },
@@ -1675,7 +1685,7 @@ test(
     assert(
       count(
         db,
-        `SELECT count(*) AS c FROM vector_document WHERE source_ref = 'keep.md'`,
+        `SELECT count(*) AS c FROM vector_document WHERE source_ref LIKE 'keep.md#p%'`,
       ) === 1,
       "the surviving document must be keep.md, not something under a/b/private",
     );
@@ -1785,6 +1795,608 @@ test(
   },
 );
 
+// ─── PASSAGE CHUNKING (src/chunk.ts) ─────────────────────────────────────────
+//
+// One embedding per file made long notes unretrievable. Two independent
+// mechanisms cause it, and both are measured, not assumed:
+//
+//  1. Truncation. The MiniLM tokenizer is capped at 256 tokens
+//     (scripts/embed_minilm.py). Everything past that cap is never embedded at
+//     all — a fact in section 6 of a long note is not "diluted", it is absent
+//     from the vector. Measured truncation onset: ~1550 chars of easy prose,
+//     ~800 chars of a mixed vault note, ~550 chars of dense markdown. A
+//     char-based size cap therefore cannot bound the window across content
+//     types, which is why the budget below is counted in estimated tokens.
+//  2. Dilution. Whatever does fit is mean-pooled, so one relevant sentence in
+//     a long note is averaged against everything around it, and a short
+//     unrelated note wins on cosine similarity.
+//
+// The consequence is worse than poor search. When `ask` retrieves the
+// wrong-but-real note, the model cites it, the pin verifies perfectly against
+// the row it was minted from, and the claim commits [ALLOWED]. A citation gate
+// cannot catch a wrong-but-real citation — only chunking can.
+
+/** A long note whose sections are individually larger than one passage. */
+function longSectionedNote(): string {
+  const para = (topic: string, i: number): string =>
+    `${topic} paragraph ${i}. This passage covers ${topic} in operational detail, ` +
+    `including the routine handling, the escalation path, and the person responsible.`;
+  const section = (name: string, n: number): string =>
+    `## ${name}\n\n` +
+    Array.from({ length: n }, (_, i) => para(name, i + 1)).join("\n\n");
+  return (
+    "# Operations Manual\n\nThe single reference for dispatch operations.\n\n" +
+    [
+      section("Receiving", 6),
+      section("Picking", 6),
+      section("Courier Reconciliation", 6),
+      section("Returns", 6),
+    ].join("\n\n") +
+    "\n"
+  );
+}
+
+test("pins", "splitPassages splits a multi-section note at its heading boundaries", () => {
+  const passages = splitPassages(longSectionedNote());
+  assert(passages.length > 4, `expected many passages, got ${passages.length}`);
+  // Each of the four headings must open a passage, so a section is never
+  // silently glued to the middle of its neighbour.
+  for (const h of ["Receiving", "Picking", "Courier Reconciliation", "Returns"]) {
+    assert(
+      passages.some((p) => p.headings[p.headings.length - 1] === h),
+      `no passage is anchored at heading ${JSON.stringify(h)}`,
+    );
+  }
+});
+
+test(
+  "pins",
+  "splitPassages keeps every passage inside the embedder's token window",
+  () => {
+    // The whole point. A passage over the cap has its tail silently dropped
+    // before it is ever embedded, which is the defect being fixed — so a
+    // chunker that emits one is not a fix.
+    for (const body of [
+      longSectionedNote(),
+      // A single section far larger than one passage: heading boundaries alone
+      // do not bound size, so oversized sections must split internally.
+      `## One Enormous Section\n\n${"Sentence about warehouse throughput and reconciliation. ".repeat(200)}`,
+      // No headings anywhere — the boundary strategy must not depend on them.
+      "Sentence about courier manifests and nightly reconciliation. ".repeat(200),
+    ]) {
+      const passages = splitPassages(body);
+      assert(passages.length > 1, "expected an oversized body to split");
+      for (const p of passages) {
+        const t = estimateTokens(p.body);
+        assert(
+          t <= PASSAGE_MAX_TOKENS,
+          `passage ${p.index} is ${t} tokens, over the ${PASSAGE_MAX_TOKENS} cap: ${JSON.stringify(p.body.slice(0, 80))}`,
+        );
+      }
+    }
+  },
+);
+
+test("pins", "splitPassages bounds a passage even when the heading itself is enormous", () => {
+  // The breadcrumb is prepended to every passage body, so it is charged
+  // against the same window as the content. A heading long enough to exhaust
+  // the window on its own would otherwise push the passage over the cap and
+  // have its tail silently dropped before embedding — reintroducing, through
+  // the fix, the exact defect the fix exists to remove.
+  const body = `# ${"Very Long Heading Words ".repeat(60)}\n\nSome content beneath it.\n`;
+  const passages = splitPassages(body);
+  for (const p of passages) {
+    const t = estimateTokens(p.body);
+    assert(t <= PASSAGE_MAX_TOKENS, `passage ${p.index} is ${t} tokens, over the cap`);
+  }
+  // …and the heading text is still somewhere in the corpus, not discarded.
+  assert(
+    passages.map((p) => p.body).join("\n").includes("Very Long Heading Words"),
+    "the oversized heading was dropped rather than split",
+  );
+  assert(
+    passages.map((p) => p.body).join("\n").includes("Some content beneath it."),
+    "the content under an oversized heading was dropped",
+  );
+});
+
+test("pins", "splitPassages does not lose a section whose heading text repeats elsewhere", () => {
+  // `## Status`, `## Notes`, `## Summary` under several parents is the normal
+  // shape of a vault, not an exotic one. An empty section's heading is allowed
+  // to be dropped only when a *descendant of that section* hoists it into its
+  // own breadcrumb; matching on the heading's text instead of its identity
+  // meant an unrelated section that merely shared a title counted as the
+  // carrier, and the empty one vanished from the corpus entirely.
+  const body = [
+    "# Project", "", "## Status", "", "## Notes", "", "- a note", "",
+    "# Archive", "", "## Status", "### Old", "", "- b", "",
+  ].join("\n");
+  const passages = splitPassages(body);
+  const crumbs = passages.map((p) => p.headings.join(" › "));
+  assert(
+    crumbs.some((c) => c === "Project › Status"),
+    `the empty "Project › Status" section vanished; got ${JSON.stringify(crumbs)}`,
+  );
+});
+
+test("pins", "splitPassages keeps an ancestor heading that is trimmed out of a breadcrumb", () => {
+  // When the breadcrumb is too big for the window it is trimmed outside-in,
+  // and an enormous innermost heading is demoted to content wholesale. Either
+  // path discards heading lines — and if the discarded ancestor's own section
+  // was empty (so it emitted no passage of its own, relying on a descendant to
+  // carry it), that heading then exists in no body at all and is invisible to
+  // retrieval.
+  const huge = "Very Long Heading Words ".repeat(60).trim();
+  const passages = splitPassages(`# Top\n\n## ${huge}\n\nchild text.\n`);
+  assert(
+    passages.map((p) => p.body).join("\n").includes("# Top"),
+    "the trimmed ancestor heading is in no passage body",
+  );
+});
+
+test("pins", "splitPassages never drops a line of the note", () => {
+  // A passage scheme that loses content is a silent corpus hole: `ask` would
+  // answer "not in the vault" about text that is plainly in the vault.
+  const body = longSectionedNote();
+  const passages = splitPassages(body);
+  const joined = passages.map((p) => p.body).join("\n");
+  for (const line of body.split("\n").map((l) => l.trim()).filter(Boolean)) {
+    assert(joined.includes(line), `line dropped by the chunker: ${JSON.stringify(line)}`);
+  }
+});
+
+test("pins", "splitPassages hoists ancestor headings so a deep passage carries its context", () => {
+  // "90 days." under `### Retention` is meaningless embedded on its own. Only
+  // `body` is embedded (upsertDocument), so the breadcrumb has to live there.
+  const body =
+    "# Policy Manual\n\n## Data\n\n### Retention\n\nRecords are kept for 90 days and then purged.\n";
+  const passages = splitPassages(body);
+  const deep = passages.find((p) => p.body.includes("90 days"))!;
+  assert(deep !== undefined, "expected a passage holding the retention line");
+  assert(
+    deep.body.includes("# Policy Manual") && deep.body.includes("## Data"),
+    `deep passage lost its ancestors: ${JSON.stringify(deep.body)}`,
+  );
+  assert(
+    JSON.stringify(deep.headings) === JSON.stringify(["Policy Manual", "Data", "Retention"]),
+    `expected the full breadcrumb, got ${JSON.stringify(deep.headings)}`,
+  );
+});
+
+test("pins", "splitPassages does not treat a comment inside a fenced code block as a heading", () => {
+  const body =
+    "# Runbook\n\nRun the restore like this:\n\n```bash\n# Restore the database\nchamber restore --from backup\n# Then verify\nchamber verify\n```\n\nThat is the whole procedure.\n";
+  const passages = splitPassages(body);
+  assert(
+    passages.every((p) => !p.headings.includes("Restore the database")),
+    `a shell comment became a heading: ${JSON.stringify(passages.map((p) => p.headings))}`,
+  );
+});
+
+test("pins", "splitPassages terminates on input with no paragraph or sentence breaks", () => {
+  // A base64 blob or a minified line has no blank line and no sentence end.
+  // A splitter that only ever splits on those boundaries loops forever or
+  // emits one enormous passage; neither is acceptable.
+  const passages = splitPassages("a".repeat(20000));
+  assert(passages.length > 1, "an unbreakable 20k body must still split");
+  for (const p of passages) {
+    assert(
+      estimateTokens(p.body) <= PASSAGE_MAX_TOKENS,
+      `hard-split passage still over cap: ${estimateTokens(p.body)}`,
+    );
+  }
+});
+
+test("pins", "splitPassages is deterministic — the same body yields byte-identical passages", () => {
+  // Idempotent ingest rests entirely on this: same body in, same passages out,
+  // therefore same sourceRefs and same pin hashes.
+  const body = longSectionedNote();
+  assert(
+    JSON.stringify(splitPassages(body)) === JSON.stringify(splitPassages(body)),
+    "chunking is not deterministic",
+  );
+});
+
+// ─── decision 2: sourceRef identity ──────────────────────────────────────────
+
+test("pins", "ingestDirectory gives every passage its own row and a unique sourceRef", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-chunk-ref-"));
+  writeFileSync(join(dir, "manual.md"), longSectionedNote());
+
+  const r = ingestDirectory(db, dir);
+  assert(r.ingested === 1, `expected 1 file, got ${r.ingested}`);
+  assert(r.passages > 4, `expected the file to yield many passages, got ${r.passages}`);
+
+  const refs = (
+    db
+      .prepare(`SELECT source_ref FROM vector_document ORDER BY source_ref`)
+      .all() as { source_ref: string }[]
+  ).map((x) => x.source_ref);
+  assert(refs.length === r.passages, `row count ${refs.length} != passages ${r.passages}`);
+  assert(new Set(refs).size === refs.length, `sourceRefs are not unique: ${JSON.stringify(refs)}`);
+  assert(
+    refs.every((ref) => ref.startsWith("manual.md#")),
+    `every passage must still name its file: ${JSON.stringify(refs)}`,
+  );
+  // The exclude controls compare against the file path prefix, so a passage
+  // ref that no longer starts with its path would silently defeat them.
+  assert(
+    passageSourceRef("manual.md", 3) === "manual.md#p3",
+    `unexpected ref scheme: ${passageSourceRef("manual.md", 3)}`,
+  );
+});
+
+test(
+  "pins",
+  "re-ingesting an unchanged file is a genuine no-op — same ids, same hashes, same row count",
+  () => {
+    // sourceRef is the idempotence key AND a hash input. If a passage's ref
+    // drifted between runs, every stored pin for that file would report
+    // hash_mismatch on an untouched note and `chamber verify` would cry wolf.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-chunk-idem-"));
+    writeFileSync(join(dir, "manual.md"), longSectionedNote());
+
+    const snapshot = (): string =>
+      JSON.stringify(
+        db
+          .prepare(
+            `SELECT id, source_ref, title, snapshot_hash FROM vector_document
+             ORDER BY source_ref`,
+          )
+          .all(),
+      );
+
+    const first = ingestDirectory(db, dir);
+    const before = snapshot();
+    const second = ingestDirectory(db, dir);
+    const after = snapshot();
+
+    assert(before === after, `re-ingest changed rows:\n${before}\n${after}`);
+    assert(
+      JSON.stringify(first.documentIds) === JSON.stringify(second.documentIds),
+      "re-ingest rotated document ids",
+    );
+    assert(second.removed === 0, `an unchanged file removed ${second.removed} row(s)`);
+  },
+);
+
+// ─── decision 3: shrinking files ─────────────────────────────────────────────
+
+test(
+  "pins",
+  "a note edited down to fewer passages leaves no orphaned rows answering from deleted content",
+  () => {
+    // The documented known limitation for *deleted files* must not be
+    // reproduced for *shrunken* ones. An orphan row keeps answering questions
+    // from text the note no longer contains, and it pins and verifies
+    // perfectly while doing it — the exact wrong-but-real failure chunking
+    // exists to close.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-chunk-shrink-"));
+    const file = join(dir, "manual.md");
+    writeFileSync(file, longSectionedNote());
+    const big = ingestDirectory(db, dir);
+    assert(big.passages > 4, `setup: expected many passages, got ${big.passages}`);
+
+    writeFileSync(file, "# Operations Manual\n\nThe manual has been cut back to one line.\n");
+    const small = ingestDirectory(db, dir);
+
+    const rows = count(db, `SELECT count(*) AS c FROM vector_document`);
+    assert(
+      rows === small.passages,
+      `expected exactly ${small.passages} row(s) after shrinking, got ${rows}`,
+    );
+    assert(small.removed === big.passages - small.passages, `removed count wrong: ${small.removed}`);
+    const bodies = (
+      db.prepare(`SELECT body FROM vector_document`).all() as { body: string }[]
+    ).map((x) => x.body);
+    assert(
+      !bodies.some((b) => b.includes("Courier Reconciliation")),
+      "a passage from the deleted content survived the shrink",
+    );
+    // Orphaned rows must be gone from the embedding table too, or they still
+    // score in searchVector via the join.
+    const embs = count(db, `SELECT count(*) AS c FROM vector_embedding`);
+    assert(embs === rows, `embeddings (${embs}) out of step with documents (${rows})`);
+  },
+);
+
+test("pins", "orphan cleanup never reaches rows belonging to a different ingest root", () => {
+  // Two vaults holding the same relative path. Shrinking a note in one must
+  // not delete the other vault's passages — the cross-root collision rule
+  // already keeps them as separate rows, and cleanup has to respect it.
+  const db = freshDb();
+  const a = mkdtempSync(join(tmpdir(), "chamber-chunk-rootA-"));
+  const b = mkdtempSync(join(tmpdir(), "chamber-chunk-rootB-"));
+  writeFileSync(join(a, "manual.md"), longSectionedNote());
+  writeFileSync(join(b, "manual.md"), longSectionedNote());
+  ingestDirectory(db, a);
+  const bFirst = ingestDirectory(db, b);
+
+  writeFileSync(join(a, "manual.md"), "# Manual\n\nCut back to one line.\n");
+  ingestDirectory(db, a);
+
+  const bRows = (
+    db
+      .prepare(
+        `SELECT id FROM vector_document WHERE metadata_json LIKE ? ORDER BY source_ref`,
+      )
+      .all(`%${b}%`) as { id: string }[]
+  ).map((x) => x.id);
+  assert(
+    bRows.length === bFirst.passages,
+    `the other root lost rows: expected ${bFirst.passages}, got ${bRows.length}`,
+  );
+});
+
+test("pins", "a note edited to an empty body loses all of its passages", () => {
+  // Shrink-to-zero is the same defect: the note now contains nothing, so it
+  // must answer nothing.
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-chunk-empty-"));
+  const file = join(dir, "manual.md");
+  writeFileSync(file, longSectionedNote());
+  ingestDirectory(db, dir);
+  writeFileSync(file, "---\ntitle: Operations Manual\n---\n");
+  const r = ingestDirectory(db, dir);
+  assert(
+    count(db, `SELECT count(*) AS c FROM vector_document`) === 0,
+    "an emptied note kept its passages",
+  );
+  assert(r.removed > 0, "emptying a note reported no removals");
+});
+
+test(
+  "pins",
+  "the first chunked ingest adopts a pre-chunking row instead of rotating its id",
+  () => {
+    // Upgrade path for a corpus already built by the one-row-per-file ingest.
+    // Those rows carry the bare path as their `source_ref`. Adopting one as
+    // passage 0 keeps its document id, so a belief already citing it reports
+    // `hash_mismatch` — "the note moved under your citation", which is
+    // actionable — instead of `not_found`, which reads as "your citation was
+    // never real" and loses the trail back to the note.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-chunk-migrate-"));
+    writeFileSync(join(dir, "note.md"), "# Note\n\nThe original single-row body.\n");
+    const legacy = ingestDirectory(db, dir);
+    // Rewrite the row into the pre-chunking shape: one row, ref == bare path.
+    db.prepare(`DELETE FROM vector_document WHERE id != ?`).run(legacy.documentIds[0]!);
+    db.prepare(`UPDATE vector_document SET source_ref = 'note.md' WHERE id = ?`).run(
+      legacy.documentIds[0]!,
+    );
+
+    const after = ingestDirectory(db, dir);
+    assert(
+      count(db, `SELECT count(*) AS c FROM vector_document`) === after.passages,
+      "the pre-chunking row was duplicated rather than adopted",
+    );
+    assert(
+      after.documentIds[0] === legacy.documentIds[0],
+      `passage 0 must keep the pre-chunking document id, got ${after.documentIds[0]} vs ${legacy.documentIds[0]}`,
+    );
+    const row = db
+      .prepare(`SELECT source_ref FROM vector_document WHERE id = ?`)
+      .get(legacy.documentIds[0]!) as { source_ref: string } | undefined;
+    assert(
+      row?.source_ref === "note.md#p0",
+      `the adopted row must be re-keyed as passage 0, got ${JSON.stringify(row)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "a zero-byte read does not delete a note's passages or rotate their ids",
+  () => {
+    // An editor saving in place, `rsync --inplace`, or an interrupted write
+    // leaves a window in which the file reads as zero bytes *successfully*.
+    // That is the same class as the unreadable path, which already declines to
+    // sweep — but it took the delete-everything branch, and the damage does not
+    // heal: once the rows are gone the next ingest has nothing to adopt and
+    // mints fresh ids, moving every belief citing that note permanently from
+    // `hash_mismatch` (names the note, actionable) to `not_found` (reads as
+    // "your citation was never real").
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-chunk-truncated-"));
+    const file = join(dir, "note.md");
+    const original = "# Note\n\n## A\n\nFirst body.\n\n## B\n\nSecond body.\n";
+    writeFileSync(file, original);
+    const first = ingestDirectory(db, dir);
+
+    writeFileSync(file, "");
+    const during = ingestDirectory(db, dir);
+    assert(during.removed === 0, `a zero-byte read deleted ${during.removed} row(s)`);
+    assert(
+      count(db, `SELECT count(*) AS c FROM vector_document`) === first.passages,
+      "a zero-byte read emptied the note out of the corpus",
+    );
+
+    writeFileSync(file, original);
+    const after = ingestDirectory(db, dir);
+    assert(
+      JSON.stringify(after.documentIds) === JSON.stringify(first.documentIds),
+      `ids rotated across a transient empty read: ${JSON.stringify(first.documentIds)} -> ${JSON.stringify(after.documentIds)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "a whitespace-only read is treated as the same transient as zero bytes, in every shape a half-finished write leaves",
+  () => {
+    // The zero-byte guard above and the sweep it guards keyed on *different*
+    // predicates: the guard on `raw === ""`, the sweep on `body.trim() === ""`.
+    // Every file whose bytes are all whitespace fell through the guard into the
+    // sweep, and `"\n"` is the most likely residue of an interrupted write, not
+    // the least — a truncate-then-write that lands the newline first, an editor
+    // that rewrites the file trailing-newline-first, a `printf '\n' > note.md`
+    // typo. Measured before the fix, every shape below deleted both rows, so
+    // the next ingest had nothing to adopt and minted fresh ids, moving the
+    // belief citing the note from `hash_mismatch` to `not_found` — permanently,
+    // because nothing later restores the original id. The two predicates now
+    // agree on `raw.trim() === ""`.
+    const shapes: [label: string, content: string][] = [
+      ["zero bytes", ""],
+      ["one newline", "\n"],
+      ["one space", " "],
+      ["CRLF", "\r\n"],
+      ["blank lines", "\n\n\n"],
+      ["tab", "\t"],
+      ["BOM", "﻿"],
+    ];
+    const original = "# Note\n\n## A\n\nFirst body.\n\n## B\n\nSecond body.\n";
+
+    for (const [label, content] of shapes) {
+      const db = freshDb();
+      const dir = mkdtempSync(join(tmpdir(), "chamber-chunk-whitespace-"));
+      const file = join(dir, "note.md");
+      writeFileSync(file, original);
+      const first = ingestDirectory(db, dir);
+      assert(
+        first.passages === 2,
+        `setup (${label}): expected 2 passages, got ${first.passages}`,
+      );
+
+      // Pin a real belief to passage 0, so the verdict after recovery is
+      // observed rather than inferred from the id list. This is the column
+      // that actually matters to an operator: `hash_mismatch` names the note
+      // and tells them what to re-check, `not_found` reads as "your citation
+      // was never real" and loses the trail.
+      const pinned = db
+        .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+        .get(first.documentIds[0]!) as { snapshot_hash: string };
+      const committed = commitBelief(db, {
+        text: `A claim held up by the note that a ${label} write briefly emptied.`,
+        type: "belief",
+        path: "deep",
+        authorFamily: "test",
+        sources: [
+          {
+            kind: "vault_page",
+            refId: first.documentIds[0]!,
+            snapshotHash: pinned.snapshot_hash,
+          },
+        ],
+      });
+      assert(committed.ok, `setup (${label}): commit failed: ${JSON.stringify(committed)}`);
+
+      writeFileSync(file, content);
+      const during = ingestDirectory(db, dir);
+      assert(
+        during.removed === 0,
+        `a ${label} read deleted ${during.removed} row(s)`,
+      );
+      assert(
+        count(db, `SELECT count(*) AS c FROM vector_document`) === first.passages,
+        `a ${label} read emptied the note out of the corpus`,
+      );
+
+      writeFileSync(file, original);
+      const after = ingestDirectory(db, dir);
+      assert(
+        JSON.stringify(after.documentIds) === JSON.stringify(first.documentIds),
+        `ids rotated across a transient ${label} read: ${JSON.stringify(first.documentIds)} -> ${JSON.stringify(after.documentIds)}`,
+      );
+
+      // The note is byte-identical to what the pin was minted against, so the
+      // pin must verify outright. Under the defect this is `not_found`.
+      const drift = verifyBeliefSources(db).find(
+        (b) => b.beliefId === committed.beliefId,
+      );
+      assert(
+        drift !== undefined && drift.verified === 1 && drift.failures.length === 0,
+        `the belief lost its support across a transient ${label} read: ${JSON.stringify(drift)}`,
+      );
+    }
+  },
+);
+
+// ─── decision 4: citation display ────────────────────────────────────────────
+
+test(
+  "pins",
+  "a passage citation still reads as a human-meaningful location, not an opaque chunk id",
+  async () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-chunk-cite-"));
+    writeFileSync(
+      join(dir, "manual.md"),
+      "# Operations Manual\n\n## Courier Reconciliation\n\nThe reconciliation window closes after forty-two hours.\n",
+    );
+    ingestDirectory(db, dir);
+
+    // No `model` override: retrieval has to run under the same embedder
+    // `ingestDirectory` just wrote with, or the join in searchVector matches
+    // nothing and the test passes vacuously on an empty corpus.
+    const asked = await runAsk(db, "when does the reconciliation window close", {
+      complete: async () => "The window closes after forty-two hours. [1]",
+    });
+    assert(asked.modelCalled, "setup: expected the model to be called");
+    const p = asked.passages[0]!;
+    // The operator has to be able to open the note and find the passage.
+    assert(
+      p.sourceRef!.startsWith("manual.md#"),
+      `citation lost its file path: ${JSON.stringify(p.sourceRef)}`,
+    );
+    assert(
+      typeof p.label === "string" && p.label.includes("manual.md"),
+      `passage has no human-readable label: ${JSON.stringify(p.label)}`,
+    );
+    assert(
+      p.label.includes("Courier Reconciliation"),
+      `the label should name the heading the passage came from, got ${JSON.stringify(p.label)}`,
+    );
+  },
+);
+
+// ─── the measured payoff ─────────────────────────────────────────────────────
+
+test(
+  "pins",
+  "chunking ranks the passage holding the fact above short unrelated notes",
+  () => {
+    // Before chunking this exact fixture put the note holding the answer at
+    // rank 6 of 9 behind `forty-two.md`, `window-cleaning.md` and three other
+    // unrelated notes (hash embedder; rank 5 with MiniLM). The regression this
+    // guards is the one that motivated the whole change.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-chunk-retrieval-"));
+    const needle = "the courier reconciliation window closes forty-two hours after dispatch";
+    writeFileSync(
+      join(dir, "manual.md"),
+      longSectionedNote().replace(
+        "## Courier Reconciliation\n",
+        `## Courier Reconciliation\n\nCouriers submit manifests nightly and ${needle}, after which any unreconciled consignment is written off.\n`,
+      ),
+    );
+    for (const [name, body] of [
+      ["forty-two.md", "# Forty Two\n\nA note about the number forty-two.\n"],
+      ["window-cleaning.md", "# Window Cleaning\n\nThe cleaner visits every forty-two days.\n"],
+      ["courier-contacts.md", "# Courier Contacts\n\nPhone numbers for courier managers.\n"],
+      ["reconciliation-tool.md", "# Reconciliation Tool\n\nThe tool runs nightly on the ops box.\n"],
+      ["dispatch-rota.md", "# Dispatch Rota\n\nWho is on dispatch each day.\n"],
+    ] as [string, string][]) {
+      writeFileSync(join(dir, name), body);
+    }
+    ingestDirectory(db, dir);
+
+    // Same embedder ingest wrote with — see the note in the citation-label
+    // test above. This is the real one (MiniLM when the model is on disk),
+    // which is the point: the 256-token truncation being fixed is that
+    // embedder's behaviour, not the hash fallback's.
+    const hits = searchVector(db, needle, { k: 10, minScore: -1 });
+    const rank = hits.findIndex((h) => h.body.includes(needle)) + 1;
+    assert(
+      rank === 1,
+      `the passage holding the fact must rank first, got rank ${rank} of ${hits.length}: ` +
+        JSON.stringify(hits.map((h) => [h.sourceRef, h.score.toFixed(3)])),
+    );
+  },
+);
+
 test(
   "pins",
   "splitFrontmatter: a horizontal rule in the body of a frontmatter-less file passes through untouched",
@@ -1866,12 +2478,22 @@ function excludeFixture(tag: string): string {
   return dir;
 }
 
-function ingestedRefs(db: DatabaseSync): string[] {
-  return (
+/**
+ * The distinct vault *files* that reached the corpus.
+ *
+ * A file is now stored as N passage rows whose `source_ref` is `path#p<n>`
+ * (src/chunk.ts), so these assertions are about the path, never the passage
+ * ordinal — what `--exclude` protects is a file, and a test that pinned the
+ * exact ref string would be asserting the chunker's arithmetic instead of the
+ * privacy control it is named for.
+ */
+function ingestedPaths(db: DatabaseSync): string[] {
+  const paths = (
     db
       .prepare(`SELECT source_ref FROM vector_document ORDER BY source_ref`)
       .all() as { source_ref: string }[]
-  ).map((r) => r.source_ref);
+  ).map((r) => passagePathOf(r.source_ref));
+  return [...new Set(paths)].sort();
 }
 
 test(
@@ -1899,8 +2521,8 @@ test(
     const r = ingestDirectory(db, dir, { exclude: parsed.exclude });
     assert(r.ingested === 1, `expected only keep.md, got ${r.ingested}`);
     assert(
-      !ingestedRefs(db).some((ref) => ref.startsWith("Private/")),
-      `deny-listed content reached the corpus: ${JSON.stringify(ingestedRefs(db))}`,
+      !ingestedPaths(db).some((ref) => ref.startsWith("Private/")),
+      `deny-listed content reached the corpus: ${JSON.stringify(ingestedPaths(db))}`,
     );
   },
 );
@@ -1929,8 +2551,8 @@ test(
         `${c.label}: expected 1 ingested, got ${JSON.stringify({ aborted: r.aborted, ingested: r.ingested, reason: r.abortReason })}`,
       );
       assert(
-        !ingestedRefs(db).some((ref) => ref.startsWith("Private/")),
-        `${c.label}: deny-listed content reached the corpus: ${JSON.stringify(ingestedRefs(db))}`,
+        !ingestedPaths(db).some((ref) => ref.startsWith("Private/")),
+        `${c.label}: deny-listed content reached the corpus: ${JSON.stringify(ingestedPaths(db))}`,
       );
       assert(
         r.excludes[0]?.matched === 1,
@@ -1982,7 +2604,7 @@ test(
 
     const r = ingestDirectory(db, dir, { exclude: ["a/Private"] });
     assert(!r.aborted, `expected the run to proceed, got ${r.abortReason}`);
-    const refs = ingestedRefs(db);
+    const refs = ingestedPaths(db);
     assert(
       refs.length === 1 && refs[0] === "b/Private/y.md",
       `"a/Private" must prune only a/Private, got ${JSON.stringify(refs)}`,
@@ -2039,8 +2661,8 @@ test(
     const r = ingestDirectory(db, dir);
     assert(r.ingested === 1, `only keep.md may be ingested, got ${r.ingested}`);
     assert(
-      !ingestedRefs(db).some((ref) => ref.includes("linked")),
-      `content outside the root was ingested: ${JSON.stringify(ingestedRefs(db))}`,
+      !ingestedPaths(db).some((ref) => ref.includes("linked")),
+      `content outside the root was ingested: ${JSON.stringify(ingestedPaths(db))}`,
     );
     assert(
       r.skipped.some((s) => s.kind === "symlink_escape" && s.path === "linked"),
@@ -2057,7 +2679,7 @@ test(
     symlinkSync(join(dir2, "Private"), join(dir2, "backdoor"));
 
     const r2 = ingestDirectory(db2, dir2, { exclude: ["Private"] });
-    const refs2 = ingestedRefs(db2);
+    const refs2 = ingestedPaths(db2);
     assert(
       refs2.includes("alias/note.md") || refs2.includes("shared/note.md"),
       `an in-root symlink must still be followed, got ${JSON.stringify(refs2)}`,
@@ -2139,7 +2761,7 @@ test(
 
     const r = ingestDirectory(db, dir);
     assert(r.ingested === 4, `expected 4 markdown files, got ${r.ingested}`);
-    const refs = ingestedRefs(db);
+    const refs = ingestedPaths(db);
     for (const want of ["plain.md", "UPPER.MD", "long.markdown", "mdx.mdx"]) {
       assert(refs.includes(want), `${want} must be ingested, got ${JSON.stringify(refs)}`);
     }
@@ -2169,8 +2791,8 @@ test(
     const r = ingestDirectory(db, dir);
     assert(r.ingested === 1, `only keep.md may be ingested by default, got ${r.ingested}`);
     assert(
-      !ingestedRefs(db).some((ref) => ref.startsWith(".trash")),
-      `deleted notes were resurrected: ${JSON.stringify(ingestedRefs(db))}`,
+      !ingestedPaths(db).some((ref) => ref.startsWith(".trash")),
+      `deleted notes were resurrected: ${JSON.stringify(ingestedPaths(db))}`,
     );
     assert(
       r.skipped.some((s) => s.path === ".trash" && s.kind === "dotted"),
@@ -2219,8 +2841,10 @@ test(
     const rowA = db
       .prepare(`SELECT body FROM vector_document WHERE id = ?`)
       .get(a.documentIds[0]) as { body: string };
+    // Trailing newline dropped by paragraph assembly — see the note on the
+    // re-ingest test above. What matters here is *whose* body it is.
     assert(
-      rowA.body === "alpha body\n",
+      rowA.body === "alpha body",
       `the first root's id must still hold the first root's body, got ${JSON.stringify(rowA.body)}`,
     );
     assert(
@@ -4013,8 +4637,12 @@ test(
     // just flip a boolean — a caller re-running `chamber ingest` needs to know
     // *which* citation to go re-check.
     const failure = bad[0]!.failures.find((f) => f.reason === "hash_mismatch")!;
+    // The note is stored as passages, so the pinned ref is `policy.md#p<n>`
+    // (src/chunk.ts). It must still resolve to the note the operator has to go
+    // re-check — that is the whole content of this assertion, and the passage
+    // ordinal makes it *more* actionable, not less.
     assert(
-      failure.sourceRef === "policy.md",
+      passagePathOf(failure.sourceRef ?? "") === "policy.md",
       `expected the failure to name policy.md, got ${JSON.stringify(failure)}`,
     );
   },
@@ -4117,6 +4745,95 @@ test(
     assert(
       broken === 0,
       "a belief with surviving support must not count toward the broken tally",
+    );
+  },
+);
+
+test(
+  "pins",
+  "a drift failure carries what occupies the pinned position now, not only the position",
+  () => {
+    // Inserting a section at the *top* of a note shifts every passage below it
+    // down one ordinal. The pin still resolves — the document id is stable —
+    // but `policy.md#p1` is now a different section than the one the belief was
+    // committed against, and the section actually cited sits intact at `#p2`.
+    // A drift line built from the ref alone therefore names content the belief
+    // never cited, which is why `verifyPin` surfaces the row's current
+    // breadcrumb title: the ref is where the pin was committed, the title is
+    // what holds that position today, and this is the case where they diverge.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-verify-shifted-"));
+    const file = join(dir, "policy.md");
+    const access = "## Access\n\nAccess requests go to the operations desk.\n\n";
+    const retention =
+      "## Retention\n\nRecords are retained for seven years after the account closes.\n";
+    writeFileSync(file, `# Policy\n\n${access}${retention}`);
+    ingestDirectory(db, dir);
+
+    const pinned = db
+      .prepare(
+        `SELECT id, title, snapshot_hash FROM vector_document WHERE source_ref = 'policy.md#p1'`,
+      )
+      .get() as { id: string; title: string; snapshot_hash: string } | undefined;
+    assert(
+      pinned !== undefined && pinned.title.includes("Retention"),
+      `setup: expected #p1 to be the Retention section, got ${JSON.stringify(pinned)}`,
+    );
+    const committed = commitBelief(db, {
+      text: "Records are retained for seven years after the account closes.",
+      type: "belief",
+      path: "deep",
+      authorFamily: "test",
+      sources: [
+        {
+          kind: "vault_page",
+          refId: pinned!.id,
+          snapshotHash: pinned!.snapshot_hash,
+        },
+      ],
+    });
+    assert(committed.ok, `setup: commit failed: ${JSON.stringify(committed)}`);
+
+    writeFileSync(
+      file,
+      `# Policy\n\n## Onboarding\n\nNew operators are enrolled by the desk lead.\n\n${access}${retention}`,
+    );
+    ingestDirectory(db, dir);
+
+    const entry = verifyBeliefSources(db).find(
+      (b) => b.beliefId === committed.beliefId,
+    );
+    assert(
+      entry !== undefined && entry.failures.length === 1,
+      `expected exactly one failure, got ${JSON.stringify(entry)}`,
+    );
+    const f = entry!.failures[0]!;
+    assert(
+      f.reason === "hash_mismatch",
+      `expected hash_mismatch, got ${f.reason}`,
+    );
+    assert(
+      f.sourceRef === "policy.md#p1",
+      `expected the committed-against ref, got ${JSON.stringify(f.sourceRef)}`,
+    );
+    assert(
+      typeof f.title === "string" && f.title.includes("Access"),
+      `the failure must name what occupies the pinned position now, got ${JSON.stringify(f.title)}`,
+    );
+    assert(
+      !f.title!.includes("Retention"),
+      `the drifted position must not still be reported as the cited section: ${JSON.stringify(f.title)}`,
+    );
+
+    // The evidence moved rather than vanished — which is exactly why the old
+    // "re-run `chamber ingest`" remedy was a no-op: re-ingest is what produced
+    // this state, and the section is already indexed, one ordinal lower.
+    const moved = db
+      .prepare(`SELECT title FROM vector_document WHERE source_ref = 'policy.md#p2'`)
+      .get() as { title: string } | undefined;
+    assert(
+      moved !== undefined && moved.title.includes("Retention"),
+      `the cited section should be intact one ordinal lower, got ${JSON.stringify(moved)}`,
     );
   },
 );

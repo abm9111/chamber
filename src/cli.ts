@@ -728,7 +728,17 @@ async function main(): Promise<void> {
         process.exitCode = 1;
         break;
       }
-      console.log(`ingested ${r.ingested} file(s) from ${parsed.path}`);
+      console.log(
+        `ingested ${r.ingested} file(s) as ${r.passages} passage(s) from ${parsed.path}`,
+      );
+      // A shrunken note's stale passages are deleted rather than left to keep
+      // answering from content the note no longer holds. That is a corpus
+      // deletion, so it is reported rather than done quietly.
+      if (r.removed > 0) {
+        console.log(
+          `  removed ${r.removed} stale passage(s) from notes that shrank`,
+        );
+      }
       for (const e of r.excludes) {
         console.log(
           `  exclude ${e.raw} → pruned ${e.matched} entr${e.matched === 1 ? "y" : "ies"}`,
@@ -807,9 +817,11 @@ async function main(): Promise<void> {
       // An answer can be produced over a filtered view of the corpus. Printing
       // the note only on the no-answer path above is what made that silent.
       if (r.note) console.log(`  note: ${r.note}\n`);
-      const refToPath = new Map(
-        r.passages.map((p) => [p.documentId, p.sourceRef ?? p.documentId]),
-      );
+      // Not `sourceRef` alone: a note is stored as many passage rows, so that
+      // renders as `manual.md#p7` — a real location, but not a legible one.
+      // The label adds the heading breadcrumb, so a cited claim names the file
+      // *and* the section it came from and the operator can go check it.
+      const refToPath = new Map(r.passages.map((p) => [p.documentId, p.label]));
       for (const c of r.claims) {
         if (c.kind === "chatter") continue;
         const cites = c.citedRefs.map((id) => refToPath.get(id) ?? id).join(", ");
@@ -881,13 +893,42 @@ async function main(): Promise<void> {
         broken += b.verified === 0 ? 1 : 0;
         console.log(`${b.beliefId}  ${b.verified}/${b.total} pins verified`);
         console.log(`  "${b.content.slice(0, 70)}"`);
+        // What this message has to convey is whether the operator's evidence
+        // *moved* or *vanished*, and the old one conveyed neither. It printed
+        // only the position (`policy.md#p1`) and then prescribed `chamber
+        // ingest` — but re-ingesting is what produced this state, so running it
+        // again changes nothing, and the position is exactly the thing an edit
+        // above the passage silently reassigns. Inserting a section at the top
+        // of a note left the message naming `#p1` while the section actually
+        // cited had shifted intact to `#p2`, so it pointed at content the
+        // belief never cited and prescribed a no-op to fix it.
         for (const f of b.failures) {
-          const where = f.sourceRef ? ` (${f.sourceRef})` : "";
-          const hint =
-            f.reason === "hash_mismatch"
-              ? " — note changed since commit; re-run `chamber ingest`"
-              : "";
-          console.log(`  ${f.reason}: ${f.refId}${where}${hint}`);
+          if (f.reason === "hash_mismatch") {
+            // The ref is what the pin was committed against; the title is what
+            // holds that position now. Printing both is what lets an operator
+            // tell "my section was edited" from "my section moved and something
+            // else took its slot" without opening the database.
+            console.log(
+              `  hash_mismatch: ${f.refId} — committed against ${f.sourceRef ?? "(no source ref)"}, which now holds: ${f.title ?? "(untitled)"}`,
+            );
+            console.log(
+              "    the cited passage is not what is stored there any more — it may have been" +
+                " edited, or shifted to another passage of the same note. Open the note and re-check;" +
+                " re-ingesting will not restore the pin.",
+            );
+          } else if (f.reason === "not_found") {
+            console.log(`  not_found: ${f.refId}`);
+            console.log(
+              "    nothing is stored under this id — the cited passage left the corpus" +
+                " (the note shrank past this position, or its rows were replaced). The text may still" +
+                " be in the note at a different passage; the citation can no longer reach it.",
+            );
+          } else {
+            // `belief_not_found` and `kind_unregistered`: no corpus row was
+            // matched, so there is nothing truthful to add beyond the reason.
+            const where = f.sourceRef ? ` (${f.sourceRef})` : "";
+            console.log(`  ${f.reason}: ${f.refId}${where}`);
+          }
         }
       }
       console.log(

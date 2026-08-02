@@ -1,0 +1,38 @@
+# Chamber runtime state — never track
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.bak
+data/*.sqlite*
+pilot.jsonl
+*.jsonl
+
+# Checkpoint receipts / exports (regenerable)
+checkpoint-*.json
+
+# Secrets & credentials
+.env
+.env.*
+*.pem
+*.key
+!models/**/*.key
+
+# Dependencies / build
+node_modules/
+dist/
+build/
+
+# Sandbox scratch
+chamber-sbx-*/
+
+# OS / editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
+.claude/
+
+# Logs
+*.log
+logs/

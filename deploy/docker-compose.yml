@@ -1,0 +1,70 @@
+# Chamber + Caddy on an internal Docker network.
+# Chamber is NOT published to the host — only Caddy is.
+#
+#   export CHAMBER_API_TOKEN=$(openssl rand -hex 24)
+#   export CHAMBER_DOMAIN=chamber.example.com
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# Local smoke without real DNS/TLS:
+#   CHAMBER_DOMAIN=localhost docker compose -f deploy/docker-compose.yml up
+
+services:
+  chamber:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      CHAMBER_DB: /data/chamber.sqlite
+      CHAMBER_BIND: "0.0.0.0"
+      PORT: "8787"
+      CHAMBER_API_TOKEN: ${CHAMBER_API_TOKEN:?set CHAMBER_API_TOKEN}
+      CHAMBER_MODEL: ${CHAMBER_MODEL:-stub}
+      CHAMBER_FACULTY_MODE: ${CHAMBER_FACULTY_MODE:-heuristic}
+    volumes:
+      - chamber-data:/data
+    networks:
+      - chamber_net
+    restart: unless-stopped
+    # No ports: section — only reachable via chamber_net
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2.8-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CHAMBER_DOMAIN: ${CHAMBER_DOMAIN:-localhost}
+      CHAMBER_API_TOKEN: ${CHAMBER_API_TOKEN:?set CHAMBER_API_TOKEN}
+    volumes:
+      - ./Caddyfile.compose:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - chamber_net
+    depends_on:
+      chamber:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  chamber_net:
+    driver: bridge
+    internal: false
+    # Set internal: true only if you terminate TLS elsewhere and attach
+    # this network to that proxy. Public ACME needs outbound DNS/HTTP.
+
+volumes:
+  chamber-data:
+  caddy-data:
+  caddy-config:

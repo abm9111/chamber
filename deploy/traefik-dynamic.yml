@@ -1,0 +1,63 @@
+# Traefik v3 dynamic config fragment for Chamber
+# Point traefik to this file via providers.file.filename
+#
+# static example:
+#   providers:
+#     file:
+#       filename: /etc/traefik/dynamic/chamber.yml
+#   entryPoints:
+#     web:
+#       address: ":80"
+#       http:
+#         redirections:
+#           entryPoint:
+#             to: websecure
+#     websecure:
+#       address: ":443"
+#   certificatesResolvers:
+#     le:
+#       acme:
+#         email: you@example.com
+#         storage: /etc/traefik/acme.json
+#         httpChallenge:
+#           entryPoint: web
+
+http:
+  routers:
+    chamber:
+      rule: "Host(`chamber.example.com`)"
+      entryPoints:
+        - websecure
+      service: chamber
+      tls:
+        certResolver: le
+      middlewares:
+        - chamber-headers
+        - chamber-ratelimit
+        # - chamber-auth
+
+  services:
+    chamber:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8787"
+
+  middlewares:
+    chamber-headers:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        contentTypeNosniff: true
+        frameDeny: true
+        referrerPolicy: "no-referrer"
+        customResponseHeaders:
+          Server: ""
+    chamber-ratelimit:
+      rateLimit:
+        average: 5
+        burst: 20
+    # chamber-auth:
+    #   basicAuth:
+    #     users:
+    #       - "chamber:$apr1$..."

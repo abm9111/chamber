@@ -1,0 +1,30 @@
+# Caddy in Docker Compose — proxies to service name "chamber"
+# {$CHAMBER_DOMAIN} from compose environment
+
+{$CHAMBER_DOMAIN} {
+	encode gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	# Forward client token if browser sent it; operators often inject via reverse path
+	reverse_proxy chamber:8787 {
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 120s
+		}
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

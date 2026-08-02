@@ -1,0 +1,19 @@
+{
+  "name": "sample",
+  "tools": [
+    {
+      "name": "ping",
+      "description": "Health ping tool",
+      "runtime": "node",
+      "risk": ["compute"],
+      "source": "console.log(JSON.stringify({ pong: true }))"
+    },
+    {
+      "name": "danger_shell",
+      "description": "Blocked without high-risk flag",
+      "runtime": "bash",
+      "risk": ["shell"],
+      "source": "echo no"
+    }
+  ]
+}

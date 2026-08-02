@@ -1,0 +1,14 @@
+[Unit]
+Description=Chamber HTTP socket (systemd activation)
+Documentation=file:///opt/chamber/deploy/systemd/README.md
+PartOf=chamber.service
+
+[Socket]
+# Internal-only by default; put Caddy/TLS in front for public access
+ListenStream=127.0.0.1:8787
+Accept=no
+NoDelay=true
+# FreeBind=true
+
+[Install]
+WantedBy=sockets.target

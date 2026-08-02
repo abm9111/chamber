@@ -1,0 +1,62 @@
+{
+  "format": "chamber_scip_graph_v1",
+  "symbols": [
+    {
+      "symbol": "local chamber src/commit_belief.ts/commitBelief().",
+      "kind": "function",
+      "display_name": "commitBelief",
+      "documentation": "Transactional belief gate"
+    },
+    {
+      "symbol": "local chamber src/try_activate_skill.ts/tryActivateSkill().",
+      "kind": "function",
+      "display_name": "tryActivateSkill",
+      "documentation": "Skill activation gate"
+    },
+    {
+      "symbol": "local chamber src/faculty.ts/openDeliberation().",
+      "kind": "function",
+      "display_name": "openDeliberation"
+    }
+  ],
+  "documents": [
+    {
+      "relative_path": "src/commit_belief.ts",
+      "content_hash": "abc123",
+      "occurrences": [
+        {
+          "symbol": "local chamber src/commit_belief.ts/commitBelief().",
+          "range": [10, 0, 80, 1],
+          "role": "definition"
+        }
+      ]
+    },
+    {
+      "relative_path": "src/try_activate_skill.ts",
+      "occurrences": [
+        {
+          "symbol": "local chamber src/try_activate_skill.ts/tryActivateSkill().",
+          "range": [108, 0, 310, 1],
+          "role": "definition"
+        },
+        {
+          "symbol": "local chamber src/faculty.ts/openDeliberation().",
+          "range": [200, 0, 200, 20],
+          "role": "reference"
+        }
+      ]
+    }
+  ],
+  "relationships": [
+    {
+      "from": "local chamber src/try_activate_skill.ts/tryActivateSkill().",
+      "to": "local chamber src/faculty.ts/openDeliberation().",
+      "kind": "calls"
+    },
+    {
+      "from": "local chamber src/try_activate_skill.ts/tryActivateSkill().",
+      "to": "local chamber src/commit_belief.ts/commitBelief().",
+      "kind": "references"
+    }
+  ]
+}

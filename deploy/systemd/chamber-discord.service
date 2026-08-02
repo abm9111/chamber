@@ -1,0 +1,27 @@
+[Unit]
+Description=Chamber Discord gateway
+Documentation=file:///opt/chamber/deploy/DISCORD.md
+After=network-online.target chamber.service
+Wants=chamber.service
+
+[Service]
+Type=simple
+User=chamber
+Group=chamber
+WorkingDirectory=/opt/chamber
+Environment=NODE_ENV=production
+Environment=CHAMBER_DB=/var/lib/chamber/chamber.sqlite
+EnvironmentFile=-/etc/chamber/env
+# Requires: npm install discord.js in /opt/chamber
+ExecStart=/usr/bin/node --experimental-strip-types /opt/chamber/src/discord_runner.ts
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/chamber /tmp
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=chamber.target

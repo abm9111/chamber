@@ -1,0 +1,45 @@
+[Unit]
+Description=Chamber governable cognition kernel (HTTP)
+Documentation=file:///opt/chamber/deploy/PILOT.md
+Documentation=file:///opt/chamber/deploy/TLS.md
+Documentation=file:///opt/chamber/deploy/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+# Socket activation (optional):
+#   systemctl enable --now chamber.socket
+#   systemctl enable chamber.service
+# Uncomment the next two lines when using chamber.socket:
+# Requires=chamber.socket
+# After=network-online.target chamber.socket
+
+[Service]
+Type=simple
+User=chamber
+Group=chamber
+WorkingDirectory=/opt/chamber
+Environment=NODE_ENV=production
+Environment=CHAMBER_DB=/var/lib/chamber/chamber.sqlite
+Environment=CHAMBER_BIND=127.0.0.1
+Environment=PORT=8787
+Environment=CHAMBER_MODEL=stub
+Environment=CHAMBER_FACULTY_MODE=heuristic
+EnvironmentFile=-/etc/chamber/env
+ExecStart=/usr/bin/node --experimental-strip-types /opt/chamber/src/server.ts
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/chamber /tmp
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=chamber.target

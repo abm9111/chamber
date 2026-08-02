@@ -1,0 +1,46 @@
+# Chamber behind Caddy (auto-HTTPS)
+# Usage:
+#   caddy run --config deploy/Caddyfile
+# Requires: chamber listening on 127.0.0.1:8787 only
+
+chamber.example.com {
+	# Automatic Let's Encrypt (or use tls internal for LAN)
+	encode gzip
+
+	# Optional basic auth — replace hash with: caddy hash-password
+	# basicauth {
+	# 	chamber $2a$14$...
+	# }
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	# Rate limit (Caddy v2.8+ rate_limit plugin or use global)
+	# For stock Caddy, prefer fail2ban / external limiter
+
+	handle /health {
+		reverse_proxy 127.0.0.1:8787
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:8787 {
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 120s
+			}
+		}
+	}
+
+	log {
+		output file /var/log/caddy/chamber.log
+		format json
+	}
+}

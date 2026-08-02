@@ -1,0 +1,28 @@
+{
+  "name": "chamber",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chamber week-1 kernel \u2014 governable cognition gates",
+  "scripts": {
+    "test": "node --experimental-strip-types tests/harness.ts",
+    "test:gates": "node --experimental-strip-types tests/harness.ts --suite=gates",
+    "test:spend": "node --experimental-strip-types tests/harness.ts --suite=spend",
+    "test:approvals": "node --experimental-strip-types tests/harness.ts --suite=approvals",
+    "test:audit": "node --experimental-strip-types tests/harness.ts --suite=audit",
+    "cli": "node --experimental-strip-types src/cli.ts",
+    "turn": "node --experimental-strip-types src/cli.ts turn",
+    "status": "node --experimental-strip-types src/cli.ts status",
+    "server": "node --experimental-strip-types src/server.ts",
+    "gateway": "node --experimental-strip-types src/gateway_runner.ts",
+    "cron-run": "node --experimental-strip-types src/cli.ts cron run",
+    "launch": "node --experimental-strip-types src/cli.ts status",
+    "gateway:telegram": "node --experimental-strip-types src/gateway_runner.ts telegram",
+    "serve": "node --experimental-strip-types src/server.ts",
+    "gateway:slack": "node --experimental-strip-types src/slack_runner.ts",
+    "gateway:discord": "node --experimental-strip-types src/discord_runner.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

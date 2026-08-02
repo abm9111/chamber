@@ -1,0 +1,21 @@
+[Unit]
+Description=Chamber job queue worker (one-shot)
+Documentation=file:///opt/chamber/deploy/PILOT.md
+After=network.target chamber.service
+
+[Service]
+Type=oneshot
+User=chamber
+Group=chamber
+WorkingDirectory=/opt/chamber
+Environment=NODE_ENV=production
+Environment=CHAMBER_DB=/var/lib/chamber/chamber.sqlite
+EnvironmentFile=-/etc/chamber/env
+ExecStart=/usr/bin/node --experimental-strip-types /opt/chamber/src/cli.ts jobs run
+Nice=10
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/chamber /tmp
+
+# Activated by chamber-jobs.timer; can also: systemctl start chamber-jobs.service

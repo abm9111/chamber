@@ -1,0 +1,12 @@
+[Unit]
+Description=Chamber stack (HTTP kernel + optional companions)
+Documentation=file:///opt/chamber/deploy/PILOT.md
+# Enable companions separately:
+#   systemctl enable chamber-slack.service
+#   systemctl enable chamber-jobs.timer
+#   systemctl enable caddy-chamber.service
+Wants=chamber.service
+After=network-online.target chamber.service
+
+[Install]
+WantedBy=multi-user.target

@@ -146,6 +146,7 @@ import { scanForSecrets, skillSecretScanRefuse } from "../src/secret_scan.ts";
 import { assertSpendBudget } from "../src/spend.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isAsyncFunction } from "node:util/types";
 import type { DatabaseSync } from "node:sqlite";
 
 // ─── mini test runner ────────────────────────────────────────────────────────
@@ -179,14 +180,30 @@ interface TestResult {
 
 const results: TestResult[] = [];
 
+interface AsyncTestThunk {
+  suite: string;
+  name: string;
+  fn: () => Promise<void>;
+}
+
 /**
- * Settled-tracking promises for tests whose `fn()` returned a Promise.
- * The summary block at the bottom of this file awaits these before it
- * counts results — without that, an async test that rejects is never
- * recorded, the tally prints green, and the process only dies afterwards
- * on the unhandled rejection.
+ * Async tests registered via `test()` land here as unstarted thunks
+ * instead of being invoked immediately. Calling `fn()` at registration
+ * time would start an async test's body executing (up to its first
+ * `await`) right then — and since every `test(...)` call in this file
+ * runs back-to-back during module evaluation, every async test would be
+ * mid-flight and interleaving with every other one before any of them
+ * settle. Several tests in this suite mutate shared `process.env` keys,
+ * so concurrent interleaving produces flaky, order-dependent failures.
+ *
+ * Nothing pushed here has run yet. The summary block at the bottom of
+ * this file drains this queue sequentially — one thunk invoked and
+ * fully awaited before the next one starts — so async tests behave like
+ * a strictly serial continuation of the synchronous ones above them,
+ * and their results land in `results` in the same order they were
+ * declared in.
  */
-const pending: Promise<void>[] = [];
+const pending: AsyncTestThunk[] = [];
 
 function suiteFromArg(): Suite {
   const arg = process.argv.find((a) => a.startsWith("--suite="));
@@ -222,28 +239,21 @@ function test(
 ): void {
   const selected = suiteFromArg();
   if (selected !== "all" && selected !== suite) return;
+
+  if (isAsyncFunction(fn)) {
+    // Defer invocation — do not call fn() here. Calling it is exactly
+    // what let async tests race each other; see the `pending` doc
+    // comment above. `isAsyncFunction` tells sync from async apart
+    // without invoking anything, so the thunk can be queued untouched.
+    // The cast is sound: an async function's call always returns a
+    // Promise, regardless of what the declared signature says.
+    pending.push({ suite, name, fn: fn as () => Promise<void> });
+    return;
+  }
+
   const t0 = Date.now();
   try {
-    const returned = fn();
-    if (returned instanceof Promise) {
-      pending.push(
-        returned.then(
-          (): void => {
-            results.push({ name, suite, ok: true, ms: Date.now() - t0 });
-          },
-          (err: unknown): void => {
-            results.push({
-              name,
-              suite,
-              ok: false,
-              detail: err instanceof Error ? err.message : String(err),
-              ms: Date.now() - t0,
-            });
-          },
-        ),
-      );
-      return;
-    }
+    fn();
     results.push({ name, suite, ok: true, ms: Date.now() - t0 });
   } catch (err) {
     results.push({
@@ -1923,9 +1933,28 @@ test("vector", "V5_minilm_semantic", () => {
 
 // ─── report ──────────────────────────────────────────────────────────────────
 
-// Async tests record their outcome when they settle, not when they are
-// called. Nothing below may read `results` until every one of them has.
-await Promise.all(pending);
+// Drain the async queue sequentially: invoke a thunk, await it fully,
+// record pass/fail, only then move to the next. Running them one at a
+// time — instead of firing them all and awaiting the batch — is what
+// actually prevents two async test bodies from ever being in flight at
+// once, which is what closes the shared process.env race that concurrent
+// invocation allowed. Nothing below may read `results` until every
+// queued thunk has been awaited.
+for (const { suite, name, fn } of pending) {
+  const t0 = Date.now();
+  try {
+    await fn();
+    results.push({ name, suite, ok: true, ms: Date.now() - t0 });
+  } catch (err) {
+    results.push({
+      name,
+      suite,
+      ok: false,
+      detail: err instanceof Error ? err.message : String(err),
+      ms: Date.now() - t0,
+    });
+  }
+}
 
 const passed = results.filter((r) => r.ok).length;
 const failed = results.filter((r) => !r.ok);

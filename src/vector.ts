@@ -128,8 +128,15 @@ export function upsertDocument(
 ): { id: string; model: string; dims: number } {
   const id = input.id ?? newId("vdoc");
   const body = input.body;
+  // JSON.stringify of a fixed 3-element array, NOT [...].join("\n"): joining is
+  // not injective across its own separator, so {title:"X", body:"Y\nZ"} and
+  // {title:"X\nY", body:"Z"} minted one identical pin. Moving a newline from the
+  // end of a title to the start of a body was therefore undetectable drift —
+  // precisely what a content pin exists to catch, and vault notes are multi-line
+  // markdown. JSON escapes separators inside each field, so the framing is
+  // unambiguous. Must stay byte-identical to vaultPageHash in src/pins.ts.
   const snapshot = sha256(
-    [input.title ?? "", body, input.sourceRef ?? ""].join("\n"),
+    JSON.stringify([input.title ?? "", body, input.sourceRef ?? ""]),
   );
   let model: string;
   let vec: Float32Array;

@@ -1020,18 +1020,127 @@ test("pins", "verifyPin reports hash_mismatch when the body drifts", () => {
   assert(v.reason === "hash_mismatch", `expected hash_mismatch, got ${v.reason}`);
 });
 
-test("pins", "verifyPin reports kind_unregistered for kinds with no formula", () => {
+test("pins", "verifyPin accepts a round-trip with neither title nor sourceRef", () => {
+  // Every other round-trip test supplies both columns, so nothing pinned the
+  // NULL path: a mutant using `row.title ?? "(untitled)"` passed the whole
+  // suite while breaking every untitled note. Both columns are NULL here.
   const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    body: "an untitled, unreferenced note",
+  });
+  const row = db
+    .prepare(`SELECT title, source_ref, snapshot_hash FROM vector_document WHERE id = ?`)
+    .get(doc.id) as {
+    title: string | null;
+    source_ref: string | null;
+    snapshot_hash: string;
+  };
+  assert(row.title === null, "precondition: title must be stored NULL");
+  assert(row.source_ref === null, "precondition: source_ref must be stored NULL");
+  const v = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: row.snapshot_hash,
+  });
+  assert(v.ok, `expected ok for NULL title/source_ref, got ${v.reason}`);
+});
+
+test("pins", "verifyPin reports kind_unregistered for a real row of an unregistered kind", () => {
+  // The row genuinely exists and the hash genuinely matches, so the only thing
+  // that can deny this is the missing formula. Asserting on a refId that does
+  // not exist would only have proved the verdict is not `not_found`.
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "x_tweet",
+    sourceRef: "https://x.com/i/status/1",
+    title: "T",
+    body: "a real tweet body",
+  });
+  const row = db
+    .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+    .get(doc.id) as { snapshot_hash: string };
   const v = verifyPin(db, {
     kind: "x_tweet",
-    refId: "t1",
-    snapshotHash: sha256("x"),
+    refId: doc.id,
+    snapshotHash: row.snapshot_hash,
   });
-  assert(!v.ok, "unregistered kinds must not pass");
+  assert(!v.ok, "unregistered kinds must not pass even with a real matching hash");
   assert(
     v.reason === "kind_unregistered",
     `expected kind_unregistered, got ${v.reason}`,
   );
+});
+
+test("pins", "verifyPin rejects a cross-kind mislabel of a real row", () => {
+  // Regression for the bypass: upsertDocument applies one hash formula to every
+  // source_kind, so before the lookup bound source_kind this exact row returned
+  // ok:true merely by relabelling the citation's `kind` to "vault_page" —
+  // turning an unverifiable source into a passing one.
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "x_tweet",
+    sourceRef: "https://x.com/i/status/1",
+    title: "T",
+    body: "a real tweet body",
+  });
+  const row = db
+    .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+    .get(doc.id) as { snapshot_hash: string };
+  const v = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: row.snapshot_hash,
+  });
+  assert(!v.ok, "a mislabelled kind must not verify under another kind's formula");
+  assert(v.reason === "not_found", `expected not_found, got ${v.reason}`);
+});
+
+test("pins", "snapshot framing is injective across the field separator", () => {
+  // `[title, body, ref].join("\n")` is ambiguous about where a field ends, so
+  // these two distinct documents minted one identical pin — and an edit moving
+  // a newline from the end of a title to the start of a body was undetectable
+  // drift. Vault notes are multi-line markdown, so this is not theoretical.
+  const db = freshDb();
+  const a = upsertDocument(db, { sourceKind: "vault_page", title: "X", body: "Y\nZ" });
+  const b = upsertDocument(db, { sourceKind: "vault_page", title: "X\nY", body: "Z" });
+  const hash = (id: string): string =>
+    (
+      db
+        .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+        .get(id) as { snapshot_hash: string }
+    ).snapshot_hash;
+  assert(
+    hash(a.id) !== hash(b.id),
+    "distinct documents must not share a pin across the separator",
+  );
+  // The property that matters downstream: A's pin must not verify against B.
+  const v = verifyPin(db, {
+    kind: "vault_page",
+    refId: b.id,
+    snapshotHash: hash(a.id),
+  });
+  assert(!v.ok, "a pin must not verify against a document it was not computed from");
+  assert(v.reason === "hash_mismatch", `expected hash_mismatch, got ${v.reason}`);
+});
+
+test("pins", "verifyPin returns a verdict for a non-string refId instead of throwing", () => {
+  // A non-string refId used to reach the SQLite binder raw and throw
+  // ({a:1} → "Unknown named parameter 'a'"). Callers pass model-derived values
+  // through here inside a gate transaction, where a throw is not a denial.
+  const db = freshDb();
+  for (const bad of [{ a: 1 }, 42, null, undefined, ["x"]]) {
+    const v = verifyPin(db, {
+      kind: "vault_page",
+      refId: bad as unknown as string,
+      snapshotHash: sha256("x"),
+    });
+    assert(!v.ok, `non-string refId ${JSON.stringify(bad)} must not pass`);
+    assert(
+      v.reason === "not_found",
+      `expected not_found for ${JSON.stringify(bad)}, got ${v.reason}`,
+    );
+  }
 });
 
 test("phase1", "P1_model_always_spends", () => {

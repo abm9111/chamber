@@ -804,6 +804,9 @@ async function main(): Promise<void> {
         break;
       }
       console.log(`\n${r.answer}\n`);
+      // An answer can be produced over a filtered view of the corpus. Printing
+      // the note only on the no-answer path above is what made that silent.
+      if (r.note) console.log(`  note: ${r.note}\n`);
       const refToPath = new Map(
         r.passages.map((p) => [p.documentId, p.sourceRef ?? p.documentId]),
       );

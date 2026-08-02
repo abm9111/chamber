@@ -4463,6 +4463,88 @@ test(
 
 test(
   "pins",
+  "runAsk reports withheld passages even when it still answers",
+  async () => {
+    // The uncitable-kind note only fired when the *filtered* retrieval came
+    // back completely empty, so in a mixed corpus the exclusion was silent:
+    // `chamber search` showed the note ranking first, `chamber ask` answered
+    // from the weaker vault_page and stamped it ALLOWED, and nothing said the
+    // better-matching passage had been withheld. The answer is not wrong and
+    // the gate is not breached — the citation genuinely verifies — but the
+    // operator could not tell that better evidence had been excluded.
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "note",
+      sourceRef: "currency-note",
+      title: "AED",
+      body: "The user base currency is AED, the UAE dirham.",
+      model: "local-hash-v1",
+    });
+    const citable = upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/policy.md",
+      title: "Currency policy",
+      body: "Our currency policy for the base rate is reviewed annually.",
+      model: "local-hash-v1",
+    });
+    const fake = async () => "The base currency is AED, the UAE dirham. [1]";
+    const r = await runAsk(db, "What is the base currency?", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+
+    // Alongside the answer, not instead of it.
+    assert(r.modelCalled && r.answer.length > 0, "the answer must still happen");
+    assert(
+      r.passages.length === 1 && r.passages[0]!.documentId === citable.id,
+      `only the citable row may reach the model, got ${JSON.stringify(r.passages)}`,
+    );
+    const a = r.claims.filter((c) => c.kind === "assertion")[0]!;
+    assert(
+      a.status === "ALLOWED" && a.citedRefs.length === 1,
+      `the verified citation must still commit, got ${a.status}`,
+    );
+    assert(!!r.note, "a withheld passage must be announced, not swallowed");
+    assert(
+      r.note!.includes("1 matching passage(s) were withheld"),
+      `the note must say how many were withheld, got ${JSON.stringify(r.note)}`,
+    );
+    assert(
+      r.note!.includes("note") && r.note!.includes("vault_page"),
+      `the note must name the kind and the remedy, got ${JSON.stringify(r.note)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "runAsk stays silent when nothing was withheld",
+  async () => {
+    // The other half: a notice printed on every answer is a notice nobody
+    // reads. An all-citable corpus must produce no note at all.
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/policy.md",
+      title: "Currency policy",
+      body: "The user base currency is AED, the UAE dirham.",
+      model: "local-hash-v1",
+    });
+    const fake = async () => "The base currency is AED, the UAE dirham. [1]";
+    const r = await runAsk(db, "What is the base currency?", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    assert(r.passages.length === 1, JSON.stringify(r.passages));
+    assert(
+      r.note === undefined,
+      `nothing was withheld, so there is nothing to report, got ${JSON.stringify(r.note)}`,
+    );
+  },
+);
+
+test(
+  "pins",
   "pay-debt writes a pin chamber verify can resolve, and reports what it could not pin",
   () => {
     // The second writer of belief_source used to bypass verifyPin entirely and

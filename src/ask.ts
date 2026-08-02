@@ -42,6 +42,13 @@ export interface AskResult {
   claims: AskClaimResult[];
   passages: { index: number; documentId: string; sourceRef: string | null }[];
   modelCalled: boolean;
+  /**
+   * Why retrieval returned what it did, when that is not self-evident from the
+   * answer. Set both when nothing could be retrieved (and so no answer exists)
+   * and when an answer *was* produced over a corpus some of whose matching
+   * passages were withheld as uncitable — the second case is not a failure and
+   * must be rendered next to the answer, not in place of it.
+   */
   note?: string;
 }
 
@@ -113,6 +120,16 @@ export function citedIndices(text: string): number[] {
   return out;
 }
 
+/** What was dropped, why it can never be cited, and how to make it citable. */
+function uncitableReason(uncitable: { sourceKind: string }[]): string {
+  const kinds = [...new Set(uncitable.map((h) => h.sourceKind))].sort();
+  return (
+    `source kind ${kinds.join("/")} has no registered pin formula, so a ` +
+    "citation to one could never verify. Re-index as vault_page " +
+    "(`chamber index vault_page <title> <body> [ref]`) or use `chamber ingest`."
+  );
+}
+
 /**
  * Explain an empty retrieval, distinguishing the three reasons it happens.
  *
@@ -122,31 +139,41 @@ export function citedIndices(text: string): number[] {
  * never back a claim. Silently conflating them is how filtering at retrieval
  * would trade one silent failure for another — a user who ran
  * `chamber index note …` would be told their own note does not exist.
- *
- * Only runs when the filtered search already came back empty, so the second
- * (unfiltered) query is off the hot path.
  */
 function emptyRetrievalNote(
   db: DatabaseSync,
-  question: string,
-  opts: AskOptions,
+  uncitable: { sourceKind: string }[],
 ): string {
   if (countDocuments(db) === 0) {
     return "nothing ingested yet — run `chamber ingest <path>`";
   }
-  const uncitable = searchVector(db, question, {
-    k: opts.k ?? 8,
-    model: opts.model,
-  }).filter((h) => !isCitableSourceKind(h.sourceKind));
   if (uncitable.length === 0) {
     return "nothing in the corpus matches this question";
   }
-  const kinds = [...new Set(uncitable.map((h) => h.sourceKind))].sort();
   return (
-    `${uncitable.length} matching passage(s) are not citable: source kind ` +
-    `${kinds.join("/")} has no registered pin formula, so a citation to one ` +
-    `could never verify. Re-index as vault_page ` +
-    "(`chamber index vault_page <title> <body> [ref]`) or use `chamber ingest`."
+    `${uncitable.length} matching passage(s) are not citable: ` +
+    uncitableReason(uncitable)
+  );
+}
+
+/**
+ * The same exclusion, reported when the answer still happens.
+ *
+ * The note above only ever fired when the filtered retrieval came back
+ * completely empty, so in a mixed corpus — the normal case for a vault that
+ * has ever seen `chamber index note …` — the operator was told nothing at all.
+ * The best-matching passage could be withheld while a weaker citable one was
+ * cited, and the claim then rendered `ALLOWED` against a passage that does not
+ * contain the fact. The gate is not breached (the citation genuinely verifies)
+ * and this is not a status change; it is the difference between "supported by
+ * what you were shown" and "supported by everything the corpus has", which the
+ * operator otherwise has no way to see.
+ */
+function withheldNote(uncitable: { sourceKind: string }[]): string {
+  return (
+    `${uncitable.length} matching passage(s) were withheld from the model ` +
+    `and are not reflected in the answer above: ` +
+    uncitableReason(uncitable)
   );
 }
 
@@ -156,17 +183,32 @@ export async function runAsk(
   opts: AskOptions = {},
 ): Promise<AskResult> {
   const k = opts.k ?? 8;
-  // Only kinds a citation can be made out of. See CITABLE_SOURCE_KINDS: a row
-  // of any other kind cannot verify (no registered formula) and cannot be
-  // stored as support (belief_source.kind CHECK), so putting one in front of
-  // the model buys a citation that is guaranteed to be rejected — and the
-  // rejection lands as blocking debt on the claim hash, refusing that
-  // assertion permanently. Filter before spending, not after.
-  const hits = searchVector(db, question, {
-    k,
-    model: opts.model,
-    sourceKinds: CITABLE_SOURCE_KINDS,
-  });
+  // Retrieve unfiltered first, purely so the passages a citation cannot be made
+  // out of are *counted*. Filtering them away in SQL is still what happens —
+  // see CITABLE_SOURCE_KINDS: a row of any other kind cannot verify (no
+  // registered formula) and cannot be stored as support (belief_source.kind
+  // CHECK), so putting one in front of the model buys a citation that is
+  // guaranteed to be rejected, and the rejection lands as blocking debt on the
+  // claim hash, refusing that assertion permanently. Filter before spending,
+  // not after. But a silent filter is its own failure, so the drop is measured
+  // here and reported below.
+  //
+  // When the top-k is already all citable — every corpus written only by
+  // `chamber ingest`, `indexCodeTree` or `scip` — the unrestricted top-k and
+  // the restricted top-k are the same rows by construction, so the second
+  // query is skipped and this costs one query, as before. Only a genuinely
+  // mixed corpus pays for the re-query, and that is the case that has
+  // something to report.
+  const unfiltered = searchVector(db, question, { k, model: opts.model });
+  const uncitable = unfiltered.filter((h) => !isCitableSourceKind(h.sourceKind));
+  const hits =
+    uncitable.length === 0
+      ? unfiltered
+      : searchVector(db, question, {
+          k,
+          model: opts.model,
+          sourceKinds: CITABLE_SOURCE_KINDS,
+        });
 
   const passages = hits.map((h, i) => ({
     index: i + 1,
@@ -187,7 +229,7 @@ export async function runAsk(
       claims: [],
       passages: [],
       modelCalled: false,
-      note: emptyRetrievalNote(db, question, opts),
+      note: emptyRetrievalNote(db, uncitable),
     };
   }
 
@@ -303,5 +345,9 @@ export async function runAsk(
       sourceRef: p.sourceRef,
     })),
     modelCalled: true,
+    // Alongside the answer, never instead of it: the answer is real and its
+    // citations verified, and the operator still needs to know it was formed
+    // over a restricted view of the corpus.
+    note: uncitable.length > 0 ? withheldNote(uncitable) : undefined,
   };
 }

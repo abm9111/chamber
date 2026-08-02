@@ -76,6 +76,16 @@ export interface CommitBeliefInput {
   path: CommittedPath;
   halfLifeSeconds?: number;
   turnId?: string;
+  /**
+   * Refuse an assertion that ends up with no source surviving verification,
+   * instead of committing it with citation debt. This is what `--strict`
+   * means, and it can only be decided in here: whether a citation *survived*
+   * is known only after commitBelief has re-checked every pin, so a caller
+   * counting the sources it handed over cannot tell "cited nothing" from
+   * "cited only things that failed". Off by default — debt is the everyday
+   * answer.
+   */
+  requireVerifiedSupport?: boolean;
 }
 
 /**

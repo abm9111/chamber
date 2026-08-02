@@ -102,6 +102,7 @@ export function commitBelief(
     path,
     halfLifeSeconds,
     turnId,
+    requireVerifiedSupport = false,
   } = input;
 
   // ── PRE (outside TX is fine for pure validation; TX still fail-closed) ──
@@ -303,6 +304,52 @@ export function commitBelief(
         status: "REJECTED",
         reason: "open blocking citation debt",
         debtIds: blockingIds,
+      });
+    }
+
+    // ── STRICT: verified support is a precondition, not an IOU ──────────────
+    // What `--strict` promises is that a consequential turn cannot answer on
+    // nothing. The contract layer enforced that by counting the sources it was
+    // *handed* (src/contract.ts), which is a count of citations, not of
+    // support: an assertion citing one drifted vault_page arrived with a
+    // non-empty list, lost it to hash_mismatch in the loop above, and committed
+    // as DEBT — the identical zero-verified-support state that is correctly
+    // REFUSED when nothing was cited at all. `verifiedSources` is the only
+    // count that means anything here, and it exists only inside this gate,
+    // which is why the decision has to be made in here rather than routed out.
+    //
+    // Refusing inside the transaction is what makes this a refusal rather than
+    // a relabelling: no belief row, no belief_source row and no debt is
+    // written, so a strict turn that could not be supported leaves the ledger
+    // exactly as it found it. Debt is the non-strict answer and is minted
+    // further down, unchanged.
+    if (
+      requireVerifiedSupport &&
+      ASSERTION.has(type) &&
+      verifiedSources.length === 0
+    ) {
+      db.exec("ROLLBACK");
+      // After the rollback so the audit row lands in autocommit and survives
+      // the unwind, matching the source_missing_pin refusal above.
+      emitGate(db, {
+        turnId,
+        gate: "commit",
+        action: "blocked",
+        subjectKind: "claim_hash",
+        subjectId: hash,
+        detail: {
+          reason: "no_verified_support_strict",
+          cited: sources.length,
+          rejectedSources,
+        },
+      });
+      return withRejected({
+        ok: false,
+        status: "REJECTED",
+        reason:
+          sources.length === 0
+            ? "completion contract: load-bearing assertion lacks source pins (strict)"
+            : "completion contract: no cited source survived verification (strict)",
       });
     }
 

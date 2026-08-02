@@ -3727,6 +3727,116 @@ test("pins", "runAsk mints debt for an uncited assertion and refuses it under st
   );
 });
 
+test(
+  "pins",
+  "strict refuses an assertion whose every citation failed verification",
+  () => {
+    // `--strict` was enforced by counting the sources a claim *cited*, never
+    // the ones that survived the gate. A claim citing one drifted vault_page
+    // therefore committed as DEBT under strict — the identical
+    // zero-verified-support state that is correctly REFUSED when nothing is
+    // cited at all, and the state `--strict` exists to prevent. All three
+    // states are pinned here, because the fix must not turn strict into
+    // "refuse anything that cites something".
+    const claim = {
+      kind: "assertion" as const,
+      text: "The audit store is SQLite, chosen for the ledger.",
+    };
+    const seed = (): { db: DatabaseSync; id: string; hash: string } => {
+      const db = freshDb();
+      const doc = upsertDocument(db, {
+        sourceKind: "vault_page",
+        sourceRef: "notes/decision.md",
+        title: "Decision",
+        body: "We decided to use SQLite for the audit store.",
+        model: "local-hash-v1",
+      });
+      const row = db
+        .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+        .get(doc.id) as { snapshot_hash: string };
+      return { db, id: doc.id, hash: row.snapshot_hash };
+    };
+    /** Rewrite the note under the pin: the citation is now real but stale. */
+    const drift = (s: { db: DatabaseSync; id: string }): void => {
+      s.db
+        .prepare(`UPDATE vector_document SET body = ? WHERE id = ?`)
+        .run("rewritten after the pin was minted", s.id);
+    };
+    const cite = (s: { id: string; hash: string }) => ({
+      kind: "vault_page" as const,
+      refId: s.id,
+      snapshotHash: s.hash,
+      provenance: "vector" as const,
+    });
+
+    // (1) Cited nothing.
+    const a = seed();
+    const r1 = enforceClaimContract(a.db, claim, { strict: true });
+    assert(r1.status === "REFUSED", `strict must refuse an uncited assertion, got ${r1.status}`);
+    assert(
+      count(a.db, `SELECT count(*) AS c FROM belief`) === 0 &&
+        count(a.db, `SELECT count(*) AS c FROM citation_debt`) === 0,
+      "a refusal writes neither a belief nor an IOU",
+    );
+
+    // (2) Cited only what fails verification.
+    const b = seed();
+    drift(b);
+    const r2 = enforceClaimContract(b.db, claim, {
+      strict: true,
+      sources: [cite(b)],
+    });
+    assert(
+      r2.status === "REFUSED",
+      `an assertion whose every citation failed verification must be refused under strict, got ${r2.status} debts=${JSON.stringify(r2.debtIds ?? [])}`,
+    );
+    assert(
+      (r2.rejectedSources ?? []).some((x) => x.reason === "hash_mismatch"),
+      `the refusal must say which citation failed and why, got ${JSON.stringify(r2.rejectedSources)}`,
+    );
+    assert(
+      count(b.db, `SELECT count(*) AS c FROM belief`) === 0,
+      "a refused assertion must not have committed a belief row",
+    );
+    assert(
+      count(b.db, `SELECT count(*) AS c FROM belief_source`) === 0,
+      "a citation that failed verification must never be written as support",
+    );
+    assert(
+      count(b.db, `SELECT count(*) AS c FROM citation_debt`) === 0,
+      "strict refuses instead of minting debt — otherwise the refusal also blocks the claim forever",
+    );
+
+    // (2b) The same state without --strict is unchanged: debt, not refusal.
+    const c = seed();
+    drift(c);
+    const r3 = enforceClaimContract(c.db, claim, { sources: [cite(c)] });
+    assert(
+      r3.status === "DEBT" && (r3.debtIds ?? []).length === 1,
+      `the lax path must still mint debt rather than refuse, got ${r3.status}`,
+    );
+    assert(
+      count(c.db, `SELECT count(*) AS c FROM belief_source`) === 0,
+      "lax or strict, a drifted pin is never support",
+    );
+
+    // (3) Cited something that verifies — strict must let it through.
+    const d = seed();
+    const r4 = enforceClaimContract(d.db, claim, {
+      strict: true,
+      sources: [cite(d)],
+    });
+    assert(
+      r4.status === "ALLOWED",
+      `strict must allow a verified citation, got ${r4.status} ${JSON.stringify(r4.rejectedSources)}`,
+    );
+    assert(
+      count(d.db, `SELECT count(*) AS c FROM belief_source WHERE ref_id = ?`, d.id) === 1,
+      "the surviving pin must be written as support",
+    );
+  },
+);
+
 test("pins", "runAsk records an I-don't-know answer as aporia, not an error", async () => {
   const db = freshDb();
   upsertDocument(db, {

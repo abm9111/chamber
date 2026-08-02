@@ -100,7 +100,13 @@ export function enforceClaimContract(
     sessionId?: string;
     turnId?: string;
     authorFamily?: string;
-    /** If true, assertions with zero sources are REFUSED (not merely debt-minted) */
+    /**
+     * If true, an assertion left with no *verified* support is REFUSED rather
+     * than debt-minted. "No verified support" covers both citing nothing and
+     * citing only pins the gate could not confirm — the two states are
+     * indistinguishable in what actually holds the claim up, and only the
+     * first was ever refused here.
+     */
     strict?: boolean;
   } = {},
 ): ContractResult {
@@ -136,6 +142,8 @@ export function enforceClaimContract(
   }
 
   if (claim.kind === "assertion") {
+    // Cited nothing: refusable without opening a transaction, because no
+    // verification can change a count of zero.
     if (opts.strict && sources.length === 0) {
       return {
         ok: false,
@@ -144,6 +152,13 @@ export function enforceClaimContract(
           "completion contract: load-bearing assertion lacks source pins (strict)",
       };
     }
+    // Cited something: whether any of it *survives* is not knowable out here.
+    // This used to be the whole strict guard, and it is a count of citations
+    // rather than of support — an assertion citing one drifted vault_page
+    // passed it and came back DEBT, which is the same zero-verified-support
+    // state the branch above refuses. `requireVerifiedSupport` moves that
+    // decision inside the gate transaction, where the survivors are known and
+    // where a refusal can still roll back rather than relabel a written row.
     const r = commitBelief(db, {
       type: "belief",
       text: claim.text,
@@ -152,6 +167,7 @@ export function enforceClaimContract(
       sessionId: opts.sessionId,
       path: "deep",
       turnId: opts.turnId,
+      requireVerifiedSupport: opts.strict,
     });
     if (!r.ok) {
       return {

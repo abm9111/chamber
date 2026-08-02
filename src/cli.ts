@@ -43,6 +43,7 @@ import {
 import { completeSync } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { runAsk } from "./ask.ts";
+import { verifyBeliefSources } from "./pins.ts";
 import { runExpiryJob } from "./expiry.ts";
 import { indexCodeTree, searchCode } from "./code_index.ts";
 import {
@@ -597,6 +598,14 @@ Usage:
       neither invent a document id nor supply a snapshot hash. Each claim is
       gated on its own citations. --strict refuses an unsourced assertion
       instead of committing it with citation debt.
+  chamber verify [--since <ISO date>]        re-check stored pins against the corpus
+      A pin is written when a belief commits; the corpus can move after that
+      (an edited, re-ingested note). verify re-derives every stored pin from
+      the corpus as it is now and reports what no longer matches — it never
+      mutates a belief or the corpus. Exits non-zero exactly when a belief
+      has no verified support left, so it is safe to run as a scheduled
+      health check. --since limits the scan to beliefs committed on or after
+      that date.
   chamber expiry                   Run belief expiry job
 
 Env:
@@ -804,6 +813,62 @@ async function main(): Promise<void> {
         }
       }
       console.log(`\n${formatSpendFooter(spendLastHours(db, 24))}`);
+      break;
+    }
+    case "verify": {
+      const i = rest.indexOf("--since");
+      let since: string | undefined;
+      if (i >= 0) {
+        const raw = rest[i + 1];
+        // Same guard `ingest --exclude` applies: a missing or flag-shaped
+        // value is a usage error, not silent "no filter".
+        if (raw === undefined || raw.startsWith("-")) {
+          console.error("usage: chamber verify [--since <date>]");
+          console.error("  --since requires a date value");
+          process.exitCode = 1;
+          break;
+        }
+        // The query below is a raw TEXT compare against belief.created_at's
+        // ISO-8601 form; SQLite never parses or validates a TEXT value, so an
+        // unparseable --since does not throw there — it silently compares as
+        // ordinary bytes. Depending on the first differing byte that can
+        // silently exclude every belief (any value that sorts after "2026-…",
+        // which is most non-numeric text) and print a false "0 with no
+        // verified support left", or silently include everything. Both look
+        // exactly like a correct, clean report on stdout — the one failure
+        // mode a scheduled health check cannot absorb. Confirmed empirically
+        // (task-7-report.md §"--since"): `--since not-a-real-date` reports a
+        // clean "0 belief(s) checked" instead of the drift that is actually
+        // there. Validate and normalize here so a malformed --since is a
+        // loud, exit-1 usage error instead of a quiet false negative.
+        const parsed = new Date(raw);
+        if (Number.isNaN(parsed.getTime())) {
+          console.error(`verify: --since is not a valid date: ${JSON.stringify(raw)}`);
+          process.exitCode = 1;
+          break;
+        }
+        since = parsed.toISOString();
+      }
+      const report = verifyBeliefSources(db, { since });
+      let broken = 0;
+      for (const b of report) {
+        if (b.failures.length === 0) continue;
+        broken += b.verified === 0 ? 1 : 0;
+        console.log(`${b.beliefId}  ${b.verified}/${b.total} pins verified`);
+        console.log(`  "${b.content.slice(0, 70)}"`);
+        for (const f of b.failures) {
+          const where = f.sourceRef ? ` (${f.sourceRef})` : "";
+          const hint =
+            f.reason === "hash_mismatch"
+              ? " — note changed since commit; re-run `chamber ingest`"
+              : "";
+          console.log(`  ${f.reason}: ${f.refId}${where}${hint}`);
+        }
+      }
+      console.log(
+        `\n${report.length} belief(s) checked, ${broken} with no verified support left`,
+      );
+      if (broken > 0) process.exitCode = 1;
       break;
     }
     case "expiry": {

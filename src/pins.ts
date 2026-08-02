@@ -110,3 +110,75 @@ export function verifyPin(db: DatabaseSync, source: PinnedSource): PinVerdict {
     sourceKind: row.source_kind,
   };
 }
+
+export interface BeliefDrift {
+  beliefId: string;
+  content: string;
+  total: number;
+  verified: number;
+  failures: { refId: string; reason: PinFailure; sourceRef?: string | null }[];
+}
+
+/**
+ * Re-check every stored pin against the current corpus.
+ *
+ * This is where verification stops being tautological: the pin was written
+ * when the belief was committed, and the corpus has moved since. Within a
+ * single `chamber ask`, `verifyPin` checks a hash against the very row it was
+ * just read from — this is the check that can actually fail, because the row
+ * it reads now may not be the row a source pin was minted against.
+ *
+ * Read-only: every row visited here is a SELECT, and verifyPin itself never
+ * writes. Calling this does not change what any future call to it reports.
+ */
+export function verifyBeliefSources(
+  db: DatabaseSync,
+  opts: { since?: string } = {},
+): BeliefDrift[] {
+  const rows = db
+    .prepare(
+      `SELECT b.id AS belief_id, b.content AS content,
+              s.kind AS kind, s.ref_id AS ref_id, s.snapshot_hash AS snapshot_hash
+         FROM belief b
+         JOIN belief_source s ON s.belief_id = b.id
+        WHERE (? IS NULL OR b.created_at >= ?)
+        ORDER BY b.created_at DESC`,
+    )
+    .all(opts.since ?? null, opts.since ?? null) as {
+    belief_id: string;
+    content: string;
+    kind: string;
+    ref_id: string;
+    snapshot_hash: string;
+  }[];
+
+  const byBelief = new Map<string, BeliefDrift>();
+  for (const r of rows) {
+    let entry = byBelief.get(r.belief_id);
+    if (!entry) {
+      entry = {
+        beliefId: r.belief_id,
+        content: r.content,
+        total: 0,
+        verified: 0,
+        failures: [],
+      };
+      byBelief.set(r.belief_id, entry);
+    }
+    entry.total += 1;
+    const verdict = verifyPin(db, {
+      kind: r.kind,
+      refId: r.ref_id,
+      snapshotHash: r.snapshot_hash,
+    });
+    if (verdict.ok) entry.verified += 1;
+    else {
+      entry.failures.push({
+        refId: r.ref_id,
+        reason: verdict.reason!,
+        sourceRef: verdict.sourceRef,
+      });
+    }
+  }
+  return [...byBelief.values()];
+}

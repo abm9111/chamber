@@ -45,7 +45,7 @@ import {
   deleteDocument,
   countDocuments,
 } from "../src/vector.ts";
-import { verifyPin } from "../src/pins.ts";
+import { verifyPin, verifyBeliefSources } from "../src/pins.ts";
 import { runAsk, citedIndices } from "../src/ask.ts";
 import {
   minilmAvailable,
@@ -3728,6 +3728,254 @@ test("pins", "citedIndices dedupes, preserves order, and ignores non-citations",
     "only bare bracketed integers count",
   );
 });
+
+// ─── VERIFY (longitudinal pin drift, src/pins.ts verifyBeliefSources) ────────
+//
+// Within one ask, pin verification is close to tautological: the hash is read
+// off a vector_document row and checked against that same row moments later.
+// The tests below are the ones that actually exercise the point of Task 7 —
+// time passing, the corpus moving, and a stored pin no longer matching. No
+// test in this section may call a live model; every completion is injected.
+
+test(
+  "pins",
+  "verify detects a belief whose source drifted after re-ingest",
+  async () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-drift-"));
+    const file = join(dir, "policy.md");
+    writeFileSync(file, "Retention policy is 90 days.\n");
+    ingestDirectory(db, dir);
+
+    const fake = async () => "Retention policy is 90 days. [1]";
+    const asked = await runAsk(db, "what is the retention policy", {
+      complete: fake,
+    });
+    assert(
+      asked.claims.some((c) => c.citedRefs.length > 0),
+      "setup failed: expected at least one cited claim",
+    );
+
+    const clean = verifyBeliefSources(db);
+    assert(
+      clean.every((b) => b.failures.length === 0),
+      "before editing, every pin should verify",
+    );
+    // `.every` on an empty array is vacuously true, which would make the
+    // assertion above pass even if setup silently committed nothing. Pin the
+    // non-vacuous precondition directly: at least one belief actually carries
+    // the source pin this test is about to invalidate.
+    assert(
+      clean.some((b) => b.total > 0),
+      "setup failed: no belief carries a corpus source to verify",
+    );
+
+    writeFileSync(file, "Retention policy is 30 days.\n");
+    ingestDirectory(db, dir);
+
+    const drifted = verifyBeliefSources(db);
+    const bad = drifted.filter((b) =>
+      b.failures.some((f) => f.reason === "hash_mismatch"),
+    );
+    assert(
+      bad.length > 0,
+      "after editing and re-ingesting, the belief's pin must report hash_mismatch",
+    );
+    // The failure must name the drifted source and point back at the note, not
+    // just flip a boolean — a caller re-running `chamber ingest` needs to know
+    // *which* citation to go re-check.
+    const failure = bad[0]!.failures.find((f) => f.reason === "hash_mismatch")!;
+    assert(
+      failure.sourceRef === "policy.md",
+      `expected the failure to name policy.md, got ${JSON.stringify(failure)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "verify leaves the corpus and the belief ledger untouched — it reports, it does not repair",
+  async () => {
+    // A binding constraint: "chamber verify must not mutate anything — it
+    // reports only." Run it twice across an edit and confirm neither call
+    // changed a single row anywhere verify has read access to.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-drift-nomutate-"));
+    const file = join(dir, "policy.md");
+    writeFileSync(file, "Retention policy is 90 days.\n");
+    ingestDirectory(db, dir);
+    const fake = async () => "Retention policy is 90 days. [1]";
+    await runAsk(db, "what is the retention policy", { complete: fake });
+
+    writeFileSync(file, "Retention policy is 30 days.\n");
+    ingestDirectory(db, dir);
+
+    const snapshot = (): { beliefs: number; sources: number; docs: number; hashes: string } => {
+      const beliefs = count(db, `SELECT count(*) AS c FROM belief`);
+      const sources = count(db, `SELECT count(*) AS c FROM belief_source`);
+      const docs = count(db, `SELECT count(*) AS c FROM vector_document`);
+      const hashes = (
+        db
+          .prepare(
+            `SELECT snapshot_hash FROM belief_source ORDER BY snapshot_hash`,
+          )
+          .all() as { snapshot_hash: string }[]
+      )
+        .map((r) => r.snapshot_hash)
+        .join(",");
+      return { beliefs, sources, docs, hashes };
+    };
+
+    const before = snapshot();
+    verifyBeliefSources(db);
+    verifyBeliefSources(db);
+    const after = snapshot();
+    assert(
+      JSON.stringify(before) === JSON.stringify(after),
+      `verify must not mutate: before=${JSON.stringify(before)} after=${JSON.stringify(after)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "verify makes a partially-drifted belief legible instead of collapsing it to pass/fail",
+  () => {
+    // Realistic shape: one belief backed by two sources, only one of which
+    // drifted. The report must show 1/2 verified and name exactly the source
+    // that failed, not flatten the belief to a single boolean.
+    const db = freshDb();
+    const good = seedPinnedDoc(db, "the sky is blue", "notes/sky.md");
+    const drifting = seedPinnedDoc(db, "original body", "notes/drift.md");
+
+    const r = commitBelief(db, {
+      text: "Two things are known, from two different notes.",
+      type: "belief",
+      path: "deep",
+      authorFamily: "test",
+      sources: [good, drifting],
+    });
+    assert(r.ok, `setup: commit should succeed: ${JSON.stringify(r)}`);
+
+    // Drift only the second source's underlying document.
+    db.prepare(`UPDATE vector_document SET body = ? WHERE id = ?`).run(
+      "edited body",
+      drifting.refId,
+    );
+
+    const report = verifyBeliefSources(db);
+    const entry = report.find((b) => b.beliefId === r.beliefId);
+    assert(entry, `expected a report entry for ${r.beliefId}`);
+    assert(
+      entry!.total === 2 && entry!.verified === 1,
+      `expected 2 total / 1 verified, got ${JSON.stringify(entry)}`,
+    );
+    assert(
+      entry!.failures.length === 1 && entry!.failures[0]!.refId === drifting.refId,
+      `expected exactly one failure naming the drifted source, got ${JSON.stringify(entry!.failures)}`,
+    );
+    assert(
+      entry!.failures[0]!.reason === "hash_mismatch",
+      `expected hash_mismatch, got ${entry!.failures[0]!.reason}`,
+    );
+
+    // The CLI's exit-code rule (broken := verified === 0) must NOT fire for
+    // this belief: partial support survives, so this is visible-but-not-fatal.
+    // Reproduce that rule directly against the report shape rather than
+    // shelling out, since nothing else in this suite spawns the CLI.
+    const broken = report.filter(
+      (b) => b.failures.length > 0 && b.verified === 0,
+    ).length;
+    assert(
+      broken === 0,
+      "a belief with surviving support must not count toward the broken tally",
+    );
+  },
+);
+
+test(
+  "pins",
+  "verify reports a belief with zero surviving support as broken; a fully-drifted belief zeroes out",
+  () => {
+    const db = freshDb();
+    const drifting = seedPinnedDoc(db, "original body", "notes/only-source.md");
+    const r = commitBelief(db, {
+      text: "One claim, one source, about to drift.",
+      type: "belief",
+      path: "deep",
+      authorFamily: "test",
+      sources: [drifting],
+    });
+    assert(r.ok, `setup: commit should succeed: ${JSON.stringify(r)}`);
+
+    db.prepare(`UPDATE vector_document SET body = ? WHERE id = ?`).run(
+      "edited body",
+      drifting.refId,
+    );
+
+    const report = verifyBeliefSources(db);
+    const entry = report.find((b) => b.beliefId === r.beliefId)!;
+    assert(
+      entry.total === 1 && entry.verified === 0 && entry.failures.length === 1,
+      `expected a fully-zeroed entry, got ${JSON.stringify(entry)}`,
+    );
+    const broken = report.filter(
+      (b) => b.failures.length > 0 && b.verified === 0,
+    ).length;
+    assert(
+      broken >= 1,
+      "a belief with zero surviving support must count toward the broken tally",
+    );
+  },
+);
+
+test(
+  "pins",
+  "verify --since: omitted filters nothing; a malformed date does not throw",
+  () => {
+    const db = freshDb();
+    commitBelief(db, {
+      type: "belief",
+      text: "an old-enough claim for the since filter",
+      path: "deep",
+      authorFamily: "test",
+      sources: [seedPinnedDoc(db, "since filter body", "notes/since.md")],
+    });
+
+    // Omitted `since` (the CLI's default when --since is absent) must not
+    // filter anything out. `(? IS NULL OR b.created_at >= ?)` with a bound
+    // NULL makes the first arm true unconditionally in SQLite's
+    // three-valued logic, regardless of what the second arm would have done.
+    const noOpt = verifyBeliefSources(db);
+    const explicitUndefined = verifyBeliefSources(db, { since: undefined });
+    assert(
+      noOpt.length > 0 && noOpt.length === explicitUndefined.length,
+      `an absent since must not filter: ${noOpt.length} vs ${explicitUndefined.length}`,
+    );
+
+    // verifyBeliefSources itself never validates `since` — SQLite TEXT
+    // comparison never throws on an unparseable value, it just compares
+    // bytes, so a malformed string here can silently under- or over-filter
+    // rather than erroring. (`chamber verify`'s CLI layer now rejects an
+    // unparseable --since before it reaches this function — see the "verify:
+    // --since is not a valid date" guard in src/cli.ts — but this library
+    // function is also callable directly, e.g. by a future scheduled job, so
+    // its own contract must still be pinned: whatever `since` it is given,
+    // it must not throw.)
+    let threw = false;
+    let malformed: ReturnType<typeof verifyBeliefSources> = [];
+    try {
+      malformed = verifyBeliefSources(db, { since: "not-a-real-date" });
+    } catch {
+      threw = true;
+    }
+    assert(!threw, "a malformed --since must not throw inside the report");
+    assert(
+      Array.isArray(malformed),
+      "a malformed --since must still return an array",
+    );
+  },
+);
 
 // ─── report ──────────────────────────────────────────────────────────────────
 

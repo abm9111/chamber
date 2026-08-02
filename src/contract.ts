@@ -11,8 +11,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { commitBelief } from "./commit_belief.ts";
-import { sha256 } from "./hash.ts";
-import type { SourceRef } from "./types.ts";
+import type { RejectedSource, SourceRef } from "./types.ts";
 
 export type ClaimKind = "observation" | "assertion" | "aporia" | "chatter";
 
@@ -31,10 +30,25 @@ export interface ContractSource {
 
 export interface ContractResult {
   ok: boolean;
-  status: "ALLOWED" | "REFUSED" | "APORIA" | "DEBT";
+  /**
+   * `UNSUPPORTED` is recorded-but-not-evidence: the claim is on the ledger and
+   * nothing holds it up. It exists because `ALLOWED` was being printed for a
+   * claim with zero `belief_source` rows — every citation it offered had been
+   * dropped by the gate, and the drop was visible only in a `gate_event` with
+   * `action='absent'` that no surface reads. A status that reads as an
+   * endorsement is worse than a refusal, because nobody goes looking.
+   */
+  status: "ALLOWED" | "REFUSED" | "APORIA" | "DEBT" | "UNSUPPORTED";
   reason?: string;
   beliefId?: string;
   debtIds?: string[];
+  /**
+   * Citations the commit gate refused to count, and why. Carried on every
+   * outcome including success: a claim can commit while some of its citations
+   * are dropped, and without this field the caller has no way to render the
+   * difference between "cited nothing" and "cited three things, kept none".
+   */
+  rejectedSources?: RejectedSource[];
 }
 
 /** Heuristic claim classifier — conservative on assertions. */
@@ -65,6 +79,13 @@ export function classifyClaims(reply: string): ClassifiedClaim[] {
     }
   }
   return out.length ? out : [{ kind: "chatter", text: reply.slice(0, 200) }];
+}
+
+/** Citations the commit gate dropped, or undefined when it dropped none. */
+function dropped(r: {
+  rejectedSources?: RejectedSource[];
+}): RejectedSource[] | undefined {
+  return r.rejectedSources?.length ? r.rejectedSources : undefined;
 }
 
 /**
@@ -110,6 +131,7 @@ export function enforceClaimContract(
       status: "APORIA",
       reason: r.reason ?? "recorded as unknown",
       beliefId: r.beliefId,
+      rejectedSources: dropped(r),
     };
   }
 
@@ -137,6 +159,7 @@ export function enforceClaimContract(
         status: "REFUSED",
         reason: r.reason,
         debtIds: r.debtIds,
+        rejectedSources: dropped(r),
       };
     }
     // Unsourced belief path mints debt inside commitBelief
@@ -152,36 +175,61 @@ export function enforceClaimContract(
         reason: "committed with open citation debt — not load-bearing until paid",
         beliefId: r.beliefId,
         debtIds: debts.map((d) => d.id),
+        rejectedSources: dropped(r),
       };
     }
-    return { ok: true, status: "ALLOWED", beliefId: r.beliefId };
+    return {
+      ok: true,
+      status: "ALLOWED",
+      beliefId: r.beliefId,
+      rejectedSources: dropped(r),
+    };
   }
 
-  // observation — prefer transcript pin when possible
-  const obsSources =
-    sources.length > 0
-      ? sources
-      : [
-          {
-            kind: "transcript" as const,
-            refId: opts.turnId ?? "contract",
-            snapshotHash: sha256(claim.text),
-          },
-        ];
+  // observation — commits with whatever verified support it was given, and
+  // nothing else. It used to synthesise a `transcript` pin over its own text
+  // when no source was offered, which is circular on its face: the model's own
+  // output is not evidence for the model's own output. The gate saw through it
+  // — `transcript` has no registered formula, so the pin was dropped as
+  // kind_unregistered every single time — but it dropped it as an *error*,
+  // filling the audit trail with rejection noise for a citation that was never
+  // meant to hold. Offering nothing is honest; the status below is what says so.
   const r = commitBelief(db, {
     type: "observation",
     text: claim.text,
-    sources: obsSources,
+    sources,
     authorFamily: opts.authorFamily ?? "contract",
     sessionId: opts.sessionId,
     path: "fast",
     turnId: opts.turnId,
   });
+  if (!r.ok) {
+    return {
+      ok: false,
+      status: "REFUSED",
+      reason: r.reason,
+      rejectedSources: dropped(r),
+    };
+  }
+  // An observation is not an assertion, so commitBelief mints no debt for it
+  // and nothing else would have marked it. Without this the CLI printed a bare
+  // `[ALLOWED]` over zero belief_source rows — a claim with no verified support
+  // rendering as an endorsement.
+  const verified = sources.length - (r.rejectedSources?.length ?? 0);
+  if (verified > 0) {
+    return {
+      ok: true,
+      status: "ALLOWED",
+      beliefId: r.beliefId,
+      rejectedSources: dropped(r),
+    };
+  }
   return {
-    ok: r.ok,
-    status: r.ok ? "ALLOWED" : "REFUSED",
-    reason: r.reason,
+    ok: true,
+    status: "UNSUPPORTED",
+    reason: "recorded with no verified source — not evidence for anything",
     beliefId: r.beliefId,
+    rejectedSources: dropped(r),
   };
 }
 

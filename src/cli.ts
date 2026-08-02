@@ -370,6 +370,8 @@ function runTurn(db: DatabaseSync, message: string): void {
     const r = contract.results[i]!;
     const c = contract.claims[i]!;
     if (c.kind === "chatter") continue;
+    // UNSUPPORTED is neither a pass nor a refusal: the claim is recorded and
+    // nothing holds it up. It must not borrow ✓, which reads as endorsement.
     const mark =
       r.status === "ALLOWED"
         ? "✓"
@@ -377,7 +379,9 @@ function runTurn(db: DatabaseSync, message: string): void {
           ? "◇"
           : r.status === "APORIA"
             ? "○"
-            : "✗";
+            : r.status === "UNSUPPORTED"
+              ? "⚠"
+              : "✗";
     console.log(
       `  ${mark} contract ${c.kind}/${r.status}${r.reason ? ` — ${r.reason}` : ""}`,
     );
@@ -583,6 +587,9 @@ Usage:
       types: observation|inference|belief|commitment|unknown|defeater
   chamber index <kind> <title> <body> [ref]
       kinds: vault_page|x_tweet|transcript|note|skill|other
+      Only vault_page is citable: every other kind is searchable but has no
+      registered pin formula, so 'chamber ask' will not retrieve it and a
+      claim can never be supported by it.
   chamber ingest <path> [--exclude <name-or-path>]… [--include-dotted]
                         [--allow-unmatched-exclude]
       Load a directory of .md/.markdown/.mdx files into the corpus (vault_page).
@@ -949,7 +956,10 @@ async function main(): Promise<void> {
       const p = proposeDebtPayment(db, id);
       console.log(`${p.status}: ${p.reason}`);
       for (const h of p.hits.slice(0, 3)) {
-        console.log(`  hit ${h.score.toFixed(3)}  ${h.title}`);
+        console.log(`  hit ${h.score.toFixed(3)}  [${h.sourceKind}]  ${h.title}`);
+      }
+      for (const rj of p.rejected) {
+        console.log(`  not pinned ${rj.refId}: ${rj.reason}`);
       }
       break;
     }

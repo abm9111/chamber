@@ -14,8 +14,16 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { searchVector, countDocuments } from "./vector.ts";
-import { classifyClaims, enforceClaimContract } from "./contract.ts";
-import { verifyPin } from "./pins.ts";
+import {
+  classifyClaims,
+  enforceClaimContract,
+  type ContractSource,
+} from "./contract.ts";
+import {
+  verifyPin,
+  isCitableSourceKind,
+  CITABLE_SOURCE_KINDS,
+} from "./pins.ts";
 import { complete } from "./model.ts";
 
 export type CompleteFn = (prompt: string) => Promise<string>;
@@ -105,13 +113,60 @@ export function citedIndices(text: string): number[] {
   return out;
 }
 
+/**
+ * Explain an empty retrieval, distinguishing the three reasons it happens.
+ *
+ * "Nothing matches" and "everything that matches is uncitable" look identical
+ * from the outside and mean opposite things: the first says ingest more, the
+ * second says the corpus already holds the answer under a source kind that can
+ * never back a claim. Silently conflating them is how filtering at retrieval
+ * would trade one silent failure for another — a user who ran
+ * `chamber index note …` would be told their own note does not exist.
+ *
+ * Only runs when the filtered search already came back empty, so the second
+ * (unfiltered) query is off the hot path.
+ */
+function emptyRetrievalNote(
+  db: DatabaseSync,
+  question: string,
+  opts: AskOptions,
+): string {
+  if (countDocuments(db) === 0) {
+    return "nothing ingested yet — run `chamber ingest <path>`";
+  }
+  const uncitable = searchVector(db, question, {
+    k: opts.k ?? 8,
+    model: opts.model,
+  }).filter((h) => !isCitableSourceKind(h.sourceKind));
+  if (uncitable.length === 0) {
+    return "nothing in the corpus matches this question";
+  }
+  const kinds = [...new Set(uncitable.map((h) => h.sourceKind))].sort();
+  return (
+    `${uncitable.length} matching passage(s) are not citable: source kind ` +
+    `${kinds.join("/")} has no registered pin formula, so a citation to one ` +
+    `could never verify. Re-index as vault_page ` +
+    "(`chamber index vault_page <title> <body> [ref]`) or use `chamber ingest`."
+  );
+}
+
 export async function runAsk(
   db: DatabaseSync,
   question: string,
   opts: AskOptions = {},
 ): Promise<AskResult> {
   const k = opts.k ?? 8;
-  const hits = searchVector(db, question, { k, model: opts.model });
+  // Only kinds a citation can be made out of. See CITABLE_SOURCE_KINDS: a row
+  // of any other kind cannot verify (no registered formula) and cannot be
+  // stored as support (belief_source.kind CHECK), so putting one in front of
+  // the model buys a citation that is guaranteed to be rejected — and the
+  // rejection lands as blocking debt on the claim hash, refusing that
+  // assertion permanently. Filter before spending, not after.
+  const hits = searchVector(db, question, {
+    k,
+    model: opts.model,
+    sourceKinds: CITABLE_SOURCE_KINDS,
+  });
 
   const passages = hits.map((h, i) => ({
     index: i + 1,
@@ -120,6 +175,7 @@ export async function runAsk(
     title: h.title,
     body: h.body,
     snapshotHash: h.snapshotHash,
+    sourceKind: h.sourceKind,
   }));
 
   // Zero passages means the model would be answering from nothing but its own
@@ -131,10 +187,7 @@ export async function runAsk(
       claims: [],
       passages: [],
       modelCalled: false,
-      note:
-        countDocuments(db) === 0
-          ? "nothing ingested yet — run `chamber ingest <path>`"
-          : "nothing in the corpus matches this question",
+      note: emptyRetrievalNote(db, question, opts),
     };
   }
 
@@ -158,12 +211,7 @@ export async function runAsk(
     const indices = citedIndices(claim.text);
     const citedRefs: string[] = [];
     const rejected: { refId: string; reason: string }[] = [];
-    const sources: {
-      kind: "vault_page";
-      refId: string;
-      snapshotHash: string;
-      provenance: "vector";
-    }[] = [];
+    const sources: ContractSource[] = [];
 
     for (const n of indices) {
       const p = byIndex.get(n);
@@ -174,12 +222,28 @@ export async function runAsk(
         rejected.push({ refId: `[${n}]`, reason: "index_out_of_range" });
         continue;
       }
+      // The pin must claim what the row actually IS. Hardcoding "vault_page"
+      // here was the whole bug: verifyPin binds source_kind in its lookup, so
+      // a retrieved `note`/`x_tweet`/`skill`/`other` row resolved to no row at
+      // all and came back `not_found` — the gate telling the operator a real,
+      // correctly-cited passage was a hallucination, then minting blocking
+      // debt on the claim hash that refused that assertion forever.
+      //
+      // Retrieval above already restricts to citable kinds, so this guard is
+      // unreachable today; it stays because it is the thing that makes the
+      // kind flow through as a *type* rather than a cast, and because a widened
+      // filter must fail as "no formula for this kind", never as "your document
+      // does not exist".
+      if (!isCitableSourceKind(p.sourceKind)) {
+        rejected.push({ refId: p.documentId, reason: "kind_unregistered" });
+        continue;
+      }
       // Diagnostic, not the gate. enforceClaimContract -> commitBelief
       // re-verifies every pin inside its own transaction and drops what fails,
       // so an unverified source passed on is reported, never recorded. Running
       // it here too is what lets the caller show *why* a citation vanished.
       const verdict = verifyPin(db, {
-        kind: "vault_page",
+        kind: p.sourceKind,
         refId: p.documentId,
         snapshotHash: p.snapshotHash,
       });
@@ -189,7 +253,7 @@ export async function runAsk(
       }
       citedRefs.push(p.documentId);
       sources.push({
-        kind: "vault_page",
+        kind: p.sourceKind,
         refId: p.documentId,
         snapshotHash: p.snapshotHash,
         provenance: "vector",
@@ -207,11 +271,24 @@ export async function runAsk(
       sessionId: opts.sessionId,
     });
 
+    // A pin can pass the diagnostic above and still be dropped by the commit
+    // transaction — another unit sharing this DB may edit the row in between,
+    // which is exactly why commitBelief re-verifies rather than trusting the
+    // caller. Fold those drops in, and take them back out of citedRefs: a
+    // source that was not written must not be rendered as one that was.
+    // Otherwise the only record of the drop is a gate_event nothing reads.
+    const droppedAtCommit = new Set(
+      (r.rejectedSources ?? []).map((rj) => rj.refId),
+    );
+    for (const rj of r.rejectedSources ?? []) {
+      if (!rejected.some((x) => x.refId === rj.refId)) rejected.push(rj);
+    }
+
     out.push({
       text: claim.text,
       kind: claim.kind,
       status: r.status,
-      citedRefs,
+      citedRefs: citedRefs.filter((id) => !droppedAtCommit.has(id)),
       rejected,
       debtIds: r.debtIds ?? [],
     });

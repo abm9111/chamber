@@ -212,6 +212,15 @@ export interface SearchOptions {
   k?: number;
   minScore?: number;
   sourceKind?: VectorSourceKind;
+  /**
+   * Restrict retrieval to a set of kinds. Applied in SQL, not by filtering the
+   * result, so `k` still returns k *eligible* hits instead of however many of
+   * the top k happened to qualify. An empty array means "no kind is eligible"
+   * and returns nothing — the fail-closed reading, not "no filter"; callers
+   * that want no filter omit the option. Composes with `sourceKind` (both
+   * apply) rather than overriding it.
+   */
+  sourceKinds?: readonly VectorSourceKind[];
   model?: string;
   /** Hybrid: also require FTS5 match; rank = 0.7*cosine + 0.3*fts_boost */
   ftsQuery?: string;
@@ -253,6 +262,11 @@ export function searchVector(
   if (opts.sourceKind) {
     sql += ` AND d.source_kind = ?`;
     params.push(opts.sourceKind);
+  }
+  if (opts.sourceKinds) {
+    if (opts.sourceKinds.length === 0) return [];
+    sql += ` AND d.source_kind IN (${opts.sourceKinds.map(() => "?").join(",")})`;
+    params.push(...opts.sourceKinds);
   }
 
   const rows = db.prepare(sql).all(...params) as {

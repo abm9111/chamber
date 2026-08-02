@@ -2336,7 +2336,16 @@ test("phase1", "P1_debt_propose_from_corpus", () => {
     )
     .all(bel.beliefId!) as { id: string }[];
   assert(debts.length >= 1, "expected debt");
-  const prop = proposeDebtPayment(db, debts[0]!.id, { minScore: 0.05 });
+  // `model` is pinned for the same reason seedPinnedDoc pins it: the document
+  // above is embedded with local-hash-v1, and proposeDebtPayment now resolves
+  // "auto" like ingest and ask do — so on a machine with the MiniLM ONNX model
+  // installed an unpinned query would search a 384-d space the fixture never
+  // wrote into and find nothing. A gate test must not change behaviour based
+  // on whether a model file happens to be on disk.
+  const prop = proposeDebtPayment(db, debts[0]!.id, {
+    minScore: 0.05,
+    model: "local-hash-v1",
+  });
   assert(
     prop.status === "proposed_paid" || prop.status === "paid",
     `expected proposal, got ${prop.status} ${prop.reason}`,
@@ -4113,6 +4122,352 @@ test(
     assert(
       broken >= 1,
       "a belief with only a dangling belief-kind source must count as broken",
+    );
+  },
+);
+
+// ─── MERGE-BLOCKING REGRESSIONS (review of feat/vault-qa-citation-gate) ──────
+//
+// Every runAsk fixture above builds `vault_page` documents, which is precisely
+// why the harness could not see the bug these first two tests cover: `ask`
+// hardcoded `kind: "vault_page"` on every hit, and verifyPin binds source_kind
+// in its lookup, so a row of any other kind resolved to nothing and came back
+// `not_found` — the gate telling an operator that a real, correctly-cited
+// passage was a hallucination, then minting blocking debt on the claim hash
+// that refused the assertion permanently. The corpus rows below are
+// deliberately NOT vault_page.
+
+test(
+  "pins",
+  "runAsk never shows the model a passage whose kind cannot be cited",
+  async () => {
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "note",
+      sourceRef: "currency-note",
+      title: "AED",
+      body: "The user base currency is AED, the UAE dirham.",
+      model: "local-hash-v1",
+    });
+    let called = false;
+    const fake = async () => {
+      called = true;
+      return "The base currency is AED, the UAE dirham. [1]";
+    };
+    const r = await runAsk(db, "What is the base currency?", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+
+    assert(!called, "an uncitable passage must not be paid for");
+    assert(r.passages.length === 0, JSON.stringify(r.passages));
+    assert(
+      count(db, `SELECT count(*) AS c FROM citation_debt`) === 0,
+      "a claim must not be blocked forever over a row the gate itself refuses to pin",
+    );
+    assert(
+      count(db, `SELECT count(*) AS c FROM belief`) === 0,
+      "nothing was answered, so nothing may be committed",
+    );
+    // Silence is the other half of the bug: a user who just indexed this note
+    // must not be told their own document does not exist.
+    assert(
+      r.note !== "nothing in the corpus matches this question",
+      "a matching-but-uncitable passage must not be reported as no match",
+    );
+    assert(
+      r.note!.includes("note") && r.note!.includes("vault_page"),
+      `the note must name the kind and the remedy, got ${JSON.stringify(r.note)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "runAsk pins a citation to the kind the row actually has, and it verifies",
+  async () => {
+    // Same text under two kinds. Before the fix the note could rank first and
+    // be pinned as vault_page — a mislabel that resolved to no row at all.
+    const db = freshDb();
+    const body = "The user base currency is AED, the UAE dirham.";
+    upsertDocument(db, {
+      sourceKind: "note",
+      sourceRef: "currency-note",
+      title: "AED",
+      body,
+      model: "local-hash-v1",
+    });
+    const citable = upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/currency.md",
+      title: "AED",
+      body,
+      model: "local-hash-v1",
+    });
+    assert(countDocuments(db) === 2, "precondition: both rows are in the corpus");
+
+    const fake = async () => "The base currency is AED, the UAE dirham. [1]";
+    const r = await runAsk(db, "What is the base currency?", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    assert(
+      r.passages.length === 1 && r.passages[0]!.documentId === citable.id,
+      `only the citable row may be retrieved, got ${JSON.stringify(r.passages)}`,
+    );
+    const a = r.claims.filter((c) => c.kind === "assertion")[0]!;
+    assert(
+      a.rejected.length === 0,
+      `a correctly-cited retrieved passage must not be rejected, got ${JSON.stringify(a.rejected)}`,
+    );
+    assert(
+      a.status === "ALLOWED" && a.debtIds.length === 0,
+      `expected clean commit, got ${a.status} ${JSON.stringify(a.debtIds)}`,
+    );
+    const rows = db
+      .prepare(`SELECT kind, ref_id FROM belief_source`)
+      .all() as { kind: string; ref_id: string }[];
+    assert(
+      rows.length === 1 &&
+        rows[0]!.kind === "vault_page" &&
+        rows[0]!.ref_id === citable.id,
+      `the stored pin must name the row's real kind and id, got ${JSON.stringify(rows)}`,
+    );
+    // The whole point of the pin: it still resolves on a later scan.
+    const drift = verifyBeliefSources(db);
+    assert(
+      drift.length === 1 && drift[0]!.verified === 1 && drift[0]!.total === 1,
+      `chamber verify must resolve the pin ask wrote, got ${JSON.stringify(drift)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "pay-debt writes a pin chamber verify can resolve, and reports what it could not pin",
+  () => {
+    // The second writer of belief_source used to bypass verifyPin entirely and
+    // store `ref_id = sourceRef` — so `chamber verify`, which re-checks pins by
+    // document id, reported not_found on a belief whose evidence was healthy.
+    const db = freshDb();
+    const doc = upsertDocument(db, {
+      id: "vdoc_aed_page",
+      sourceKind: "vault_page",
+      sourceRef: "notes/aed.md",
+      title: "Currency",
+      body: "User base currency is AED (UAE dirham).",
+      model: "local-hash-v1",
+    });
+    upsertDocument(db, {
+      id: "vdoc_aed_note",
+      sourceKind: "note",
+      sourceRef: "notes/aed-note.md",
+      title: "Currency",
+      body: "User base currency is AED (UAE dirham).",
+      model: "local-hash-v1",
+    });
+    const bel = commitBelief(db, {
+      type: "belief",
+      text: "User base currency is AED",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    assert(bel.ok, JSON.stringify(bel));
+    const debtId = (
+      db
+        .prepare(`SELECT id FROM citation_debt WHERE belief_id = ?`)
+        .get(bel.beliefId!) as { id: string }
+    ).id;
+
+    const prop = proposeDebtPayment(db, debtId, {
+      minScore: 0.05,
+      model: "local-hash-v1",
+      useCode: false,
+    });
+    assert(
+      prop.status === "proposed_paid",
+      `expected a proposal, got ${prop.status}: ${prop.reason}`,
+    );
+    const rows = db
+      .prepare(`SELECT kind, ref_id FROM belief_source WHERE belief_id = ?`)
+      .all(bel.beliefId!) as { kind: string; ref_id: string }[];
+    assert(
+      rows.length === 1,
+      `only the verifiable hit may be written as support, got ${JSON.stringify(rows)}`,
+    );
+    assert(
+      rows[0]!.ref_id === doc.id,
+      `ref_id must be the document id verifyPin looks up, not a path, got ${rows[0]!.ref_id}`,
+    );
+    assert(rows[0]!.kind === "vault_page", `kind must be the row's own, got ${rows[0]!.kind}`);
+    // The defect's whole signature: verify crying wolf on healthy evidence.
+    const drift = verifyBeliefSources(db);
+    const entry = drift.find((b) => b.beliefId === bel.beliefId)!;
+    assert(
+      entry.total === 1 && entry.verified === 1 && entry.failures.length === 0,
+      `pay-debt's pin must verify, got ${JSON.stringify(entry)}`,
+    );
+    // The drop that used to be written as a bogus pin is now reported.
+    assert(
+      prop.rejected.some(
+        (x) => x.refId === "vdoc_aed_note" && x.reason === "kind_unregistered",
+      ),
+      `the unpinnable hit must be reported, got ${JSON.stringify(prop.rejected)}`,
+    );
+    assert(
+      prop.attached.length === 1 && prop.attached[0] === doc.id,
+      `attached must list what actually landed, got ${JSON.stringify(prop.attached)}`,
+    );
+  },
+);
+
+test("pins", "pay-debt searches the space the corpus was written into", () => {
+  // debt.ts hardcoded `model: "local-hash-v1"` while ingest and ask both
+  // resolve "auto" (→ minilm-l6-v2-q whenever the ONNX model is on disk).
+  // searchVector filters on `e.model = ?`, so every query landed in an empty
+  // space and every debt on a real corpus was unpayable — and debt is the only
+  // route out of a blocked claim, so the exit was a one-way door.
+  //
+  // The first half only *fails* under the old code on a machine where "auto"
+  // resolves to something other than local-hash-v1; that is the honest shape of
+  // this bug, so the second half pins the mechanism directly and holds
+  // everywhere: the model option must be obeyed, not ignored.
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/aed.md",
+    title: "Currency",
+    body: "User base currency is AED (UAE dirham).",
+  });
+  const bel = commitBelief(db, {
+    type: "belief",
+    text: "User base currency is AED",
+    sources: [],
+    authorFamily: "test",
+    path: "deep",
+  });
+  assert(bel.ok, JSON.stringify(bel));
+  const debtId = (
+    db
+      .prepare(`SELECT id FROM citation_debt WHERE belief_id = ?`)
+      .get(bel.beliefId!) as { id: string }
+  ).id;
+
+  const auto = proposeDebtPayment(db, debtId, { minScore: 0.05, useCode: false });
+  assert(
+    auto.hits.some((h) => h.documentId === doc.id),
+    `a default-embedded corpus must be reachable from pay-debt, got ${auto.status}: ${auto.reason}`,
+  );
+
+  const foreign = proposeDebtPayment(db, debtId, {
+    minScore: 0.05,
+    useCode: false,
+    model: "no-such-embedding-space",
+  });
+  assert(
+    foreign.status === "insufficient" && foreign.hits.length === 0,
+    `the model option must select the space searched, got ${foreign.status}: ${foreign.reason}`,
+  );
+});
+
+test(
+  "pins",
+  "an observation with no verified support does not render as ALLOWED",
+  () => {
+    // contract.ts synthesised a `transcript` pin over the claim's own text when
+    // nothing else was offered — a model's output cited as evidence for itself.
+    // The gate dropped it every time (transcript has no formula), so the claim
+    // committed with zero belief_source rows, minted no debt (an observation is
+    // not an assertion), and printed a bare [ALLOWED] over nothing at all. The
+    // only trace was a gate_event action='absent' no surface reads.
+    const db = freshDb();
+    const r = enforceClaimContract(
+      db,
+      { kind: "observation", text: "We decided to price everything in dirhams." },
+      { turnId: "t_obs" },
+    );
+    assert(r.ok, `the claim is still recorded: ${JSON.stringify(r)}`);
+    assert(
+      r.status === "UNSUPPORTED",
+      `zero verified support must not read as an endorsement, got ${r.status}`,
+    );
+    assert(
+      count(db, `SELECT count(*) AS c FROM belief_source`) === 0,
+      "no source was offered, so none may be stored",
+    );
+    assert(
+      count(db, `SELECT count(*) AS c FROM belief_source WHERE kind = 'transcript'`) === 0,
+      "a model's own output is not evidence for itself",
+    );
+    assert(
+      count(db, `SELECT count(*) AS c FROM gate_event WHERE action = 'absent'`) === 0,
+      "declining to cite is intentional, not a rejection worth logging",
+    );
+
+    // The other half: a claim that DID cite something the gate dropped must
+    // carry the drop out to the caller, not only into a gate_event.
+    const drifted = seedPinnedDoc(db, "original body", "notes/drift.md");
+    db.prepare(`UPDATE vector_document SET body = ? WHERE id = ?`).run(
+      "edited body",
+      drifted.refId,
+    );
+    const r2 = enforceClaimContract(
+      db,
+      { kind: "observation", text: "We recorded the drifted note." },
+      { sources: [{ ...drifted, provenance: "vector" }] },
+    );
+    assert(
+      r2.status === "UNSUPPORTED",
+      `every citation was dropped, so support is zero, got ${r2.status}`,
+    );
+    assert(
+      (r2.rejectedSources ?? []).length === 1 &&
+        r2.rejectedSources![0]!.reason === "hash_mismatch",
+      `ContractResult must carry the drop, got ${JSON.stringify(r2.rejectedSources)}`,
+    );
+
+    // And a claim whose citation survives is still plainly ALLOWED.
+    const good = seedPinnedDoc(db, "the sky is blue", "notes/sky.md");
+    const r3 = enforceClaimContract(
+      db,
+      { kind: "observation", text: "We recorded that the sky is blue." },
+      { sources: [{ ...good, provenance: "vector" }] },
+    );
+    assert(
+      r3.status === "ALLOWED" && !r3.rejectedSources,
+      `verified support must still pass cleanly, got ${JSON.stringify(r3)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "runAsk surfaces an uncited observation as UNSUPPORTED, not ALLOWED",
+  async () => {
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/aed.md",
+      title: "Currency",
+      body: "User base currency is AED (UAE dirham).",
+      model: "local-hash-v1",
+    });
+    const fake = async () => "We decided to price everything in dirhams.";
+    const r = await runAsk(db, "what currency do we price in?", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    const obs = r.claims.filter((c) => c.kind === "observation");
+    assert(obs.length === 1, JSON.stringify(r.claims));
+    assert(
+      obs[0]!.status === "UNSUPPORTED",
+      `an uncited observation must not render as ALLOWED, got ${obs[0]!.status}`,
+    );
+    assert(obs[0]!.citedRefs.length === 0, "it cited nothing");
+    assert(
+      count(db, `SELECT count(*) AS c FROM belief_source`) === 0,
+      "and nothing holds it up",
     );
   },
 );

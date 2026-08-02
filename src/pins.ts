@@ -47,6 +47,38 @@ export interface PinnedSource {
 }
 
 /**
+ * Corpus source kinds a citation can actually be made out of.
+ *
+ * Two independent walls decide this list, and both land in the same place:
+ *
+ *  1. `verifyPin` registers a formula for `vault_page` and nothing else, so a
+ *     citation of any other kind is unverifiable by construction — it comes
+ *     back `kind_unregistered` and can never count as support.
+ *  2. `belief_source.kind` (sql/schema.sql) is CHECK-constrained to
+ *     `transcript|url|vault_page|x_tweet|belief`, so `note`, `skill` and
+ *     `other` cannot be *stored* as support even if a formula existed.
+ *
+ * `chamber ask` retrieves only these kinds. Showing the model a passage it
+ * cannot legally cite is not a neutral act: the model cites it, the pin fails,
+ * the assertion mints blocking debt keyed on its claim hash, and that claim is
+ * then refused forever — after the tokens have already been paid for. Filtering
+ * at retrieval is the fail-closed choice, and it costs nothing in practice
+ * because `chamber ingest`, `indexCodeTree` and `scip` all write `vault_page`.
+ *
+ * This is the one list to extend when a kind gains a formula: adding a kind
+ * here without registering its formula in `verifyPin` re-opens exactly the bug
+ * this closes, so `isCitableSourceKind` is a narrowing guard rather than a
+ * cast — the type system then requires the `verifyPin` call site to agree.
+ */
+export const CITABLE_SOURCE_KINDS = ["vault_page"] as const;
+
+export type CitableSourceKind = (typeof CITABLE_SOURCE_KINDS)[number];
+
+export function isCitableSourceKind(kind: string): kind is CitableSourceKind {
+  return (CITABLE_SOURCE_KINDS as readonly string[]).includes(kind);
+}
+
+/**
  * Recompute a vault_page pin from the stored row.
  * Must stay byte-identical to the snapshot formula in upsertDocument
  * (src/vector.ts) — a pin minted there is only checkable if the framing is

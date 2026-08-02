@@ -1,0 +1,15 @@
+# Model weights provenance
+
+File:     model_quantized.onnx
+Size:     22972370 bytes
+SHA-256:  afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1
+
+Upstream: sentence-transformers/all-MiniLM-L6-v2 (quantized ONNX export)
+Licence:  Apache-2.0
+Revision: UNIDENTIFIED — no upstream commit/revision was recorded when these
+          weights were committed. Verify against the upstream export before
+          claiming a specific revision.
+
+These weights are load-bearing: src/embedder.ts uses them for retrieval, which
+feeds the citation-pin path. An unattested artifact inside that path undercuts
+the provenance guarantee, hence this file.

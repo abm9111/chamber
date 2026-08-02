@@ -1,0 +1,23 @@
+# Vendored upstream provenance
+
+Source:   https://github.com/huggingface/transformers.js
+Licence:  Apache-2.0 (see ./LICENSE in this directory)
+Revision: UNIDENTIFIED — these files were copied without recording an upstream
+          tag or commit. Do not claim a version until it is verified by
+          diffing against an upstream release. Tracked as a known gap.
+
+Vendored at: 2026-08-02
+
+## SHA-256 of vendored files (verify with: shasum -a 256 -c VERSION.sha256)
+
+cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30  LICENSE
+d482024cd27da56f320ea89fd57d1da574361c54eaa9839cb7062c21b7f99b35  src/configs.js
+375a408f4554de5dd60a95ee2fee478ddab3a6fa3a740c27a1eddbbbec76a7a1  src/env.js
+1eb492e7d2cc425c27a596639a46a2c61b9aed9e4f8f6ea4c917421189ba503d  src/models.js
+55101ae9b3ef622d19793c337aa189cf17e2976a42634a0aa56a8f1d75f28803  src/utils/audio.js
+47b676780b669b83ae9d499fae6e2209a36e6ca45c3db4a916f1620175e56262  src/utils/core.js
+15f2af0933cc132cf10f450b4ae0ae4fa69e454ec8c037aec49d404695c6ffe1  src/utils/data-structures.js
+7f53c83940a20e8e10ffca4264c3a7e0585a3e5c2d7fab3b2f59c89087d58a44  src/utils/generation.js
+08dd1fc0c54f7e3bcc891ccf0c3196783c1698ecb3f402710dc691687fdd8821  src/utils/hub.js
+5effd5be67c0175e4eaa3103b624c0753ecc261ad0db9dbf2d076cf4e9f109bc  src/utils/image.js
+5272ec4d9e6f976dd5781bb65917d3381dd46711823fa6cee5acda89b7f7dcf9  src/utils/maths.js

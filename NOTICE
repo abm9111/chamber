@@ -1,0 +1,29 @@
+Chamber
+Copyright (c) 2026 abm9111
+
+This product includes third-party software redistributed under its own terms.
+Chamber itself is MIT-licensed (see LICENSE); the components below are not.
+
+---
+
+## vendor/xenova-transformers/
+
+Portions of Transformers.js (https://github.com/huggingface/transformers.js),
+Copyright (c) Xenova and the Transformers.js contributors.
+
+Licensed under the Apache License, Version 2.0. The full licence text is at
+vendor/xenova-transformers/LICENSE and at
+http://www.apache.org/licenses/LICENSE-2.0
+
+These files are vendored (copied into this repository) rather than installed
+as an npm dependency, so that Chamber's runtime has no package dependencies.
+That choice makes them invisible to `npm audit`, Dependabot, and SBOM tooling
+— see vendor/xenova-transformers/VERSION for the pinned upstream revision and
+integrity hashes. Redistribution of this repository redistributes these files
+under Apache-2.0.
+
+## models/minilm/
+
+Model weights (model_quantized.onnx, ~23 MB) derived from
+sentence-transformers/all-MiniLM-L6-v2, licensed under Apache-2.0.
+See models/minilm/VERSION for the source revision and file hashes.

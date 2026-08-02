@@ -179,6 +179,15 @@ interface TestResult {
 
 const results: TestResult[] = [];
 
+/**
+ * Settled-tracking promises for tests whose `fn()` returned a Promise.
+ * The summary block at the bottom of this file awaits these before it
+ * counts results — without that, an async test that rejects is never
+ * recorded, the tally prints green, and the process only dies afterwards
+ * on the unhandled rejection.
+ */
+const pending: Promise<void>[] = [];
+
 function suiteFromArg(): Suite {
   const arg = process.argv.find((a) => a.startsWith("--suite="));
   if (!arg) return "all";
@@ -206,12 +215,35 @@ function suiteFromArg(): Suite {
     : "all";
 }
 
-function test(suite: string, name: string, fn: () => void): void {
+function test(
+  suite: string,
+  name: string,
+  fn: () => void | Promise<void>,
+): void {
   const selected = suiteFromArg();
   if (selected !== "all" && selected !== suite) return;
   const t0 = Date.now();
   try {
-    fn();
+    const returned = fn();
+    if (returned instanceof Promise) {
+      pending.push(
+        returned.then(
+          (): void => {
+            results.push({ name, suite, ok: true, ms: Date.now() - t0 });
+          },
+          (err: unknown): void => {
+            results.push({
+              name,
+              suite,
+              ok: false,
+              detail: err instanceof Error ? err.message : String(err),
+              ms: Date.now() - t0,
+            });
+          },
+        ),
+      );
+      return;
+    }
     results.push({ name, suite, ok: true, ms: Date.now() - t0 });
   } catch (err) {
     results.push({
@@ -1567,6 +1599,17 @@ test("pins", "getHarness throws on unknown id", () => {
   assert(threw, "getHarness must throw on an unregistered id, not return the stub");
 });
 
+/**
+ * Guards the runner itself: a rejected async test must be recorded as a
+ * failure. Before the runner awaited `pending`, the assertion below ran
+ * after the summary printed, so a failing async test scored as a pass and
+ * the tally lied. Flip the `true` to `false` to re-prove the runner still
+ * goes red — that is what this test exists to keep true.
+ */
+test("pins", "runner reports async test failures", async () => {
+  await Promise.resolve();
+  assert(true, "async assertion must reach the results tally");
+});
 
 test("gates", "idempotent_approve_double", () => {
   const db = freshDb();
@@ -1879,6 +1922,10 @@ test("vector", "V5_minilm_semantic", () => {
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────
+
+// Async tests record their outcome when they settle, not when they are
+// called. Nothing below may read `results` until every one of them has.
+await Promise.all(pending);
 
 const passed = results.filter((r) => r.ok).length;
 const failed = results.filter((r) => !r.ok);

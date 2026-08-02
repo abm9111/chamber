@@ -1359,7 +1359,49 @@ async function main(): Promise<void> {
   }
 }
 
+/**
+ * Render an error together with its underlying cause chain.
+ *
+ * Node's `fetch` reports every transport failure as the useless
+ * `Error: fetch failed` and hides the real reason — ECONNREFUSED, DNS
+ * failure, TLS error — in `err.cause` (or, when several addresses were
+ * tried, in an AggregateError's `errors`). Printing only `err.message`
+ * throws away the one diagnostic this handler exists to surface.
+ *
+ * Structural property reads are used instead of `instanceof AggregateError`
+ * / typed `.cause` so this stays correct without an ES2021+ lib setting.
+ */
+function formatErrorChain(
+  err: unknown,
+  depth = 0,
+  seen = new Set<object>(),
+): string[] {
+  const prefix = depth === 0 ? "" : `${"  ".repeat(depth)}caused by: `;
+
+  if (typeof err === "object" && err !== null) {
+    if (seen.has(err)) return [`${prefix}[circular error reference]`];
+    seen.add(err);
+  }
+  if (!(err instanceof Error)) return [`${prefix}${String(err)}`];
+
+  const code = (err as { code?: unknown }).code;
+  const suffix = typeof code === "string" ? ` (${code})` : "";
+  const lines = [`${prefix}${err.name}: ${err.message}${suffix}`];
+
+  const nested: unknown[] = [];
+  const aggregated = (err as { errors?: unknown }).errors;
+  if (Array.isArray(aggregated)) nested.push(...(aggregated as unknown[]));
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause !== undefined && cause !== null) nested.push(cause);
+
+  for (const inner of nested) {
+    lines.push(...formatErrorChain(inner, depth + 1, seen));
+  }
+  return lines;
+}
+
 main().catch((err: unknown) => {
-  console.error(err instanceof Error ? err.message : String(err));
+  console.error(formatErrorChain(err).join("\n"));
+  // exitCode (not exit()) so buffered stdout still flushes.
   process.exitCode = 1;
 });

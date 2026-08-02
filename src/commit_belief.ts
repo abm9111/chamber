@@ -9,6 +9,8 @@
  * - Defeaters cannot be used as citable sources
  * - Every corpus citation is verified against the local corpus before it counts
  *   as support; an unverifiable pin is a gap, not evidence
+ * - A belief cited as a source must reference a belief row that exists; a pin
+ *   with no formula is still not a pin with no check
  * - claim_hash upsert + debt inheritance across revision_of
  */
 
@@ -129,7 +131,16 @@ export function commitBelief(
   // unwind the caller instead of failing closed to PARKED, which is exactly
   // what src/pins.ts assumes it is protected from.
   const verifiedSources: SourceRef[] = [];
-  const rejectedSources: { refId: string; reason: PinFailure }[] = [];
+  /**
+   * Why a citation was refused. `belief`-kind sources are checked for
+   * existence rather than by formula, so their failure is not one verifyPin
+   * can return and gets its own reason — a caller must be able to tell a
+   * corpus row that drifted from an internal edge that points at nothing.
+   */
+  const rejectedSources: {
+    refId: string;
+    reason: PinFailure | "belief_not_found";
+  }[] = [];
 
   /**
    * Attach the rejection list to any verdict this call returns. A dropped
@@ -150,16 +161,61 @@ export function commitBelief(
   try {
     db.exec("BEGIN IMMEDIATE");
 
+    /**
+     * Belief rows named by `belief`-kind citations, read at most once each.
+     * Two separate rules need this row — the existence check in the loop
+     * below and the FM-5 defeater rider further down — and they must agree on
+     * what they saw, so they share one lookup and one cache rather than
+     * issuing the same SELECT twice against a corpus another unit may be
+     * writing to. `undefined` is a cached answer ("no such belief"), which is
+     * why membership is tested with `has`, not truthiness.
+     */
+    type CitedBelief = { epistemic_type: string } | undefined;
+    const citedBeliefs = new Map<string, CitedBelief>();
+    const citedBelief = (refId: string): CitedBelief => {
+      if (!citedBeliefs.has(refId)) {
+        citedBeliefs.set(
+          refId,
+          db
+            .prepare(`SELECT epistemic_type FROM belief WHERE id = ?`)
+            .get(refId) as CitedBelief,
+        );
+      }
+      return citedBeliefs.get(refId);
+    };
+
     for (const s of sources) {
       if (!s.snapshotHash) {
         db.exec("ROLLBACK");
-        return { ok: false, status: "REJECTED", reason: "source missing snapshot_hash pin" };
+        // Shaped like the FM-5 refusal below: roll back first so the audit row
+        // lands in autocommit and survives the unwind, then report through
+        // `withRejected`. Returning bare discarded every rejection earlier
+        // sources in this loop had already accumulated — the exact thing
+        // withRejected exists to prevent — and emitted no gate event, so a
+        // refusal that dropped citations left nothing in the audit trail.
+        emitGate(db, {
+          turnId,
+          gate: "commit",
+          action: "blocked",
+          detail: { reason: "source_missing_pin", refId: s.refId },
+        });
+        return withRejected({
+          ok: false,
+          status: "REJECTED",
+          reason: "source missing snapshot_hash pin",
+        });
       }
       if (s.kind === "belief") {
         // A belief citing another belief is an internal edge, not a corpus
-        // pin: there is no document to recompute a hash from. It stays exempt
-        // from verifyPin and keeps its own rule — the defeater check below.
-        verifiedSources.push(s);
+        // pin: there is no document to recompute a hash from, so verifyPin's
+        // formula cannot apply. Existence still can, and must — `kind:
+        // "belief"` on an invented id was probes/pin_bypass.ts one field value
+        // away, committing a consequential claim clean with zero debt because
+        // nothing was checked at all. An unverifiable pin never counts as
+        // support: a source whose belief row does not exist is dropped like
+        // any other, and the defeater rule below still judges the rest.
+        if (citedBelief(s.refId)) verifiedSources.push(s);
+        else rejectedSources.push({ refId: s.refId, reason: "belief_not_found" });
         continue;
       }
       const verdict = verifyPin(db, {
@@ -188,16 +244,14 @@ export function commitBelief(
 
     // Reject defeater-typed beliefs used as sources (FM-5 rider).
     // Deliberately scans `sources`, not `verifiedSources`: this is a rejection
-    // rule, so it must see everything the caller *claimed* to cite. Today the
-    // two lists agree on belief-kind entries (they pass through verification
-    // untouched), so this only matters if that ever changes — and then the
-    // conservative reading is the one that keeps a cited defeater fatal rather
-    // than quietly dropping it.
+    // rule, so it must see everything the caller *claimed* to cite. The two
+    // lists no longer agree on belief-kind entries — one that names no belief
+    // row is dropped above — so reading the survivors would let a citation
+    // escape this rule by failing an earlier one. Same rows as before, from
+    // the cache the existence check already filled.
     for (const s of sources) {
       if (s.kind === "belief") {
-        const srcBel = db
-          .prepare(`SELECT epistemic_type FROM belief WHERE id = ?`)
-          .get(s.refId) as { epistemic_type: string } | undefined;
+        const srcBel = citedBelief(s.refId);
         if (srcBel?.epistemic_type === "defeater") {
           db.exec("ROLLBACK");
           emitGate(db, {

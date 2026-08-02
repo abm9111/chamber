@@ -1299,6 +1299,131 @@ test("pins", "one bad pin among good ones is dropped, not silently trusted", () 
   );
 });
 
+test("pins", "a belief-kind source naming no belief row buys nothing", () => {
+  // The fabricated-pin bypass one field value away: `kind: "belief"` used to
+  // skip verification *and* existence, so an invented id committed a
+  // consequential claim clean with zero debt and a support row to show for it.
+  // A pin with no formula is still not a pin with no check.
+  const db = freshDb();
+  const text = "Compound Y is safe because an earlier finding said so.";
+  const r = commitBelief(db, {
+    text,
+    type: "belief",
+    path: "deep",
+    stakes: "consequential",
+    authorFamily: "test",
+    sources: [
+      { kind: "belief", refId: "blf_totally_made_up", snapshotHash: "zzzz" },
+    ],
+  });
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief_source`) === 0,
+    "a belief edge to a nonexistent belief must never be written as support",
+  );
+  assert(
+    count(
+      db,
+      `SELECT count(*) AS c FROM citation_debt
+       WHERE claim_hash = ? AND blocking = 1 AND status = 'pending'`,
+      claimHash("belief", text),
+    ) === 1,
+    "an unverified belief source must not suppress citation debt",
+  );
+  const reasons = (r.rejectedSources ?? []).map((x) => x.reason);
+  assert(
+    reasons.join(",") === "belief_not_found",
+    `fabricated belief source needs its own reason, got ${JSON.stringify(r.rejectedSources)}`,
+  );
+});
+
+test("pins", "a real belief cited as a source still counts as support", () => {
+  // The complement, and the thing the existence check must not break: legitimate
+  // belief-chaining. Without this, dropping every belief-kind source would pass
+  // the test above and quietly sever every internal edge in the graph.
+  const db = freshDb();
+  const parentText = "Compound X is safe at 400mg daily.";
+  const parent = commitBelief(db, {
+    text: parentText,
+    type: "belief",
+    path: "deep",
+    authorFamily: "test",
+    sources: [seedPinnedDoc(db, "Compound X: 400mg daily is within tolerance.")],
+  });
+  assert(parent.ok, `parent belief must commit: ${JSON.stringify(parent)}`);
+
+  const text = "Compound X can be recommended at the studied dose.";
+  const r = commitBelief(db, {
+    text,
+    type: "belief",
+    path: "deep",
+    stakes: "consequential",
+    authorFamily: "test",
+    sources: [
+      {
+        kind: "belief",
+        refId: parent.beliefId,
+        snapshotHash: claimHash("belief", parentText),
+      },
+    ],
+  });
+  assert(r.ok, `a real belief edge must commit: ${JSON.stringify(r)}`);
+  assert(
+    (r.rejectedSources?.length ?? 0) === 0,
+    `nothing should be rejected: ${JSON.stringify(r.rejectedSources)}`,
+  );
+  assert(
+    count(
+      db,
+      `SELECT count(*) AS c FROM belief_source WHERE kind = 'belief' AND ref_id = ?`,
+      parent.beliefId,
+    ) === 1,
+    "the belief edge must be written as support",
+  );
+  assert(
+    count(db, `SELECT count(*) AS c FROM citation_debt WHERE blocking = 1`) === 0,
+    "a real belief source must suppress citation debt exactly as before",
+  );
+});
+
+test("pins", "a pinless source keeps earlier rejections and leaves a gate event", () => {
+  // The pinless path is a refusal like the FM-5 one beside it, and must report
+  // like one: returning bare threw away every rejection the loop had already
+  // accumulated — so a caller could not tell a confabulated citation from one
+  // never offered — and left no audit row for a refusal that dropped evidence.
+  const db = freshDb();
+  const r = commitBelief(db, {
+    text: "A claim citing one confabulation and one unpinned source.",
+    type: "belief",
+    path: "deep",
+    authorFamily: "test",
+    sources: [
+      { kind: "vault_page", refId: "vdoc_fabricated", snapshotHash: "aaaa" },
+      { kind: "vault_page", refId: "vdoc_unpinned", snapshotHash: "" },
+    ],
+  });
+  assert(!r.ok && r.status === "REJECTED", `expected REJECTED, got ${JSON.stringify(r)}`);
+  const reasons = (r.rejectedSources ?? []).map((x) => x.reason);
+  assert(
+    reasons.join(",") === "not_found",
+    `rejections before the pinless source must survive, got ${JSON.stringify(
+      r.rejectedSources,
+    )}`,
+  );
+  assert(
+    count(
+      db,
+      `SELECT count(*) AS c FROM gate_event
+       WHERE gate = 'commit' AND action = 'blocked'
+         AND detail_json LIKE '%source_missing_pin%'`,
+    ) === 1,
+    "the pinless refusal must leave an audit row",
+  );
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief`) === 0,
+    "no belief row from a rejected commit",
+  );
+});
+
 test("phase1", "P1_model_always_spends", () => {
   const db = freshDb();
   const r = completeSync(db, {

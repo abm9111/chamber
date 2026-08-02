@@ -61,6 +61,7 @@ import { completeSync } from "../src/model.ts";
 import {
   classifyClaims,
   enforceClaimContract,
+  enforceReplyContract,
 } from "../src/contract.ts";
 import { runExpiryJob } from "../src/expiry.ts";
 import { extractChunks, fileMerkleRoot } from "../src/code_index.ts";
@@ -1423,6 +1424,49 @@ test("pins", "a pinless source keeps earlier rejections and leaves a gate event"
     "no belief row from a rejected commit",
   );
 });
+
+test("pins", "contract preserves source provenance", () => {
+  // ContractSource used to omit `provenance`, so every belief_source row
+  // routed through enforceClaimContract landed with provenance = NULL —
+  // silently discarding which retriever produced the evidence.
+  const db = freshDb();
+  const src = seedPinnedDoc(db, "retrieved via vector search");
+  enforceClaimContract(
+    db,
+    { kind: "assertion", text: "The retrieved passage is authoritative here." },
+    { sources: [{ ...src, provenance: "vector" }] },
+  );
+  const n = count(
+    db,
+    `SELECT count(*) AS c FROM belief_source WHERE provenance = 'vector'`,
+  );
+  assert(n > 0, "provenance must survive the contract layer");
+});
+
+test(
+  "pins",
+  "enforceReplyContract forwards provenance through to the contract layer",
+  () => {
+    // enforceReplyContract does not map ContractSource itself — it forwards
+    // opts straight into enforceClaimContract per claim. That passthrough is
+    // the path every channel runner (slack/discord/cli/server/gateway) and
+    // Task 6's vector-search wiring actually call, so prove it carries
+    // provenance end to end rather than trusting the single-claim call above.
+    const db = freshDb();
+    const src = seedPinnedDoc(db, "retrieved via vector search, reply path");
+    enforceReplyContract(db, "The retrieved passage is authoritative here.", {
+      sources: [{ ...src, provenance: "vector" }],
+    });
+    const n = count(
+      db,
+      `SELECT count(*) AS c FROM belief_source WHERE provenance = 'vector'`,
+    );
+    assert(
+      n > 0,
+      "provenance must survive the enforceReplyContract passthrough",
+    );
+  },
+);
 
 test("phase1", "P1_model_always_spends", () => {
   const db = freshDb();

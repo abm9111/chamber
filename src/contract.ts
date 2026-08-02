@@ -26,6 +26,7 @@ export interface ContractSource {
   refId: string;
   snapshotHash: string;
   spanHash?: string;
+  provenance?: SourceRef["provenance"];
 }
 
 export interface ContractResult {
@@ -87,6 +88,7 @@ export function enforceClaimContract(
     refId: s.refId,
     snapshotHash: s.snapshotHash,
     spanHash: s.spanHash,
+    provenance: s.provenance,
   }));
 
   if (claim.kind === "chatter") {

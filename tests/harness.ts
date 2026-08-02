@@ -2223,6 +2223,97 @@ test(
   },
 );
 
+test(
+  "pins",
+  "a whitespace-only read is treated as the same transient as zero bytes, in every shape a half-finished write leaves",
+  () => {
+    // The zero-byte guard above and the sweep it guards keyed on *different*
+    // predicates: the guard on `raw === ""`, the sweep on `body.trim() === ""`.
+    // Every file whose bytes are all whitespace fell through the guard into the
+    // sweep, and `"\n"` is the most likely residue of an interrupted write, not
+    // the least — a truncate-then-write that lands the newline first, an editor
+    // that rewrites the file trailing-newline-first, a `printf '\n' > note.md`
+    // typo. Measured before the fix, every shape below deleted both rows, so
+    // the next ingest had nothing to adopt and minted fresh ids, moving the
+    // belief citing the note from `hash_mismatch` to `not_found` — permanently,
+    // because nothing later restores the original id. The two predicates now
+    // agree on `raw.trim() === ""`.
+    const shapes: [label: string, content: string][] = [
+      ["zero bytes", ""],
+      ["one newline", "\n"],
+      ["one space", " "],
+      ["CRLF", "\r\n"],
+      ["blank lines", "\n\n\n"],
+      ["tab", "\t"],
+      ["BOM", "﻿"],
+    ];
+    const original = "# Note\n\n## A\n\nFirst body.\n\n## B\n\nSecond body.\n";
+
+    for (const [label, content] of shapes) {
+      const db = freshDb();
+      const dir = mkdtempSync(join(tmpdir(), "chamber-chunk-whitespace-"));
+      const file = join(dir, "note.md");
+      writeFileSync(file, original);
+      const first = ingestDirectory(db, dir);
+      assert(
+        first.passages === 2,
+        `setup (${label}): expected 2 passages, got ${first.passages}`,
+      );
+
+      // Pin a real belief to passage 0, so the verdict after recovery is
+      // observed rather than inferred from the id list. This is the column
+      // that actually matters to an operator: `hash_mismatch` names the note
+      // and tells them what to re-check, `not_found` reads as "your citation
+      // was never real" and loses the trail.
+      const pinned = db
+        .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+        .get(first.documentIds[0]!) as { snapshot_hash: string };
+      const committed = commitBelief(db, {
+        text: `A claim held up by the note that a ${label} write briefly emptied.`,
+        type: "belief",
+        path: "deep",
+        authorFamily: "test",
+        sources: [
+          {
+            kind: "vault_page",
+            refId: first.documentIds[0]!,
+            snapshotHash: pinned.snapshot_hash,
+          },
+        ],
+      });
+      assert(committed.ok, `setup (${label}): commit failed: ${JSON.stringify(committed)}`);
+
+      writeFileSync(file, content);
+      const during = ingestDirectory(db, dir);
+      assert(
+        during.removed === 0,
+        `a ${label} read deleted ${during.removed} row(s)`,
+      );
+      assert(
+        count(db, `SELECT count(*) AS c FROM vector_document`) === first.passages,
+        `a ${label} read emptied the note out of the corpus`,
+      );
+
+      writeFileSync(file, original);
+      const after = ingestDirectory(db, dir);
+      assert(
+        JSON.stringify(after.documentIds) === JSON.stringify(first.documentIds),
+        `ids rotated across a transient ${label} read: ${JSON.stringify(first.documentIds)} -> ${JSON.stringify(after.documentIds)}`,
+      );
+
+      // The note is byte-identical to what the pin was minted against, so the
+      // pin must verify outright. Under the defect this is `not_found`.
+      const drift = verifyBeliefSources(db).find(
+        (b) => b.beliefId === committed.beliefId,
+      );
+      assert(
+        drift !== undefined && drift.verified === 1 && drift.failures.length === 0,
+        `the belief lost its support across a transient ${label} read: ${JSON.stringify(drift)}`,
+      );
+    }
+  },
+);
+
 // ─── decision 4: citation display ────────────────────────────────────────────
 
 test(

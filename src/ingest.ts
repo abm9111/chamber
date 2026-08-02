@@ -659,6 +659,28 @@ export function ingestDirectory(
       ),
     ];
 
+    // A file that reads as zero bytes is treated exactly like one that would
+    // not read at all: reported, and swept for nothing. An editor saving in
+    // place, `rsync --inplace` or an interrupted write all leave a window where
+    // the read *succeeds* and returns nothing, which is indistinguishable from
+    // a note deliberately emptied — and the two outcomes are wildly asymmetric.
+    // The damage does not heal: once the rows are deleted the next ingest has
+    // nothing to adopt and mints fresh ids, moving every belief citing that
+    // note permanently from `hash_mismatch` (names the note, tells the operator
+    // what to re-check) to `not_found` (reads as "your citation was never
+    // real"). A note truly blanked to zero bytes is instead covered by the
+    // documented deleted-file limitation, which is the honest place for it.
+    // A file with bytes but no body — frontmatter only — is unambiguous and
+    // still sweeps below.
+    if (raw === "") {
+      report.skipped.push({
+        path,
+        kind: "empty_body",
+        reason: "file is zero bytes — left as-is, not treated as an emptied note",
+      });
+      continue;
+    }
+
     const passages = body.trim() === "" ? [] : splitPassages(body);
 
     if (passages.length === 0) {

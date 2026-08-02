@@ -1900,6 +1900,40 @@ test("pins", "splitPassages bounds a passage even when the heading itself is eno
   );
 });
 
+test("pins", "splitPassages does not lose a section whose heading text repeats elsewhere", () => {
+  // `## Status`, `## Notes`, `## Summary` under several parents is the normal
+  // shape of a vault, not an exotic one. An empty section's heading is allowed
+  // to be dropped only when a *descendant of that section* hoists it into its
+  // own breadcrumb; matching on the heading's text instead of its identity
+  // meant an unrelated section that merely shared a title counted as the
+  // carrier, and the empty one vanished from the corpus entirely.
+  const body = [
+    "# Project", "", "## Status", "", "## Notes", "", "- a note", "",
+    "# Archive", "", "## Status", "### Old", "", "- b", "",
+  ].join("\n");
+  const passages = splitPassages(body);
+  const crumbs = passages.map((p) => p.headings.join(" › "));
+  assert(
+    crumbs.some((c) => c === "Project › Status"),
+    `the empty "Project › Status" section vanished; got ${JSON.stringify(crumbs)}`,
+  );
+});
+
+test("pins", "splitPassages keeps an ancestor heading that is trimmed out of a breadcrumb", () => {
+  // When the breadcrumb is too big for the window it is trimmed outside-in,
+  // and an enormous innermost heading is demoted to content wholesale. Either
+  // path discards heading lines — and if the discarded ancestor's own section
+  // was empty (so it emitted no passage of its own, relying on a descendant to
+  // carry it), that heading then exists in no body at all and is invisible to
+  // retrieval.
+  const huge = "Very Long Heading Words ".repeat(60).trim();
+  const passages = splitPassages(`# Top\n\n## ${huge}\n\nchild text.\n`);
+  assert(
+    passages.map((p) => p.body).join("\n").includes("# Top"),
+    "the trimmed ancestor heading is in no passage body",
+  );
+});
+
 test("pins", "splitPassages never drops a line of the note", () => {
   // A passage scheme that loses content is a silent corpus hole: `ask` would
   // answer "not in the vault" about text that is plainly in the vault.
@@ -2149,6 +2183,42 @@ test(
     assert(
       row?.source_ref === "note.md#p0",
       `the adopted row must be re-keyed as passage 0, got ${JSON.stringify(row)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "a zero-byte read does not delete a note's passages or rotate their ids",
+  () => {
+    // An editor saving in place, `rsync --inplace`, or an interrupted write
+    // leaves a window in which the file reads as zero bytes *successfully*.
+    // That is the same class as the unreadable path, which already declines to
+    // sweep — but it took the delete-everything branch, and the damage does not
+    // heal: once the rows are gone the next ingest has nothing to adopt and
+    // mints fresh ids, moving every belief citing that note permanently from
+    // `hash_mismatch` (names the note, actionable) to `not_found` (reads as
+    // "your citation was never real").
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-chunk-truncated-"));
+    const file = join(dir, "note.md");
+    const original = "# Note\n\n## A\n\nFirst body.\n\n## B\n\nSecond body.\n";
+    writeFileSync(file, original);
+    const first = ingestDirectory(db, dir);
+
+    writeFileSync(file, "");
+    const during = ingestDirectory(db, dir);
+    assert(during.removed === 0, `a zero-byte read deleted ${during.removed} row(s)`);
+    assert(
+      count(db, `SELECT count(*) AS c FROM vector_document`) === first.passages,
+      "a zero-byte read emptied the note out of the corpus",
+    );
+
+    writeFileSync(file, original);
+    const after = ingestDirectory(db, dir);
+    assert(
+      JSON.stringify(after.documentIds) === JSON.stringify(first.documentIds),
+      `ids rotated across a transient empty read: ${JSON.stringify(first.documentIds)} -> ${JSON.stringify(after.documentIds)}`,
     );
   },
 );

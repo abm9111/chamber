@@ -163,6 +163,19 @@ export function passagePathOf(sourceRef: string): string {
 // ─── section parsing ─────────────────────────────────────────────────────────
 
 interface Section {
+  /**
+   * Identity of this section within the note, distinct from its heading text.
+   *
+   * Two sections can carry the same heading — `## Status` under `# Project` and
+   * under `# Archive` is the ordinary shape of a vault note, not an exotic one
+   * — so "is this section an ancestor of that one" must be answered by identity.
+   * Answering it by comparing heading *line strings* made an unrelated
+   * same-titled section count as the carrier of an empty one, and the empty
+   * section then vanished from the corpus.
+   */
+  id: number;
+  /** Ids of strict ancestors, outermost first. Parallel to `ancestorLines`. */
+  ancestorIds: number[];
   /** Verbatim heading lines of strict ancestors, outermost first. */
   ancestorLines: string[];
   /** This section's own verbatim heading line, or null for the preamble. */
@@ -191,8 +204,11 @@ const FENCE_RE = /^[ \t]{0,3}(```+|~~~+)/;
 function parseSections(body: string): Section[] {
   const lines = body.split(/\r?\n/);
   const sections: Section[] = [];
-  const stack: { level: number; line: string; text: string }[] = [];
+  const stack: { id: number; level: number; line: string; text: string }[] = [];
+  let nextId = 1;
   let current: Section = {
+    id: 0,
+    ancestorIds: [],
     ancestorLines: [],
     ownLine: null,
     headings: [],
@@ -224,10 +240,20 @@ function parseSections(body: string): Section[] {
     const level = heading[1]!.length;
     const text = heading[2]!.trim();
     while (stack.length > 0 && stack[stack.length - 1]!.level >= level) stack.pop();
+    const ancestorIds = stack.map((s) => s.id);
     const ancestorLines = stack.map((s) => s.line);
     const headings = [...stack.map((s) => s.text), text];
-    stack.push({ level, line, text });
-    current = { ancestorLines, ownLine: line, headings, lines: [], level };
+    const id = nextId++;
+    stack.push({ id, level, line, text });
+    current = {
+      id,
+      ancestorIds,
+      ancestorLines,
+      ownLine: line,
+      headings,
+      lines: [],
+      level,
+    };
   }
   sections.push(current);
   return sections;
@@ -362,7 +388,8 @@ export function splitPassages(body: string): Passage[] {
     // body. If the headings are so long that no useful content budget is left,
     // drop ancestors from the outside in — the innermost heading is the most
     // informative, and an unbounded prefix would otherwise blow the cap.
-    let prefixLines = [...s.ancestorLines, ...(s.ownLine !== null ? [s.ownLine] : [])];
+    const fullPrefix = [...s.ancestorLines, ...(s.ownLine !== null ? [s.ownLine] : [])];
+    let prefixLines = fullPrefix;
     const roomFor = (lines: string[]): number =>
       PASSAGE_MAX_TOKENS - estimateTokens(lines.join("\n"));
     while (prefixLines.length > 1 && roomFor(prefixLines) < MIN_CONTENT_TOKENS) {
@@ -384,8 +411,17 @@ export function splitPassages(body: string): Passage[] {
     );
     const target = Math.max(1, Math.min(PASSAGE_TARGET_TOKENS, budget));
 
+    // Heading lines the prefix could not keep — trimmed ancestors, or the whole
+    // breadcrumb when it was demoted. They are re-entered as ordinary content
+    // so they still reach some passage body: an ancestor whose own section was
+    // empty emits no passage of its own and relies on a descendant's breadcrumb
+    // to carry it, so dropping it here would leave it in no body at all and
+    // invisible to retrieval. Content units, not a repeated prefix, so it lands
+    // once at the top of the section rather than in every chunk of it.
+    const spilled = demoted ? fullPrefix : fullPrefix.slice(0, fullPrefix.length - prefixLines.length);
+
     const units: string[] = [];
-    for (const p of demoted ? [...prefixLines, ...paragraphs(s.lines)] : paragraphs(s.lines)) {
+    for (const p of [...spilled, ...paragraphs(s.lines)]) {
       if (estimateTokens(p) <= budget) units.push(p);
       else units.push(...splitOversized(p, budget));
     }
@@ -395,9 +431,13 @@ export function splitPassages(body: string): Passage[] {
       // A heading with no content of its own. Its text is not dropped when a
       // following subsection will hoist it into its own breadcrumb; when
       // nothing will, emit the breadcrumb alone so no line of the note is lost.
+      // Carried by *a descendant of this section*, matched on section identity
+      // rather than on heading text — `## Status` under `# Project` and under
+      // `# Archive` are different sections that share a line, and comparing
+      // lines let the second one count as the first one's carrier, dropping the
+      // first from the corpus entirely.
       const carried =
-        s.ownLine !== null &&
-        sections.slice(i + 1).some((n) => n.ancestorLines.includes(s.ownLine!));
+        s.ownLine !== null && sections.slice(i + 1).some((n) => n.ancestorIds.includes(s.id));
       if (prefix === "" || carried) continue;
       chunks = [""];
     }
@@ -414,9 +454,16 @@ export function splitPassages(body: string): Passage[] {
   // Safety net: a non-blank body must never ingest as nothing. Reaching here
   // would mean every section was skipped, which the `carried` rule above is
   // written to prevent — but the cost of being wrong is a silently missing
-  // note, so the invariant is enforced rather than assumed.
+  // note, so the invariant is enforced rather than assumed. Split rather than
+  // returning the body whole: an unbounded passage here would be truncated at
+  // the embedder, which is the very defect this module exists to remove, and a
+  // fallback that reintroduces it is not a safety net.
   if (passages.length === 0 && body.trim() !== "") {
-    return [{ index: 0, headings: [], body: body.trim() }];
+    return hardSplit(body.trim(), PASSAGE_MAX_TOKENS).map((b, i) => ({
+      index: i,
+      headings: [],
+      body: b,
+    }));
   }
   return passages;
 }

@@ -322,6 +322,42 @@ function freshDb(): DatabaseSync {
   return openChamberDb(":memory:");
 }
 
+/**
+ * Ingest a real document and return a SourceRef whose pin actually verifies.
+ *
+ * Tests that need a citation but are not *about* citations used to inline
+ * `{ kind: "transcript", refId: "t1", snapshotHash: sha256("x") }` — a hash of a
+ * string that was never stored anywhere. Those pins are exactly what the gate
+ * now rejects, so a test wanting a source must mint one from the corpus.
+ *
+ * `model: "local-hash-v1"` keeps this hermetic: the default embedder spawns
+ * Python/MiniLM (~145ms per call, and only when the model is on disk), while
+ * the snapshot pin is computed from title/body/source_ref alone and is
+ * identical either way. A gate test must not change behaviour based on whether
+ * an ONNX model happens to be installed.
+ */
+function seedPinnedDoc(
+  db: DatabaseSync,
+  body: string,
+  sourceRef = "notes/seed.md",
+): { kind: "vault_page"; refId: string; snapshotHash: string } {
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef,
+    title: "seed",
+    body,
+    model: "local-hash-v1",
+  });
+  const row = db
+    .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+    .get(doc.id) as { snapshot_hash: string };
+  return {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: row.snapshot_hash,
+  };
+}
+
 function count(db: DatabaseSync, sql: string, ...params: unknown[]): number {
   const row = db.prepare(sql).get(...params) as { c: number };
   return row?.c ?? 0;
@@ -417,10 +453,13 @@ test("gates", "3_gate_write_atomicity", () => {
   const text = "atomic check claim";
   insertDebt(db, claimHash("belief", text), text);
 
+  // The source must be one that genuinely verifies. With a fabricated pin the
+  // belief_source assertion below is vacuous — the gate drops the source before
+  // the insert, so zero rows proves nothing about atomicity.
   commitBelief(db, {
     type: "belief",
     text,
-    sources: [{ kind: "transcript", refId: "t1", snapshotHash: sha256("x") }],
+    sources: [seedPinnedDoc(db, "x")],
     authorFamily: "test",
     path: "deep",
   });
@@ -472,13 +511,7 @@ test("gates", "5_expiry_suspends_skill_teeth", () => {
   const bel = commitBelief(db, {
     type: "observation",
     text: "foundation fact for skill",
-    sources: [
-      {
-        kind: "transcript",
-        refId: "turn1",
-        snapshotHash: sha256("foundation fact"),
-      },
-    ],
+    sources: [seedPinnedDoc(db, "foundation fact")],
     authorFamily: "test",
     path: "fast",
   });
@@ -566,9 +599,7 @@ test("gates", "8_fast_path_belief_forbidden", () => {
   const r = commitBelief(db, {
     type: "belief",
     text: "should not be fast",
-    sources: [
-      { kind: "transcript", refId: "t", snapshotHash: sha256("s") },
-    ],
+    sources: [seedPinnedDoc(db, "s", "notes/fast-belief.md")],
     authorFamily: "test",
     path: "fast",
   });
@@ -585,9 +616,7 @@ test("gates", "8_fast_path_belief_forbidden", () => {
   const obs = commitBelief(db, {
     type: "observation",
     text: "seen in transcript",
-    sources: [
-      { kind: "transcript", refId: "t", snapshotHash: sha256("seen") },
-    ],
+    sources: [seedPinnedDoc(db, "seen", "notes/seen.md")],
     authorFamily: "test",
     path: "fast",
   });
@@ -601,14 +630,19 @@ test("gates", "9_router_uncertainty_proxy_deep_lite", () => {
   const r = commitBelief(db, {
     type: "belief",
     text: "needs escalation",
-    sources: [
-      { kind: "transcript", refId: "t", snapshotHash: sha256("esc") },
-    ],
+    sources: [seedPinnedDoc(db, "esc")],
     authorFamily: "test",
     path: "deep_lite",
   });
   // empty sources would mint debt but we provided source — should commit
   assert(r.ok, `deep_lite belief with source should pass: ${JSON.stringify(r)}`);
+  // ...and commit *clean*. `r.ok` alone does not say that: an assertion whose
+  // sources are all dropped also returns ok, carrying blocking debt. The
+  // sentence above is only true if the debt is absent, so assert it.
+  assert(
+    count(db, `SELECT COUNT(*) AS c FROM citation_debt WHERE blocking = 1`) === 0,
+    "a real source means no blocking debt",
+  );
   const row = db
     .prepare(`SELECT committed_path FROM belief WHERE id = ?`)
     .get(r.beliefId!) as { committed_path: string };
@@ -1141,6 +1175,128 @@ test("pins", "verifyPin returns a verdict for a non-string refId instead of thro
       `expected not_found for ${JSON.stringify(bad)}, got ${v.reason}`,
     );
   }
+});
+
+test("pins", "fabricated pin mints blocking debt instead of committing clean", () => {
+  const db = freshDb();
+  const r = commitBelief(db, {
+    text: "Compound X is safe at 400mg daily.",
+    type: "belief",
+    path: "deep_lite",
+    stakes: "consequential",
+    authorFamily: "test",
+    sources: [
+      { kind: "vault_page", refId: "vdoc_fabricated", snapshotHash: "aaaa" },
+    ],
+  });
+  const debts = count(
+    db,
+    `SELECT count(*) AS c FROM citation_debt WHERE blocking = 1 AND status = 'pending'`,
+  );
+  assert(debts > 0, "a fabricated pin must mint blocking debt");
+  assert(
+    !r.ok || (r.rejectedSources?.length ?? 0) > 0,
+    "the fabricated source must be reported as rejected",
+  );
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief_source`) === 0,
+    "an unverified source must never be written as support",
+  );
+});
+
+test("pins", "a verified pin commits clean, with support written and no debt", () => {
+  // The complement of the test above: without this, a gate that rejected every
+  // source would pass the whole suite — nothing else asserts that support
+  // actually survives verification, only that commits still return ok.
+  const db = freshDb();
+  const r = commitBelief(db, {
+    text: "Compound X is safe at 400mg daily.",
+    type: "belief",
+    path: "deep_lite",
+    stakes: "consequential",
+    authorFamily: "test",
+    sources: [seedPinnedDoc(db, "Compound X: 400mg daily is within tolerance.")],
+  });
+  assert(r.ok, `verified pin must commit: ${JSON.stringify(r)}`);
+  assert(
+    (r.rejectedSources?.length ?? 0) === 0,
+    `nothing should be rejected: ${JSON.stringify(r.rejectedSources)}`,
+  );
+  assert(
+    count(db, `SELECT count(*) AS c FROM citation_debt WHERE blocking = 1`) === 0,
+    "a verified pin must not mint blocking debt",
+  );
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief_source`) === 1,
+    "the verified source must be written as support",
+  );
+});
+
+test("pins", "a source with no pin rejects and leaves no open transaction", () => {
+  // Verification runs inside the gate transaction (FM-6), so this early
+  // rejection now returns from inside it. Forgetting the ROLLBACK would leave
+  // the connection mid-transaction and every later BEGIN IMMEDIATE would throw
+  // — a rejection that poisons the process. The second commit is the assertion
+  // that matters; the first only sets it up.
+  const db = freshDb();
+  const r = commitBelief(db, {
+    type: "belief",
+    text: "unpinned claim",
+    sources: [{ kind: "vault_page", refId: "vdoc_x", snapshotHash: "" }],
+    authorFamily: "test",
+    path: "deep",
+  });
+  assert(!r.ok && r.status === "REJECTED", `expected REJECTED, got ${JSON.stringify(r)}`);
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief`) === 0,
+    "no belief row from a rejected commit",
+  );
+  const next = commitBelief(db, {
+    type: "observation",
+    text: "the connection still works",
+    sources: [seedPinnedDoc(db, "still works", "notes/after-reject.md")],
+    authorFamily: "test",
+    path: "fast",
+  });
+  assert(next.ok, `transaction was left open: ${JSON.stringify(next)}`);
+});
+
+test("pins", "one bad pin among good ones is dropped, not silently trusted", () => {
+  // Mixed citation lists are the realistic case: a model cites three things and
+  // one is confabulated. The claim keeps the support that verifies, the bad pin
+  // never becomes a belief_source row, and the caller is told which one failed.
+  const db = freshDb();
+  const good = seedPinnedDoc(db, "the sky is blue", "notes/sky.md");
+  const drifted = seedPinnedDoc(db, "original body", "notes/drift.md");
+  db.prepare(`UPDATE vector_document SET body = ? WHERE id = ?`).run(
+    "edited body",
+    drifted.refId,
+  );
+  const r = commitBelief(db, {
+    text: "Two things are known about the sky.",
+    type: "belief",
+    path: "deep",
+    authorFamily: "test",
+    sources: [
+      good,
+      drifted,
+      { kind: "x_tweet", refId: "vdoc_unregistered", snapshotHash: "bbbb" },
+    ],
+  });
+  assert(r.ok, `commit should proceed on surviving support: ${JSON.stringify(r)}`);
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief_source`) === 1,
+    "only the verifying source may be written as support",
+  );
+  const reasons = (r.rejectedSources ?? []).map((x) => x.reason).sort();
+  assert(
+    reasons.join(",") === "hash_mismatch,kind_unregistered",
+    `expected both failures reported, got ${JSON.stringify(r.rejectedSources)}`,
+  );
+  assert(
+    count(db, `SELECT count(*) AS c FROM citation_debt WHERE blocking = 1`) === 0,
+    "surviving support means no blocking debt",
+  );
 });
 
 test("phase1", "P1_model_always_spends", () => {

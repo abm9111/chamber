@@ -78,9 +78,25 @@ export interface CommitBeliefInput {
   turnId?: string;
 }
 
+/**
+ * A cited source the commit gate refused to count as support, and why.
+ * Present on success as well as failure: a claim can commit while some of its
+ * citations are dropped, and the caller must be able to see which.
+ */
+export interface RejectedSource {
+  refId: string;
+  reason: string;
+}
+
 export type CommitResult =
-  | { ok: true; beliefId: string }
-  | { ok: false; status: "REJECTED" | "PARKED"; reason: string; debtIds?: string[] };
+  | { ok: true; beliefId: string; rejectedSources?: RejectedSource[] }
+  | {
+      ok: false;
+      status: "REJECTED" | "PARKED";
+      reason: string;
+      debtIds?: string[];
+      rejectedSources?: RejectedSource[];
+    };
 
 export interface ActivateSkillInput {
   skillId: string;

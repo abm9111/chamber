@@ -133,10 +133,17 @@ export function upsertDocument(
   // {title:"X\nY", body:"Z"} minted one identical pin. Moving a newline from the
   // end of a title to the start of a body was therefore undetectable drift —
   // precisely what a content pin exists to catch, and vault notes are multi-line
-  // markdown. JSON escapes separators inside each field, so the framing is
-  // unambiguous. Must stay byte-identical to vaultPageHash in src/pins.ts.
+  // markdown. JSON escapes separators inside each field, so the array framing
+  // is unambiguous about where fields end — but that alone does not make the
+  // formula injective: title/sourceRef are nullable, and defaulting to "" —
+  // `input.title ?? ""` — *before* building the array collapsed NULL and ""
+  // to the same element, reopening the identical undetectable-drift bug one
+  // level up. `?? null` below keeps NULL and "" distinct and only normalizes
+  // `undefined` (which JSON.stringify would otherwise also render as `null`
+  // inside the array) — see vaultPageHash in src/pins.ts for the full
+  // account. Must stay byte-identical to it.
   const snapshot = sha256(
-    JSON.stringify([input.title ?? "", body, input.sourceRef ?? ""]),
+    JSON.stringify([input.title ?? null, body, input.sourceRef ?? null]),
   );
   let model: string;
   let vec: Float32Array;

@@ -1174,6 +1174,115 @@ test("pins", "snapshot framing is injective across the field separator", () => {
   assert(v.reason === "hash_mismatch", `expected hash_mismatch, got ${v.reason}`);
 });
 
+test(
+  "pins",
+  "NULL title and empty-string title mint distinct pins, and each round-trips",
+  () => {
+    // `row.title ?? ""` before framing erased the distinction between SQL
+    // NULL and the empty string: an omitted title (stored NULL) and an
+    // explicit title: "" (stored "") hashed identically. A title flipping
+    // between NULL and "" across re-ingests was therefore undetectable
+    // drift — exactly the failure mode a content pin exists to catch.
+    const db = freshDb();
+    const withNullTitle = upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/same-ref.md",
+      body: "same body",
+    });
+    const withEmptyTitle = upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/same-ref.md",
+      title: "",
+      body: "same body",
+    });
+
+    const stored = (
+      id: string,
+    ): { title: string | null; snapshot_hash: string } =>
+      db
+        .prepare(`SELECT title, snapshot_hash FROM vector_document WHERE id = ?`)
+        .get(id) as { title: string | null; snapshot_hash: string };
+
+    const nullRow = stored(withNullTitle.id);
+    const emptyRow = stored(withEmptyTitle.id);
+    assert(nullRow.title === null, "precondition: omitted title must be stored NULL");
+    assert(
+      emptyRow.title === "",
+      'precondition: title:"" must be stored as "", not NULL',
+    );
+
+    assert(
+      nullRow.snapshot_hash !== emptyRow.snapshot_hash,
+      "NULL title and empty-string title must not mint the same pin",
+    );
+
+    const vNull = verifyPin(db, {
+      kind: "vault_page",
+      refId: withNullTitle.id,
+      snapshotHash: nullRow.snapshot_hash,
+    });
+    assert(
+      vNull.ok,
+      `NULL-title document must round-trip through writer and verifier, got ${vNull.reason}`,
+    );
+
+    const vEmpty = verifyPin(db, {
+      kind: "vault_page",
+      refId: withEmptyTitle.id,
+      snapshotHash: emptyRow.snapshot_hash,
+    });
+    assert(
+      vEmpty.ok,
+      `empty-title document must round-trip through writer and verifier, got ${vEmpty.reason}`,
+    );
+
+    // The property that matters downstream, same shape as the separator test
+    // above: one document's pin must not verify against the other.
+    const cross = verifyPin(db, {
+      kind: "vault_page",
+      refId: withEmptyTitle.id,
+      snapshotHash: nullRow.snapshot_hash,
+    });
+    assert(
+      !cross.ok,
+      "a NULL-title pin must not verify against an empty-title document",
+    );
+    assert(cross.reason === "hash_mismatch", `expected hash_mismatch, got ${cross.reason}`);
+  },
+);
+
+test(
+  "pins",
+  "NULL source_ref and empty-string source_ref mint distinct pins",
+  () => {
+    // Same collision class, the other coalesced field: upsertDocument stores
+    // an omitted sourceRef as NULL and an explicit sourceRef: "" as "" — the
+    // hash must tell them apart the same way it now does for title.
+    const db = freshDb();
+    const withNullRef = upsertDocument(db, {
+      sourceKind: "vault_page",
+      title: "same title",
+      body: "same body",
+    });
+    const withEmptyRef = upsertDocument(db, {
+      sourceKind: "vault_page",
+      title: "same title",
+      sourceRef: "",
+      body: "same body",
+    });
+    const hash = (id: string): string =>
+      (
+        db
+          .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+          .get(id) as { snapshot_hash: string }
+      ).snapshot_hash;
+    assert(
+      hash(withNullRef.id) !== hash(withEmptyRef.id),
+      "NULL source_ref and empty-string source_ref must not mint the same pin",
+    );
+  },
+);
+
 test("pins", "verifyPin returns a verdict for a non-string refId instead of throwing", () => {
   // A non-string refId used to reach the SQLite binder raw and throw
   // ({a:1} → "Unknown named parameter 'a'"). Callers pass model-derived values

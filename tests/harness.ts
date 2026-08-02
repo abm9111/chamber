@@ -143,6 +143,7 @@ import {
   surfaceRateKey,
 } from "../src/surface_harden.ts";
 import { scanForSecrets, skillSecretScanRefuse } from "../src/secret_scan.ts";
+import { formatErrorChain } from "../src/error_chain.ts";
 import { assertSpendBudget } from "../src/spend.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -205,6 +206,29 @@ interface AsyncTestThunk {
  */
 const pending: AsyncTestThunk[] = [];
 
+/**
+ * Every test that passed the suite filter and is therefore *expected* to
+ * produce exactly one entry in `results`.
+ *
+ * `results.length` cannot be the denominator of the summary: it is
+ * self-referential, so a test that is dropped before it can record a
+ * result (never drained, thunk never invoked, an early `return` added to
+ * the drain loop) shrinks the denominator with it and the tally still
+ * reads `N/N passed · 0 failed`, exit 0. A reviewer simulated a full
+ * revert of the drain loop and the suite reported 100/100 green while the
+ * async test had silently vanished. This counter is incremented at
+ * registration, never derived from results, so the report block can
+ * compare the two and fail loudly on any gap.
+ */
+let registered = 0;
+
+/** True for real promises and for any thenable a test body might return. */
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  if (value === null) return false;
+  if (typeof value !== "object" && typeof value !== "function") return false;
+  return typeof (value as { then?: unknown }).then === "function";
+}
+
 function suiteFromArg(): Suite {
   const arg = process.argv.find((a) => a.startsWith("--suite="));
   if (!arg) return "all";
@@ -239,21 +263,44 @@ function test(
 ): void {
   const selected = suiteFromArg();
   if (selected !== "all" && selected !== suite) return;
+  registered++;
 
   if (isAsyncFunction(fn)) {
     // Defer invocation — do not call fn() here. Calling it is exactly
     // what let async tests race each other; see the `pending` doc
     // comment above. `isAsyncFunction` tells sync from async apart
     // without invoking anything, so the thunk can be queued untouched.
-    // The cast is sound: an async function's call always returns a
-    // Promise, regardless of what the declared signature says.
+    // The cast is sound for a genuine async function; the drain loop
+    // re-checks what the call actually returned, because
+    // `isAsyncFunction` is also true for async *generator* functions,
+    // whose call returns an AsyncGenerator and never runs the body.
     pending.push({ suite, name, fn: fn as () => Promise<void> });
     return;
   }
 
   const t0 = Date.now();
   try {
-    fn();
+    // `isAsyncFunction` matches the `async` keyword and nothing else: a
+    // plain function that *returns* a promise — `() => somePromiseCall()`,
+    // a `withSetup(async () => {…})` wrapper, a bound async function —
+    // lands here. Ignoring that promise records `ok: true` for a test
+    // whose assertions have not run yet, and the eventual rejection kills
+    // the process as an unhandled rejection: green tally, then death, or
+    // (on a delayed rejection) death mid-drain with no summary printed at
+    // all. Fail closed instead — neutralise the promise so it cannot
+    // crash the run later, then fail this test by name.
+    const returned: unknown = fn();
+    if (isThenable(returned)) {
+      void Promise.resolve(returned).catch(() => {
+        /* defused: the throw below is this test's real failure */
+      });
+      throw new Error(
+        `test "${suite}/${name}" is not declared \`async\` but returned a ` +
+          `Promise. The runner cannot await it, so its assertions would be ` +
+          `ignored and a rejection would crash the run. Declare the test ` +
+          `function \`async\`.`,
+      );
+    }
     results.push({ name, suite, ok: true, ms: Date.now() - t0 });
   } catch (err) {
     results.push({
@@ -1621,6 +1668,92 @@ test("pins", "runner reports async test failures", async () => {
   assert(true, "async assertion must reach the results tally");
 });
 
+// ─── error chain formatter (src/error_chain.ts) ──────────────────────────────
+// The last-chance handler in src/cli.ts renders thrown values through this and
+// then sets the exit code. If the formatter throws, the exit code is never set
+// and a failed run reports success — so hostile input is part of the contract.
+
+test("pins", "EC1_bare_error", () => {
+  const lines = formatErrorChain(new Error("boom"));
+  assert(lines.length === 1, JSON.stringify(lines));
+  assert(lines[0] === "Error: boom", String(lines[0]));
+});
+
+test("pins", "EC2_nested_cause_chain", () => {
+  const root = new Error("connect ECONNREFUSED 127.0.0.1:443");
+  (root as { code?: string }).code = "ECONNREFUSED";
+  const mid = new Error("socket hang up", { cause: root });
+  const top = new Error("fetch failed", { cause: mid });
+
+  const lines = formatErrorChain(top);
+  assert(lines.length === 3, JSON.stringify(lines));
+  assert(lines[0] === "Error: fetch failed", String(lines[0]));
+  assert(lines[1] === "  caused by: Error: socket hang up", String(lines[1]));
+  assert(
+    lines[2]!.startsWith("    caused by: Error: connect ECONNREFUSED") &&
+      lines[2]!.endsWith("(ECONNREFUSED)"),
+    String(lines[2]),
+  );
+});
+
+test("pins", "EC3_aggregate_error", () => {
+  const agg = new AggregateError(
+    [new Error("ipv6 refused"), new Error("ipv4 refused")],
+    "all addresses failed",
+  );
+  const lines = formatErrorChain(agg);
+  assert(lines.length === 3, JSON.stringify(lines));
+  assert(lines[0]!.includes("all addresses failed"), String(lines[0]));
+  assert(lines[1]!.includes("ipv6 refused"), String(lines[1]));
+  assert(lines[2]!.includes("ipv4 refused"), String(lines[2]));
+});
+
+test("pins", "EC4_plain_object_throw_not_object_Object", () => {
+  // `throw await res.json()` — the whole diagnostic is in the object.
+  const lines = formatErrorChain({ status: 500, error: "upstream unavailable" });
+  assert(lines.length === 1, JSON.stringify(lines));
+  assert(!lines[0]!.includes("[object Object]"), String(lines[0]));
+  assert(
+    lines[0]!.includes("500") && lines[0]!.includes("upstream unavailable"),
+    String(lines[0]),
+  );
+
+  // …and the same object arriving as a non-Error `cause`.
+  const wrapped = formatErrorChain(
+    new Error("request failed", { cause: { status: 502 } }),
+  );
+  assert(wrapped.length === 2, JSON.stringify(wrapped));
+  assert(!wrapped[1]!.includes("[object Object]"), String(wrapped[1]));
+  assert(wrapped[1]!.includes("502"), String(wrapped[1]));
+});
+
+test("pins", "EC5_string_throw", () => {
+  const lines = formatErrorChain("plain string failure");
+  assert(lines.length === 1, JSON.stringify(lines));
+  assert(lines[0] === "plain string failure", String(lines[0]));
+});
+
+test("pins", "EC6_hostile_input_never_throws", () => {
+  // String(Object.create(null)) throws TypeError: Cannot convert object to
+  // primitive value. Escaping the formatter would skip process.exitCode = 1.
+  const nullProto: object = Object.create(null);
+  const lines = formatErrorChain(nullProto);
+  assert(lines.length >= 1, JSON.stringify(lines));
+  assert(!lines[0]!.includes("[object Object]"), String(lines[0]));
+
+  // An Error whose `message` getter throws does the same.
+  const hostile = new Error("placeholder");
+  Object.defineProperty(hostile, "message", {
+    configurable: true,
+    get(): string {
+      throw new Error("hostile message getter");
+    },
+  });
+  const hostileLines = formatErrorChain(hostile);
+  assert(hostileLines.length >= 1, JSON.stringify(hostileLines));
+  assert(hostileLines[0]!.startsWith("Error:"), String(hostileLines[0]));
+});
+
 test("gates", "idempotent_approve_double", () => {
   const db = freshDb();
   const q = proposeWrite(db, {
@@ -1943,7 +2076,23 @@ test("vector", "V5_minilm_semantic", () => {
 for (const { suite, name, fn } of pending) {
   const t0 = Date.now();
   try {
-    await fn();
+    // Invoke and inspect before awaiting. `isAsyncFunction` is true for
+    // async *generator* functions too, and calling one returns an
+    // AsyncGenerator: `await` on it resolves instantly to the generator
+    // object, the body never runs, and a test that asserts nothing scores
+    // a silent green. Anything that is not thenable is a runner-level
+    // failure, not a pass.
+    const returned: unknown = fn();
+    if (!isThenable(returned)) {
+      throw new Error(
+        `test "${suite}/${name}" was queued as async but invoking it ` +
+          `returned ${returned === null ? "null" : typeof returned}, not a ` +
+          `Promise, so its body never ran and nothing was awaited. An ` +
+          `async generator function (\`async function*\`) does this. Use a ` +
+          `plain \`async\` function.`,
+      );
+    }
+    await returned;
     results.push({ name, suite, ok: true, ms: Date.now() - t0 });
   } catch (err) {
     results.push({
@@ -1956,6 +2105,25 @@ for (const { suite, name, fn } of pending) {
   }
 }
 
+// Runner integrity: every registered test must have produced exactly one
+// result. Checked before the tally is computed, because the tally is
+// meaningless if results went missing — a dropped or never-drained test
+// used to shrink the denominator along with itself and stay invisible.
+const missing = registered - results.length;
+if (missing !== 0) {
+  const what =
+    missing > 0
+      ? `${missing} test(s) registered but never recorded a result`
+      : `${-missing} more results than registered tests`;
+  console.error(
+    `\n✗✗ RUNNER INTEGRITY FAILURE: ${what} ` +
+      `(registered=${registered}, results=${results.length}).\n` +
+      `   Tests were dropped before reporting — the pass tally below cannot ` +
+      `be trusted. Check that every queued async thunk is drained.\n`,
+  );
+  process.exitCode = 1;
+}
+
 const passed = results.filter((r) => r.ok).length;
 const failed = results.filter((r) => !r.ok);
 
@@ -1966,7 +2134,7 @@ for (const r of results) {
   console.log(r.ok ? line : `${line}\n         → ${r.detail}`);
 }
 console.log(
-  `\n── ${passed}/${results.length} passed · ${failed.length} failed ──\n`,
+  `\n── ${passed}/${registered} passed · ${failed.length} failed ──\n`,
 );
 
 if (failed.length > 0) {

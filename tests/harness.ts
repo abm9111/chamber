@@ -45,6 +45,7 @@ import {
   deleteDocument,
   countDocuments,
 } from "../src/vector.ts";
+import { verifyPin } from "../src/pins.ts";
 import {
   minilmAvailable,
   embedLocal,
@@ -961,6 +962,76 @@ test("vector", "V4_injected_embedding", () => {
   const hits = searchVector(db, q, { k: 1, model: "injected-test", minScore: 0.5 });
   assert(hits.length === 1, "injected embedding must retrieve");
   assert(hits[0]!.model === "injected-test", "model label");
+});
+
+// ─── PINS (content-pin verification, src/pins.ts) ────────────────────────────
+
+test("pins", "verifyPin accepts a round-tripped document", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/a.md",
+    title: "A",
+    body: "the sky is blue",
+  });
+  const row = db
+    .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+    .get(doc.id) as { snapshot_hash: string };
+  const v = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: row.snapshot_hash,
+  });
+  assert(v.ok, `expected ok, got ${v.reason}`);
+});
+
+test("pins", "verifyPin reports not_found for an unknown refId", () => {
+  const db = freshDb();
+  const v = verifyPin(db, {
+    kind: "vault_page",
+    refId: "vdoc_does_not_exist",
+    snapshotHash: sha256("anything"),
+  });
+  assert(!v.ok, "must not pass");
+  assert(v.reason === "not_found", `expected not_found, got ${v.reason}`);
+});
+
+test("pins", "verifyPin reports hash_mismatch when the body drifts", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/b.md",
+    title: "B",
+    body: "original body",
+  });
+  const row = db
+    .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+    .get(doc.id) as { snapshot_hash: string };
+  db.prepare(`UPDATE vector_document SET body = ? WHERE id = ?`).run(
+    "edited body",
+    doc.id,
+  );
+  const v = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: row.snapshot_hash,
+  });
+  assert(!v.ok, "must not pass after drift");
+  assert(v.reason === "hash_mismatch", `expected hash_mismatch, got ${v.reason}`);
+});
+
+test("pins", "verifyPin reports kind_unregistered for kinds with no formula", () => {
+  const db = freshDb();
+  const v = verifyPin(db, {
+    kind: "x_tweet",
+    refId: "t1",
+    snapshotHash: sha256("x"),
+  });
+  assert(!v.ok, "unregistered kinds must not pass");
+  assert(
+    v.reason === "kind_unregistered",
+    `expected kind_unregistered, got ${v.reason}`,
+  );
 });
 
 test("phase1", "P1_model_always_spends", () => {

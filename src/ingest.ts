@@ -22,7 +22,8 @@ import {
   statSync,
 } from "node:fs";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { upsertDocument } from "./vector.ts";
+import { deleteDocument, upsertDocument } from "./vector.ts";
+import { passagePathOf, passageSourceRef, splitPassages } from "./chunk.ts";
 
 /**
  * Extensions treated as markdown, compared case-insensitively.
@@ -73,7 +74,19 @@ export interface IngestCollision {
 }
 
 export interface IngestReport {
+  /** Files ingested. Unchanged meaning: one per markdown file stored. */
   ingested: number;
+  /**
+   * Rows written. A file is split into passages before embedding, so this is
+   * `>= ingested` and is the number that actually describes the corpus.
+   */
+  passages: number;
+  /**
+   * Passage rows deleted because the note they came from no longer contains
+   * them. Non-zero means a note shrank; see the orphan sweep in
+   * `ingestDirectory` for what is and is not eligible for removal.
+   */
+  removed: number;
   skipped: IngestSkip[];
   documentIds: string[];
   /** The resolved (symlink-free, absolute) root that was actually walked. */
@@ -512,6 +525,8 @@ export function ingestDirectory(
     if (!norm.ok) {
       return {
         ingested: 0,
+        passages: 0,
+        removed: 0,
         skipped: [],
         documentIds: [],
         root,
@@ -552,6 +567,8 @@ export function ingestDirectory(
 
   const report: IngestReport = {
     ingested: 0,
+    passages: 0,
+    removed: 0,
     skipped: ctx.skipped,
     documentIds: [],
     root,
@@ -575,69 +592,172 @@ export function ingestDirectory(
     return report;
   }
 
+  // One pass over the existing corpus, indexed by the *file* each row came
+  // from, rather than one query per file. With N passages per file the
+  // per-file query would have had to become a per-file prefix scan, and a
+  // `LIKE 'path#p%'` scan is both unindexed and wrong — `_` and `%` are
+  // wildcards, and vault filenames legitimately contain both.
+  interface ExistingRow {
+    id: string;
+    ref: string;
+    /** Recorded ingest root, or null for a row written before roots existed. */
+    rowRoot: string | null;
+  }
+  const existingByPath = new Map<string, ExistingRow[]>();
+  for (const row of db
+    .prepare(
+      `SELECT id, source_ref, metadata_json FROM vector_document
+       WHERE source_kind = 'vault_page' AND source_ref IS NOT NULL`,
+    )
+    .all() as { id: string; source_ref: string; metadata_json: string | null }[]) {
+    const path = passagePathOf(row.source_ref);
+    const list = existingByPath.get(path);
+    const entry: ExistingRow = {
+      id: row.id,
+      ref: row.source_ref,
+      rowRoot: readIngestRoot(row.metadata_json),
+    };
+    if (list) list.push(entry);
+    else existingByPath.set(path, [entry]);
+  }
+
   for (const file of ctx.files) {
-    const sourceRef = relPosix(root, file);
+    const path = relPosix(root, file);
     let raw: string;
     try {
       raw = readFileSync(file, "utf8");
     } catch (err) {
-      report.skipped.push({ path: sourceRef, kind: "unreadable", reason: errText(err) });
+      // Deliberately no orphan sweep on this path. "I could not read the file"
+      // is not "the file no longer contains this", and deleting a note's
+      // passages because of a transient EACCES would silently empty the corpus
+      // of content that is still on disk.
+      report.skipped.push({ path, kind: "unreadable", reason: errText(err) });
       continue;
     }
     const { title, body } = splitFrontmatter(raw);
-    if (!body.trim()) {
-      report.skipped.push({ path: sourceRef, kind: "empty_body", reason: "empty body" });
-      continue;
-    }
 
     // Identity is (root, sourceRef), not sourceRef alone. Keyed on sourceRef
     // alone, two vaults that both hold `notes/index.md` collapsed into one
     // row: the first root's document id silently ended up holding the second
     // root's body and hash, so every citation pinned to that id then verified
     // against different content, both runs reporting success.
-    const rows = db
-      .prepare(
-        `SELECT id, metadata_json FROM vector_document
-         WHERE source_kind = 'vault_page' AND source_ref = ?`,
-      )
-      .all(sourceRef) as { id: string; metadata_json: string | null }[];
+    const candidates = existingByPath.get(path) ?? [];
+    /**
+     * Rows this run provably owns: same file, same recorded root. Only these
+     * are eligible for deletion. A row with no recorded root is adopted but
+     * never deleted — `indexCodeTree` and `scip` also write `vault_page` rows,
+     * and a sweep that could not tell their rows from ours would delete a code
+     * index because a note of the same name shrank.
+     */
+    const owned = candidates.filter((c) => c.rowRoot === root);
+    const legacy = candidates.filter((c) => c.rowRoot === null);
+    const otherRoots = [
+      ...new Set(
+        candidates
+          .filter((c) => c.rowRoot !== null && c.rowRoot !== root)
+          .map((c) => c.rowRoot!),
+      ),
+    ];
 
-    let existingId: string | undefined;
-    let legacyId: string | undefined;
-    const otherRoots: string[] = [];
-    for (const row of rows) {
-      const rowRoot = readIngestRoot(row.metadata_json);
-      if (rowRoot === root) {
-        existingId = row.id;
-        break;
+    const passages = body.trim() === "" ? [] : splitPassages(body);
+
+    if (passages.length === 0) {
+      // The note still exists but now holds nothing. Its old passages must go:
+      // an orphan row keeps answering questions from text the note no longer
+      // contains, and — because the pin was minted from that row — it verifies
+      // perfectly while doing it.
+      for (const o of owned) {
+        if (deleteDocument(db, o.id)) report.removed += 1;
       }
-      if (rowRoot === null) legacyId ??= row.id;
-      else otherRoots.push(rowRoot);
+      report.skipped.push({ path, kind: "empty_body", reason: "empty body" });
+      continue;
     }
-    // Rows written before roots were recorded carry no root; adopt them rather
-    // than duplicating the whole corpus on the first run after this change.
-    if (existingId === undefined && legacyId !== undefined) existingId = legacyId;
-    if (existingId === undefined && otherRoots.length > 0) {
+
+    const idByRef = new Map(owned.map((o) => [o.ref, o.id]));
+    // Two kinds of row predate this scheme and must be adopted rather than
+    // duplicated: rows written before ingest roots were recorded (no root),
+    // and rows written before chunking (ref is the bare path, no `#p`). Adopt
+    // one as passage 0 so its document id survives the upgrade. The id
+    // surviving is the point: a belief already citing that row then reports
+    // `hash_mismatch` — "the note moved under your citation", which names the
+    // note and tells the operator what to re-check — instead of `not_found`,
+    // which reads as "your citation was never real" and loses the trail. The
+    // hash does move, and correctly so: that row now holds only the first
+    // passage of the note, not the whole of it.
+    // Matched on the exact pre-chunking shape — ref === the bare path — and
+    // not on "any row that happens to be left over". Adopting an arbitrary
+    // leftover as passage 0 would reuse its id for p0 while p1..pN minted fresh
+    // ids beside the rows already holding those refs, duplicating the file.
+    const firstRef = passageSourceRef(path, 0);
+    if (!idByRef.has(firstRef)) {
+      const preChunk =
+        owned.find((o) => o.ref === path) ?? legacy.find((o) => o.ref === path);
+      if (preChunk) idByRef.set(firstRef, preChunk.id);
+    }
+    if (idByRef.size === 0 && otherRoots.length > 0) {
       report.collisions.push({
-        sourceRef,
-        existingRoots: [...new Set(otherRoots)],
+        sourceRef: path,
+        existingRoots: otherRoots,
         incomingRoot: root,
       });
     }
 
-    const doc = upsertDocument(db, {
-      id: existingId,
-      sourceKind: "vault_page",
-      sourceRef,
-      title: title ?? stripMarkdownExt(sourceRef),
-      body,
-      metadata: { ingestRoot: root },
-    });
+    const docTitle = title ?? stripMarkdownExt(path);
+    const writtenIds = new Set<string>();
+    for (const p of passages) {
+      const sourceRef = passageSourceRef(path, p.index);
+      const doc = upsertDocument(db, {
+        id: idByRef.get(sourceRef),
+        sourceKind: "vault_page",
+        sourceRef,
+        // The heading breadcrumb is in the title as well as the body: the body
+        // is what gets embedded, the title is what a citation is rendered as.
+        // Both are pin-hash inputs, so renaming a heading correctly shows up
+        // as drift on every passage under it.
+        title: passageTitle(docTitle, p.headings),
+        body: p.body,
+        metadata: { ingestRoot: root },
+      });
+      report.passages += 1;
+      report.documentIds.push(doc.id);
+      writtenIds.add(doc.id);
+    }
+
+    // Shrink sweep. A note edited from 10 passages down to 4 leaves 6 rows
+    // that still hold — and still verify against — content the note no longer
+    // contains. This is the same defect class already documented as a known
+    // limitation for *deleted files*; it is closed here for files that were
+    // walked and read, which is the case where "the note no longer contains
+    // this" is something ingest actually knows. Whole-file deletion stays out
+    // of scope on purpose: a file absent from the walk is indistinguishable
+    // from one an `--exclude` pattern pruned, and deleting on that signal
+    // would let a mistyped pattern wipe the corpus.
+    // Keyed on the ids actually written this pass, NOT on which refs are live.
+    // An adopted pre-chunking row is still indexed under its *old* ref here
+    // while the upsert above has already re-keyed it to `path#p0`, so a
+    // ref-based sweep would delete the very row it had just rewritten — the
+    // whole file would vanish on the upgrade run, and only on that run.
+    for (const o of owned) {
+      if (writtenIds.has(o.id)) continue;
+      if (deleteDocument(db, o.id)) report.removed += 1;
+    }
+
     report.ingested += 1;
-    report.documentIds.push(doc.id);
   }
 
   return report;
+}
+
+/**
+ * Render a passage's display title: the note, then where in the note.
+ *
+ * A citation has to stay a human-meaningful location. `manual.md#p7` alone
+ * tells an operator nothing they can act on, and the whole reason this project
+ * exists is that a citation nobody can check is indistinguishable from one
+ * that is wrong.
+ */
+export function passageTitle(docTitle: string, headings: readonly string[]): string {
+  return headings.length === 0 ? docTitle : `${docTitle} › ${headings.join(" › ")}`;
 }
 
 // ─── CLI argument parsing ────────────────────────────────────────────────────

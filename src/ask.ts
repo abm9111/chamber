@@ -40,7 +40,22 @@ export interface AskClaimResult {
 export interface AskResult {
   answer: string;
   claims: AskClaimResult[];
-  passages: { index: number; documentId: string; sourceRef: string | null }[];
+  passages: {
+    index: number;
+    documentId: string;
+    sourceRef: string | null;
+    /**
+     * How this passage should be shown to a human — see `passageLabel`.
+     *
+     * A file is now stored as many passage rows, so `sourceRef` alone is
+     * `manual.md#p7`: a real location, but not one an operator can read. The
+     * label carries the heading breadcrumb alongside it. Rendering a citation
+     * as something nobody can check is the failure this whole project exists
+     * to prevent, so the renderable form is part of the result rather than
+     * something each caller re-derives.
+     */
+    label: string;
+  }[];
   modelCalled: boolean;
   /**
    * Why retrieval returned what it did, when that is not self-evident from the
@@ -175,6 +190,25 @@ function withheldNote(uncitable: { sourceKind: string }[]): string {
     `and are not reflected in the answer above: ` +
     uncitableReason(uncitable)
   );
+}
+
+/**
+ * Render one retrieved passage as a location a human can actually go to.
+ *
+ * `path#p7 — Ops Manual › Courier Reconciliation` rather than a bare document
+ * id or a bare chunk ref: the path says which file to open, the ordinal
+ * disambiguates repeated headings, and the breadcrumb says where in the file
+ * to look. Falls back to the ref, then the id, so a corpus row written by
+ * something other than `chamber ingest` still renders as *something*
+ * addressable instead of an empty string.
+ */
+export function passageLabel(
+  sourceRef: string | null,
+  title: string | null,
+  documentId: string,
+): string {
+  const where = sourceRef ?? documentId;
+  return title !== null && title.trim() !== "" ? `${where} — ${title}` : where;
 }
 
 export async function runAsk(
@@ -343,6 +377,7 @@ export async function runAsk(
       index: p.index,
       documentId: p.documentId,
       sourceRef: p.sourceRef,
+      label: passageLabel(p.sourceRef, p.title, p.documentId),
     })),
     modelCalled: true,
     // Alongside the answer, never instead of it: the answer is real and its

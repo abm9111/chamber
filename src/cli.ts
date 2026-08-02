@@ -728,7 +728,17 @@ async function main(): Promise<void> {
         process.exitCode = 1;
         break;
       }
-      console.log(`ingested ${r.ingested} file(s) from ${parsed.path}`);
+      console.log(
+        `ingested ${r.ingested} file(s) as ${r.passages} passage(s) from ${parsed.path}`,
+      );
+      // A shrunken note's stale passages are deleted rather than left to keep
+      // answering from content the note no longer holds. That is a corpus
+      // deletion, so it is reported rather than done quietly.
+      if (r.removed > 0) {
+        console.log(
+          `  removed ${r.removed} stale passage(s) from notes that shrank`,
+        );
+      }
       for (const e of r.excludes) {
         console.log(
           `  exclude ${e.raw} → pruned ${e.matched} entr${e.matched === 1 ? "y" : "ies"}`,
@@ -807,9 +817,11 @@ async function main(): Promise<void> {
       // An answer can be produced over a filtered view of the corpus. Printing
       // the note only on the no-answer path above is what made that silent.
       if (r.note) console.log(`  note: ${r.note}\n`);
-      const refToPath = new Map(
-        r.passages.map((p) => [p.documentId, p.sourceRef ?? p.documentId]),
-      );
+      // Not `sourceRef` alone: a note is stored as many passage rows, so that
+      // renders as `manual.md#p7` — a real location, but not a legible one.
+      // The label adds the heading breadcrumb, so a cited claim names the file
+      // *and* the section it came from and the operator can go check it.
+      const refToPath = new Map(r.passages.map((p) => [p.documentId, p.label]));
       for (const c of r.claims) {
         if (c.kind === "chatter") continue;
         const cites = c.citedRefs.map((id) => refToPath.get(id) ?? id).join(", ");

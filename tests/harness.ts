@@ -147,9 +147,12 @@ import {
 import { scanForSecrets, skillSecretScanRefuse } from "../src/secret_scan.ts";
 import { formatErrorChain } from "../src/error_chain.ts";
 import { assertSpendBudget } from "../src/spend.ts";
+import { ingestDirectory, splitFrontmatter } from "../src/ingest.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isAsyncFunction } from "node:util/types";
+import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import type { DatabaseSync } from "node:sqlite";
 
 // ─── mini test runner ────────────────────────────────────────────────────────
@@ -1464,6 +1467,233 @@ test(
     assert(
       n > 0,
       "provenance must survive the enforceReplyContract passthrough",
+    );
+  },
+);
+
+// ─── INGEST (src/ingest.ts) ──────────────────────────────────────────────────
+
+test("pins", "ingestDirectory loads markdown and is idempotent", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-"));
+  writeFileSync(join(dir, "a.md"), "---\ntitle: Alpha\n---\nalpha body\n");
+  writeFileSync(join(dir, "b.md"), "beta body\n");
+  writeFileSync(join(dir, "ignore.txt"), "not markdown\n");
+
+  const first = ingestDirectory(db, dir);
+  assert(first.ingested === 2, `expected 2 ingested, got ${first.ingested}`);
+
+  const second = ingestDirectory(db, dir);
+  const rows = count(db, `SELECT count(*) AS c FROM vector_document`);
+  assert(rows === 2, `re-ingest must update in place, got ${rows} rows`);
+  assert(second.ingested === 2, "re-ingest still reports the files it processed");
+});
+
+test("pins", "ingestDirectory honours exclude patterns", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-ex-"));
+  mkdirSync(join(dir, "private"));
+  writeFileSync(join(dir, "keep.md"), "keep me\n");
+  writeFileSync(join(dir, "private", "secret.md"), "secret\n");
+
+  const r = ingestDirectory(db, dir, { exclude: ["private"] });
+  assert(r.ingested === 1, `expected 1 ingested, got ${r.ingested}`);
+});
+
+test(
+  "pins",
+  "ingestDirectory re-ingest updates the same document id rather than minting a new one",
+  () => {
+    // The count staying stable (checked above) does not by itself prove the
+    // SAME row was updated — deleting and re-inserting fresh rows on every
+    // re-ingest would also keep the count stable. Document ids are what
+    // citations pin against downstream, so a re-ingest that silently rotates
+    // ids would break every citation minted against the previous id.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-stableid-"));
+    writeFileSync(join(dir, "a.md"), "version one\n");
+
+    const first = ingestDirectory(db, dir);
+    writeFileSync(join(dir, "a.md"), "version two, edited\n");
+    const second = ingestDirectory(db, dir);
+
+    assert(
+      first.documentIds.length === 1 && second.documentIds.length === 1,
+      `expected exactly one document id each pass, got ${JSON.stringify(first.documentIds)} / ${JSON.stringify(second.documentIds)}`,
+    );
+    assert(
+      first.documentIds[0] === second.documentIds[0],
+      `re-ingest must keep the same document id, got ${first.documentIds[0]} then ${second.documentIds[0]}`,
+    );
+    const row = db
+      .prepare(`SELECT body FROM vector_document WHERE id = ?`)
+      .get(second.documentIds[0]) as { body: string };
+    assert(
+      row.body === "version two, edited\n",
+      `expected the row to hold the re-ingested body, got ${JSON.stringify(row.body)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "ingestDirectory exclude prunes a nested directory at any depth",
+  () => {
+    // The brief's own exclude test only places "private" directly under the
+    // ingest root. A shallow implementation (matching only root-level
+    // entries) would pass that test while failing to protect a deny-listed
+    // folder nested a few levels down, which is the realistic vault shape.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-nested-"));
+    mkdirSync(join(dir, "a", "b", "private"), { recursive: true });
+    writeFileSync(join(dir, "keep.md"), "keep me\n");
+    writeFileSync(join(dir, "a", "b", "private", "secret.md"), "secret\n");
+
+    const r = ingestDirectory(db, dir, { exclude: ["private"] });
+    assert(r.ingested === 1, `expected 1 ingested, got ${r.ingested}`);
+    assert(
+      count(
+        db,
+        `SELECT count(*) AS c FROM vector_document WHERE source_ref = 'keep.md'`,
+      ) === 1,
+      "the surviving document must be keep.md, not something under a/b/private",
+    );
+  },
+);
+
+test(
+  "pins",
+  "ingestDirectory exclude does not match a name that is only a substring of a longer directory name",
+  () => {
+    // A directory literally named "private-notes" must survive an
+    // `exclude: ["private"]` — the match is a whole path segment, not
+    // `dirname.includes("private")`. An over-broad substring match would
+    // silently drop unrelated, non-deny-listed content.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-substr-"));
+    mkdirSync(join(dir, "private-notes"));
+    writeFileSync(join(dir, "private-notes", "keep.md"), "not actually private\n");
+
+    const r = ingestDirectory(db, dir, { exclude: ["private"] });
+    assert(
+      r.ingested === 1,
+      `"private-notes" must not be excluded by an exact "private" pattern, got ${r.ingested}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "ingestDirectory does not veto the ingest root itself for matching an exclude pattern",
+  () => {
+    // exclude prunes subdirectories discovered while walking; it is not a
+    // second check on the path the caller explicitly pointed ingestion at.
+    // A root whose own basename happens to equal an exclude pattern (e.g.
+    // ingesting a directory literally named "private") must still ingest
+    // its own direct contents.
+    const db = freshDb();
+    const parent = mkdtempSync(join(tmpdir(), "chamber-ingest-root-"));
+    const root = join(parent, "private");
+    mkdirSync(root);
+    writeFileSync(join(root, "keep.md"), "keep me\n");
+
+    const r = ingestDirectory(db, root, { exclude: ["private"] });
+    assert(
+      r.ingested === 1,
+      `a root named "private" must still ingest its own contents, got ${r.ingested}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "splitFrontmatter: a frontmatter-only file yields an empty body, not a crash",
+  () => {
+    const { title, body } = splitFrontmatter("---\ntitle: Alpha\n---\n");
+    assert(title === "Alpha", `title: ${JSON.stringify(title)}`);
+    assert(body.trim() === "", `expected empty body, got ${JSON.stringify(body)}`);
+  },
+);
+
+test(
+  "pins",
+  "ingestDirectory skips a frontmatter-only file as empty body instead of storing a blank document",
+  () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-fmonly-"));
+    writeFileSync(join(dir, "empty.md"), "---\ntitle: Alpha\n---\n");
+    writeFileSync(join(dir, "real.md"), "has a body\n");
+
+    const r = ingestDirectory(db, dir);
+    assert(r.ingested === 1, `expected 1 ingested, got ${r.ingested}`);
+    assert(
+      r.skipped.some((s) => s.path === "empty.md" && s.reason === "empty body"),
+      `expected empty.md to be skipped as empty body, got ${JSON.stringify(r.skipped)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "splitFrontmatter: a horizontal rule in the body of a frontmatter-less file passes through untouched",
+  () => {
+    const raw = "Some intro text.\n\n---\n\nMore text after a horizontal rule.\n";
+    const { title, body } = splitFrontmatter(raw);
+    assert(title === undefined, `expected no title, got ${JSON.stringify(title)}`);
+    assert(
+      body === raw,
+      "a file with no leading frontmatter marker must pass through unchanged",
+    );
+  },
+);
+
+test(
+  "pins",
+  "splitFrontmatter: a title containing a colon is captured in full",
+  () => {
+    const plain = splitFrontmatter(
+      "---\ntitle: Something: A Subtitle\n---\nbody text\n",
+    );
+    assert(
+      plain.title === "Something: A Subtitle",
+      `title: ${JSON.stringify(plain.title)}`,
+    );
+    assert(plain.body === "body text\n", `body: ${JSON.stringify(plain.body)}`);
+
+    const quoted = splitFrontmatter(
+      '---\ntitle: "Something: A Subtitle"\n---\nbody text\n',
+    );
+    assert(
+      quoted.title === "Something: A Subtitle",
+      `quoted title: ${JSON.stringify(quoted.title)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "splitFrontmatter: a leading horizontal rule that is not frontmatter does not swallow the real opening paragraph",
+  () => {
+    // A document that opens with a `---` divider (its first line is not
+    // `key: value`) and later uses `---` again as an ordinary section break
+    // must not have everything between the two treated as frontmatter and
+    // dropped. Real frontmatter's first line is always `key: value`; this
+    // document's is an ordinary sentence, so the whole thing must come back
+    // as body, exactly as if there had been no leading `---` at all.
+    const raw =
+      "---\n\nThis is the real opening paragraph, not frontmatter.\n\n---\n\nThis paragraph must not be silently dropped.\n";
+    const { title, body } = splitFrontmatter(raw);
+    assert(
+      title === undefined,
+      `expected no title extracted, got ${JSON.stringify(title)}`,
+    );
+    assert(
+      body.includes("This is the real opening paragraph"),
+      `a leading horizontal rule must not be misparsed as frontmatter and eat real content: ${JSON.stringify(body)}`,
+    );
+    assert(
+      body.includes("must not be silently dropped"),
+      `expected the rest of the document to survive too: ${JSON.stringify(body)}`,
     );
   },
 );

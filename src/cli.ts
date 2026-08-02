@@ -35,6 +35,7 @@ import {
   countDocuments,
   type VectorSourceKind,
 } from "./vector.ts";
+import { ingestDirectory } from "./ingest.ts";
 import { completeSync } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { runExpiryJob } from "./expiry.ts";
@@ -555,6 +556,8 @@ Usage:
       types: observation|inference|belief|commitment|unknown|defeater
   chamber index <kind> <title> <body> [ref]
       kinds: vault_page|x_tweet|transcript|note|skill|other
+  chamber ingest <path> [--exclude <name>]
+      Load a directory of markdown files into the corpus (vault_page)
   chamber search <query>           Local vector search
   chamber search --hybrid <query>  Vector + FTS5 hybrid
   chamber expiry                   Run belief expiry job
@@ -644,6 +647,22 @@ async function main(): Promise<void> {
         return;
       }
       cmdIndex(db, kind, title ?? "", body, ref);
+      break;
+    }
+    case "ingest": {
+      const target = rest.filter((a) => !a.startsWith("--"))[0];
+      if (!target) {
+        console.error('usage: chamber ingest <path> [--exclude <name>]');
+        process.exitCode = 1;
+        break;
+      }
+      const exclude: string[] = [];
+      for (let i = 0; i < rest.length; i++) {
+        if (rest[i] === "--exclude" && rest[i + 1]) exclude.push(rest[i + 1]!);
+      }
+      const r = ingestDirectory(db, target, { exclude });
+      console.log(`ingested ${r.ingested} file(s) from ${target}`);
+      for (const s of r.skipped) console.log(`  skipped ${s.path}: ${s.reason}`);
       break;
     }
     case "search": {

@@ -107,11 +107,21 @@ async function openaiComplete(
     throw new Error(`openai complete ${res.status}: ${body.slice(0, 300)}`);
   }
   const data = (await res.json()) as {
-    choices?: { message?: { content?: string } }[];
+    choices?: { message?: { content?: string; reasoning_content?: string } }[];
     usage?: { prompt_tokens?: number; completion_tokens?: number };
     model?: string;
   };
-  const text = data.choices?.[0]?.message?.content ?? "";
+  // Reasoning models (local and hosted) route their answer to reasoning_content
+  // and leave content empty; treat a wholly empty reply as an error, not as "".
+  const message = data.choices?.[0]?.message;
+  const text = message?.content?.trim()
+    ? message.content
+    : (message?.reasoning_content ?? "");
+  if (!text) {
+    throw new Error(
+      "openai complete returned no content (checked content and reasoning_content)",
+    );
+  }
   const inputTokens = data.usage?.prompt_tokens ?? estimateTokens(
     input.messages.map((m) => m.content).join("\n"),
   );

@@ -92,7 +92,7 @@ import { ensureDefaultScope, createScope, listScopes, globalPosture, effectivePo
 import { enqueueJob, processJobQueue, listJobs } from "./job_queue.ts";
 import { getHarness, listHarnesses } from "./harness_adapter.ts";
 import { pilotSummary, logPilotEvent } from "./pilot.ts";
-import { pendingWhy, listPendingQueue } from "./approvals.ts";
+import { pendingWhy } from "./approvals.ts";
 import {
   mcpDiscover,
   mcpToolsList,

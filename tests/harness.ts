@@ -166,6 +166,7 @@ type Suite =
   | "qm"
   | "slack"
   | "discord"
+  | "pins"
   | "all";
 
 interface TestResult {
@@ -198,6 +199,7 @@ function suiteFromArg(): Suite {
     "qm",
     "slack",
     "discord",
+    "pins",
     "all",
   ].includes(v)
     ? v
@@ -1553,6 +1555,16 @@ test("qm", "Q3_job_queue_expiry", () => {
 test("qm", "Q4_harness_registry", () => {
   assert(listHarnesses().includes("stub-local"));
   assert(getHarness().id === "stub-local" || getHarness("stub-local").id === "stub-local");
+});
+
+test("pins", "getHarness throws on unknown id", () => {
+  let threw = false;
+  try {
+    getHarness("no-such-harness");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "getHarness must throw on an unregistered id, not return the stub");
 });
 
 

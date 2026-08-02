@@ -27,7 +27,13 @@ export function registerHarness(h: ModelHarness): void {
 
 export function getHarness(id?: string): ModelHarness {
   const want = id ?? process.env.CHAMBER_HARNESS ?? "stub-local";
-  return registry.get(want) ?? stubHarness;
+  const found = registry.get(want);
+  if (!found) {
+    throw new Error(
+      `unknown harness "${want}" (registered: ${[...registry.keys()].join(", ")})`,
+    );
+  }
+  return found;
 }
 
 export function listHarnesses(): string[] {

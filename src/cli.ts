@@ -575,7 +575,7 @@ Examples:
 `);
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   if (!cmd || cmd === "help" || cmd === "-h" || cmd === "--help") {
     help();
@@ -1359,4 +1359,7 @@ function main(): void {
   }
 }
 
-main();
+main().catch((err: unknown) => {
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exitCode = 1;
+});

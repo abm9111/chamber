@@ -1,0 +1,13 @@
+;; Workable seatbelt profile: Node boots, network denied, writes confined.
+;; NOTE: reads of $HOME are STILL ALLOWED under this profile — see README.
+(version 1)
+(allow default)
+(deny network*)
+(deny file-write*)
+(allow file-write*
+  (subpath (param "WORKDIR"))
+  (subpath "/private/var/folders")
+  (literal "/dev/null")
+  (literal "/dev/stdout")
+  (literal "/dev/stderr")
+  (literal "/dev/dtracehelper"))

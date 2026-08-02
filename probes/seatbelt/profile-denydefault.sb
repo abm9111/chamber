@@ -1,0 +1,12 @@
+;; NEGATIVE EXAMPLE — aborts Node with SIGABRT (exit 134). Do not build on this.
+;; Kept so the dead end is not rediscovered.
+(version 1)
+(deny default)
+(allow process-exec process-fork)
+(allow sysctl-read)
+(allow mach-lookup)
+(allow file-read*
+  (subpath "/usr") (subpath "/System") (subpath "/private/var/db/dyld")
+  (subpath "/opt/homebrew") (literal "/dev/urandom") (literal "/dev/null"))
+(allow file-read* file-write* (subpath (param "WORKDIR")))
+(deny network*)

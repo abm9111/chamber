@@ -912,7 +912,7 @@ test("pins", "runAsk rejects a citation to a passage it never retrieved", async 
 
 Add `runAsk` to the `tests/harness.ts` imports from `../src/ask.ts`.
 
-**Note:** these tests are `async`. Task 1 did not make the runner await test functions. Add that now — in `tests/harness.ts`, change the `test` signature and body:
+**Note:** these tests are `async`. The runner was made async-aware in **Task 1b** (moved forward after Task 1's review proved the old runner recorded failing async tests as passing). Confirm it is in place before writing these tests — `tests/harness.ts` `test()` must accept `() => void | Promise<void>` and the runner must await pending results. If for any reason it is not, stop and apply this:
 
 ```typescript
 const pending: Promise<void>[] = [];

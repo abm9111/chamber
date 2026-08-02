@@ -60,14 +60,14 @@ Verification does real work **longitudinally**. A belief committed today stores 
 
 ```
 verifyPin(db, source: { kind, refId, snapshotHash })
-  -> { ok: true } | { ok: false, reason: "not_found" | "hash_mismatch", actualHash?: string }
+  -> { ok: true } | { ok: false, reason: "not_found" | "hash_mismatch" | "kind_unregistered", actualHash?: string }
 ```
 
-Looks up `vector_document` by `refId`, recomputes `sha256([title ?? "", body, sourceRef ?? ""].join("\n"))` — byte-identical to the formula `upsertDocument` uses at `src/vector.ts:131-133` — and compares. Pure lookup: no network, no model, safe inside a gate transaction.
+Looks up `vector_document` by `refId` **and** `source_kind` — the kind a citation claims must be the kind the row actually has — recomputes `sha256(JSON.stringify([title, body, sourceRef]))` with SQL NULL preserved as JSON `null`, byte-identical to the formula `upsertDocument` uses, and compares. Pure lookup: no network, no model, safe inside a gate transaction.
 
-The two failure reasons are semantically different and must stay distinct. `not_found` means the model named something that never existed, or the source was deleted from the corpus. `hash_mismatch` means the corpus drifted underneath a belief. Only the first is the model's fault, and conflating them makes the tool feel accusatory during normal vault editing.
+The three failure reasons are semantically different and must stay distinct. `not_found` means the model named something that never existed, the source was deleted from the corpus, or the claimed kind does not match the stored row. `hash_mismatch` means the corpus drifted underneath a belief. `kind_unregistered` means the kind has no formula at all, so the pin is unverifiable rather than wrong — it is load-bearing, not cosmetic: it is what keeps an unregistered kind unverifiable instead of exempt, and `commit_belief.ts`, `ask.ts` and `verify` all branch on it. Only `not_found` is plausibly the model's fault, and conflating them makes the tool feel accusatory during normal vault editing.
 
-Only `kind: 'vault_page'` is supported in this iteration. Other kinds return `not_found` with a reason noting the kind is unregistered, so adding kinds later is additive.
+Only `kind: 'vault_page'` is supported in this iteration. Other kinds return `kind_unregistered`, so adding kinds later is additive.
 
 Depends on: `node:sqlite`, `src/hash.ts`.
 
@@ -88,7 +88,7 @@ Walks a directory for `.md` files and calls the existing `upsertDocument` per fi
 
 `sourceRef` is the identity key: re-ingesting the same relative path updates in place. Files that cannot be read are skipped and reported per-file; one unreadable file never aborts the run.
 
-Takes `--exclude <glob>` (repeatable) with a default exclude list covering the vault folders denied in `~/.claude/settings.json`. The tool must not be the thing that quietly copies a deny-listed folder into a database.
+Takes `--exclude <glob>` (repeatable). It ships with **no** default exclude list: `exclude` defaults to empty, so pointing `ingest` at a vault root copies every non-dotted folder under it into the database unless the operator passes `--exclude` for each one. A default list covering the folders denied in `~/.claude/settings.json` was intended and is not implemented; see Known limitations.
 
 Depends on: `src/vector.ts`, `node:fs`.
 
@@ -97,7 +97,7 @@ Depends on: `src/vector.ts`, `node:fs`.
 1. `searchVector(db, question, { k: 8, model: MINILM_MODEL })`.
 2. If zero hits: print "nothing ingested yet, run `chamber ingest`" for an empty corpus, or "nothing in the corpus matches" otherwise. **Return without calling the model.** Calling a model with no context produces confident fabrication and costs money.
 3. Build one user message with each passage rendered as `[n] <title> (<sourceRef>)\n<body>`, plus instructions: answer only from these passages, cite `[n]` inline after each claim, say you don't know if the passages don't answer it.
-4. `await complete(...)` through `getHarness(...)`. Request timeout from `CHAMBER_TURN_DEADLINE_MS`, default 120000.
+4. `await complete(db, ...)` from `src/model.ts`, **directly** — not through `getHarness(...)`, so an unknown `CHAMBER_MODEL` falls back to stub prose instead of throwing. There is no request timeout: `src/model.ts` calls `fetch` with no `AbortSignal`, and no `CHAMBER_TURN_DEADLINE_MS` is read anywhere. Both are Known limitations, not features.
 5. `classifyClaims(answer)` (`src/contract.ts`) splits the reply into claims.
 6. Per claim: extract `[n]` markers, map each index to that retrieval hit's `id` and `snapshot_hash`, build sources with `kind: 'vault_page'` and `provenance: 'vector'`, and `verifyPin` each for display purposes.
 
@@ -107,7 +107,7 @@ Depends on: `src/vector.ts`, `node:fs`.
 
 Per-claim dispatch via `enforceClaimContract` is deliberate. `enforceReplyContract` applies one source list to every claim in the reply, which would give a claim citing `[3]` credit for `[5]` as well.
 
-`--strict` passes `strict: true`, upgrading unsourced assertions from debt to refusal. Default is debt: for daily use you want the answer plus a visible IOU. Strict is for demos and anything consequential.
+`--strict` passes `strict: true`, upgrading an assertion with no *verified* support from debt to refusal — which covers citing nothing and citing only pins the gate could not confirm, since those are the same state as far as what holds the claim up. The refusal happens inside the commit transaction, so a refused assertion leaves no belief row, no `belief_source` row and no debt. Default is debt: for daily use you want the answer plus a visible IOU. Strict is for demos and anything consequential.
 
 Depends on: `src/vector.ts`, `src/model.ts`, `src/harness_adapter.ts`, `src/contract.ts`, `src/pins.ts`, `src/spend.ts`.
 
@@ -144,9 +144,9 @@ The pin written to `belief_source` at commit time is the value that later goes s
 
 **Fail before spending.** Zero hits skips the model entirely (step 2 above).
 
-**Fail loudly, never plausibly.** A missing API key, unreachable endpoint, or unknown harness id is a hard error. `getHarness` must throw on an unknown id rather than silently returning the stub — canned stub output that looks like a real answer is worse than a crash. This is the `NEXT_LEVEL_PLAN.md` Phase 1.5 item, pulled forward because this spec depends on it.
+**Fail loudly, never plausibly.** A missing API key, unreachable endpoint, or unknown harness id should be a hard error, because canned stub output that looks like a real answer is worse than a crash. `getHarness` does throw on an unknown id — the `NEXT_LEVEL_PLAN.md` Phase 1.5 item, pulled forward — but `ask` does not go through it, and `complete()` treats any `CHAMBER_MODEL` that is not exactly `openai` as `stub`. So this property is only half shipped; see Known limitations.
 
-**Timeouts.** `src/model.ts` has no request timeout; `ask` sets one and treats expiry as a failed turn with no commit.
+**Timeouts.** There are none. `src/model.ts` has no request timeout and `ask` does not set one, so a stalled endpoint hangs the turn until the operator kills it; see Known limitations.
 
 **Ingest.** Unreadable files are skipped with a per-file report. Re-ingest updates in place.
 
@@ -178,6 +178,18 @@ Explicitly out of scope, to keep this to one plan:
 - Acting on drift automatically (suspension, re-evaluation tickets, debt on stale sources). `verify` reports; a human decides. Automating this before seeing real drift patterns would be guessing.
 - Session FTS as a pinnable source. Only `vector_document` is verifiable in this iteration.
 - Telegram or any surface other than the CLI.
+
+## Known limitations
+
+These are shipped, not fixed. Each one is a sharp edge a user can hit today.
+
+- **The corpus has no notion of deletion.** Deleting or renaming a note in your vault leaves the old row behind — it is still retrieved, still cited, and still verifies, because the row's content is intact even though the file it came from is gone; only `chamber index`'s explicit delete path removes anything.
+- **A corpus written before the current snapshot formula reports drift, including one written earlier on this branch.** The formula is now `sha256(JSON.stringify([title, body, sourceRef]))` with SQL NULL passed through as JSON `null`. It changed twice and neither step has a migration: first from `[title, body, ref].join("\n")` to the JSON array framing, which invalidates every pin from before this branch; then from coalescing NULL to `""` *before* building the array (`JSON.stringify([title ?? "", body, ref ?? ""])`) to preserving it, which invalidates any pin minted earlier **on** this branch for a row with a NULL title or a NULL `source_ref`. That second set is not exotic — it is every row from `chamber index <kind> <title> <body>` with no ref argument, and every untitled document. Affected pins fail as `hash_mismatch` and the corpus has to be re-ingested.
+- **A typo'd `CHAMBER_MODEL` answers you anyway.** `ask` calls `complete()` directly rather than going through `getHarness` (which throws on an unknown id), and `complete()` treats anything that is not exactly `openai` as `stub` — so `CHAMBER_MODEL=openia` silently returns canned stub prose, and that prose gets classified, gated, and committed as if it were a real answer.
+- **There is no request timeout.** `src/model.ts` calls `fetch` with no deadline, so an endpoint that accepts the connection and then stalls hangs `chamber ask` until you kill it.
+- **Mixed embedding spaces silently shrink the corpus.** `searchVector` filters on `e.model` and `e.dims`, so a corpus half-ingested with MiniLM present and half without splits into two spaces of which any one query sees only one — with no warning, no count, and no way to tell "no match" from "wrong half".
+- **`ingest` has no default exclude list.** Pointing it at a vault root ingests every non-dotted folder under it — drafts, clippings, exports, anything private that is not behind a leading dot — unless you pass `--exclude` for each one yourself.
+- **Only `vault_page` can be cited; everything else is withheld, with a count.** Documents indexed as `note`, `skill`, `x_tweet`, `transcript` or `other` are searchable through `chamber search` but have no registered pin formula and cannot be stored in `belief_source`, so `chamber ask` never puts one in front of the model and no claim can ever be supported by one. The exclusion is announced whenever anything was dropped — both when it leaves nothing to answer from and when an answer is still produced over what remains — as a note saying how many passages were withheld and which kinds they were. What the note cannot tell you is what those passages *said*, or whether one of them was the better answer to your question; `chamber search` shows them unfiltered.
 
 ## Open risks
 

@@ -912,55 +912,9 @@ test("pins", "runAsk rejects a citation to a passage it never retrieved", async 
 
 Add `runAsk` to the `tests/harness.ts` imports from `../src/ask.ts`.
 
-**Note:** these tests are `async`. Task 1 did not make the runner await test functions. Add that now — in `tests/harness.ts`, change the `test` signature and body:
+**Note:** these tests are `async`. The runner was made async-aware and serialized in **Tasks 1b/1c**, moved forward after Task 1's review proved the original runner recorded failing async tests as passing.
 
-```typescript
-const pending: Promise<void>[] = [];
-
-function test(
-  suite: string,
-  name: string,
-  fn: () => void | Promise<void>,
-): void {
-  const selected = suiteFromArg();
-  if (selected !== "all" && selected !== suite) return;
-  const t0 = Date.now();
-  try {
-    const out = fn();
-    if (out instanceof Promise) {
-      pending.push(
-        out.then(
-          () => {
-            results.push({ name, suite, ok: true, ms: Date.now() - t0 });
-          },
-          (err: unknown) => {
-            results.push({
-              name,
-              suite,
-              ok: false,
-              detail: err instanceof Error ? err.message : String(err),
-              ms: Date.now() - t0,
-            });
-          },
-        ),
-      );
-      return;
-    }
-    results.push({ name, suite, ok: true, ms: Date.now() - t0 });
-  } catch (err) {
-    results.push({
-      name,
-      suite,
-      ok: false,
-      detail: err instanceof Error ? err.message : String(err),
-      ms: Date.now() - t0,
-    });
-  }
-}
-```
-
-Then, immediately before the code that prints the summary at the bottom of the file, add `await Promise.all(pending);`. If that code is not already inside an async function, wrap it: `await (async () => { ... })();` is not needed — top-level await works because the file is an ES module.
-
+Before writing these tests, confirm the runner is in its current state: `test()` accepts `() => void | Promise<void>`, async tests are queued as thunks and drained **sequentially** in source order, a test that returns a Promise without being declared `async` is rejected outright, and the report block asserts every registered test produced a result. Do not reimplement it — read `tests/harness.ts` and verify. If any of those properties is missing, stop and report rather than patching it inline, because every later task depends on this runner being correct.
 - [ ] **Step 2: Add a meta-test proving async failures are caught**
 
 ```typescript

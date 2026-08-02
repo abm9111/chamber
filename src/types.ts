@@ -76,11 +76,37 @@ export interface CommitBeliefInput {
   path: CommittedPath;
   halfLifeSeconds?: number;
   turnId?: string;
+  /**
+   * Refuse an assertion that ends up with no source surviving verification,
+   * instead of committing it with citation debt. This is what `--strict`
+   * means, and it can only be decided in here: whether a citation *survived*
+   * is known only after commitBelief has re-checked every pin, so a caller
+   * counting the sources it handed over cannot tell "cited nothing" from
+   * "cited only things that failed". Off by default — debt is the everyday
+   * answer.
+   */
+  requireVerifiedSupport?: boolean;
+}
+
+/**
+ * A cited source the commit gate refused to count as support, and why.
+ * Present on success as well as failure: a claim can commit while some of its
+ * citations are dropped, and the caller must be able to see which.
+ */
+export interface RejectedSource {
+  refId: string;
+  reason: string;
 }
 
 export type CommitResult =
-  | { ok: true; beliefId: string }
-  | { ok: false; status: "REJECTED" | "PARKED"; reason: string; debtIds?: string[] };
+  | { ok: true; beliefId: string; rejectedSources?: RejectedSource[] }
+  | {
+      ok: false;
+      status: "REJECTED" | "PARKED";
+      reason: string;
+      debtIds?: string[];
+      rejectedSources?: RejectedSource[];
+    };
 
 export interface ActivateSkillInput {
   skillId: string;

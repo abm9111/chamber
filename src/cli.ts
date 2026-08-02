@@ -35,8 +35,15 @@ import {
   countDocuments,
   type VectorSourceKind,
 } from "./vector.ts";
+import {
+  ingestDirectory,
+  parseIngestArgs,
+  type IngestSkipKind,
+} from "./ingest.ts";
 import { completeSync } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
+import { runAsk } from "./ask.ts";
+import { verifyBeliefSources } from "./pins.ts";
 import { runExpiryJob } from "./expiry.ts";
 import { indexCodeTree, searchCode } from "./code_index.ts";
 import {
@@ -117,11 +124,33 @@ import {
   queryCallees,
 } from "./scip.ts";
 import { exportCheckpoint } from "./checkpoint_export.ts";
+import { formatErrorChain } from "./error_chain.ts";
 import type { DatabaseSync } from "node:sqlite";
 import type { EpistemicType, CommittedPath } from "./types.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let resolvedDbPath: string | null = null;
+
+const INGEST_USAGE =
+  "usage: chamber ingest <path> [--exclude <name-or-path>]… " +
+  "[--include-dotted] [--allow-unmatched-exclude]";
+
+/**
+ * Cap on individually-listed skips. The full list is always in the report;
+ * a vault with thousands of attachments would otherwise bury the privacy
+ * relevant lines (excluded, dotted, symlink-escaped) under image filenames.
+ * The total count is printed unconditionally, so nothing goes unmentioned.
+ */
+const INGEST_SKIP_PRINT_LIMIT = 20;
+
+/** Skip kinds that say something about the privacy boundary, printed first. */
+const NOTABLE_SKIP_KINDS: ReadonlySet<IngestSkipKind> = new Set<IngestSkipKind>([
+  "excluded",
+  "dotted",
+  "symlink_escape",
+  "unreadable",
+  "cycle",
+]);
 
 /** Prefer env → /tmp (writable) → cwd. openChamberDb also falls back on I/O errors. */
 function dbPath(): string {
@@ -341,6 +370,8 @@ function runTurn(db: DatabaseSync, message: string): void {
     const r = contract.results[i]!;
     const c = contract.claims[i]!;
     if (c.kind === "chatter") continue;
+    // UNSUPPORTED is neither a pass nor a refusal: the claim is recorded and
+    // nothing holds it up. It must not borrow ✓, which reads as endorsement.
     const mark =
       r.status === "ALLOWED"
         ? "✓"
@@ -348,7 +379,9 @@ function runTurn(db: DatabaseSync, message: string): void {
           ? "◇"
           : r.status === "APORIA"
             ? "○"
-            : "✗";
+            : r.status === "UNSUPPORTED"
+              ? "⚠"
+              : "✗";
     console.log(
       `  ${mark} contract ${c.kind}/${r.status}${r.reason ? ` — ${r.reason}` : ""}`,
     );
@@ -554,8 +587,32 @@ Usage:
       types: observation|inference|belief|commitment|unknown|defeater
   chamber index <kind> <title> <body> [ref]
       kinds: vault_page|x_tweet|transcript|note|skill|other
+      Only vault_page is citable: every other kind is searchable but has no
+      registered pin formula, so 'chamber ask' will not retrieve it and a
+      claim can never be supported by it.
+  chamber ingest <path> [--exclude <name-or-path>]… [--include-dotted]
+                        [--allow-unmatched-exclude]
+      Load a directory of .md/.markdown/.mdx files into the corpus (vault_page).
+      --exclude prunes any path segment (or root-relative path) matching the
+      pattern, case-insensitively, at any depth. A pattern that matches
+      nothing aborts the run — quote multi-word names. Dotted entries
+      (.trash, .obsidian) and symlinks leaving the root are skipped.
   chamber search <query>           Local vector search
   chamber search --hybrid <query>  Vector + FTS5 hybrid
+  chamber ask "<question>" [--strict]        answer from the corpus with verified pins
+      The model is shown passages numbered [1]..[k] and cites those numbers;
+      index→document and document→hash mapping happen locally, so it can
+      neither invent a document id nor supply a snapshot hash. Each claim is
+      gated on its own citations. --strict refuses an unsourced assertion
+      instead of committing it with citation debt.
+  chamber verify [--since <ISO date>]        re-check stored pins against the corpus
+      A pin is written when a belief commits; the corpus can move after that
+      (an edited, re-ingested note). verify re-derives every stored pin from
+      the corpus as it is now and reports what no longer matches — it never
+      mutates a belief or the corpus. Exits non-zero exactly when a belief
+      has no verified support left, so it is safe to run as a scheduled
+      health check. --since limits the scan to beliefs committed on or after
+      that date.
   chamber expiry                   Run belief expiry job
 
 Env:
@@ -575,7 +632,7 @@ Examples:
 `);
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   if (!cmd || cmd === "help" || cmd === "-h" || cmd === "--help") {
     help();
@@ -645,6 +702,64 @@ function main(): void {
       cmdIndex(db, kind, title ?? "", body, ref);
       break;
     }
+    case "ingest": {
+      const parsed = parseIngestArgs(rest);
+      if (!parsed.ok) {
+        console.error(`ingest: ${parsed.error}`);
+        console.error(INGEST_USAGE);
+        process.exitCode = 1;
+        break;
+      }
+      const r = ingestDirectory(db, parsed.path, {
+        exclude: parsed.exclude,
+        includeDotted: parsed.includeDotted,
+        requireExcludeMatch: !parsed.allowUnmatchedExclude,
+      });
+      // An exclude that matched nothing aborts the run before anything is
+      // stored: on a privacy control a no-op pattern is a typo far more often
+      // than an intent, and a warning buried in output is not a control.
+      if (r.aborted) {
+        console.error(`ingest refused: ${r.abortReason}`);
+        console.error(
+          r.abortKind === "unmatched_exclude"
+            ? "  nothing was ingested. Fix the pattern, or pass --allow-unmatched-exclude to proceed anyway."
+            : "  nothing was ingested. Fix the pattern.",
+        );
+        process.exitCode = 1;
+        break;
+      }
+      console.log(`ingested ${r.ingested} file(s) from ${parsed.path}`);
+      for (const e of r.excludes) {
+        console.log(
+          `  exclude ${e.raw} → pruned ${e.matched} entr${e.matched === 1 ? "y" : "ies"}`,
+        );
+      }
+      if (r.unmatchedExcludes.length > 0) {
+        console.error(
+          `  ⚠ --exclude matched nothing: ${r.unmatchedExcludes.join(", ")} (allowed via --allow-unmatched-exclude)`,
+        );
+      }
+      if (r.skipped.length > 0) {
+        // Privacy-relevant skips first, then the rest, so a vault full of
+        // attachments cannot push an escaping symlink off the bottom.
+        const ranked = [
+          ...r.skipped.filter((s) => NOTABLE_SKIP_KINDS.has(s.kind)),
+          ...r.skipped.filter((s) => !NOTABLE_SKIP_KINDS.has(s.kind)),
+        ];
+        console.log(`  skipped ${ranked.length} entr${ranked.length === 1 ? "y" : "ies"}:`);
+        for (const s of ranked.slice(0, INGEST_SKIP_PRINT_LIMIT)) {
+          console.log(`    [${s.kind}] ${s.path}: ${s.reason}`);
+        }
+        const hidden = ranked.length - INGEST_SKIP_PRINT_LIMIT;
+        if (hidden > 0) console.log(`    … and ${hidden} more`);
+      }
+      for (const c of r.collisions) {
+        console.error(
+          `  ⚠ cross-root collision on ${c.sourceRef}: already ingested from ${c.existingRoots.join(", ")} — stored as a separate document, not overwritten`,
+        );
+      }
+      break;
+    }
     case "search": {
       let hybrid = false;
       let parts = rest;
@@ -659,6 +774,126 @@ function main(): void {
         return;
       }
       cmdSearch(db, q, hybrid);
+      break;
+    }
+    case "ask": {
+      const strict = rest.includes("--strict");
+      // A mistyped `--stict` must not silently answer in lax mode: --strict is
+      // the control that turns an unsourced assertion from minted debt into a
+      // refusal, so swallowing an unrecognised flag disables a gate quietly.
+      // Same rule `ingest` already applies to its own flags.
+      const unknown = rest.filter((a) => a.startsWith("--") && a !== "--strict");
+      if (unknown.length > 0) {
+        console.error(`ask: unknown flag(s): ${unknown.join(", ")}`);
+        console.error('usage: chamber ask "<question>" [--strict]');
+        process.exitCode = 1;
+        break;
+      }
+      const q = rest
+        .filter((a) => !a.startsWith("--"))
+        .join(" ")
+        .trim();
+      if (!q) {
+        console.error('usage: chamber ask "<question>" [--strict]');
+        process.exitCode = 1;
+        break;
+      }
+      const r = await runAsk(db, q, { strict });
+      if (!r.modelCalled) {
+        console.log(r.note ?? "no passages retrieved");
+        break;
+      }
+      console.log(`\n${r.answer}\n`);
+      // An answer can be produced over a filtered view of the corpus. Printing
+      // the note only on the no-answer path above is what made that silent.
+      if (r.note) console.log(`  note: ${r.note}\n`);
+      const refToPath = new Map(
+        r.passages.map((p) => [p.documentId, p.sourceRef ?? p.documentId]),
+      );
+      for (const c of r.claims) {
+        if (c.kind === "chatter") continue;
+        const cites = c.citedRefs.map((id) => refToPath.get(id) ?? id).join(", ");
+        console.log(`  [${c.status}] ${c.text.slice(0, 70)}`);
+        if (cites) console.log(`     sources: ${cites}`);
+        for (const rj of c.rejected) {
+          console.log(`     rejected ${rj.refId}: ${rj.reason}`);
+        }
+        if (c.debtIds.length) {
+          console.log(`     debt: ${c.debtIds.join(", ")}`);
+        }
+      }
+      console.log(`\n${formatSpendFooter(spendLastHours(db, 24))}`);
+      break;
+    }
+    case "verify": {
+      // A typo'd flag must not be silently treated as "no filter": the same
+      // rule `ingest` and `ask` already apply to their own flags. `--since`'s
+      // value is a date and is never itself `--`-prefixed (guarded below), so
+      // it is unambiguous to exclude only the literal `--since` token here —
+      // anything else starting with `--` (e.g. a mistyped `--sinse`) is an
+      // unrecognized flag and must be refused before it ever reaches
+      // verifyBeliefSources, which cannot tell "no --since given" from "you
+      // meant --since but misspelled it" — both look like an absent filter.
+      const unknown = rest.filter((a) => a.startsWith("--") && a !== "--since");
+      if (unknown.length > 0) {
+        console.error(`verify: unknown flag(s): ${unknown.join(", ")}`);
+        console.error("usage: chamber verify [--since <date>]");
+        process.exitCode = 1;
+        break;
+      }
+      const i = rest.indexOf("--since");
+      let since: string | undefined;
+      if (i >= 0) {
+        const raw = rest[i + 1];
+        // Same guard `ingest --exclude` applies: a missing or flag-shaped
+        // value is a usage error, not silent "no filter".
+        if (raw === undefined || raw.startsWith("-")) {
+          console.error("usage: chamber verify [--since <date>]");
+          console.error("  --since requires a date value");
+          process.exitCode = 1;
+          break;
+        }
+        // The query below is a raw TEXT compare against belief.created_at's
+        // ISO-8601 form; SQLite never parses or validates a TEXT value, so an
+        // unparseable --since does not throw there — it silently compares as
+        // ordinary bytes. Depending on the first differing byte that can
+        // silently exclude every belief (any value that sorts after "2026-…",
+        // which is most non-numeric text) and print a false "0 with no
+        // verified support left", or silently include everything. Both look
+        // exactly like a correct, clean report on stdout — the one failure
+        // mode a scheduled health check cannot absorb. Confirmed empirically
+        // (task-7-report.md §"--since"): `--since not-a-real-date` reports a
+        // clean "0 belief(s) checked" instead of the drift that is actually
+        // there. Validate and normalize here so a malformed --since is a
+        // loud, exit-1 usage error instead of a quiet false negative.
+        const parsed = new Date(raw);
+        if (Number.isNaN(parsed.getTime())) {
+          console.error(`verify: --since is not a valid date: ${JSON.stringify(raw)}`);
+          process.exitCode = 1;
+          break;
+        }
+        since = parsed.toISOString();
+      }
+      const report = verifyBeliefSources(db, { since });
+      let broken = 0;
+      for (const b of report) {
+        if (b.failures.length === 0) continue;
+        broken += b.verified === 0 ? 1 : 0;
+        console.log(`${b.beliefId}  ${b.verified}/${b.total} pins verified`);
+        console.log(`  "${b.content.slice(0, 70)}"`);
+        for (const f of b.failures) {
+          const where = f.sourceRef ? ` (${f.sourceRef})` : "";
+          const hint =
+            f.reason === "hash_mismatch"
+              ? " — note changed since commit; re-run `chamber ingest`"
+              : "";
+          console.log(`  ${f.reason}: ${f.refId}${where}${hint}`);
+        }
+      }
+      console.log(
+        `\n${report.length} belief(s) checked, ${broken} with no verified support left`,
+      );
+      if (broken > 0) process.exitCode = 1;
       break;
     }
     case "expiry": {
@@ -724,7 +959,10 @@ function main(): void {
       const p = proposeDebtPayment(db, id);
       console.log(`${p.status}: ${p.reason}`);
       for (const h of p.hits.slice(0, 3)) {
-        console.log(`  hit ${h.score.toFixed(3)}  ${h.title}`);
+        console.log(`  hit ${h.score.toFixed(3)}  [${h.sourceKind}]  ${h.title}`);
+      }
+      for (const rj of p.rejected) {
+        console.log(`  not pinned ${rj.refId}: ${rj.reason}`);
       }
       break;
     }
@@ -1359,4 +1597,8 @@ function main(): void {
   }
 }
 
-main();
+main().catch((err: unknown) => {
+  console.error(formatErrorChain(err).join("\n"));
+  // exitCode (not exit()) so buffered stdout still flushes.
+  process.exitCode = 1;
+});

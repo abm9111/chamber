@@ -128,8 +128,22 @@ export function upsertDocument(
 ): { id: string; model: string; dims: number } {
   const id = input.id ?? newId("vdoc");
   const body = input.body;
+  // JSON.stringify of a fixed 3-element array, NOT [...].join("\n"): joining is
+  // not injective across its own separator, so {title:"X", body:"Y\nZ"} and
+  // {title:"X\nY", body:"Z"} minted one identical pin. Moving a newline from the
+  // end of a title to the start of a body was therefore undetectable drift —
+  // precisely what a content pin exists to catch, and vault notes are multi-line
+  // markdown. JSON escapes separators inside each field, so the array framing
+  // is unambiguous about where fields end — but that alone does not make the
+  // formula injective: title/sourceRef are nullable, and defaulting to "" —
+  // `input.title ?? ""` — *before* building the array collapsed NULL and ""
+  // to the same element, reopening the identical undetectable-drift bug one
+  // level up. `?? null` below keeps NULL and "" distinct and only normalizes
+  // `undefined` (which JSON.stringify would otherwise also render as `null`
+  // inside the array) — see vaultPageHash in src/pins.ts for the full
+  // account. Must stay byte-identical to it.
   const snapshot = sha256(
-    [input.title ?? "", body, input.sourceRef ?? ""].join("\n"),
+    JSON.stringify([input.title ?? null, body, input.sourceRef ?? null]),
   );
   let model: string;
   let vec: Float32Array;
@@ -205,6 +219,15 @@ export interface SearchOptions {
   k?: number;
   minScore?: number;
   sourceKind?: VectorSourceKind;
+  /**
+   * Restrict retrieval to a set of kinds. Applied in SQL, not by filtering the
+   * result, so `k` still returns k *eligible* hits instead of however many of
+   * the top k happened to qualify. An empty array means "no kind is eligible"
+   * and returns nothing — the fail-closed reading, not "no filter"; callers
+   * that want no filter omit the option. Composes with `sourceKind` (both
+   * apply) rather than overriding it.
+   */
+  sourceKinds?: readonly VectorSourceKind[];
   model?: string;
   /** Hybrid: also require FTS5 match; rank = 0.7*cosine + 0.3*fts_boost */
   ftsQuery?: string;
@@ -246,6 +269,11 @@ export function searchVector(
   if (opts.sourceKind) {
     sql += ` AND d.source_kind = ?`;
     params.push(opts.sourceKind);
+  }
+  if (opts.sourceKinds) {
+    if (opts.sourceKinds.length === 0) return [];
+    sql += ` AND d.source_kind IN (${opts.sourceKinds.map(() => "?").join(",")})`;
+    params.push(...opts.sourceKinds);
   }
 
   const rows = db.prepare(sql).all(...params) as {

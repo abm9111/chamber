@@ -45,6 +45,8 @@ import {
   deleteDocument,
   countDocuments,
 } from "../src/vector.ts";
+import { verifyPin, verifyBeliefSources } from "../src/pins.ts";
+import { runAsk, citedIndices } from "../src/ask.ts";
 import {
   minilmAvailable,
   embedLocal,
@@ -60,6 +62,7 @@ import { completeSync } from "../src/model.ts";
 import {
   classifyClaims,
   enforceClaimContract,
+  enforceReplyContract,
 } from "../src/contract.ts";
 import { runExpiryJob } from "../src/expiry.ts";
 import { extractChunks, fileMerkleRoot } from "../src/code_index.ts";
@@ -143,9 +146,25 @@ import {
   surfaceRateKey,
 } from "../src/surface_harden.ts";
 import { scanForSecrets, skillSecretScanRefuse } from "../src/secret_scan.ts";
+import { formatErrorChain } from "../src/error_chain.ts";
 import { assertSpendBudget } from "../src/spend.ts";
+import {
+  ingestDirectory,
+  parseIngestArgs,
+  splitFrontmatter,
+  type IngestReport,
+} from "../src/ingest.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isAsyncFunction } from "node:util/types";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import type { DatabaseSync } from "node:sqlite";
 
 // ─── mini test runner ────────────────────────────────────────────────────────
@@ -166,6 +185,7 @@ type Suite =
   | "qm"
   | "slack"
   | "discord"
+  | "pins"
   | "all";
 
 interface TestResult {
@@ -177,6 +197,54 @@ interface TestResult {
 }
 
 const results: TestResult[] = [];
+
+interface AsyncTestThunk {
+  suite: string;
+  name: string;
+  fn: () => Promise<void>;
+}
+
+/**
+ * Async tests registered via `test()` land here as unstarted thunks
+ * instead of being invoked immediately. Calling `fn()` at registration
+ * time would start an async test's body executing (up to its first
+ * `await`) right then — and since every `test(...)` call in this file
+ * runs back-to-back during module evaluation, every async test would be
+ * mid-flight and interleaving with every other one before any of them
+ * settle. Several tests in this suite mutate shared `process.env` keys,
+ * so concurrent interleaving produces flaky, order-dependent failures.
+ *
+ * Nothing pushed here has run yet. The summary block at the bottom of
+ * this file drains this queue sequentially — one thunk invoked and
+ * fully awaited before the next one starts — so async tests behave like
+ * a strictly serial continuation of the synchronous ones above them,
+ * and their results land in `results` in the same order they were
+ * declared in.
+ */
+const pending: AsyncTestThunk[] = [];
+
+/**
+ * Every test that passed the suite filter and is therefore *expected* to
+ * produce exactly one entry in `results`.
+ *
+ * `results.length` cannot be the denominator of the summary: it is
+ * self-referential, so a test that is dropped before it can record a
+ * result (never drained, thunk never invoked, an early `return` added to
+ * the drain loop) shrinks the denominator with it and the tally still
+ * reads `N/N passed · 0 failed`, exit 0. A reviewer simulated a full
+ * revert of the drain loop and the suite reported 100/100 green while the
+ * async test had silently vanished. This counter is incremented at
+ * registration, never derived from results, so the report block can
+ * compare the two and fail loudly on any gap.
+ */
+let registered = 0;
+
+/** True for real promises and for any thenable a test body might return. */
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  if (value === null) return false;
+  if (typeof value !== "object" && typeof value !== "function") return false;
+  return typeof (value as { then?: unknown }).then === "function";
+}
 
 function suiteFromArg(): Suite {
   const arg = process.argv.find((a) => a.startsWith("--suite="));
@@ -198,18 +266,58 @@ function suiteFromArg(): Suite {
     "qm",
     "slack",
     "discord",
+    "pins",
     "all",
   ].includes(v)
     ? v
     : "all";
 }
 
-function test(suite: string, name: string, fn: () => void): void {
+function test(
+  suite: string,
+  name: string,
+  fn: () => void | Promise<void>,
+): void {
   const selected = suiteFromArg();
   if (selected !== "all" && selected !== suite) return;
+  registered++;
+
+  if (isAsyncFunction(fn)) {
+    // Defer invocation — do not call fn() here. Calling it is exactly
+    // what let async tests race each other; see the `pending` doc
+    // comment above. `isAsyncFunction` tells sync from async apart
+    // without invoking anything, so the thunk can be queued untouched.
+    // The cast is sound for a genuine async function; the drain loop
+    // re-checks what the call actually returned, because
+    // `isAsyncFunction` is also true for async *generator* functions,
+    // whose call returns an AsyncGenerator and never runs the body.
+    pending.push({ suite, name, fn: fn as () => Promise<void> });
+    return;
+  }
+
   const t0 = Date.now();
   try {
-    fn();
+    // `isAsyncFunction` matches the `async` keyword and nothing else: a
+    // plain function that *returns* a promise — `() => somePromiseCall()`,
+    // a `withSetup(async () => {…})` wrapper, a bound async function —
+    // lands here. Ignoring that promise records `ok: true` for a test
+    // whose assertions have not run yet, and the eventual rejection kills
+    // the process as an unhandled rejection: green tally, then death, or
+    // (on a delayed rejection) death mid-drain with no summary printed at
+    // all. Fail closed instead — neutralise the promise so it cannot
+    // crash the run later, then fail this test by name.
+    const returned: unknown = fn();
+    if (isThenable(returned)) {
+      void Promise.resolve(returned).catch(() => {
+        /* defused: the throw below is this test's real failure */
+      });
+      throw new Error(
+        `test "${suite}/${name}" is not declared \`async\` but returned a ` +
+          `Promise. The runner cannot await it, so its assertions would be ` +
+          `ignored and a rejection would crash the run. Declare the test ` +
+          `function \`async\`.`,
+      );
+    }
     results.push({ name, suite, ok: true, ms: Date.now() - t0 });
   } catch (err) {
     results.push({
@@ -228,6 +336,42 @@ function assert(cond: unknown, msg: string): asserts cond {
 
 function freshDb(): DatabaseSync {
   return openChamberDb(":memory:");
+}
+
+/**
+ * Ingest a real document and return a SourceRef whose pin actually verifies.
+ *
+ * Tests that need a citation but are not *about* citations used to inline
+ * `{ kind: "transcript", refId: "t1", snapshotHash: sha256("x") }` — a hash of a
+ * string that was never stored anywhere. Those pins are exactly what the gate
+ * now rejects, so a test wanting a source must mint one from the corpus.
+ *
+ * `model: "local-hash-v1"` keeps this hermetic: the default embedder spawns
+ * Python/MiniLM (~145ms per call, and only when the model is on disk), while
+ * the snapshot pin is computed from title/body/source_ref alone and is
+ * identical either way. A gate test must not change behaviour based on whether
+ * an ONNX model happens to be installed.
+ */
+function seedPinnedDoc(
+  db: DatabaseSync,
+  body: string,
+  sourceRef = "notes/seed.md",
+): { kind: "vault_page"; refId: string; snapshotHash: string } {
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef,
+    title: "seed",
+    body,
+    model: "local-hash-v1",
+  });
+  const row = db
+    .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+    .get(doc.id) as { snapshot_hash: string };
+  return {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: row.snapshot_hash,
+  };
 }
 
 function count(db: DatabaseSync, sql: string, ...params: unknown[]): number {
@@ -325,10 +469,13 @@ test("gates", "3_gate_write_atomicity", () => {
   const text = "atomic check claim";
   insertDebt(db, claimHash("belief", text), text);
 
+  // The source must be one that genuinely verifies. With a fabricated pin the
+  // belief_source assertion below is vacuous — the gate drops the source before
+  // the insert, so zero rows proves nothing about atomicity.
   commitBelief(db, {
     type: "belief",
     text,
-    sources: [{ kind: "transcript", refId: "t1", snapshotHash: sha256("x") }],
+    sources: [seedPinnedDoc(db, "x")],
     authorFamily: "test",
     path: "deep",
   });
@@ -380,13 +527,7 @@ test("gates", "5_expiry_suspends_skill_teeth", () => {
   const bel = commitBelief(db, {
     type: "observation",
     text: "foundation fact for skill",
-    sources: [
-      {
-        kind: "transcript",
-        refId: "turn1",
-        snapshotHash: sha256("foundation fact"),
-      },
-    ],
+    sources: [seedPinnedDoc(db, "foundation fact")],
     authorFamily: "test",
     path: "fast",
   });
@@ -474,9 +615,7 @@ test("gates", "8_fast_path_belief_forbidden", () => {
   const r = commitBelief(db, {
     type: "belief",
     text: "should not be fast",
-    sources: [
-      { kind: "transcript", refId: "t", snapshotHash: sha256("s") },
-    ],
+    sources: [seedPinnedDoc(db, "s", "notes/fast-belief.md")],
     authorFamily: "test",
     path: "fast",
   });
@@ -493,9 +632,7 @@ test("gates", "8_fast_path_belief_forbidden", () => {
   const obs = commitBelief(db, {
     type: "observation",
     text: "seen in transcript",
-    sources: [
-      { kind: "transcript", refId: "t", snapshotHash: sha256("seen") },
-    ],
+    sources: [seedPinnedDoc(db, "seen", "notes/seen.md")],
     authorFamily: "test",
     path: "fast",
   });
@@ -509,14 +646,19 @@ test("gates", "9_router_uncertainty_proxy_deep_lite", () => {
   const r = commitBelief(db, {
     type: "belief",
     text: "needs escalation",
-    sources: [
-      { kind: "transcript", refId: "t", snapshotHash: sha256("esc") },
-    ],
+    sources: [seedPinnedDoc(db, "esc")],
     authorFamily: "test",
     path: "deep_lite",
   });
   // empty sources would mint debt but we provided source — should commit
   assert(r.ok, `deep_lite belief with source should pass: ${JSON.stringify(r)}`);
+  // ...and commit *clean*. `r.ok` alone does not say that: an assertion whose
+  // sources are all dropped also returns ok, carrying blocking debt. The
+  // sentence above is only true if the debt is absent, so assert it.
+  assert(
+    count(db, `SELECT COUNT(*) AS c FROM citation_debt WHERE blocking = 1`) === 0,
+    "a real source means no blocking debt",
+  );
   const row = db
     .prepare(`SELECT committed_path FROM belief WHERE id = ?`)
     .get(r.beliefId!) as { committed_path: string };
@@ -872,6 +1014,1331 @@ test("vector", "V4_injected_embedding", () => {
   assert(hits[0]!.model === "injected-test", "model label");
 });
 
+// ─── PINS (content-pin verification, src/pins.ts) ────────────────────────────
+
+test("pins", "verifyPin accepts a round-tripped document", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/a.md",
+    title: "A",
+    body: "the sky is blue",
+  });
+  const row = db
+    .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+    .get(doc.id) as { snapshot_hash: string };
+  const v = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: row.snapshot_hash,
+  });
+  assert(v.ok, `expected ok, got ${v.reason}`);
+});
+
+test("pins", "verifyPin reports not_found for an unknown refId", () => {
+  const db = freshDb();
+  const v = verifyPin(db, {
+    kind: "vault_page",
+    refId: "vdoc_does_not_exist",
+    snapshotHash: sha256("anything"),
+  });
+  assert(!v.ok, "must not pass");
+  assert(v.reason === "not_found", `expected not_found, got ${v.reason}`);
+});
+
+test("pins", "verifyPin reports hash_mismatch when the body drifts", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/b.md",
+    title: "B",
+    body: "original body",
+  });
+  const row = db
+    .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+    .get(doc.id) as { snapshot_hash: string };
+  db.prepare(`UPDATE vector_document SET body = ? WHERE id = ?`).run(
+    "edited body",
+    doc.id,
+  );
+  const v = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: row.snapshot_hash,
+  });
+  assert(!v.ok, "must not pass after drift");
+  assert(v.reason === "hash_mismatch", `expected hash_mismatch, got ${v.reason}`);
+});
+
+test("pins", "verifyPin accepts a round-trip with neither title nor sourceRef", () => {
+  // Every other round-trip test supplies both columns, so nothing pinned the
+  // NULL path: a mutant using `row.title ?? "(untitled)"` passed the whole
+  // suite while breaking every untitled note. Both columns are NULL here.
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    body: "an untitled, unreferenced note",
+  });
+  const row = db
+    .prepare(`SELECT title, source_ref, snapshot_hash FROM vector_document WHERE id = ?`)
+    .get(doc.id) as {
+    title: string | null;
+    source_ref: string | null;
+    snapshot_hash: string;
+  };
+  assert(row.title === null, "precondition: title must be stored NULL");
+  assert(row.source_ref === null, "precondition: source_ref must be stored NULL");
+  const v = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: row.snapshot_hash,
+  });
+  assert(v.ok, `expected ok for NULL title/source_ref, got ${v.reason}`);
+});
+
+test("pins", "verifyPin reports kind_unregistered for a real row of an unregistered kind", () => {
+  // The row genuinely exists and the hash genuinely matches, so the only thing
+  // that can deny this is the missing formula. Asserting on a refId that does
+  // not exist would only have proved the verdict is not `not_found`.
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "x_tweet",
+    sourceRef: "https://x.com/i/status/1",
+    title: "T",
+    body: "a real tweet body",
+  });
+  const row = db
+    .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+    .get(doc.id) as { snapshot_hash: string };
+  const v = verifyPin(db, {
+    kind: "x_tweet",
+    refId: doc.id,
+    snapshotHash: row.snapshot_hash,
+  });
+  assert(!v.ok, "unregistered kinds must not pass even with a real matching hash");
+  assert(
+    v.reason === "kind_unregistered",
+    `expected kind_unregistered, got ${v.reason}`,
+  );
+});
+
+test("pins", "verifyPin rejects a cross-kind mislabel of a real row", () => {
+  // Regression for the bypass: upsertDocument applies one hash formula to every
+  // source_kind, so before the lookup bound source_kind this exact row returned
+  // ok:true merely by relabelling the citation's `kind` to "vault_page" —
+  // turning an unverifiable source into a passing one.
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "x_tweet",
+    sourceRef: "https://x.com/i/status/1",
+    title: "T",
+    body: "a real tweet body",
+  });
+  const row = db
+    .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+    .get(doc.id) as { snapshot_hash: string };
+  const v = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: row.snapshot_hash,
+  });
+  assert(!v.ok, "a mislabelled kind must not verify under another kind's formula");
+  assert(v.reason === "not_found", `expected not_found, got ${v.reason}`);
+});
+
+test("pins", "snapshot framing is injective across the field separator", () => {
+  // `[title, body, ref].join("\n")` is ambiguous about where a field ends, so
+  // these two distinct documents minted one identical pin — and an edit moving
+  // a newline from the end of a title to the start of a body was undetectable
+  // drift. Vault notes are multi-line markdown, so this is not theoretical.
+  const db = freshDb();
+  const a = upsertDocument(db, { sourceKind: "vault_page", title: "X", body: "Y\nZ" });
+  const b = upsertDocument(db, { sourceKind: "vault_page", title: "X\nY", body: "Z" });
+  const hash = (id: string): string =>
+    (
+      db
+        .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+        .get(id) as { snapshot_hash: string }
+    ).snapshot_hash;
+  assert(
+    hash(a.id) !== hash(b.id),
+    "distinct documents must not share a pin across the separator",
+  );
+  // The property that matters downstream: A's pin must not verify against B.
+  const v = verifyPin(db, {
+    kind: "vault_page",
+    refId: b.id,
+    snapshotHash: hash(a.id),
+  });
+  assert(!v.ok, "a pin must not verify against a document it was not computed from");
+  assert(v.reason === "hash_mismatch", `expected hash_mismatch, got ${v.reason}`);
+});
+
+test(
+  "pins",
+  "NULL title and empty-string title mint distinct pins, and each round-trips",
+  () => {
+    // `row.title ?? ""` before framing erased the distinction between SQL
+    // NULL and the empty string: an omitted title (stored NULL) and an
+    // explicit title: "" (stored "") hashed identically. A title flipping
+    // between NULL and "" across re-ingests was therefore undetectable
+    // drift — exactly the failure mode a content pin exists to catch.
+    const db = freshDb();
+    const withNullTitle = upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/same-ref.md",
+      body: "same body",
+    });
+    const withEmptyTitle = upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/same-ref.md",
+      title: "",
+      body: "same body",
+    });
+
+    const stored = (
+      id: string,
+    ): { title: string | null; snapshot_hash: string } =>
+      db
+        .prepare(`SELECT title, snapshot_hash FROM vector_document WHERE id = ?`)
+        .get(id) as { title: string | null; snapshot_hash: string };
+
+    const nullRow = stored(withNullTitle.id);
+    const emptyRow = stored(withEmptyTitle.id);
+    assert(nullRow.title === null, "precondition: omitted title must be stored NULL");
+    assert(
+      emptyRow.title === "",
+      'precondition: title:"" must be stored as "", not NULL',
+    );
+
+    assert(
+      nullRow.snapshot_hash !== emptyRow.snapshot_hash,
+      "NULL title and empty-string title must not mint the same pin",
+    );
+
+    const vNull = verifyPin(db, {
+      kind: "vault_page",
+      refId: withNullTitle.id,
+      snapshotHash: nullRow.snapshot_hash,
+    });
+    assert(
+      vNull.ok,
+      `NULL-title document must round-trip through writer and verifier, got ${vNull.reason}`,
+    );
+
+    const vEmpty = verifyPin(db, {
+      kind: "vault_page",
+      refId: withEmptyTitle.id,
+      snapshotHash: emptyRow.snapshot_hash,
+    });
+    assert(
+      vEmpty.ok,
+      `empty-title document must round-trip through writer and verifier, got ${vEmpty.reason}`,
+    );
+
+    // The property that matters downstream, same shape as the separator test
+    // above: one document's pin must not verify against the other.
+    const cross = verifyPin(db, {
+      kind: "vault_page",
+      refId: withEmptyTitle.id,
+      snapshotHash: nullRow.snapshot_hash,
+    });
+    assert(
+      !cross.ok,
+      "a NULL-title pin must not verify against an empty-title document",
+    );
+    assert(cross.reason === "hash_mismatch", `expected hash_mismatch, got ${cross.reason}`);
+  },
+);
+
+test(
+  "pins",
+  "NULL source_ref and empty-string source_ref mint distinct pins",
+  () => {
+    // Same collision class, the other coalesced field: upsertDocument stores
+    // an omitted sourceRef as NULL and an explicit sourceRef: "" as "" — the
+    // hash must tell them apart the same way it now does for title.
+    const db = freshDb();
+    const withNullRef = upsertDocument(db, {
+      sourceKind: "vault_page",
+      title: "same title",
+      body: "same body",
+    });
+    const withEmptyRef = upsertDocument(db, {
+      sourceKind: "vault_page",
+      title: "same title",
+      sourceRef: "",
+      body: "same body",
+    });
+    const hash = (id: string): string =>
+      (
+        db
+          .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+          .get(id) as { snapshot_hash: string }
+      ).snapshot_hash;
+    assert(
+      hash(withNullRef.id) !== hash(withEmptyRef.id),
+      "NULL source_ref and empty-string source_ref must not mint the same pin",
+    );
+  },
+);
+
+test("pins", "verifyPin returns a verdict for a non-string refId instead of throwing", () => {
+  // A non-string refId used to reach the SQLite binder raw and throw
+  // ({a:1} → "Unknown named parameter 'a'"). Callers pass model-derived values
+  // through here inside a gate transaction, where a throw is not a denial.
+  const db = freshDb();
+  for (const bad of [{ a: 1 }, 42, null, undefined, ["x"]]) {
+    const v = verifyPin(db, {
+      kind: "vault_page",
+      refId: bad as unknown as string,
+      snapshotHash: sha256("x"),
+    });
+    assert(!v.ok, `non-string refId ${JSON.stringify(bad)} must not pass`);
+    assert(
+      v.reason === "not_found",
+      `expected not_found for ${JSON.stringify(bad)}, got ${v.reason}`,
+    );
+  }
+});
+
+test("pins", "fabricated pin mints blocking debt instead of committing clean", () => {
+  const db = freshDb();
+  const r = commitBelief(db, {
+    text: "Compound X is safe at 400mg daily.",
+    type: "belief",
+    path: "deep_lite",
+    stakes: "consequential",
+    authorFamily: "test",
+    sources: [
+      { kind: "vault_page", refId: "vdoc_fabricated", snapshotHash: "aaaa" },
+    ],
+  });
+  const debts = count(
+    db,
+    `SELECT count(*) AS c FROM citation_debt WHERE blocking = 1 AND status = 'pending'`,
+  );
+  assert(debts > 0, "a fabricated pin must mint blocking debt");
+  assert(
+    !r.ok || (r.rejectedSources?.length ?? 0) > 0,
+    "the fabricated source must be reported as rejected",
+  );
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief_source`) === 0,
+    "an unverified source must never be written as support",
+  );
+});
+
+test("pins", "a verified pin commits clean, with support written and no debt", () => {
+  // The complement of the test above: without this, a gate that rejected every
+  // source would pass the whole suite — nothing else asserts that support
+  // actually survives verification, only that commits still return ok.
+  const db = freshDb();
+  const r = commitBelief(db, {
+    text: "Compound X is safe at 400mg daily.",
+    type: "belief",
+    path: "deep_lite",
+    stakes: "consequential",
+    authorFamily: "test",
+    sources: [seedPinnedDoc(db, "Compound X: 400mg daily is within tolerance.")],
+  });
+  assert(r.ok, `verified pin must commit: ${JSON.stringify(r)}`);
+  assert(
+    (r.rejectedSources?.length ?? 0) === 0,
+    `nothing should be rejected: ${JSON.stringify(r.rejectedSources)}`,
+  );
+  assert(
+    count(db, `SELECT count(*) AS c FROM citation_debt WHERE blocking = 1`) === 0,
+    "a verified pin must not mint blocking debt",
+  );
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief_source`) === 1,
+    "the verified source must be written as support",
+  );
+});
+
+test("pins", "a source with no pin rejects and leaves no open transaction", () => {
+  // Verification runs inside the gate transaction (FM-6), so this early
+  // rejection now returns from inside it. Forgetting the ROLLBACK would leave
+  // the connection mid-transaction and every later BEGIN IMMEDIATE would throw
+  // — a rejection that poisons the process. The second commit is the assertion
+  // that matters; the first only sets it up.
+  const db = freshDb();
+  const r = commitBelief(db, {
+    type: "belief",
+    text: "unpinned claim",
+    sources: [{ kind: "vault_page", refId: "vdoc_x", snapshotHash: "" }],
+    authorFamily: "test",
+    path: "deep",
+  });
+  assert(!r.ok && r.status === "REJECTED", `expected REJECTED, got ${JSON.stringify(r)}`);
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief`) === 0,
+    "no belief row from a rejected commit",
+  );
+  const next = commitBelief(db, {
+    type: "observation",
+    text: "the connection still works",
+    sources: [seedPinnedDoc(db, "still works", "notes/after-reject.md")],
+    authorFamily: "test",
+    path: "fast",
+  });
+  assert(next.ok, `transaction was left open: ${JSON.stringify(next)}`);
+});
+
+test("pins", "one bad pin among good ones is dropped, not silently trusted", () => {
+  // Mixed citation lists are the realistic case: a model cites three things and
+  // one is confabulated. The claim keeps the support that verifies, the bad pin
+  // never becomes a belief_source row, and the caller is told which one failed.
+  const db = freshDb();
+  const good = seedPinnedDoc(db, "the sky is blue", "notes/sky.md");
+  const drifted = seedPinnedDoc(db, "original body", "notes/drift.md");
+  db.prepare(`UPDATE vector_document SET body = ? WHERE id = ?`).run(
+    "edited body",
+    drifted.refId,
+  );
+  const r = commitBelief(db, {
+    text: "Two things are known about the sky.",
+    type: "belief",
+    path: "deep",
+    authorFamily: "test",
+    sources: [
+      good,
+      drifted,
+      { kind: "x_tweet", refId: "vdoc_unregistered", snapshotHash: "bbbb" },
+    ],
+  });
+  assert(r.ok, `commit should proceed on surviving support: ${JSON.stringify(r)}`);
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief_source`) === 1,
+    "only the verifying source may be written as support",
+  );
+  const reasons = (r.rejectedSources ?? []).map((x) => x.reason).sort();
+  assert(
+    reasons.join(",") === "hash_mismatch,kind_unregistered",
+    `expected both failures reported, got ${JSON.stringify(r.rejectedSources)}`,
+  );
+  assert(
+    count(db, `SELECT count(*) AS c FROM citation_debt WHERE blocking = 1`) === 0,
+    "surviving support means no blocking debt",
+  );
+});
+
+test("pins", "a belief-kind source naming no belief row buys nothing", () => {
+  // The fabricated-pin bypass one field value away: `kind: "belief"` used to
+  // skip verification *and* existence, so an invented id committed a
+  // consequential claim clean with zero debt and a support row to show for it.
+  // A pin with no formula is still not a pin with no check.
+  const db = freshDb();
+  const text = "Compound Y is safe because an earlier finding said so.";
+  const r = commitBelief(db, {
+    text,
+    type: "belief",
+    path: "deep",
+    stakes: "consequential",
+    authorFamily: "test",
+    sources: [
+      { kind: "belief", refId: "blf_totally_made_up", snapshotHash: "zzzz" },
+    ],
+  });
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief_source`) === 0,
+    "a belief edge to a nonexistent belief must never be written as support",
+  );
+  assert(
+    count(
+      db,
+      `SELECT count(*) AS c FROM citation_debt
+       WHERE claim_hash = ? AND blocking = 1 AND status = 'pending'`,
+      claimHash("belief", text),
+    ) === 1,
+    "an unverified belief source must not suppress citation debt",
+  );
+  const reasons = (r.rejectedSources ?? []).map((x) => x.reason);
+  assert(
+    reasons.join(",") === "belief_not_found",
+    `fabricated belief source needs its own reason, got ${JSON.stringify(r.rejectedSources)}`,
+  );
+});
+
+test("pins", "a real belief cited as a source still counts as support", () => {
+  // The complement, and the thing the existence check must not break: legitimate
+  // belief-chaining. Without this, dropping every belief-kind source would pass
+  // the test above and quietly sever every internal edge in the graph.
+  const db = freshDb();
+  const parentText = "Compound X is safe at 400mg daily.";
+  const parent = commitBelief(db, {
+    text: parentText,
+    type: "belief",
+    path: "deep",
+    authorFamily: "test",
+    sources: [seedPinnedDoc(db, "Compound X: 400mg daily is within tolerance.")],
+  });
+  assert(parent.ok, `parent belief must commit: ${JSON.stringify(parent)}`);
+
+  const text = "Compound X can be recommended at the studied dose.";
+  const r = commitBelief(db, {
+    text,
+    type: "belief",
+    path: "deep",
+    stakes: "consequential",
+    authorFamily: "test",
+    sources: [
+      {
+        kind: "belief",
+        refId: parent.beliefId,
+        snapshotHash: claimHash("belief", parentText),
+      },
+    ],
+  });
+  assert(r.ok, `a real belief edge must commit: ${JSON.stringify(r)}`);
+  assert(
+    (r.rejectedSources?.length ?? 0) === 0,
+    `nothing should be rejected: ${JSON.stringify(r.rejectedSources)}`,
+  );
+  assert(
+    count(
+      db,
+      `SELECT count(*) AS c FROM belief_source WHERE kind = 'belief' AND ref_id = ?`,
+      parent.beliefId,
+    ) === 1,
+    "the belief edge must be written as support",
+  );
+  assert(
+    count(db, `SELECT count(*) AS c FROM citation_debt WHERE blocking = 1`) === 0,
+    "a real belief source must suppress citation debt exactly as before",
+  );
+});
+
+test("pins", "a pinless source keeps earlier rejections and leaves a gate event", () => {
+  // The pinless path is a refusal like the FM-5 one beside it, and must report
+  // like one: returning bare threw away every rejection the loop had already
+  // accumulated — so a caller could not tell a confabulated citation from one
+  // never offered — and left no audit row for a refusal that dropped evidence.
+  const db = freshDb();
+  const r = commitBelief(db, {
+    text: "A claim citing one confabulation and one unpinned source.",
+    type: "belief",
+    path: "deep",
+    authorFamily: "test",
+    sources: [
+      { kind: "vault_page", refId: "vdoc_fabricated", snapshotHash: "aaaa" },
+      { kind: "vault_page", refId: "vdoc_unpinned", snapshotHash: "" },
+    ],
+  });
+  assert(!r.ok && r.status === "REJECTED", `expected REJECTED, got ${JSON.stringify(r)}`);
+  const reasons = (r.rejectedSources ?? []).map((x) => x.reason);
+  assert(
+    reasons.join(",") === "not_found",
+    `rejections before the pinless source must survive, got ${JSON.stringify(
+      r.rejectedSources,
+    )}`,
+  );
+  assert(
+    count(
+      db,
+      `SELECT count(*) AS c FROM gate_event
+       WHERE gate = 'commit' AND action = 'blocked'
+         AND detail_json LIKE '%source_missing_pin%'`,
+    ) === 1,
+    "the pinless refusal must leave an audit row",
+  );
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief`) === 0,
+    "no belief row from a rejected commit",
+  );
+});
+
+test("pins", "contract preserves source provenance", () => {
+  // ContractSource used to omit `provenance`, so every belief_source row
+  // routed through enforceClaimContract landed with provenance = NULL —
+  // silently discarding which retriever produced the evidence.
+  const db = freshDb();
+  const src = seedPinnedDoc(db, "retrieved via vector search");
+  enforceClaimContract(
+    db,
+    { kind: "assertion", text: "The retrieved passage is authoritative here." },
+    { sources: [{ ...src, provenance: "vector" }] },
+  );
+  const n = count(
+    db,
+    `SELECT count(*) AS c FROM belief_source WHERE provenance = 'vector'`,
+  );
+  assert(n > 0, "provenance must survive the contract layer");
+});
+
+test(
+  "pins",
+  "enforceReplyContract forwards provenance through to the contract layer",
+  () => {
+    // enforceReplyContract does not map ContractSource itself — it forwards
+    // opts straight into enforceClaimContract per claim. That passthrough is
+    // the path every channel runner (slack/discord/cli/server/gateway) and
+    // Task 6's vector-search wiring actually call, so prove it carries
+    // provenance end to end rather than trusting the single-claim call above.
+    const db = freshDb();
+    const src = seedPinnedDoc(db, "retrieved via vector search, reply path");
+    enforceReplyContract(db, "The retrieved passage is authoritative here.", {
+      sources: [{ ...src, provenance: "vector" }],
+    });
+    const n = count(
+      db,
+      `SELECT count(*) AS c FROM belief_source WHERE provenance = 'vector'`,
+    );
+    assert(
+      n > 0,
+      "provenance must survive the enforceReplyContract passthrough",
+    );
+  },
+);
+
+// ─── INGEST (src/ingest.ts) ──────────────────────────────────────────────────
+
+test("pins", "ingestDirectory loads markdown and is idempotent", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-"));
+  writeFileSync(join(dir, "a.md"), "---\ntitle: Alpha\n---\nalpha body\n");
+  writeFileSync(join(dir, "b.md"), "beta body\n");
+  writeFileSync(join(dir, "ignore.txt"), "not markdown\n");
+
+  const first = ingestDirectory(db, dir);
+  assert(first.ingested === 2, `expected 2 ingested, got ${first.ingested}`);
+
+  const second = ingestDirectory(db, dir);
+  const rows = count(db, `SELECT count(*) AS c FROM vector_document`);
+  assert(rows === 2, `re-ingest must update in place, got ${rows} rows`);
+  assert(second.ingested === 2, "re-ingest still reports the files it processed");
+});
+
+test("pins", "ingestDirectory honours exclude patterns", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-ex-"));
+  mkdirSync(join(dir, "private"));
+  writeFileSync(join(dir, "keep.md"), "keep me\n");
+  writeFileSync(join(dir, "private", "secret.md"), "secret\n");
+
+  const r = ingestDirectory(db, dir, { exclude: ["private"] });
+  assert(r.ingested === 1, `expected 1 ingested, got ${r.ingested}`);
+});
+
+test(
+  "pins",
+  "ingestDirectory re-ingest updates the same document id rather than minting a new one",
+  () => {
+    // The count staying stable (checked above) does not by itself prove the
+    // SAME row was updated — deleting and re-inserting fresh rows on every
+    // re-ingest would also keep the count stable. Document ids are what
+    // citations pin against downstream, so a re-ingest that silently rotates
+    // ids would break every citation minted against the previous id.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-stableid-"));
+    writeFileSync(join(dir, "a.md"), "version one\n");
+
+    const first = ingestDirectory(db, dir);
+    writeFileSync(join(dir, "a.md"), "version two, edited\n");
+    const second = ingestDirectory(db, dir);
+
+    assert(
+      first.documentIds.length === 1 && second.documentIds.length === 1,
+      `expected exactly one document id each pass, got ${JSON.stringify(first.documentIds)} / ${JSON.stringify(second.documentIds)}`,
+    );
+    assert(
+      first.documentIds[0] === second.documentIds[0],
+      `re-ingest must keep the same document id, got ${first.documentIds[0]} then ${second.documentIds[0]}`,
+    );
+    const row = db
+      .prepare(`SELECT body FROM vector_document WHERE id = ?`)
+      .get(second.documentIds[0]) as { body: string };
+    assert(
+      row.body === "version two, edited\n",
+      `expected the row to hold the re-ingested body, got ${JSON.stringify(row.body)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "ingestDirectory exclude prunes a nested directory at any depth",
+  () => {
+    // The brief's own exclude test only places "private" directly under the
+    // ingest root. A shallow implementation (matching only root-level
+    // entries) would pass that test while failing to protect a deny-listed
+    // folder nested a few levels down, which is the realistic vault shape.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-nested-"));
+    mkdirSync(join(dir, "a", "b", "private"), { recursive: true });
+    writeFileSync(join(dir, "keep.md"), "keep me\n");
+    writeFileSync(join(dir, "a", "b", "private", "secret.md"), "secret\n");
+
+    const r = ingestDirectory(db, dir, { exclude: ["private"] });
+    assert(r.ingested === 1, `expected 1 ingested, got ${r.ingested}`);
+    assert(
+      count(
+        db,
+        `SELECT count(*) AS c FROM vector_document WHERE source_ref = 'keep.md'`,
+      ) === 1,
+      "the surviving document must be keep.md, not something under a/b/private",
+    );
+  },
+);
+
+test(
+  "pins",
+  "ingestDirectory exclude does not match a name that is only a substring of a longer directory name",
+  () => {
+    // A directory literally named "private-notes" must survive an
+    // `exclude: ["private"]` — the match is a whole path segment, not
+    // `dirname.includes("private")`. An over-broad substring match would
+    // silently drop unrelated, non-deny-listed content.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-substr-"));
+    mkdirSync(join(dir, "private-notes"));
+    writeFileSync(join(dir, "private-notes", "keep.md"), "not actually private\n");
+
+    // `requireExcludeMatch: false` only disables the separate "a pattern that
+    // pruned nothing aborts the run" guard, which would otherwise fire here
+    // *because* the substring correctly failed to match. The segment-equality
+    // assertion below is unchanged.
+    const r = ingestDirectory(db, dir, {
+      exclude: ["private"],
+      requireExcludeMatch: false,
+    });
+    assert(
+      r.ingested === 1,
+      `"private-notes" must not be excluded by an exact "private" pattern, got ${r.ingested}`,
+    );
+
+    // And with the guard at its default, the same non-matching pattern is a
+    // hard failure rather than a silent no-op.
+    const guarded = ingestDirectory(freshDb(), dir, { exclude: ["private"] });
+    assert(
+      guarded.aborted && guarded.ingested === 0,
+      `a pattern that matches nothing must abort the run, got ${JSON.stringify(guarded)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "ingestDirectory does not veto the ingest root itself for matching an exclude pattern",
+  () => {
+    // exclude prunes subdirectories discovered while walking; it is not a
+    // second check on the path the caller explicitly pointed ingestion at.
+    // A root whose own basename happens to equal an exclude pattern (e.g.
+    // ingesting a directory literally named "private") must still ingest
+    // its own direct contents.
+    const db = freshDb();
+    const parent = mkdtempSync(join(tmpdir(), "chamber-ingest-root-"));
+    const root = join(parent, "private");
+    mkdirSync(root);
+    writeFileSync(join(root, "keep.md"), "keep me\n");
+
+    // `requireExcludeMatch: false` only disables the separate "a pattern that
+    // pruned nothing aborts the run" guard, which fires here *because* the
+    // root itself is correctly not vetoed and nothing under it matches. The
+    // root-is-not-vetoed assertion below is unchanged.
+    const r = ingestDirectory(db, root, {
+      exclude: ["private"],
+      requireExcludeMatch: false,
+    });
+    assert(
+      r.ingested === 1,
+      `a root named "private" must still ingest its own contents, got ${r.ingested}`,
+    );
+
+    // With the guard at its default, pointing ingest at a folder while also
+    // excluding that name is a contradiction worth failing on rather than
+    // resolving silently in either direction.
+    const guarded = ingestDirectory(freshDb(), root, { exclude: ["private"] });
+    assert(
+      guarded.aborted && guarded.ingested === 0,
+      `the unmatched-pattern guard must still fire here, got ${JSON.stringify(guarded)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "splitFrontmatter: a frontmatter-only file yields an empty body, not a crash",
+  () => {
+    const { title, body } = splitFrontmatter("---\ntitle: Alpha\n---\n");
+    assert(title === "Alpha", `title: ${JSON.stringify(title)}`);
+    assert(body.trim() === "", `expected empty body, got ${JSON.stringify(body)}`);
+  },
+);
+
+test(
+  "pins",
+  "ingestDirectory skips a frontmatter-only file as empty body instead of storing a blank document",
+  () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-fmonly-"));
+    writeFileSync(join(dir, "empty.md"), "---\ntitle: Alpha\n---\n");
+    writeFileSync(join(dir, "real.md"), "has a body\n");
+
+    const r = ingestDirectory(db, dir);
+    assert(r.ingested === 1, `expected 1 ingested, got ${r.ingested}`);
+    assert(
+      r.skipped.some((s) => s.path === "empty.md" && s.reason === "empty body"),
+      `expected empty.md to be skipped as empty body, got ${JSON.stringify(r.skipped)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "splitFrontmatter: a horizontal rule in the body of a frontmatter-less file passes through untouched",
+  () => {
+    const raw = "Some intro text.\n\n---\n\nMore text after a horizontal rule.\n";
+    const { title, body } = splitFrontmatter(raw);
+    assert(title === undefined, `expected no title, got ${JSON.stringify(title)}`);
+    assert(
+      body === raw,
+      "a file with no leading frontmatter marker must pass through unchanged",
+    );
+  },
+);
+
+test(
+  "pins",
+  "splitFrontmatter: a title containing a colon is captured in full",
+  () => {
+    const plain = splitFrontmatter(
+      "---\ntitle: Something: A Subtitle\n---\nbody text\n",
+    );
+    assert(
+      plain.title === "Something: A Subtitle",
+      `title: ${JSON.stringify(plain.title)}`,
+    );
+    assert(plain.body === "body text\n", `body: ${JSON.stringify(plain.body)}`);
+
+    const quoted = splitFrontmatter(
+      '---\ntitle: "Something: A Subtitle"\n---\nbody text\n',
+    );
+    assert(
+      quoted.title === "Something: A Subtitle",
+      `quoted title: ${JSON.stringify(quoted.title)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "splitFrontmatter: a leading horizontal rule that is not frontmatter does not swallow the real opening paragraph",
+  () => {
+    // A document that opens with a `---` divider (its first line is not
+    // `key: value`) and later uses `---` again as an ordinary section break
+    // must not have everything between the two treated as frontmatter and
+    // dropped. Real frontmatter's first line is always `key: value`; this
+    // document's is an ordinary sentence, so the whole thing must come back
+    // as body, exactly as if there had been no leading `---` at all.
+    const raw =
+      "---\n\nThis is the real opening paragraph, not frontmatter.\n\n---\n\nThis paragraph must not be silently dropped.\n";
+    const { title, body } = splitFrontmatter(raw);
+    assert(
+      title === undefined,
+      `expected no title extracted, got ${JSON.stringify(title)}`,
+    );
+    assert(
+      body.includes("This is the real opening paragraph"),
+      `a leading horizontal rule must not be misparsed as frontmatter and eat real content: ${JSON.stringify(body)}`,
+    );
+    assert(
+      body.includes("must not be silently dropped"),
+      `expected the rest of the document to survive too: ${JSON.stringify(body)}`,
+    );
+  },
+);
+
+// ─── INGEST: --exclude is a privacy control, not a filter ────────────────────
+//
+// `chamber ingest` is pointed at a personal vault holding folders that are
+// deny-listed precisely because they must never be bulk-read, and `--exclude`
+// is the only thing between the command and those folders. Every test below
+// pins a way the control used to leak at exit 0 with no diagnostic.
+
+/** Fixture root with a deny-listed folder and one ordinary note. */
+function excludeFixture(tag: string): string {
+  const dir = mkdtempSync(join(tmpdir(), `chamber-ingest-${tag}-`));
+  mkdirSync(join(dir, "Private"));
+  writeFileSync(join(dir, "keep.md"), "keep me\n");
+  writeFileSync(join(dir, "Private", "secret.md"), "deny-listed content\n");
+  return dir;
+}
+
+function ingestedRefs(db: DatabaseSync): string[] {
+  return (
+    db
+      .prepare(`SELECT source_ref FROM vector_document ORDER BY source_ref`)
+      .all() as { source_ref: string }[]
+  ).map((r) => r.source_ref);
+}
+
+test(
+  "pins",
+  "C1: a flag value can never be mistaken for the positional ingest path",
+  () => {
+    // `chamber ingest --exclude Private fakevault` used to pick `Private` as
+    // the target — the first argument not starting with `--` — and ingest the
+    // very folder it was told to exclude: "ingested 1 file(s) from Private",
+    // exit 0. Flags and their values must be consumed together.
+    const parsed = parseIngestArgs(["--exclude", "Private", "fakevault"]);
+    assert(parsed.ok, `expected a parse, got ${JSON.stringify(parsed)}`);
+    assert(
+      parsed.path === "fakevault",
+      `the positional path must be "fakevault", got ${JSON.stringify(parsed.path)}`,
+    );
+    assert(
+      parsed.exclude.length === 1 && parsed.exclude[0] === "Private",
+      `"Private" must be consumed as the --exclude value, got ${JSON.stringify(parsed.exclude)}`,
+    );
+
+    // …and the parse actually protects the folder end to end.
+    const db = freshDb();
+    const dir = excludeFixture("c1");
+    const r = ingestDirectory(db, dir, { exclude: parsed.exclude });
+    assert(r.ingested === 1, `expected only keep.md, got ${r.ingested}`);
+    assert(
+      !ingestedRefs(db).some((ref) => ref.startsWith("Private/")),
+      `deny-listed content reached the corpus: ${JSON.stringify(ingestedRefs(db))}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "C2: exclude forms that used to be silently inert all prune the folder",
+  () => {
+    // Each of these ingested the folder it named, exit 0, no warning:
+    // the GNU equals form, a shell-completed trailing slash, a shell-completed
+    // "./" prefix, an absolute path, and a case mismatch against a folder on a
+    // case-insensitive filesystem.
+    const cases: { label: string; pattern: (dir: string) => string }[] = [
+      { label: "trailing slash", pattern: () => "Private/" },
+      { label: "./ prefix", pattern: () => "./Private" },
+      { label: "absolute path", pattern: (dir) => join(dir, "Private") },
+      { label: "case mismatch", pattern: () => "private" },
+      { label: "multi-segment path", pattern: () => "./Private/" },
+    ];
+    for (const c of cases) {
+      const db = freshDb();
+      const dir = excludeFixture("c2");
+      const r = ingestDirectory(db, dir, { exclude: [c.pattern(dir)] });
+      assert(
+        !r.aborted && r.ingested === 1,
+        `${c.label}: expected 1 ingested, got ${JSON.stringify({ aborted: r.aborted, ingested: r.ingested, reason: r.abortReason })}`,
+      );
+      assert(
+        !ingestedRefs(db).some((ref) => ref.startsWith("Private/")),
+        `${c.label}: deny-listed content reached the corpus: ${JSON.stringify(ingestedRefs(db))}`,
+      );
+      assert(
+        r.excludes[0]?.matched === 1,
+        `${c.label}: the pattern must be recorded as having pruned something, got ${JSON.stringify(r.excludes)}`,
+      );
+    }
+
+    // The GNU equals form and a dangling --exclude are parser-level.
+    const eq = parseIngestArgs(["vault", "--exclude=Private"]);
+    assert(
+      eq.ok && eq.exclude[0] === "Private" && eq.path === "vault",
+      `--exclude=Private must parse, got ${JSON.stringify(eq)}`,
+    );
+    const dangling = parseIngestArgs(["vault", "--exclude"]);
+    assert(
+      !dangling.ok,
+      `a dangling --exclude must be rejected, got ${JSON.stringify(dangling)}`,
+    );
+    const emptyEq = parseIngestArgs(["vault", "--exclude="]);
+    assert(
+      !emptyEq.ok,
+      `--exclude= with no value must be rejected, got ${JSON.stringify(emptyEq)}`,
+    );
+
+    // An unquoted multi-word folder name silently became the pattern "06".
+    const unquoted = parseIngestArgs(["--exclude", "06", "-", "Private", "vault"]);
+    assert(
+      !unquoted.ok,
+      `an unquoted multi-word pattern must be rejected, not truncated to "06": ${JSON.stringify(unquoted)}`,
+    );
+    const quoted = parseIngestArgs(["--exclude", "06 - Private", "vault"]);
+    assert(
+      quoted.ok && quoted.exclude[0] === "06 - Private" && quoted.path === "vault",
+      `a quoted multi-word pattern must survive intact, got ${JSON.stringify(quoted)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "C2: a multi-segment exclude path prunes exactly that path, not every same-named folder",
+  () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-segpath-"));
+    mkdirSync(join(dir, "a", "Private"), { recursive: true });
+    mkdirSync(join(dir, "b", "Private"), { recursive: true });
+    writeFileSync(join(dir, "a", "Private", "x.md"), "a secret\n");
+    writeFileSync(join(dir, "b", "Private", "y.md"), "b secret\n");
+
+    const r = ingestDirectory(db, dir, { exclude: ["a/Private"] });
+    assert(!r.aborted, `expected the run to proceed, got ${r.abortReason}`);
+    const refs = ingestedRefs(db);
+    assert(
+      refs.length === 1 && refs[0] === "b/Private/y.md",
+      `"a/Private" must prune only a/Private, got ${JSON.stringify(refs)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "C2: an exclude pattern that matched nothing fails the run and stores nothing",
+  () => {
+    // The single highest-value safeguard: a pattern matching nothing is far
+    // more likely a typo or a quoting mistake than a deliberate no-op, and it
+    // catches every inert-pattern shape at once. It must be a hard failure
+    // before anything is written, not a warning buried in output.
+    const db = freshDb();
+    const dir = excludeFixture("c2-nomatch");
+    const r = ingestDirectory(db, dir, { exclude: ["Privte"] });
+    assert(r.aborted, `a typo'd pattern must abort the run: ${JSON.stringify(r)}`);
+    assert(
+      r.ingested === 0 && countDocuments(db) === 0,
+      `nothing may be stored when an exclude did not match: ${countDocuments(db)} row(s)`,
+    );
+    assert(
+      r.unmatchedExcludes.includes("Privte"),
+      `the offending pattern must be named, got ${JSON.stringify(r.unmatchedExcludes)}`,
+    );
+
+    // An absolute pattern pointing outside the root can never match, so it is
+    // rejected up front rather than silently ingesting everything.
+    const outside = ingestDirectory(freshDb(), dir, { exclude: [tmpdir()] });
+    assert(
+      outside.aborted && outside.ingested === 0,
+      `an absolute pattern outside the root must abort, got ${JSON.stringify(outside)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "I3: a symlink pointing outside the ingest root cannot smuggle content in",
+  () => {
+    // The deny-listed folder's real name never appears as a walked entry, so
+    // --exclude is structurally unable to stop this. Symlinks are resolved and
+    // required to be contained under the resolved root.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-symout-"));
+    const outside = mkdtempSync(join(tmpdir(), "chamber-ingest-outside-"));
+    mkdirSync(join(outside, "Private"));
+    writeFileSync(join(outside, "Private", "leak.md"), "content outside the root\n");
+    writeFileSync(join(dir, "keep.md"), "keep me\n");
+    symlinkSync(outside, join(dir, "linked"));
+
+    const r = ingestDirectory(db, dir);
+    assert(r.ingested === 1, `only keep.md may be ingested, got ${r.ingested}`);
+    assert(
+      !ingestedRefs(db).some((ref) => ref.includes("linked")),
+      `content outside the root was ingested: ${JSON.stringify(ingestedRefs(db))}`,
+    );
+    assert(
+      r.skipped.some((s) => s.kind === "symlink_escape" && s.path === "linked"),
+      `the escaping symlink must be reported, got ${JSON.stringify(r.skipped)}`,
+    );
+
+    // A symlink that stays inside the root still works — and is still subject
+    // to --exclude by its *target*, so it cannot launder a deny-listed folder.
+    const db2 = freshDb();
+    const dir2 = excludeFixture("i3-inside");
+    mkdirSync(join(dir2, "shared"));
+    writeFileSync(join(dir2, "shared", "note.md"), "shared note\n");
+    symlinkSync(join(dir2, "shared"), join(dir2, "alias"));
+    symlinkSync(join(dir2, "Private"), join(dir2, "backdoor"));
+
+    const r2 = ingestDirectory(db2, dir2, { exclude: ["Private"] });
+    const refs2 = ingestedRefs(db2);
+    assert(
+      refs2.includes("alias/note.md") || refs2.includes("shared/note.md"),
+      `an in-root symlink must still be followed, got ${JSON.stringify(refs2)}`,
+    );
+    assert(
+      !refs2.some((ref) => ref.startsWith("backdoor/") || ref.startsWith("Private/")),
+      `a symlink to an excluded folder must not launder it: ${JSON.stringify(refs2)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "I4: an unreadable directory, a dangling symlink and a symlink loop are reported, not fatal",
+  () => {
+    // All three used to throw out of ingestDirectory before anything was
+    // ingested and before `skipped` was populated: one dangling link anywhere
+    // in a large vault meant zero progress and no partial report.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-resilient-"));
+    writeFileSync(join(dir, "keep.md"), "keep me\n");
+    symlinkSync(join(dir, "does-not-exist.md"), join(dir, "dangling.md"));
+    symlinkSync(join(dir, "loop-b"), join(dir, "loop-a"));
+    symlinkSync(join(dir, "loop-a"), join(dir, "loop-b"));
+    symlinkSync(dir, join(dir, "self"));
+
+    const locked = join(dir, "locked");
+    mkdirSync(locked);
+    writeFileSync(join(locked, "inner.md"), "unreachable\n");
+    const canTestPermissions = (process.getuid?.() ?? 0) !== 0;
+    if (canTestPermissions) chmodSync(locked, 0o000);
+
+    let r: IngestReport;
+    try {
+      r = ingestDirectory(db, dir);
+    } finally {
+      if (canTestPermissions) chmodSync(locked, 0o755);
+    }
+
+    assert(
+      r.ingested === 1,
+      `the run must make progress past the broken entries, got ${r.ingested}`,
+    );
+    assert(
+      r.skipped.some((s) => s.path === "dangling.md" && s.kind === "unreadable"),
+      `a dangling symlink must land in skipped, got ${JSON.stringify(r.skipped)}`,
+    );
+    assert(
+      r.skipped.some((s) => s.path === "loop-a" && s.kind === "unreadable"),
+      `a symlink loop must land in skipped, got ${JSON.stringify(r.skipped)}`,
+    );
+    assert(
+      r.skipped.some((s) => s.path === "self" && s.kind === "cycle"),
+      `a self-referential directory link must land in skipped, got ${JSON.stringify(r.skipped)}`,
+    );
+    if (canTestPermissions) {
+      assert(
+        r.skipped.some((s) => s.path === "locked" && s.kind === "unreadable"),
+        `an unreadable directory must land in skipped, got ${JSON.stringify(r.skipped)}`,
+      );
+    }
+  },
+);
+
+test(
+  "pins",
+  "I5: markdown that is not literally .md is ingested, and anything skipped is named",
+  () => {
+    // `UPPER.MD`, `long.markdown` and `mdx.mdx` used to vanish with no record
+    // at all — the exact "operator believes everything was ingested" failure.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-ext-"));
+    writeFileSync(join(dir, "plain.md"), "plain\n");
+    writeFileSync(join(dir, "UPPER.MD"), "upper\n");
+    writeFileSync(join(dir, "long.markdown"), "long\n");
+    writeFileSync(join(dir, "mdx.mdx"), "mdx\n");
+    writeFileSync(join(dir, "notes.txt"), "not markdown\n");
+    writeFileSync(join(dir, "image.png"), "binary-ish\n");
+
+    const r = ingestDirectory(db, dir);
+    assert(r.ingested === 4, `expected 4 markdown files, got ${r.ingested}`);
+    const refs = ingestedRefs(db);
+    for (const want of ["plain.md", "UPPER.MD", "long.markdown", "mdx.mdx"]) {
+      assert(refs.includes(want), `${want} must be ingested, got ${JSON.stringify(refs)}`);
+    }
+    for (const want of ["notes.txt", "image.png"]) {
+      assert(
+        r.skipped.some((s) => s.path === want && s.kind === "unsupported_extension"),
+        `${want} must appear in the report rather than vanishing: ${JSON.stringify(r.skipped)}`,
+      );
+    }
+  },
+);
+
+test(
+  "pins",
+  "I6: dot-directories are skipped by default so .trash is not resurrected",
+  () => {
+    // Obsidian's .trash holds notes the user *deleted*; ingesting it puts
+    // deleted content back into a queryable corpus.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-dot-"));
+    mkdirSync(join(dir, ".trash"));
+    mkdirSync(join(dir, ".obsidian"));
+    writeFileSync(join(dir, "keep.md"), "keep me\n");
+    writeFileSync(join(dir, ".trash", "deleted-note.md"), "the user deleted this\n");
+    writeFileSync(join(dir, ".hidden.md"), "hidden note\n");
+
+    const r = ingestDirectory(db, dir);
+    assert(r.ingested === 1, `only keep.md may be ingested by default, got ${r.ingested}`);
+    assert(
+      !ingestedRefs(db).some((ref) => ref.startsWith(".trash")),
+      `deleted notes were resurrected: ${JSON.stringify(ingestedRefs(db))}`,
+    );
+    assert(
+      r.skipped.some((s) => s.path === ".trash" && s.kind === "dotted"),
+      `the dotted skip must be reported, got ${JSON.stringify(r.skipped)}`,
+    );
+
+    // Opt-in flag brings them back.
+    const db2 = freshDb();
+    const r2 = ingestDirectory(db2, dir, { includeDotted: true });
+    assert(
+      r2.ingested === 3,
+      `--include-dotted must ingest dotted entries, got ${r2.ingested}`,
+    );
+    assert(
+      parseIngestArgs(["vault", "--include-dotted"]).ok,
+      "--include-dotted must be an accepted flag",
+    );
+  },
+);
+
+test(
+  "pins",
+  "I7: the same relative path under two roots does not silently overwrite one document",
+  () => {
+    // Keyed on source_ref alone, the first root's document id ended up holding
+    // the second root's body and hash — both runs reporting success — so every
+    // citation pinned to that id then verified against different content.
+    const db = freshDb();
+    const rootA = mkdtempSync(join(tmpdir(), "chamber-ingest-rootA-"));
+    const rootB = mkdtempSync(join(tmpdir(), "chamber-ingest-rootB-"));
+    mkdirSync(join(rootA, "notes"));
+    mkdirSync(join(rootB, "notes"));
+    writeFileSync(join(rootA, "notes", "index.md"), "alpha body\n");
+    writeFileSync(join(rootB, "notes", "index.md"), "beta body\n");
+
+    const a = ingestDirectory(db, rootA);
+    const b = ingestDirectory(db, rootB);
+    assert(
+      a.documentIds[0] !== b.documentIds[0],
+      `two roots must not share one document id: ${a.documentIds[0]}`,
+    );
+    assert(
+      countDocuments(db) === 2,
+      `both documents must survive, got ${countDocuments(db)} row(s)`,
+    );
+    const rowA = db
+      .prepare(`SELECT body FROM vector_document WHERE id = ?`)
+      .get(a.documentIds[0]) as { body: string };
+    assert(
+      rowA.body === "alpha body\n",
+      `the first root's id must still hold the first root's body, got ${JSON.stringify(rowA.body)}`,
+    );
+    assert(
+      b.collisions.some((c) => c.sourceRef === "notes/index.md"),
+      `the collision must be visible in the report, got ${JSON.stringify(b.collisions)}`,
+    );
+
+    // Re-ingesting the first root still updates its own row in place — the
+    // collision handling must not cost idempotence.
+    writeFileSync(join(rootA, "notes", "index.md"), "alpha body, edited\n");
+    const a2 = ingestDirectory(db, rootA);
+    assert(
+      a2.documentIds[0] === a.documentIds[0] && a2.collisions.length === 0,
+      `re-ingesting the same root must reuse its id with no collision, got ${JSON.stringify(a2)}`,
+    );
+    assert(
+      countDocuments(db) === 2,
+      `re-ingest must not add a row, got ${countDocuments(db)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "I8: an opening paragraph whose first line ends in a colon is not swallowed as frontmatter",
+  () => {
+    // A document opening with `---` and a blank line, whose first prose line
+    // ends in a colon (`Note:`, `TODO:`, `Source:`), had that whole paragraph
+    // consumed as frontmatter and dropped. Real YAML frontmatter never opens
+    // with a blank line, so the first line inside the fence — not the first
+    // non-blank one — is what decides.
+    for (const lead of ["Note:", "TODO:", "Source:"]) {
+      const raw = `---\n\n${lead} the opening paragraph.\n\n---\n\nAnd the rest.\n`;
+      const { title, body } = splitFrontmatter(raw);
+      assert(
+        title === undefined,
+        `${lead} expected no title, got ${JSON.stringify(title)}`,
+      );
+      assert(
+        body.includes(`${lead} the opening paragraph.`),
+        `${lead} opening paragraph was swallowed: ${JSON.stringify(body)}`,
+      );
+      assert(body.includes("And the rest."), `${lead} tail lost: ${JSON.stringify(body)}`);
+    }
+
+    // No regression on real frontmatter shapes.
+    const tagsFirst = splitFrontmatter("---\ntags: [a, b]\ntitle: Alpha\n---\nbody\n");
+    assert(
+      tagsFirst.title === "Alpha" && tagsFirst.body === "body\n",
+      `tags-first frontmatter must still parse: ${JSON.stringify(tagsFirst)}`,
+    );
+    const crlf = splitFrontmatter("---\r\ntitle: Alpha\r\n---\r\nbody\r\n");
+    assert(
+      crlf.title === "Alpha" && crlf.body === "body\r\n",
+      `CRLF frontmatter must still parse: ${JSON.stringify(crlf)}`,
+    );
+    const none = splitFrontmatter("Note: just prose, no fence.\n");
+    assert(
+      none.title === undefined && none.body === "Note: just prose, no fence.\n",
+      `a file with no frontmatter must pass through: ${JSON.stringify(none)}`,
+    );
+
+    // And end to end: the paragraph reaches the corpus.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-ingest-colon-"));
+    writeFileSync(
+      join(dir, "note.md"),
+      "---\n\nNote: this paragraph must survive.\n\n---\n\nTail.\n",
+    );
+    const r = ingestDirectory(db, dir);
+    assert(r.ingested === 1, `expected the note to be ingested, got ${r.ingested}`);
+    const row = db
+      .prepare(`SELECT body FROM vector_document WHERE id = ?`)
+      .get(r.documentIds[0]) as { body: string };
+    assert(
+      row.body.includes("this paragraph must survive"),
+      `the stored body lost the opening paragraph: ${JSON.stringify(row.body)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "M9: unknown flags and extra positionals are rejected, not silently accepted",
+  () => {
+    // `--dry-run` was ignored rather than rejected. A silently-ignored flag on
+    // a privacy control is how people believe they are protected when they
+    // are not.
+    for (const bad of [
+      ["vault", "--dry-run"],
+      ["vault", "-x"],
+      ["vault", "--exclude", "Private", "--verbose"],
+      ["vault", "second-vault"],
+      [],
+    ]) {
+      const parsed = parseIngestArgs(bad);
+      assert(
+        !parsed.ok,
+        `${JSON.stringify(bad)} must be rejected, got ${JSON.stringify(parsed)}`,
+      );
+    }
+    const good = parseIngestArgs([
+      "vault",
+      "--exclude",
+      "Private",
+      "--include-dotted",
+      "--allow-unmatched-exclude",
+    ]);
+    assert(
+      good.ok &&
+        good.path === "vault" &&
+        good.includeDotted &&
+        good.allowUnmatchedExclude,
+      `the documented flags must still parse, got ${JSON.stringify(good)}`,
+    );
+  },
+);
+
 test("phase1", "P1_model_always_spends", () => {
   const db = freshDb();
   const r = completeSync(db, {
@@ -978,7 +2445,16 @@ test("phase1", "P1_debt_propose_from_corpus", () => {
     )
     .all(bel.beliefId!) as { id: string }[];
   assert(debts.length >= 1, "expected debt");
-  const prop = proposeDebtPayment(db, debts[0]!.id, { minScore: 0.05 });
+  // `model` is pinned for the same reason seedPinnedDoc pins it: the document
+  // above is embedded with local-hash-v1, and proposeDebtPayment now resolves
+  // "auto" like ingest and ask do — so on a machine with the MiniLM ONNX model
+  // installed an unpinned query would search a 384-d space the fixture never
+  // wrote into and find nothing. A gate test must not change behaviour based
+  // on whether a model file happens to be on disk.
+  const prop = proposeDebtPayment(db, debts[0]!.id, {
+    minScore: 0.05,
+    model: "local-hash-v1",
+  });
   assert(
     prop.status === "proposed_paid" || prop.status === "paid",
     `expected proposal, got ${prop.status} ${prop.reason}`,
@@ -1555,6 +3031,113 @@ test("qm", "Q4_harness_registry", () => {
   assert(getHarness().id === "stub-local" || getHarness("stub-local").id === "stub-local");
 });
 
+test("pins", "getHarness throws on unknown id", () => {
+  let threw = false;
+  try {
+    getHarness("no-such-harness");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "getHarness must throw on an unregistered id, not return the stub");
+});
+
+/**
+ * Guards the runner itself: a rejected async test must be recorded as a
+ * failure. Before the runner awaited `pending`, the assertion below ran
+ * after the summary printed, so a failing async test scored as a pass and
+ * the tally lied. Flip the `true` to `false` to re-prove the runner still
+ * goes red — that is what this test exists to keep true.
+ */
+test("pins", "runner reports async test failures", async () => {
+  await Promise.resolve();
+  assert(true, "async assertion must reach the results tally");
+});
+
+// ─── error chain formatter (src/error_chain.ts) ──────────────────────────────
+// The last-chance handler in src/cli.ts renders thrown values through this and
+// then sets the exit code. If the formatter throws, the exit code is never set
+// and a failed run reports success — so hostile input is part of the contract.
+
+test("pins", "EC1_bare_error", () => {
+  const lines = formatErrorChain(new Error("boom"));
+  assert(lines.length === 1, JSON.stringify(lines));
+  assert(lines[0] === "Error: boom", String(lines[0]));
+});
+
+test("pins", "EC2_nested_cause_chain", () => {
+  const root = new Error("connect ECONNREFUSED 127.0.0.1:443");
+  (root as { code?: string }).code = "ECONNREFUSED";
+  const mid = new Error("socket hang up", { cause: root });
+  const top = new Error("fetch failed", { cause: mid });
+
+  const lines = formatErrorChain(top);
+  assert(lines.length === 3, JSON.stringify(lines));
+  assert(lines[0] === "Error: fetch failed", String(lines[0]));
+  assert(lines[1] === "  caused by: Error: socket hang up", String(lines[1]));
+  assert(
+    lines[2]!.startsWith("    caused by: Error: connect ECONNREFUSED") &&
+      lines[2]!.endsWith("(ECONNREFUSED)"),
+    String(lines[2]),
+  );
+});
+
+test("pins", "EC3_aggregate_error", () => {
+  const agg = new AggregateError(
+    [new Error("ipv6 refused"), new Error("ipv4 refused")],
+    "all addresses failed",
+  );
+  const lines = formatErrorChain(agg);
+  assert(lines.length === 3, JSON.stringify(lines));
+  assert(lines[0]!.includes("all addresses failed"), String(lines[0]));
+  assert(lines[1]!.includes("ipv6 refused"), String(lines[1]));
+  assert(lines[2]!.includes("ipv4 refused"), String(lines[2]));
+});
+
+test("pins", "EC4_plain_object_throw_not_object_Object", () => {
+  // `throw await res.json()` — the whole diagnostic is in the object.
+  const lines = formatErrorChain({ status: 500, error: "upstream unavailable" });
+  assert(lines.length === 1, JSON.stringify(lines));
+  assert(!lines[0]!.includes("[object Object]"), String(lines[0]));
+  assert(
+    lines[0]!.includes("500") && lines[0]!.includes("upstream unavailable"),
+    String(lines[0]),
+  );
+
+  // …and the same object arriving as a non-Error `cause`.
+  const wrapped = formatErrorChain(
+    new Error("request failed", { cause: { status: 502 } }),
+  );
+  assert(wrapped.length === 2, JSON.stringify(wrapped));
+  assert(!wrapped[1]!.includes("[object Object]"), String(wrapped[1]));
+  assert(wrapped[1]!.includes("502"), String(wrapped[1]));
+});
+
+test("pins", "EC5_string_throw", () => {
+  const lines = formatErrorChain("plain string failure");
+  assert(lines.length === 1, JSON.stringify(lines));
+  assert(lines[0] === "plain string failure", String(lines[0]));
+});
+
+test("pins", "EC6_hostile_input_never_throws", () => {
+  // String(Object.create(null)) throws TypeError: Cannot convert object to
+  // primitive value. Escaping the formatter would skip process.exitCode = 1.
+  const nullProto: object = Object.create(null);
+  const lines = formatErrorChain(nullProto);
+  assert(lines.length >= 1, JSON.stringify(lines));
+  assert(!lines[0]!.includes("[object Object]"), String(lines[0]));
+
+  // An Error whose `message` getter throws does the same.
+  const hostile = new Error("placeholder");
+  Object.defineProperty(hostile, "message", {
+    configurable: true,
+    get(): string {
+      throw new Error("hostile message getter");
+    },
+  });
+  const hostileLines = formatErrorChain(hostile);
+  assert(hostileLines.length >= 1, JSON.stringify(hostileLines));
+  assert(hostileLines[0]!.startsWith("Error:"), String(hostileLines[0]));
+});
 
 test("gates", "idempotent_approve_double", () => {
   const db = freshDb();
@@ -1866,7 +3449,1389 @@ test("vector", "V5_minilm_semantic", () => {
   );
 });
 
+// ─── ASK (src/ask.ts — retrieve, number, cite, verify, commit) ───────────────
+//
+// The pipeline exists to make citation forgery structurally impossible: the
+// model is shown passages numbered [1]..[k] and emits only those numbers.
+// Index→document-id and id→snapshot-hash mapping happen locally from the
+// retrieval results, so no model-produced string can reach verifyPin as a
+// refId or a snapshotHash. Every test below injects its own completion
+// function — nothing here may call a live model.
+//
+// `model: "local-hash-v1"` on the extra tests keeps them hermetic and fast:
+// the default embedder spawns Python/MiniLM (~250ms per call) only when the
+// ONNX model happens to be on disk, and a gate test must not change behaviour
+// based on that. The three tests carried over from the task brief deliberately
+// leave the model unset, which exercises the same "auto" resolution that
+// `chamber ingest` uses on both the document and the query side.
+
+test("pins", "runAsk maps cited passage numbers to verified sources", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/decision.md",
+    title: "Decision",
+    body: "We decided to use SQLite for the audit store.",
+  });
+  // The brief's fake answer was "We decided to use SQLite for the audit store.
+  // [1]", which classifyClaims scores as an *observation*: none of
+  // is/are/was/were/will/must/always/never/fact: appears in it. The assertion
+  // filter below therefore found nothing and the test failed against a correct
+  // implementation. Same fact, phrased in the tense the heuristic reads as
+  // load-bearing; the observation wording is covered by the test right below.
+  const fake = async () => "The audit store is SQLite. [1]";
+  const r = await runAsk(db, "what did we decide about the audit store", {
+    complete: fake,
+  });
+  assert(r.modelCalled, "model should have been called");
+  const assertions = r.claims.filter((c) => c.kind === "assertion");
+  assert(assertions.length > 0, "expected at least one assertion claim");
+  assert(
+    assertions[0]!.citedRefs.length === 1,
+    `expected 1 cited ref, got ${assertions[0]!.citedRefs.length}`,
+  );
+  assert(
+    assertions[0]!.rejected.length === 0,
+    `expected no rejected citations, got ${JSON.stringify(assertions[0]!.rejected)}`,
+  );
+  assert(
+    assertions[0]!.citedRefs[0] === r.passages[0]!.documentId,
+    "the cited ref must be the retrieved document's id, not anything the model wrote",
+  );
+  assert(
+    assertions[0]!.status === "ALLOWED",
+    `a verified citation must commit clean, got ${assertions[0]!.status} debts=${JSON.stringify(assertions[0]!.debtIds)}`,
+  );
+});
+
+test("pins", "runAsk credits a cited observation, not only an assertion", async () => {
+  // The brief's original wording for the test above. classifyClaims reads a
+  // past-tense narrative line as an observation, which still commits and still
+  // carries the pin — the citation gate is not assertion-only.
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/decision.md",
+    title: "Decision",
+    body: "We decided to use SQLite for the audit store.",
+    model: "local-hash-v1",
+  });
+  const fake = async () => "We decided to use SQLite for the audit store. [1]";
+  const r = await runAsk(db, "what did we decide about the audit store", {
+    complete: fake,
+    model: "local-hash-v1",
+  });
+  const obs = r.claims.filter((c) => c.kind === "observation");
+  assert(obs.length === 1, `expected one observation, got ${JSON.stringify(r.claims)}`);
+  assert(
+    obs[0]!.citedRefs.length === 1 && obs[0]!.citedRefs[0] === r.passages[0]!.documentId,
+    `observation must carry the retrieved pin, got ${JSON.stringify(obs[0]!.citedRefs)}`,
+  );
+  const src = db
+    .prepare(
+      `SELECT ref_id, provenance FROM belief_source WHERE ref_id = ?`,
+    )
+    .all(r.passages[0]!.documentId) as { ref_id: string; provenance: string | null }[];
+  assert(src.length === 1, `expected one belief_source row, got ${src.length}`);
+  assert(
+    src[0]!.provenance === "vector",
+    `provenance must survive the contract layer, got ${String(src[0]!.provenance)}`,
+  );
+});
+
+test("pins", "runAsk does not call the model on an empty corpus", async () => {
+  const db = freshDb();
+  let called = false;
+  const fake = async () => {
+    called = true;
+    return "should never run";
+  };
+  const r = await runAsk(db, "anything at all", { complete: fake });
+  assert(!called, "the model must not be called with zero retrieved passages");
+  assert(!r.modelCalled, "modelCalled must be false");
+  assert(!!r.note, "a note explaining why must be returned");
+  assert(
+    r.note!.includes("nothing ingested yet"),
+    `an empty corpus must say so, got ${JSON.stringify(r.note)}`,
+  );
+  assert(r.claims.length === 0 && r.passages.length === 0, JSON.stringify(r));
+});
+
+test("pins", "runAsk distinguishes an empty corpus from a corpus with no match", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/cats.md",
+    title: "Cats",
+    body: "zzzz",
+    model: "local-hash-v1",
+  });
+  let called = false;
+  const fake = async () => {
+    called = true;
+    return "should never run";
+  };
+  const r = await runAsk(db, "qqqqqqqqqq", {
+    complete: fake,
+    model: "local-hash-v1",
+  });
+  assert(!called, "still no model call when retrieval comes back empty");
+  assert(
+    r.note === "nothing in the corpus matches this question",
+    `a populated corpus must not claim nothing was ingested, got ${JSON.stringify(r.note)}`,
+  );
+});
+
+test("pins", "runAsk rejects a citation to a passage it never retrieved", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/one.md",
+    title: "One",
+    body: "Only one passage exists in this corpus.",
+  });
+  const fake = async () => "This claim is supported by nothing real. [7]";
+  const r = await runAsk(db, "one passage", { complete: fake });
+  const assertions = r.claims.filter((c) => c.kind === "assertion");
+  assert(assertions.length > 0, "expected an assertion");
+  assert(
+    assertions[0]!.citedRefs.length === 0,
+    "an out-of-range index must not become a source",
+  );
+  assert(
+    assertions[0]!.rejected.some((x) => x.reason === "index_out_of_range"),
+    `the drop must be reported, got ${JSON.stringify(assertions[0]!.rejected)}`,
+  );
+  assert(
+    assertions[0]!.rejected[0]!.refId === "[7]",
+    "an out-of-range citation has no document id — report the index the model wrote",
+  );
+  assert(
+    assertions[0]!.status === "DEBT" && assertions[0]!.debtIds.length === 1,
+    `an unsupported assertion must mint debt, got ${assertions[0]!.status}`,
+  );
+});
+
+test(
+  "pins",
+  "runAsk never lets a model-produced identifier or hash reach the pin gate",
+  async () => {
+    // The forgery routes this pipeline closes, exercised directly: the model
+    // emits a plausible document id and a plausible 64-hex snapshot hash in
+    // its answer. Neither is a passage number, so neither is read; the only
+    // model-derived value that survives into the gate is the integer index,
+    // used solely as a Map key against the retrieval results.
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/decision.md",
+      title: "Decision",
+      body: "We decided to use SQLite for the audit store.",
+      model: "local-hash-v1",
+    });
+    const forgedId = "vdoc_forged_by_the_model";
+    const forgedHash = "a".repeat(64);
+    const fake = async () =>
+      `The audit store is SQLite. [1] refId=${forgedId} snapshotHash=${forgedHash}`;
+    const r = await runAsk(db, "audit store", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    const real = r.passages[0]!.documentId;
+    for (const c of r.claims) {
+      assert(
+        c.citedRefs.every((id) => id === real),
+        `only retrieved ids may be cited, got ${JSON.stringify(c.citedRefs)}`,
+      );
+    }
+    const forgedRows = count(
+      db,
+      `SELECT count(*) AS c FROM belief_source WHERE ref_id = ? OR snapshot_hash = ?`,
+      forgedId,
+      forgedHash,
+    );
+    assert(forgedRows === 0, `a forged pin reached belief_source ${forgedRows} time(s)`);
+    const realRows = count(
+      db,
+      `SELECT count(*) AS c FROM belief_source WHERE ref_id = ?`,
+      real,
+    );
+    assert(realRows >= 1, "the real retrieved pin should still have committed");
+  },
+);
+
+test("pins", "runAsk counts a passage cited twice in one claim once", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/decision.md",
+    title: "Decision",
+    body: "We decided to use SQLite for the audit store.",
+    model: "local-hash-v1",
+  });
+  const fake = async () => "The audit store is SQLite [1], as recorded in [1].";
+  const r = await runAsk(db, "audit store", {
+    complete: fake,
+    model: "local-hash-v1",
+  });
+  const a = r.claims.filter((c) => c.kind === "assertion")[0]!;
+  assert(
+    a.citedRefs.length === 1,
+    `a repeated citation must not double-count, got ${JSON.stringify(a.citedRefs)}`,
+  );
+  const rows = count(
+    db,
+    `SELECT count(*) AS c FROM belief_source WHERE ref_id = ?`,
+    r.passages[0]!.documentId,
+  );
+  assert(rows === 1, `expected one belief_source row, got ${rows}`);
+});
+
+test("pins", "runAsk mints debt for an uncited assertion and refuses it under strict", async () => {
+  const seed = (): DatabaseSync => {
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/decision.md",
+      title: "Decision",
+      body: "We decided to use SQLite for the audit store.",
+      model: "local-hash-v1",
+    });
+    return db;
+  };
+  const fake = async () => "The audit store is a distributed ledger.";
+
+  const lax = seed();
+  const r1 = await runAsk(lax, "audit store", {
+    complete: fake,
+    model: "local-hash-v1",
+  });
+  const a1 = r1.claims.filter((c) => c.kind === "assertion")[0]!;
+  assert(
+    a1.status === "DEBT" && a1.debtIds.length === 1,
+    `expected blocking debt, got ${a1.status} ${JSON.stringify(a1.debtIds)}`,
+  );
+  assert(a1.rejected.length === 0, "nothing was cited, so nothing was rejected");
+
+  const strict = seed();
+  const r2 = await runAsk(strict, "audit store", {
+    complete: fake,
+    strict: true,
+    model: "local-hash-v1",
+  });
+  const a2 = r2.claims.filter((c) => c.kind === "assertion")[0]!;
+  assert(a2.status === "REFUSED", `strict must refuse, got ${a2.status}`);
+  assert(
+    count(strict, `SELECT count(*) AS c FROM belief WHERE epistemic_type = 'belief'`) === 0,
+    "a refused assertion must not have committed a belief row",
+  );
+});
+
+test(
+  "pins",
+  "strict refuses an assertion whose every citation failed verification",
+  () => {
+    // `--strict` was enforced by counting the sources a claim *cited*, never
+    // the ones that survived the gate. A claim citing one drifted vault_page
+    // therefore committed as DEBT under strict — the identical
+    // zero-verified-support state that is correctly REFUSED when nothing is
+    // cited at all, and the state `--strict` exists to prevent. All three
+    // states are pinned here, because the fix must not turn strict into
+    // "refuse anything that cites something".
+    const claim = {
+      kind: "assertion" as const,
+      text: "The audit store is SQLite, chosen for the ledger.",
+    };
+    const seed = (): { db: DatabaseSync; id: string; hash: string } => {
+      const db = freshDb();
+      const doc = upsertDocument(db, {
+        sourceKind: "vault_page",
+        sourceRef: "notes/decision.md",
+        title: "Decision",
+        body: "We decided to use SQLite for the audit store.",
+        model: "local-hash-v1",
+      });
+      const row = db
+        .prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`)
+        .get(doc.id) as { snapshot_hash: string };
+      return { db, id: doc.id, hash: row.snapshot_hash };
+    };
+    /** Rewrite the note under the pin: the citation is now real but stale. */
+    const drift = (s: { db: DatabaseSync; id: string }): void => {
+      s.db
+        .prepare(`UPDATE vector_document SET body = ? WHERE id = ?`)
+        .run("rewritten after the pin was minted", s.id);
+    };
+    const cite = (s: { id: string; hash: string }) => ({
+      kind: "vault_page" as const,
+      refId: s.id,
+      snapshotHash: s.hash,
+      provenance: "vector" as const,
+    });
+
+    // (1) Cited nothing.
+    const a = seed();
+    const r1 = enforceClaimContract(a.db, claim, { strict: true });
+    assert(r1.status === "REFUSED", `strict must refuse an uncited assertion, got ${r1.status}`);
+    assert(
+      count(a.db, `SELECT count(*) AS c FROM belief`) === 0 &&
+        count(a.db, `SELECT count(*) AS c FROM citation_debt`) === 0,
+      "a refusal writes neither a belief nor an IOU",
+    );
+
+    // (2) Cited only what fails verification.
+    const b = seed();
+    drift(b);
+    const r2 = enforceClaimContract(b.db, claim, {
+      strict: true,
+      sources: [cite(b)],
+    });
+    assert(
+      r2.status === "REFUSED",
+      `an assertion whose every citation failed verification must be refused under strict, got ${r2.status} debts=${JSON.stringify(r2.debtIds ?? [])}`,
+    );
+    assert(
+      (r2.rejectedSources ?? []).some((x) => x.reason === "hash_mismatch"),
+      `the refusal must say which citation failed and why, got ${JSON.stringify(r2.rejectedSources)}`,
+    );
+    assert(
+      count(b.db, `SELECT count(*) AS c FROM belief`) === 0,
+      "a refused assertion must not have committed a belief row",
+    );
+    assert(
+      count(b.db, `SELECT count(*) AS c FROM belief_source`) === 0,
+      "a citation that failed verification must never be written as support",
+    );
+    assert(
+      count(b.db, `SELECT count(*) AS c FROM citation_debt`) === 0,
+      "strict refuses instead of minting debt — otherwise the refusal also blocks the claim forever",
+    );
+
+    // (2b) The same state without --strict is unchanged: debt, not refusal.
+    const c = seed();
+    drift(c);
+    const r3 = enforceClaimContract(c.db, claim, { sources: [cite(c)] });
+    assert(
+      r3.status === "DEBT" && (r3.debtIds ?? []).length === 1,
+      `the lax path must still mint debt rather than refuse, got ${r3.status}`,
+    );
+    assert(
+      count(c.db, `SELECT count(*) AS c FROM belief_source`) === 0,
+      "lax or strict, a drifted pin is never support",
+    );
+
+    // (3) Cited something that verifies — strict must let it through.
+    const d = seed();
+    const r4 = enforceClaimContract(d.db, claim, {
+      strict: true,
+      sources: [cite(d)],
+    });
+    assert(
+      r4.status === "ALLOWED",
+      `strict must allow a verified citation, got ${r4.status} ${JSON.stringify(r4.rejectedSources)}`,
+    );
+    assert(
+      count(d.db, `SELECT count(*) AS c FROM belief_source WHERE ref_id = ?`, d.id) === 1,
+      "the surviving pin must be written as support",
+    );
+  },
+);
+
+test("pins", "runAsk records an I-don't-know answer as aporia, not an error", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/decision.md",
+    title: "Decision",
+    body: "We decided to use SQLite for the audit store.",
+    model: "local-hash-v1",
+  });
+  const fake = async () => "I don't know.";
+  const r = await runAsk(db, "audit store", {
+    complete: fake,
+    model: "local-hash-v1",
+  });
+  assert(r.claims.length === 1, JSON.stringify(r.claims));
+  assert(r.claims[0]!.kind === "aporia", `expected aporia, got ${r.claims[0]!.kind}`);
+  assert(r.claims[0]!.status === "APORIA", `expected APORIA, got ${r.claims[0]!.status}`);
+  assert(r.claims[0]!.citedRefs.length === 0, "an aporia cites nothing");
+  assert(
+    count(db, `SELECT count(*) AS c FROM citation_debt WHERE status = 'pending'`) === 0,
+    "an aporia must not mint debt",
+  );
+});
+
+test("pins", "runAsk returns an empty answer coherently", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/decision.md",
+    title: "Decision",
+    body: "We decided to use SQLite for the audit store.",
+    model: "local-hash-v1",
+  });
+  const fake = async () => "   \n\n  ";
+  const r = await runAsk(db, "audit store", {
+    complete: fake,
+    model: "local-hash-v1",
+  });
+  assert(r.modelCalled, "the model did run");
+  assert(r.claims.length === 1 && r.claims[0]!.kind === "chatter", JSON.stringify(r.claims));
+  assert(
+    count(db, `SELECT count(*) AS c FROM belief`) === 0,
+    "an empty answer must commit nothing",
+  );
+});
+
+test(
+  "pins",
+  "runAsk splits an answer per line: bullets, numbering, and a bare citation line",
+  async () => {
+    // classifyClaims is line-based, so this pins down exactly what that means
+    // for model output shapes that show up in practice. A claim spanning two
+    // lines is two claims, and only the line carrying the bracket gets the
+    // pin — the other one is unsupported and mints debt. That is the
+    // fail-closed direction, but it is a real limitation, not a nicety.
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/decision.md",
+      title: "Decision",
+      body: "We decided to use SQLite for the audit store, indexed locally.",
+      model: "local-hash-v1",
+    });
+    const fake = async () =>
+      [
+        "1. The audit store is SQLite. [1]",
+        "- The index is local to the process. [1]",
+        "[1]",
+        "The retriever is in-process,",
+        "and needs no server. [1]",
+      ].join("\n");
+    const r = await runAsk(db, "audit store", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    const doc = r.passages[0]!.documentId;
+    assert(r.claims.length === 5, `expected 5 line-claims, got ${r.claims.length}`);
+
+    // A numbered prefix is NOT stripped (only -, * and • are), but it is
+    // harmless: citedIndices only reads bracketed numbers, so "1." is text.
+    assert(
+      r.claims[0]!.text.startsWith("1. ") && r.claims[0]!.citedRefs[0] === doc,
+      JSON.stringify(r.claims[0]),
+    );
+    // A "-" bullet is stripped before classification.
+    assert(
+      r.claims[1]!.text.startsWith("The index") && r.claims[1]!.citedRefs[0] === doc,
+      JSON.stringify(r.claims[1]),
+    );
+    // A citation alone on its line becomes its own claim and carries the pin.
+    assert(
+      r.claims[2]!.text === "[1]" && r.claims[2]!.citedRefs[0] === doc,
+      JSON.stringify(r.claims[2]),
+    );
+    // A wrapped claim: the first half has no bracket, so it is unsupported.
+    assert(
+      r.claims[3]!.citedRefs.length === 0 && r.claims[3]!.status === "DEBT",
+      `a wrapped claim's uncited half must mint debt, got ${JSON.stringify(r.claims[3])}`,
+    );
+    assert(
+      r.claims[4]!.citedRefs[0] === doc,
+      JSON.stringify(r.claims[4]),
+    );
+  },
+);
+
+test("pins", "citedIndices dedupes, preserves order, and ignores non-citations", () => {
+  assert(JSON.stringify(citedIndices("a [2] b [1] c [2]")) === "[2,1]", "dedupe + order");
+  assert(JSON.stringify(citedIndices("no citations here")) === "[]", "none");
+  assert(JSON.stringify(citedIndices("array[0] and [3]")) === "[0,3]", "bare [0] is read and later rejected as out of range");
+  assert(
+    JSON.stringify(citedIndices("see [1][2][3]")) === "[1,2,3]",
+    "adjacent citations",
+  );
+  assert(
+    JSON.stringify(citedIndices("footnote [1a] and [ 2 ] and [] and [1]")) === "[1]",
+    "only bare bracketed integers count",
+  );
+});
+
+// ─── VERIFY (longitudinal pin drift, src/pins.ts verifyBeliefSources) ────────
+//
+// Within one ask, pin verification is close to tautological: the hash is read
+// off a vector_document row and checked against that same row moments later.
+// The tests below are the ones that actually exercise the point of Task 7 —
+// time passing, the corpus moving, and a stored pin no longer matching. No
+// test in this section may call a live model; every completion is injected.
+
+test(
+  "pins",
+  "verify detects a belief whose source drifted after re-ingest",
+  async () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-drift-"));
+    const file = join(dir, "policy.md");
+    writeFileSync(file, "Retention policy is 90 days.\n");
+    ingestDirectory(db, dir);
+
+    const fake = async () => "Retention policy is 90 days. [1]";
+    const asked = await runAsk(db, "what is the retention policy", {
+      complete: fake,
+    });
+    assert(
+      asked.claims.some((c) => c.citedRefs.length > 0),
+      "setup failed: expected at least one cited claim",
+    );
+
+    const clean = verifyBeliefSources(db);
+    assert(
+      clean.every((b) => b.failures.length === 0),
+      "before editing, every pin should verify",
+    );
+    // `.every` on an empty array is vacuously true, which would make the
+    // assertion above pass even if setup silently committed nothing. Pin the
+    // non-vacuous precondition directly: at least one belief actually carries
+    // the source pin this test is about to invalidate.
+    assert(
+      clean.some((b) => b.total > 0),
+      "setup failed: no belief carries a corpus source to verify",
+    );
+
+    writeFileSync(file, "Retention policy is 30 days.\n");
+    ingestDirectory(db, dir);
+
+    const drifted = verifyBeliefSources(db);
+    const bad = drifted.filter((b) =>
+      b.failures.some((f) => f.reason === "hash_mismatch"),
+    );
+    assert(
+      bad.length > 0,
+      "after editing and re-ingesting, the belief's pin must report hash_mismatch",
+    );
+    // The failure must name the drifted source and point back at the note, not
+    // just flip a boolean — a caller re-running `chamber ingest` needs to know
+    // *which* citation to go re-check.
+    const failure = bad[0]!.failures.find((f) => f.reason === "hash_mismatch")!;
+    assert(
+      failure.sourceRef === "policy.md",
+      `expected the failure to name policy.md, got ${JSON.stringify(failure)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "verify leaves the corpus and the belief ledger untouched — it reports, it does not repair",
+  async () => {
+    // A binding constraint: "chamber verify must not mutate anything — it
+    // reports only." Run it twice across an edit and confirm neither call
+    // changed a single row anywhere verify has read access to.
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-drift-nomutate-"));
+    const file = join(dir, "policy.md");
+    writeFileSync(file, "Retention policy is 90 days.\n");
+    ingestDirectory(db, dir);
+    const fake = async () => "Retention policy is 90 days. [1]";
+    await runAsk(db, "what is the retention policy", { complete: fake });
+
+    writeFileSync(file, "Retention policy is 30 days.\n");
+    ingestDirectory(db, dir);
+
+    const snapshot = (): { beliefs: number; sources: number; docs: number; hashes: string } => {
+      const beliefs = count(db, `SELECT count(*) AS c FROM belief`);
+      const sources = count(db, `SELECT count(*) AS c FROM belief_source`);
+      const docs = count(db, `SELECT count(*) AS c FROM vector_document`);
+      const hashes = (
+        db
+          .prepare(
+            `SELECT snapshot_hash FROM belief_source ORDER BY snapshot_hash`,
+          )
+          .all() as { snapshot_hash: string }[]
+      )
+        .map((r) => r.snapshot_hash)
+        .join(",");
+      return { beliefs, sources, docs, hashes };
+    };
+
+    const before = snapshot();
+    verifyBeliefSources(db);
+    verifyBeliefSources(db);
+    const after = snapshot();
+    assert(
+      JSON.stringify(before) === JSON.stringify(after),
+      `verify must not mutate: before=${JSON.stringify(before)} after=${JSON.stringify(after)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "verify makes a partially-drifted belief legible instead of collapsing it to pass/fail",
+  () => {
+    // Realistic shape: one belief backed by two sources, only one of which
+    // drifted. The report must show 1/2 verified and name exactly the source
+    // that failed, not flatten the belief to a single boolean.
+    const db = freshDb();
+    const good = seedPinnedDoc(db, "the sky is blue", "notes/sky.md");
+    const drifting = seedPinnedDoc(db, "original body", "notes/drift.md");
+
+    const r = commitBelief(db, {
+      text: "Two things are known, from two different notes.",
+      type: "belief",
+      path: "deep",
+      authorFamily: "test",
+      sources: [good, drifting],
+    });
+    assert(r.ok, `setup: commit should succeed: ${JSON.stringify(r)}`);
+
+    // Drift only the second source's underlying document.
+    db.prepare(`UPDATE vector_document SET body = ? WHERE id = ?`).run(
+      "edited body",
+      drifting.refId,
+    );
+
+    const report = verifyBeliefSources(db);
+    const entry = report.find((b) => b.beliefId === r.beliefId);
+    assert(entry, `expected a report entry for ${r.beliefId}`);
+    assert(
+      entry!.total === 2 && entry!.verified === 1,
+      `expected 2 total / 1 verified, got ${JSON.stringify(entry)}`,
+    );
+    assert(
+      entry!.failures.length === 1 && entry!.failures[0]!.refId === drifting.refId,
+      `expected exactly one failure naming the drifted source, got ${JSON.stringify(entry!.failures)}`,
+    );
+    assert(
+      entry!.failures[0]!.reason === "hash_mismatch",
+      `expected hash_mismatch, got ${entry!.failures[0]!.reason}`,
+    );
+
+    // The CLI's exit-code rule (broken := verified === 0) must NOT fire for
+    // this belief: partial support survives, so this is visible-but-not-fatal.
+    // Reproduce that rule directly against the report shape rather than
+    // shelling out, since nothing else in this suite spawns the CLI.
+    const broken = report.filter(
+      (b) => b.failures.length > 0 && b.verified === 0,
+    ).length;
+    assert(
+      broken === 0,
+      "a belief with surviving support must not count toward the broken tally",
+    );
+  },
+);
+
+test(
+  "pins",
+  "verify reports a belief with zero surviving support as broken; a fully-drifted belief zeroes out",
+  () => {
+    const db = freshDb();
+    const drifting = seedPinnedDoc(db, "original body", "notes/only-source.md");
+    const r = commitBelief(db, {
+      text: "One claim, one source, about to drift.",
+      type: "belief",
+      path: "deep",
+      authorFamily: "test",
+      sources: [drifting],
+    });
+    assert(r.ok, `setup: commit should succeed: ${JSON.stringify(r)}`);
+
+    db.prepare(`UPDATE vector_document SET body = ? WHERE id = ?`).run(
+      "edited body",
+      drifting.refId,
+    );
+
+    const report = verifyBeliefSources(db);
+    const entry = report.find((b) => b.beliefId === r.beliefId)!;
+    assert(
+      entry.total === 1 && entry.verified === 0 && entry.failures.length === 1,
+      `expected a fully-zeroed entry, got ${JSON.stringify(entry)}`,
+    );
+    const broken = report.filter(
+      (b) => b.failures.length > 0 && b.verified === 0,
+    ).length;
+    assert(
+      broken >= 1,
+      "a belief with zero surviving support must count toward the broken tally",
+    );
+  },
+);
+
+test(
+  "pins",
+  "verify --since: omitted filters nothing; a malformed date does not throw",
+  () => {
+    const db = freshDb();
+    commitBelief(db, {
+      type: "belief",
+      text: "an old-enough claim for the since filter",
+      path: "deep",
+      authorFamily: "test",
+      sources: [seedPinnedDoc(db, "since filter body", "notes/since.md")],
+    });
+
+    // Omitted `since` (the CLI's default when --since is absent) must not
+    // filter anything out. `(? IS NULL OR b.created_at >= ?)` with a bound
+    // NULL makes the first arm true unconditionally in SQLite's
+    // three-valued logic, regardless of what the second arm would have done.
+    const noOpt = verifyBeliefSources(db);
+    const explicitUndefined = verifyBeliefSources(db, { since: undefined });
+    assert(
+      noOpt.length > 0 && noOpt.length === explicitUndefined.length,
+      `an absent since must not filter: ${noOpt.length} vs ${explicitUndefined.length}`,
+    );
+
+    // verifyBeliefSources itself never validates `since` — SQLite TEXT
+    // comparison never throws on an unparseable value, it just compares
+    // bytes, so a malformed string here can silently under- or over-filter
+    // rather than erroring. (`chamber verify`'s CLI layer now rejects an
+    // unparseable --since before it reaches this function — see the "verify:
+    // --since is not a valid date" guard in src/cli.ts — but this library
+    // function is also callable directly, e.g. by a future scheduled job, so
+    // its own contract must still be pinned: whatever `since` it is given,
+    // it must not throw.)
+    let threw = false;
+    let malformed: ReturnType<typeof verifyBeliefSources> = [];
+    try {
+      malformed = verifyBeliefSources(db, { since: "not-a-real-date" });
+    } catch {
+      threw = true;
+    }
+    assert(!threw, "a malformed --since must not throw inside the report");
+    assert(
+      Array.isArray(malformed),
+      "a malformed --since must still return an array",
+    );
+  },
+);
+
+test(
+  "pins",
+  "verify: a belief citing a belief that still exists counts as verified — a healthy chain reports clean",
+  () => {
+    // Task 7b regression. verifyBeliefSources used to route every stored
+    // source through verifyPin uniformly, and verifyPin only registers a
+    // formula for vault_page. A `belief`-kind source — a belief citing
+    // another belief, committed and tested as a legitimate pattern in "a
+    // real belief cited as a source still counts as support" above — always
+    // came back kind_unregistered from that call, so a chain that had never
+    // drifted at all still reported a failure and made `chamber verify` exit
+    // 1 on perfectly healthy data. Same setup as that commit-time test, one
+    // layer up: this one asks whether the *drift scan*, not the *gate*,
+    // agrees the citation is fine.
+    const db = freshDb();
+    const parentText = "Compound X is safe at 400mg daily.";
+    const parent = commitBelief(db, {
+      text: parentText,
+      type: "belief",
+      path: "deep",
+      authorFamily: "test",
+      sources: [seedPinnedDoc(db, "Compound X: 400mg daily is within tolerance.")],
+    });
+    assert(parent.ok, `setup: parent belief must commit: ${JSON.stringify(parent)}`);
+
+    const childText = "Compound X can be recommended at the studied dose.";
+    const child = commitBelief(db, {
+      text: childText,
+      type: "belief",
+      path: "deep",
+      stakes: "consequential",
+      authorFamily: "test",
+      sources: [
+        {
+          kind: "belief",
+          refId: parent.beliefId,
+          snapshotHash: claimHash("belief", parentText),
+        },
+      ],
+    });
+    assert(child.ok, `setup: child belief must commit: ${JSON.stringify(child)}`);
+    assert(
+      (child.rejectedSources?.length ?? 0) === 0,
+      `setup: the belief-kind citation must be accepted at commit time: ${JSON.stringify(child.rejectedSources)}`,
+    );
+
+    const report = verifyBeliefSources(db);
+    const childEntry = report.find((b) => b.beliefId === child.beliefId);
+    assert(childEntry, `expected a report entry for ${child.beliefId}`);
+    assert(
+      childEntry!.total === 1 && childEntry!.verified === 1,
+      `a belief-kind source whose belief still exists must verify, got ${JSON.stringify(childEntry)}`,
+    );
+    assert(
+      childEntry!.failures.length === 0,
+      `expected no failures on an undrifted belief-kind source, got ${JSON.stringify(childEntry!.failures)}`,
+    );
+
+    // Reproduce the CLI's exit-code rule directly against the report shape,
+    // the same way the partial- and full-drift tests above this one already
+    // do — nothing else in this suite spawns the CLI as a subprocess.
+    // `broken` is exactly what `chamber verify` counts before deciding
+    // process.exitCode; zero here is what "exits 0" means for this belief.
+    const broken = report.filter(
+      (b) => b.failures.length > 0 && b.verified === 0,
+    ).length;
+    assert(
+      broken === 0,
+      `a healthy belief chain must not make chamber verify exit non-zero, got ${broken} broken`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "verify: a belief-kind source naming a belief that no longer exists fails as belief_not_found, not kind_unregistered",
+  () => {
+    // The complement of the test above, and the thing the fix must not
+    // over-correct into: verifyBeliefSources must still catch a genuinely
+    // missing belief row, and must report it under the same distinct reason
+    // commitBelief already uses for this case ("a belief-kind source naming
+    // no belief row buys nothing", above) — not silently accept it, and not
+    // mislabel it kind_unregistered, which would make it indistinguishable
+    // from a source kind that was never checked at all.
+    //
+    // commitBelief refuses to ever *write* a belief-kind source that fails
+    // its own existence check, so the only way a stored belief_source row
+    // can name a belief that does not exist is the ledger moving after the
+    // pin was written — inserted directly here to isolate exactly that
+    // shape, the same way the hash-drift tests above simulate a moved corpus
+    // with a raw UPDATE instead of re-running ingest against a deleted file.
+    const db = freshDb();
+    const citing = commitBelief(db, {
+      text: "An observation, so no citation debt is at stake in this test.",
+      type: "observation",
+      path: "deep",
+      authorFamily: "test",
+      sources: [],
+    });
+    assert(citing.ok, `setup: citing belief must commit: ${JSON.stringify(citing)}`);
+
+    db.prepare(
+      `INSERT INTO belief_source (id, belief_id, kind, ref_id, snapshot_hash, provenance)
+       VALUES (?, ?, 'belief', ?, ?, 'direct')`,
+    ).run(
+      newId("src"),
+      citing.beliefId,
+      "blf_totally_made_up",
+      claimHash("belief", "a belief that was never actually committed"),
+    );
+
+    const report = verifyBeliefSources(db);
+    const entry = report.find((b) => b.beliefId === citing.beliefId);
+    assert(entry, `expected a report entry for ${citing.beliefId}`);
+    assert(
+      entry!.total === 1 && entry!.verified === 0,
+      `expected the dangling belief-kind source to fail verification, got ${JSON.stringify(entry)}`,
+    );
+    assert(
+      entry!.failures.length === 1 &&
+        entry!.failures[0]!.refId === "blf_totally_made_up",
+      `expected exactly one failure naming the missing belief, got ${JSON.stringify(entry!.failures)}`,
+    );
+    assert(
+      entry!.failures[0]!.reason === "belief_not_found",
+      `expected the distinct belief_not_found reason (matching commitBelief's own reason for this case), got ${entry!.failures[0]!.reason}`,
+    );
+
+    // Zero surviving support: this belief must count toward the CLI's broken
+    // tally, i.e. `chamber verify` must exit non-zero for it.
+    const broken = report.filter(
+      (b) => b.failures.length > 0 && b.verified === 0,
+    ).length;
+    assert(
+      broken >= 1,
+      "a belief with only a dangling belief-kind source must count as broken",
+    );
+  },
+);
+
+// ─── MERGE-BLOCKING REGRESSIONS (review of feat/vault-qa-citation-gate) ──────
+//
+// Every runAsk fixture above builds `vault_page` documents, which is precisely
+// why the harness could not see the bug these first two tests cover: `ask`
+// hardcoded `kind: "vault_page"` on every hit, and verifyPin binds source_kind
+// in its lookup, so a row of any other kind resolved to nothing and came back
+// `not_found` — the gate telling an operator that a real, correctly-cited
+// passage was a hallucination, then minting blocking debt on the claim hash
+// that refused the assertion permanently. The corpus rows below are
+// deliberately NOT vault_page.
+
+test(
+  "pins",
+  "runAsk never shows the model a passage whose kind cannot be cited",
+  async () => {
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "note",
+      sourceRef: "currency-note",
+      title: "AED",
+      body: "The user base currency is AED, the UAE dirham.",
+      model: "local-hash-v1",
+    });
+    let called = false;
+    const fake = async () => {
+      called = true;
+      return "The base currency is AED, the UAE dirham. [1]";
+    };
+    const r = await runAsk(db, "What is the base currency?", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+
+    assert(!called, "an uncitable passage must not be paid for");
+    assert(r.passages.length === 0, JSON.stringify(r.passages));
+    assert(
+      count(db, `SELECT count(*) AS c FROM citation_debt`) === 0,
+      "a claim must not be blocked forever over a row the gate itself refuses to pin",
+    );
+    assert(
+      count(db, `SELECT count(*) AS c FROM belief`) === 0,
+      "nothing was answered, so nothing may be committed",
+    );
+    // Silence is the other half of the bug: a user who just indexed this note
+    // must not be told their own document does not exist.
+    assert(
+      r.note !== "nothing in the corpus matches this question",
+      "a matching-but-uncitable passage must not be reported as no match",
+    );
+    assert(
+      r.note!.includes("note") && r.note!.includes("vault_page"),
+      `the note must name the kind and the remedy, got ${JSON.stringify(r.note)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "runAsk pins a citation to the kind the row actually has, and it verifies",
+  async () => {
+    // Same text under two kinds. Before the fix the note could rank first and
+    // be pinned as vault_page — a mislabel that resolved to no row at all.
+    const db = freshDb();
+    const body = "The user base currency is AED, the UAE dirham.";
+    upsertDocument(db, {
+      sourceKind: "note",
+      sourceRef: "currency-note",
+      title: "AED",
+      body,
+      model: "local-hash-v1",
+    });
+    const citable = upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/currency.md",
+      title: "AED",
+      body,
+      model: "local-hash-v1",
+    });
+    assert(countDocuments(db) === 2, "precondition: both rows are in the corpus");
+
+    const fake = async () => "The base currency is AED, the UAE dirham. [1]";
+    const r = await runAsk(db, "What is the base currency?", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    assert(
+      r.passages.length === 1 && r.passages[0]!.documentId === citable.id,
+      `only the citable row may be retrieved, got ${JSON.stringify(r.passages)}`,
+    );
+    const a = r.claims.filter((c) => c.kind === "assertion")[0]!;
+    assert(
+      a.rejected.length === 0,
+      `a correctly-cited retrieved passage must not be rejected, got ${JSON.stringify(a.rejected)}`,
+    );
+    assert(
+      a.status === "ALLOWED" && a.debtIds.length === 0,
+      `expected clean commit, got ${a.status} ${JSON.stringify(a.debtIds)}`,
+    );
+    const rows = db
+      .prepare(`SELECT kind, ref_id FROM belief_source`)
+      .all() as { kind: string; ref_id: string }[];
+    assert(
+      rows.length === 1 &&
+        rows[0]!.kind === "vault_page" &&
+        rows[0]!.ref_id === citable.id,
+      `the stored pin must name the row's real kind and id, got ${JSON.stringify(rows)}`,
+    );
+    // The whole point of the pin: it still resolves on a later scan.
+    const drift = verifyBeliefSources(db);
+    assert(
+      drift.length === 1 && drift[0]!.verified === 1 && drift[0]!.total === 1,
+      `chamber verify must resolve the pin ask wrote, got ${JSON.stringify(drift)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "runAsk reports withheld passages even when it still answers",
+  async () => {
+    // The uncitable-kind note only fired when the *filtered* retrieval came
+    // back completely empty, so in a mixed corpus the exclusion was silent:
+    // `chamber search` showed the note ranking first, `chamber ask` answered
+    // from the weaker vault_page and stamped it ALLOWED, and nothing said the
+    // better-matching passage had been withheld. The answer is not wrong and
+    // the gate is not breached — the citation genuinely verifies — but the
+    // operator could not tell that better evidence had been excluded.
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "note",
+      sourceRef: "currency-note",
+      title: "AED",
+      body: "The user base currency is AED, the UAE dirham.",
+      model: "local-hash-v1",
+    });
+    const citable = upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/policy.md",
+      title: "Currency policy",
+      body: "Our currency policy for the base rate is reviewed annually.",
+      model: "local-hash-v1",
+    });
+    const fake = async () => "The base currency is AED, the UAE dirham. [1]";
+    const r = await runAsk(db, "What is the base currency?", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+
+    // Alongside the answer, not instead of it.
+    assert(r.modelCalled && r.answer.length > 0, "the answer must still happen");
+    assert(
+      r.passages.length === 1 && r.passages[0]!.documentId === citable.id,
+      `only the citable row may reach the model, got ${JSON.stringify(r.passages)}`,
+    );
+    const a = r.claims.filter((c) => c.kind === "assertion")[0]!;
+    assert(
+      a.status === "ALLOWED" && a.citedRefs.length === 1,
+      `the verified citation must still commit, got ${a.status}`,
+    );
+    assert(!!r.note, "a withheld passage must be announced, not swallowed");
+    assert(
+      r.note!.includes("1 matching passage(s) were withheld"),
+      `the note must say how many were withheld, got ${JSON.stringify(r.note)}`,
+    );
+    assert(
+      r.note!.includes("note") && r.note!.includes("vault_page"),
+      `the note must name the kind and the remedy, got ${JSON.stringify(r.note)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "runAsk stays silent when nothing was withheld",
+  async () => {
+    // The other half: a notice printed on every answer is a notice nobody
+    // reads. An all-citable corpus must produce no note at all.
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/policy.md",
+      title: "Currency policy",
+      body: "The user base currency is AED, the UAE dirham.",
+      model: "local-hash-v1",
+    });
+    const fake = async () => "The base currency is AED, the UAE dirham. [1]";
+    const r = await runAsk(db, "What is the base currency?", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    assert(r.passages.length === 1, JSON.stringify(r.passages));
+    assert(
+      r.note === undefined,
+      `nothing was withheld, so there is nothing to report, got ${JSON.stringify(r.note)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "pay-debt writes a pin chamber verify can resolve, and reports what it could not pin",
+  () => {
+    // The second writer of belief_source used to bypass verifyPin entirely and
+    // store `ref_id = sourceRef` — so `chamber verify`, which re-checks pins by
+    // document id, reported not_found on a belief whose evidence was healthy.
+    const db = freshDb();
+    const doc = upsertDocument(db, {
+      id: "vdoc_aed_page",
+      sourceKind: "vault_page",
+      sourceRef: "notes/aed.md",
+      title: "Currency",
+      body: "User base currency is AED (UAE dirham).",
+      model: "local-hash-v1",
+    });
+    upsertDocument(db, {
+      id: "vdoc_aed_note",
+      sourceKind: "note",
+      sourceRef: "notes/aed-note.md",
+      title: "Currency",
+      body: "User base currency is AED (UAE dirham).",
+      model: "local-hash-v1",
+    });
+    const bel = commitBelief(db, {
+      type: "belief",
+      text: "User base currency is AED",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    assert(bel.ok, JSON.stringify(bel));
+    const debtId = (
+      db
+        .prepare(`SELECT id FROM citation_debt WHERE belief_id = ?`)
+        .get(bel.beliefId!) as { id: string }
+    ).id;
+
+    const prop = proposeDebtPayment(db, debtId, {
+      minScore: 0.05,
+      model: "local-hash-v1",
+      useCode: false,
+    });
+    assert(
+      prop.status === "proposed_paid",
+      `expected a proposal, got ${prop.status}: ${prop.reason}`,
+    );
+    const rows = db
+      .prepare(`SELECT kind, ref_id FROM belief_source WHERE belief_id = ?`)
+      .all(bel.beliefId!) as { kind: string; ref_id: string }[];
+    assert(
+      rows.length === 1,
+      `only the verifiable hit may be written as support, got ${JSON.stringify(rows)}`,
+    );
+    assert(
+      rows[0]!.ref_id === doc.id,
+      `ref_id must be the document id verifyPin looks up, not a path, got ${rows[0]!.ref_id}`,
+    );
+    assert(rows[0]!.kind === "vault_page", `kind must be the row's own, got ${rows[0]!.kind}`);
+    // The defect's whole signature: verify crying wolf on healthy evidence.
+    const drift = verifyBeliefSources(db);
+    const entry = drift.find((b) => b.beliefId === bel.beliefId)!;
+    assert(
+      entry.total === 1 && entry.verified === 1 && entry.failures.length === 0,
+      `pay-debt's pin must verify, got ${JSON.stringify(entry)}`,
+    );
+    // The drop that used to be written as a bogus pin is now reported.
+    assert(
+      prop.rejected.some(
+        (x) => x.refId === "vdoc_aed_note" && x.reason === "kind_unregistered",
+      ),
+      `the unpinnable hit must be reported, got ${JSON.stringify(prop.rejected)}`,
+    );
+    assert(
+      prop.attached.length === 1 && prop.attached[0] === doc.id,
+      `attached must list what actually landed, got ${JSON.stringify(prop.attached)}`,
+    );
+  },
+);
+
+test("pins", "pay-debt searches the space the corpus was written into", () => {
+  // debt.ts hardcoded `model: "local-hash-v1"` while ingest and ask both
+  // resolve "auto" (→ minilm-l6-v2-q whenever the ONNX model is on disk).
+  // searchVector filters on `e.model = ?`, so every query landed in an empty
+  // space and every debt on a real corpus was unpayable — and debt is the only
+  // route out of a blocked claim, so the exit was a one-way door.
+  //
+  // The first half only *fails* under the old code on a machine where "auto"
+  // resolves to something other than local-hash-v1; that is the honest shape of
+  // this bug, so the second half pins the mechanism directly and holds
+  // everywhere: the model option must be obeyed, not ignored.
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/aed.md",
+    title: "Currency",
+    body: "User base currency is AED (UAE dirham).",
+  });
+  const bel = commitBelief(db, {
+    type: "belief",
+    text: "User base currency is AED",
+    sources: [],
+    authorFamily: "test",
+    path: "deep",
+  });
+  assert(bel.ok, JSON.stringify(bel));
+  const debtId = (
+    db
+      .prepare(`SELECT id FROM citation_debt WHERE belief_id = ?`)
+      .get(bel.beliefId!) as { id: string }
+  ).id;
+
+  const auto = proposeDebtPayment(db, debtId, { minScore: 0.05, useCode: false });
+  assert(
+    auto.hits.some((h) => h.documentId === doc.id),
+    `a default-embedded corpus must be reachable from pay-debt, got ${auto.status}: ${auto.reason}`,
+  );
+
+  const foreign = proposeDebtPayment(db, debtId, {
+    minScore: 0.05,
+    useCode: false,
+    model: "no-such-embedding-space",
+  });
+  assert(
+    foreign.status === "insufficient" && foreign.hits.length === 0,
+    `the model option must select the space searched, got ${foreign.status}: ${foreign.reason}`,
+  );
+});
+
+test(
+  "pins",
+  "an observation with no verified support does not render as ALLOWED",
+  () => {
+    // contract.ts synthesised a `transcript` pin over the claim's own text when
+    // nothing else was offered — a model's output cited as evidence for itself.
+    // The gate dropped it every time (transcript has no formula), so the claim
+    // committed with zero belief_source rows, minted no debt (an observation is
+    // not an assertion), and printed a bare [ALLOWED] over nothing at all. The
+    // only trace was a gate_event action='absent' no surface reads.
+    const db = freshDb();
+    const r = enforceClaimContract(
+      db,
+      { kind: "observation", text: "We decided to price everything in dirhams." },
+      { turnId: "t_obs" },
+    );
+    assert(r.ok, `the claim is still recorded: ${JSON.stringify(r)}`);
+    assert(
+      r.status === "UNSUPPORTED",
+      `zero verified support must not read as an endorsement, got ${r.status}`,
+    );
+    assert(
+      count(db, `SELECT count(*) AS c FROM belief_source`) === 0,
+      "no source was offered, so none may be stored",
+    );
+    assert(
+      count(db, `SELECT count(*) AS c FROM belief_source WHERE kind = 'transcript'`) === 0,
+      "a model's own output is not evidence for itself",
+    );
+    assert(
+      count(db, `SELECT count(*) AS c FROM gate_event WHERE action = 'absent'`) === 0,
+      "declining to cite is intentional, not a rejection worth logging",
+    );
+
+    // The other half: a claim that DID cite something the gate dropped must
+    // carry the drop out to the caller, not only into a gate_event.
+    const drifted = seedPinnedDoc(db, "original body", "notes/drift.md");
+    db.prepare(`UPDATE vector_document SET body = ? WHERE id = ?`).run(
+      "edited body",
+      drifted.refId,
+    );
+    const r2 = enforceClaimContract(
+      db,
+      { kind: "observation", text: "We recorded the drifted note." },
+      { sources: [{ ...drifted, provenance: "vector" }] },
+    );
+    assert(
+      r2.status === "UNSUPPORTED",
+      `every citation was dropped, so support is zero, got ${r2.status}`,
+    );
+    assert(
+      (r2.rejectedSources ?? []).length === 1 &&
+        r2.rejectedSources![0]!.reason === "hash_mismatch",
+      `ContractResult must carry the drop, got ${JSON.stringify(r2.rejectedSources)}`,
+    );
+
+    // And a claim whose citation survives is still plainly ALLOWED.
+    const good = seedPinnedDoc(db, "the sky is blue", "notes/sky.md");
+    const r3 = enforceClaimContract(
+      db,
+      { kind: "observation", text: "We recorded that the sky is blue." },
+      { sources: [{ ...good, provenance: "vector" }] },
+    );
+    assert(
+      r3.status === "ALLOWED" && !r3.rejectedSources,
+      `verified support must still pass cleanly, got ${JSON.stringify(r3)}`,
+    );
+  },
+);
+
+test(
+  "pins",
+  "runAsk surfaces an uncited observation as UNSUPPORTED, not ALLOWED",
+  async () => {
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/aed.md",
+      title: "Currency",
+      body: "User base currency is AED (UAE dirham).",
+      model: "local-hash-v1",
+    });
+    const fake = async () => "We decided to price everything in dirhams.";
+    const r = await runAsk(db, "what currency do we price in?", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    const obs = r.claims.filter((c) => c.kind === "observation");
+    assert(obs.length === 1, JSON.stringify(r.claims));
+    assert(
+      obs[0]!.status === "UNSUPPORTED",
+      `an uncited observation must not render as ALLOWED, got ${obs[0]!.status}`,
+    );
+    assert(obs[0]!.citedRefs.length === 0, "it cited nothing");
+    assert(
+      count(db, `SELECT count(*) AS c FROM belief_source`) === 0,
+      "and nothing holds it up",
+    );
+  },
+);
+
 // ─── report ──────────────────────────────────────────────────────────────────
+
+// Drain the async queue sequentially: invoke a thunk, await it fully,
+// record pass/fail, only then move to the next. Running them one at a
+// time — instead of firing them all and awaiting the batch — is what
+// actually prevents two async test bodies from ever being in flight at
+// once, which is what closes the shared process.env race that concurrent
+// invocation allowed. Nothing below may read `results` until every
+// queued thunk has been awaited.
+for (const { suite, name, fn } of pending) {
+  const t0 = Date.now();
+  try {
+    // Invoke and inspect before awaiting. `isAsyncFunction` is true for
+    // async *generator* functions too, and calling one returns an
+    // AsyncGenerator: `await` on it resolves instantly to the generator
+    // object, the body never runs, and a test that asserts nothing scores
+    // a silent green. Anything that is not thenable is a runner-level
+    // failure, not a pass.
+    const returned: unknown = fn();
+    if (!isThenable(returned)) {
+      throw new Error(
+        `test "${suite}/${name}" was queued as async but invoking it ` +
+          `returned ${returned === null ? "null" : typeof returned}, not a ` +
+          `Promise, so its body never ran and nothing was awaited. An ` +
+          `async generator function (\`async function*\`) does this. Use a ` +
+          `plain \`async\` function.`,
+      );
+    }
+    await returned;
+    results.push({ name, suite, ok: true, ms: Date.now() - t0 });
+  } catch (err) {
+    results.push({
+      name,
+      suite,
+      ok: false,
+      detail: err instanceof Error ? err.message : String(err),
+      ms: Date.now() - t0,
+    });
+  }
+}
+
+// Runner integrity: every registered test must have produced exactly one
+// result. Checked before the tally is computed, because the tally is
+// meaningless if results went missing — a dropped or never-drained test
+// used to shrink the denominator along with itself and stay invisible.
+const missing = registered - results.length;
+if (missing !== 0) {
+  const what =
+    missing > 0
+      ? `${missing} test(s) registered but never recorded a result`
+      : `${-missing} more results than registered tests`;
+  console.error(
+    `\n✗✗ RUNNER INTEGRITY FAILURE: ${what} ` +
+      `(registered=${registered}, results=${results.length}).\n` +
+      `   Tests were dropped before reporting — the pass tally below cannot ` +
+      `be trusted. Check that every queued async thunk is drained.\n`,
+  );
+  process.exitCode = 1;
+}
 
 const passed = results.filter((r) => r.ok).length;
 const failed = results.filter((r) => !r.ok);
@@ -1878,7 +4843,7 @@ for (const r of results) {
   console.log(r.ok ? line : `${line}\n         → ${r.detail}`);
 }
 console.log(
-  `\n── ${passed}/${results.length} passed · ${failed.length} failed ──\n`,
+  `\n── ${passed}/${registered} passed · ${failed.length} failed ──\n`,
 );
 
 if (failed.length > 0) {

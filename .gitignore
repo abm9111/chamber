@@ -40,3 +40,4 @@ logs/
 # probe scratch
 probes/seatbelt/work/inside.txt
 probes/seatbelt/work/*.txt
+.superpowers/

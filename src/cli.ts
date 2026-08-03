@@ -33,7 +33,10 @@ import {
   upsertDocument,
   searchVector,
   countDocuments,
+  parseSearchArgs,
   type VectorSourceKind,
+  type ParsedSearchArgs,
+  type LexicalSearchError,
 } from "./vector.ts";
 import {
   ingestDirectory,
@@ -553,21 +556,44 @@ function cmdIndex(
   console.log(`corpus size: ${countDocuments(db)}`);
 }
 
-function cmdSearch(db: DatabaseSync, query: string, hybrid = false): void {
+function cmdSearch(db: DatabaseSync, args: ParsedSearchArgs): void {
+  const { query, hybrid, exact } = args;
+  let degraded: LexicalSearchError | undefined;
   const hits = searchVector(db, query, {
     k: 5,
     minScore: 0.01,
-    ftsQuery: hybrid ? query : undefined,
+    lexical: hybrid
+      ? {
+          query,
+          mode: exact ? "phrase" : "terms",
+          require: exact,
+        }
+      : undefined,
+    // A search that quietly stopped being hybrid is a search whose result the
+    // operator would misread as "the corpus does not contain it".
+    onLexicalError: (e) => {
+      degraded = e;
+    },
   });
+  if (degraded) {
+    console.error(
+      `warning: keyword leg unavailable, ranking on vectors alone — ${degraded.message}`,
+    );
+  }
   if (hits.length === 0) {
     console.log("no hits");
     return;
   }
-  console.log(`search: "${query}" (${hits.length} hits)`);
+  const mode = exact ? "exact" : hybrid ? "hybrid" : "semantic";
+  console.log(`search[${mode}]: "${query}" (${hits.length} hits)`);
   for (const h of hits) {
     const preview = h.body.slice(0, 100).replace(/\n/g, " ");
+    const detail =
+      h.fusedScore === undefined
+        ? ""
+        : `  (cos=${h.score.toFixed(3)} lex=${(h.lexicalScore ?? 0).toFixed(3)} via=${h.retrievedBy})`;
     console.log(
-      `  ${h.score.toFixed(4)}  [${h.sourceKind}]  ${h.title ?? h.documentId}`,
+      `  ${(h.fusedScore ?? h.score).toFixed(4)}  [${h.sourceKind}]  ${h.title ?? h.documentId}${detail}`,
     );
     console.log(`           ${preview}${h.body.length > 100 ? "…" : ""}`);
     console.log(`           snap=${h.snapshotHash.slice(0, 12)}…`);
@@ -597,14 +623,20 @@ Usage:
       pattern, case-insensitively, at any depth. A pattern that matches
       nothing aborts the run — quote multi-word names. Dotted entries
       (.trash, .obsidian) and symlinks leaving the root are skipped.
-  chamber search <query>           Local vector search
-  chamber search --hybrid <query>  Vector + FTS5 hybrid
-  chamber ask "<question>" [--strict]        answer from the corpus with verified pins
+  chamber search [--exact|--semantic] <query>   Hybrid (vector + FTS5) search
+      Hybrid is the default: results are the union of the two legs, ranked by
+      0.7*cosine + 0.3*(share of the query's idf mass this passage contains).
+      A passage found by both legs generally outranks one found by either.
+      --exact  narrows to passages containing the query as a literal phrase.
+      --semantic  turns the keyword leg off (vector similarity only).
+  chamber ask "<question>" [--strict] [--exact|--semantic]
+                                             answer from the corpus with verified pins
       The model is shown passages numbered [1]..[k] and cites those numbers;
       index→document and document→hash mapping happen locally, so it can
       neither invent a document id nor supply a snapshot hash. Each claim is
       gated on its own citations. --strict refuses an unsourced assertion
-      instead of committing it with citation debt.
+      instead of committing it with citation debt. Retrieval is hybrid by
+      default; --exact / --semantic mean what they mean for `search`.
   chamber verify [--since <ISO date>]        re-check stored pins against the corpus
       A pin is written when a belief commits; the corpus can move after that
       (an edited, re-ingested note). verify re-derives every stored pin from
@@ -628,7 +660,7 @@ Examples:
   chamber turn "remember I prefer short answers"
   chamber index note "AED" "User base currency is AED (UAE dirham)."
   chamber search "currency UAE"
-  chamber search --hybrid "currency"
+  chamber search --exact "revealed preference"
 `);
 }
 
@@ -771,19 +803,14 @@ async function main(): Promise<void> {
       break;
     }
     case "search": {
-      let hybrid = false;
-      let parts = rest;
-      if (parts[0] === "--hybrid") {
-        hybrid = true;
-        parts = parts.slice(1);
-      }
-      const q = parts.join(" ").trim();
-      if (!q) {
-        console.error("usage: chamber search [--hybrid] <query>");
+      const parsed = parseSearchArgs(rest);
+      if (!parsed.ok) {
+        console.error(`search: ${parsed.error}`);
+        console.error("usage: chamber search [--exact|--semantic] <query>");
         process.exitCode = 1;
         return;
       }
-      cmdSearch(db, q, hybrid);
+      cmdSearch(db, parsed);
       break;
     }
     case "ask": {
@@ -792,10 +819,24 @@ async function main(): Promise<void> {
       // the control that turns an unsourced assertion from minted debt into a
       // refusal, so swallowing an unrecognised flag disables a gate quietly.
       // Same rule `ingest` already applies to its own flags.
-      const unknown = rest.filter((a) => a.startsWith("--") && a !== "--strict");
+      const exact = rest.includes("--exact");
+      const semantic = rest.includes("--semantic");
+      const known = ["--strict", "--exact", "--semantic"];
+      const unknown = rest.filter(
+        (a) => a.startsWith("--") && !known.includes(a),
+      );
       if (unknown.length > 0) {
         console.error(`ask: unknown flag(s): ${unknown.join(", ")}`);
-        console.error('usage: chamber ask "<question>" [--strict]');
+        console.error(
+          'usage: chamber ask "<question>" [--strict] [--exact|--semantic]',
+        );
+        process.exitCode = 1;
+        break;
+      }
+      if (exact && semantic) {
+        console.error(
+          "ask: --semantic and --exact contradict: --exact is a lexical filter",
+        );
         process.exitCode = 1;
         break;
       }
@@ -804,11 +845,13 @@ async function main(): Promise<void> {
         .join(" ")
         .trim();
       if (!q) {
-        console.error('usage: chamber ask "<question>" [--strict]');
+        console.error(
+          'usage: chamber ask "<question>" [--strict] [--exact|--semantic]',
+        );
         process.exitCode = 1;
         break;
       }
-      const r = await runAsk(db, q, { strict });
+      const r = await runAsk(db, q, { strict, exact, hybrid: !semantic });
       if (!r.modelCalled) {
         console.log(r.note ?? "no passages retrieved");
         break;

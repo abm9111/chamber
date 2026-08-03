@@ -13,7 +13,12 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
-import { searchVector, countDocuments } from "./vector.ts";
+import {
+  searchVector,
+  countDocuments,
+  type LexicalOptions,
+  type LexicalSearchError,
+} from "./vector.ts";
 import {
   classifyClaims,
   enforceClaimContract,
@@ -91,6 +96,19 @@ export interface AskOptions {
    * space, e.g. `"local-hash-v1"` for hermetic tests.
    */
   model?: string;
+  /**
+   * Run the lexical leg alongside the vector leg. On by default: a question
+   * naming something distinctive — a project codename, an identifier, a
+   * person — is exactly the case a sentence embedder has no representation for,
+   * and it is also the case a user is most confident the corpus contains.
+   * Set false for a deliberately vector-only comparison.
+   */
+  hybrid?: boolean;
+  /**
+   * Treat the question as an exact phrase and retrieve only passages that
+   * contain it. Narrowing, so opt-in; implies `hybrid`.
+   */
+  exact?: boolean;
 }
 
 const SYSTEM = [
@@ -193,6 +211,26 @@ function withheldNote(uncitable: { sourceKind: string }[]): string {
 }
 
 /**
+ * What a dead lexical leg costs, said out loud.
+ *
+ * `searchVector` throws by default precisely so this cannot be forgotten. The
+ * degradation is real — exact-term recall is gone — and it is invisible in the
+ * answer, so it belongs next to it.
+ */
+function lexicalDegradedNote(e: { message: string }): string {
+  return (
+    "keyword (FTS5) retrieval was unavailable, so this answer used vector " +
+    "similarity alone and a passage containing an exact rare term may have " +
+    `been missed: ${e.message}`
+  );
+}
+
+function joinNotes(...parts: (string | undefined)[]): string | undefined {
+  const kept = parts.filter((p): p is string => p !== undefined && p !== "");
+  return kept.length === 0 ? undefined : kept.join("; also: ");
+}
+
+/**
  * Render one retrieved passage as a location a human can actually go to.
  *
  * `path#p7 — Ops Manual › Courier Reconciliation` rather than a bare document
@@ -233,7 +271,32 @@ export async function runAsk(
   // query is skipped and this costs one query, as before. Only a genuinely
   // mixed corpus pays for the re-query, and that is the case that has
   // something to report.
-  const unfiltered = searchVector(db, question, { k, model: opts.model });
+  // Hybrid by default. The two searchVector calls below share one lexical
+  // spec and one failure sink, so a degraded leg is reported once rather than
+  // per query.
+  const lexical: LexicalOptions | undefined =
+    opts.hybrid === false && opts.exact !== true
+      ? undefined
+      : {
+          query: question,
+          mode: opts.exact === true ? "phrase" : "terms",
+          require: opts.exact === true,
+        };
+  let lexicalError: LexicalSearchError | undefined;
+  // Answering semantically is better than not answering, but only if the user
+  // is told the answer was formed without the lexical leg — otherwise a broken
+  // index is indistinguishable from a corpus that does not contain the answer,
+  // which is the silent quality regression this whole change exists to remove.
+  const onLexicalError = (e: LexicalSearchError): void => {
+    lexicalError = e;
+  };
+
+  const unfiltered = searchVector(db, question, {
+    k,
+    model: opts.model,
+    lexical,
+    onLexicalError,
+  });
   const uncitable = unfiltered.filter((h) => !isCitableSourceKind(h.sourceKind));
   const hits =
     uncitable.length === 0
@@ -242,6 +305,8 @@ export async function runAsk(
           k,
           model: opts.model,
           sourceKinds: CITABLE_SOURCE_KINDS,
+          lexical,
+          onLexicalError,
         });
 
   const passages = hits.map((h, i) => ({
@@ -263,7 +328,10 @@ export async function runAsk(
       claims: [],
       passages: [],
       modelCalled: false,
-      note: emptyRetrievalNote(db, uncitable),
+      note: joinNotes(
+        emptyRetrievalNote(db, uncitable),
+        lexicalError && lexicalDegradedNote(lexicalError),
+      ),
     };
   }
 
@@ -383,6 +451,9 @@ export async function runAsk(
     // Alongside the answer, never instead of it: the answer is real and its
     // citations verified, and the operator still needs to know it was formed
     // over a restricted view of the corpus.
-    note: uncitable.length > 0 ? withheldNote(uncitable) : undefined,
+    note: joinNotes(
+      uncitable.length > 0 ? withheldNote(uncitable) : undefined,
+      lexicalError && lexicalDegradedNote(lexicalError),
+    ),
   };
 }

@@ -44,8 +44,15 @@ import {
   searchVector,
   deleteDocument,
   countDocuments,
+  toMatchExpression,
+  parseSearchArgs,
+  LexicalSearchError,
 } from "../src/vector.ts";
-import { verifyPin, verifyBeliefSources } from "../src/pins.ts";
+import {
+  verifyPin,
+  verifyBeliefSources,
+  CITABLE_SOURCE_KINDS,
+} from "../src/pins.ts";
 import { runAsk, citedIndices } from "../src/ask.ts";
 import {
   minilmAvailable,
@@ -1020,6 +1027,437 @@ test("vector", "V4_injected_embedding", () => {
   const hits = searchVector(db, q, { k: 1, model: "injected-test", minScore: 0.5 });
   assert(hits.length === 1, "injected embedding must retrieve");
   assert(hits[0]!.model === "injected-test", "model label");
+});
+
+// ─── HYBRID RETRIEVAL (lexical ∪ semantic, src/vector.ts) ────────────────────
+//
+// The corpora below inject their own vectors so the *semantic* leg is exactly
+// specified: a hybrid ranking test that depended on whatever MiniLM happens to
+// think of a sentence would be a test of MiniLM. The cosines used
+// (0.48 – 0.62) are the band MiniLM actually produces for a topical
+// neighbourhood — the compression that is the root cause of the proper-noun
+// failure this suite exists to pin down.
+
+/** A unit 8-vector whose cosine against `probeVector()` is exactly `cos`. */
+function vecAtCosine(cos: number): Float32Array {
+  const v = new Float32Array(8);
+  v[0] = cos;
+  v[1] = Math.sqrt(Math.max(0, 1 - cos * cos));
+  return v;
+}
+
+function probeVector(): Float32Array {
+  return vecAtCosine(1);
+}
+
+const RARE_QUERY = "gbrain Hindsight memory bolt-ons revealed preference";
+
+/**
+ * The reported failure, reduced: one passage holds the rare literal tokens,
+ * three topical decoys outrank it on cosine alone, one filler shares a single
+ * common word with the query.
+ */
+function seedRareTokenCorpus(db: DatabaseSync): {
+  target: string;
+  decoys: string[];
+  filler: string;
+} {
+  const target = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/gbrain.md#p1",
+    title: "gbrain",
+    body:
+      "gbrain shipped Hindsight as a bolt-ons layer; the revealed preference " +
+      "was for recall you can audit, not for a bigger context window.",
+    embedding: vecAtCosine(0.48),
+    model: "injected-test",
+  }).id;
+  const decoyBodies = [
+    "A survey of episodic recall architectures for language agents.",
+    "Retrieval augmentation over long conversational context windows.",
+    "Benchmarking long-term retention in multi-turn dialogue systems.",
+  ];
+  const decoyCosines = [0.62, 0.58, 0.55];
+  const decoys = decoyBodies.map(
+    (body, i) =>
+      upsertDocument(db, {
+        sourceKind: "vault_page",
+        sourceRef: `papers/survey-${i}.md#p1`,
+        title: `survey ${i}`,
+        body,
+        embedding: vecAtCosine(decoyCosines[i]!),
+        model: "injected-test",
+      }).id,
+  );
+  const filler = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/coffee.md#p1",
+    title: "coffee",
+    body: "Standing preference: espresso, no sugar, before the first call.",
+    embedding: vecAtCosine(0.3),
+    model: "injected-test",
+  }).id;
+  return { target, decoys, filler };
+}
+
+test("vector", "H1_match_expression_quotes_every_user_token", () => {
+  assert(
+    toMatchExpression(RARE_QUERY) ===
+      '"gbrain" OR "Hindsight" OR "memory" OR "bolt" OR "ons" OR "revealed" OR "preference"',
+    `terms mode: got ${toMatchExpression(RARE_QUERY)}`,
+  );
+  // FTS5 operators arriving as user text must be literals, not operators.
+  assert(
+    toMatchExpression("AND OR NOT NEAR") ===
+      '"AND" OR "OR" OR "NOT" OR "NEAR"',
+    `operators: got ${toMatchExpression("AND OR NOT NEAR")}`,
+  );
+  // A double quote cannot survive tokenization, so the expression can never be
+  // broken out of — escaping is by construction, not by substitution.
+  assert(
+    toMatchExpression('he said "drop table" -- now') ===
+      '"he" OR "said" OR "drop" OR "table" OR "now"',
+    `quotes: got ${toMatchExpression('he said "drop table" -- now')}`,
+  );
+  assert(toMatchExpression("-- ?? () *") === null, "punctuation-only -> null");
+  assert(toMatchExpression("   ") === null, "blank -> null");
+  assert(
+    toMatchExpression("revealed preference", "phrase") ===
+      '"revealed preference"',
+    `phrase mode: got ${toMatchExpression("revealed preference", "phrase")}`,
+  );
+});
+
+test("vector", "H2_raw_user_text_is_a_syntax_error_the_sanitiser_removes", () => {
+  const db = freshDb();
+  seedRareTokenCorpus(db);
+  // Control: the reported query, handed to MATCH verbatim, is a syntax error.
+  // That error is the whole reason the hybrid leg used to vanish silently.
+  let raw = "no error";
+  try {
+    db.prepare(
+      `SELECT count(*) AS c FROM vector_document_fts
+       WHERE vector_document_fts MATCH ?`,
+    ).get(RARE_QUERY);
+  } catch (err) {
+    raw = (err as Error).message;
+  }
+  assert(raw !== "no error", "expected raw user text to be an FTS5 syntax error");
+
+  // Sanitised, the same text runs and finds the passage.
+  const rows = db
+    .prepare(
+      `SELECT count(*) AS c FROM vector_document_fts
+       WHERE vector_document_fts MATCH ?`,
+    )
+    .get(toMatchExpression(RARE_QUERY)!) as { c: number };
+  assert(rows.c >= 1, "sanitised expression must match the target passage");
+});
+
+test("vector", "H3_hybrid_lifts_a_rare_token_over_semantic_decoys", () => {
+  const db = freshDb();
+  const { target } = seedRareTokenCorpus(db);
+  const q = probeVector();
+
+  const before = searchVector(db, q, { k: 5, model: "injected-test" });
+  const beforeRank = before.findIndex((h) => h.documentId === target) + 1;
+  assert(
+    beforeRank === 4,
+    `semantic-only must reproduce the failure (target at rank 4), got ${beforeRank}`,
+  );
+
+  const after = searchVector(db, q, {
+    k: 5,
+    model: "injected-test",
+    lexical: { query: RARE_QUERY },
+  });
+  assert(
+    after[0]?.documentId === target,
+    `hybrid must rank the rare-token passage first, got ${after
+      .map((h) => `${h.title}:${(h.fusedScore ?? h.score).toFixed(3)}`)
+      .join(" ")}`,
+  );
+  assert(after[0]!.retrievedBy === "both", "target found by both legs");
+  assert(
+    after[0]!.score === before[beforeRank - 1]!.score,
+    "cosine reported for the target must be untouched by fusion",
+  );
+});
+
+test("vector", "H4_hybrid_is_a_union_not_an_intersection", () => {
+  const db = freshDb();
+  // The passage that answers the question shares no token with it.
+  const answer = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "ops/quiqup.md#p3",
+    title: "Quiqup",
+    body: "Quiqup charges AED 12 per undelivered shipment returned to origin.",
+    embedding: vecAtCosine(0.72),
+    model: "injected-test",
+  }).id;
+  // …while an unrelated passage happens to share most of its wording.
+  const lexicalJunk = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/shelf.md#p1",
+    title: "shelf",
+    body:
+      "The team could not agree on how much to bill for the parcel shelf, " +
+      "so the courier question was parked.",
+    embedding: vecAtCosine(0.34),
+    model: "injected-test",
+  }).id;
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/misc.md#p1",
+    title: "misc",
+    body: "Office plants are watered on Tuesdays.",
+    embedding: vecAtCosine(0.12),
+    model: "injected-test",
+  });
+
+  const question =
+    "how much does the courier bill for a parcel that could not be delivered";
+  const semantic = searchVector(db, probeVector(), {
+    k: 5,
+    model: "injected-test",
+  });
+  assert(semantic[0]?.documentId === answer, "semantic-only baseline");
+
+  const hybrid = searchVector(db, probeVector(), {
+    k: 5,
+    model: "injected-test",
+    lexical: { query: question },
+  });
+  // Union: a passage matching nothing lexically is still retrieved. Under the
+  // old `if (ftsBoost.size > 0 && !ftsBoost.has(row.id)) continue` this row
+  // was discarded outright.
+  const hit = hybrid.find((h) => h.documentId === answer);
+  assert(hit !== undefined, "semantic-only passage must survive the lexical leg");
+  assert(hit!.retrievedBy === "semantic", "…and be labelled as semantic-only");
+  // No regression: lexical overlap must not float an unrelated passage past it.
+  assert(
+    hybrid[0]?.documentId === answer,
+    `natural-language query regressed: ${hybrid
+      .map((h) => `${h.title}:${(h.fusedScore ?? h.score).toFixed(3)}`)
+      .join(" ")}`,
+  );
+  assert(
+    hybrid.some((h) => h.documentId === lexicalJunk),
+    "the lexically-overlapping passage should still be offered, just lower",
+  );
+});
+
+test("vector", "H5_a_passage_found_by_both_legs_outranks_one_found_by_either", () => {
+  const db = freshDb();
+  const both = upsertDocument(db, {
+    sourceKind: "vault_page",
+    body: "the zarvox rollout is scheduled for Tuesday",
+    title: "both",
+    embedding: vecAtCosine(0.5),
+    model: "injected-test",
+  }).id;
+  const semanticOnly = upsertDocument(db, {
+    sourceKind: "vault_page",
+    body: "the rollout is scheduled for Tuesday",
+    title: "semantic",
+    embedding: vecAtCosine(0.5),
+    model: "injected-test",
+  }).id;
+  const lexicalOnly = upsertDocument(db, {
+    sourceKind: "vault_page",
+    body: "zarvox appears once here and nowhere else",
+    title: "lexical",
+    embedding: vecAtCosine(0.02),
+    model: "injected-test",
+  }).id;
+
+  const hits = searchVector(db, probeVector(), {
+    k: 5,
+    model: "injected-test",
+    lexical: { query: "zarvox" },
+  });
+  const rank = (id: string): number => hits.findIndex((h) => h.documentId === id);
+  assert(rank(both) === 0, `both-legs passage must lead: ${JSON.stringify(hits.map((h) => h.title))}`);
+  assert(rank(both) < rank(semanticOnly), "both > semantic-only at equal cosine");
+  assert(rank(both) < rank(lexicalOnly), "both > lexical-only");
+  assert(hits[rank(semanticOnly)]!.retrievedBy === "semantic", "label semantic");
+  assert(hits[rank(lexicalOnly)]!.retrievedBy === "lexical", "label lexical");
+});
+
+test("vector", "H6_lexical_leg_cannot_surface_an_uncitable_kind", () => {
+  const db = freshDb();
+  const note = upsertDocument(db, {
+    sourceKind: "note",
+    title: "private",
+    body: "zarvox lives in a note, which has no registered pin formula",
+    embedding: vecAtCosine(0.9),
+    model: "injected-test",
+  }).id;
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    title: "page",
+    body: "zarvox also lives in a citable vault page",
+    embedding: vecAtCosine(0.4),
+    model: "injected-test",
+  });
+
+  const gated = searchVector(db, probeVector(), {
+    k: 10,
+    model: "injected-test",
+    sourceKinds: CITABLE_SOURCE_KINDS,
+    lexical: { query: "zarvox" },
+  });
+  assert(
+    !gated.some((h) => h.documentId === note),
+    "the lexical leg must obey the citable-kind gate",
+  );
+  assert(gated.length === 1, "the citable page is still retrieved");
+
+  // Fail closed: an empty kind list means nothing is eligible, lexically too.
+  const none = searchVector(db, probeVector(), {
+    k: 10,
+    model: "injected-test",
+    sourceKinds: [],
+    lexical: { query: "zarvox" },
+  });
+  assert(none.length === 0, "empty kind list retrieves nothing");
+});
+
+test("vector", "H7_a_dead_lexical_leg_is_loud_not_silent", () => {
+  const db = freshDb();
+  seedRareTokenCorpus(db);
+  // Simulate a corpus whose FTS index was never built (a DB that predates the
+  // index, or one whose triggers were dropped). Bare `catch {}` used to turn
+  // this into a quiet semantic-only answer.
+  db.exec("DROP TRIGGER vector_document_ai");
+  db.exec("DROP TRIGGER vector_document_ad");
+  db.exec("DROP TRIGGER vector_document_au");
+  db.exec("DROP TABLE vector_document_fts");
+
+  let threw: unknown;
+  try {
+    searchVector(db, probeVector(), {
+      k: 5,
+      model: "injected-test",
+      lexical: { query: RARE_QUERY },
+    });
+  } catch (err) {
+    threw = err;
+  }
+  assert(
+    threw instanceof LexicalSearchError,
+    `default must throw LexicalSearchError, got ${String(threw)}`,
+  );
+
+  // Degradation is available, but only by explicitly asking to be told.
+  const seen: LexicalSearchError[] = [];
+  const degraded = searchVector(db, probeVector(), {
+    k: 5,
+    model: "injected-test",
+    lexical: { query: RARE_QUERY },
+    onLexicalError: (e) => seen.push(e),
+  });
+  assert(seen.length === 1, `handler called once, got ${seen.length}`);
+  assert(degraded.length === 5, "degrades to semantic-only rather than dying");
+  assert(
+    degraded.every((h) => h.retrievedBy === "semantic"),
+    "every hit is semantic when the lexical leg is gone",
+  );
+});
+
+test("vector", "H8_exact_mode_narrows_and_is_opt_in", () => {
+  const db = freshDb();
+  const { target } = seedRareTokenCorpus(db);
+
+  const union = searchVector(db, probeVector(), {
+    k: 10,
+    model: "injected-test",
+    lexical: { query: "revealed preference" },
+  });
+  assert(union.length === 5, `default unions the corpus, got ${union.length}`);
+
+  const exact = searchVector(db, probeVector(), {
+    k: 10,
+    model: "injected-test",
+    lexical: { query: "revealed preference", mode: "phrase", require: true },
+  });
+  assert(
+    exact.length === 1 && exact[0]!.documentId === target,
+    `exact mode must narrow to the phrase, got ${exact.map((h) => h.title).join(",")}`,
+  );
+
+  // …and a phrase nobody wrote returns nothing rather than semantic soup.
+  const miss = searchVector(db, probeVector(), {
+    k: 10,
+    model: "injected-test",
+    lexical: { query: "revealed indifference", mode: "phrase", require: true },
+  });
+  assert(miss.length === 0, `exact miss must be empty, got ${miss.length}`);
+});
+
+test("vector", "H9_lexical_hits_below_minScore_are_still_admitted", () => {
+  const db = freshDb();
+  const buried = upsertDocument(db, {
+    sourceKind: "vault_page",
+    title: "buried",
+    body: "zarvox is mentioned only here",
+    embedding: vecAtCosine(0.01),
+    model: "injected-test",
+  }).id;
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    title: "near",
+    body: "nothing to do with it",
+    embedding: vecAtCosine(0.9),
+    model: "injected-test",
+  });
+
+  const semantic = searchVector(db, probeVector(), {
+    k: 5,
+    model: "injected-test",
+    minScore: 0.05,
+  });
+  assert(
+    !semantic.some((h) => h.documentId === buried),
+    "minScore gates the semantic leg, as before",
+  );
+
+  const hybrid = searchVector(db, probeVector(), {
+    k: 5,
+    model: "injected-test",
+    minScore: 0.05,
+    lexical: { query: "zarvox" },
+  });
+  assert(
+    hybrid.some((h) => h.documentId === buried),
+    "an exact lexical match is not silenced by a semantic threshold",
+  );
+});
+
+test("vector", "H10_parseSearchArgs_defaults_to_hybrid_and_refuses_typos", () => {
+  const ok = parseSearchArgs(["courier", "reconciliation"]);
+  assert(ok.ok === true, "plain query parses");
+  assert(ok.ok && ok.query === "courier reconciliation", "query joined");
+  assert(ok.ok && ok.hybrid === true, "hybrid is the default");
+  assert(ok.ok && ok.exact === false, "exact is not the default");
+
+  const exact = parseSearchArgs(["--exact", "revealed", "preference"]);
+  assert(exact.ok && exact.exact === true && exact.hybrid === true, "--exact");
+
+  const semantic = parseSearchArgs(["--semantic", "anything"]);
+  assert(semantic.ok && semantic.hybrid === false, "--semantic opts out");
+
+  // `--hybrid` is now the default; it stays accepted so an existing invocation
+  // does not start erroring, but it must mean what it says.
+  const legacy = parseSearchArgs(["--hybrid", "anything"]);
+  assert(legacy.ok && legacy.hybrid === true, "--hybrid still accepted");
+
+  const typo = parseSearchArgs(["--exakt", "q"]);
+  assert(!typo.ok, "unknown flag refused, never silently ignored");
+  const empty = parseSearchArgs(["--exact"]);
+  assert(!empty.ok, "empty query refused");
+  const contradiction = parseSearchArgs(["--semantic", "--exact", "q"]);
+  assert(!contradiction.ok, "--semantic --exact is contradictory, not silent");
 });
 
 // ─── PINS (content-pin verification, src/pins.ts) ────────────────────────────
@@ -5554,6 +5992,128 @@ test(
     assert(
       count(db, `SELECT count(*) AS c FROM belief_source`) === 0,
       "and nothing holds it up",
+    );
+  },
+);
+
+/**
+ * A corpus large enough for idf to mean something.
+ *
+ * Rarity is the signal the lexical leg trades on, and in a four-document
+ * fixture every term is equally "rare" — idf cannot tell `Zqx7` from `the`. So
+ * the reported failure only reproduces against a background: 200 filler
+ * passages that all talk about rollout windows, one passage that answers in
+ * other words and happens to carry the codename, three near-duplicates of the
+ * question itself. `local-hash-v1` keeps it hermetic and fast (~70ms to seed).
+ */
+function seedCodenameCorpus(db: DatabaseSync): string {
+  const target = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "ops/yard.md#p4",
+    title: "Freight yard",
+    body:
+      "Pallet staging at the leased freight yard runs overnight; the morning " +
+      "sweep clears anything left on the apron, and the lease renews each " +
+      "March under the same terms as last year. Zqx7 goes live on the fifteenth.",
+    model: "local-hash-v1",
+  }).id;
+  const nearQuestion = [
+    "We decided about the rollout window that it should not clash with the audit.",
+    "The rollout window we decided on was agreed at the Monday review.",
+    "What we decided about the rollout window is recorded in the ops board.",
+  ];
+  for (const [i, body] of nearQuestion.entries()) {
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: `ops/rollout-${i}.md#p1`,
+      title: `rollout ${i}`,
+      body,
+      model: "local-hash-v1",
+    });
+  }
+  for (let i = 0; i < 200; i++) {
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: `bg/${i}.md#p1`,
+      title: `bg ${i}`,
+      body:
+        `Background note ${i}: what we decided about the rollout window ` +
+        `for team ${i} and the release schedule.`,
+      model: "local-hash-v1",
+    });
+  }
+  return target;
+}
+
+const CODENAME_QUESTION = "what did we decide about the Zqx7 rollout window?";
+
+test(
+  "pins",
+  "runAsk retrieves a passage by a codename its embedding cannot represent",
+  async () => {
+    const db = freshDb();
+    const target = seedCodenameCorpus(db);
+    const fake = async () => "Zqx7 goes live on the fifteenth. [1]";
+
+    // The reported failure: the embedder drifts to the topical neighbourhood
+    // and the one passage that literally says `Zqx7` is nowhere in the top-k.
+    const before = await runAsk(db, CODENAME_QUESTION, {
+      complete: fake,
+      model: "local-hash-v1",
+      hybrid: false,
+    });
+    assert(
+      !before.passages.some((p) => p.documentId === target),
+      `semantic-only must reproduce the miss, got ${JSON.stringify(
+        before.passages.map((p) => p.label),
+      )}`,
+    );
+
+    const after = await runAsk(db, CODENAME_QUESTION, {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    assert(
+      after.passages[0]?.documentId === target,
+      `hybrid must retrieve the codename passage first, got ${JSON.stringify(
+        after.passages.map((p) => p.label),
+      )}`,
+    );
+    // Retrieval changed; the gate did not. The claim citing [1] must still be
+    // held up by a pin that verifies against the row it actually came from.
+    const a = after.claims.filter((c) => c.kind !== "chatter")[0]!;
+    assert(
+      a !== undefined && a.status === "ALLOWED" && a.rejected.length === 0,
+      `hybrid retrieval must still produce a citable pin, got ${JSON.stringify(after.claims)}`,
+    );
+    assert(a.citedRefs.length === 1 && a.citedRefs[0] === target, "cited the target");
+    assert(after.note === undefined, `no note expected, got ${after.note}`);
+  },
+);
+
+test(
+  "pins",
+  "runAsk reports a lexical leg it could not run instead of quietly dropping it",
+  async () => {
+    const db = freshDb();
+    seedCodenameCorpus(db);
+    db.exec("DROP TRIGGER vector_document_ai");
+    db.exec("DROP TRIGGER vector_document_ad");
+    db.exec("DROP TRIGGER vector_document_au");
+    db.exec("DROP TABLE vector_document_fts");
+
+    const fake = async () => "The rollout window was agreed at review. [1]";
+    const r = await runAsk(db, CODENAME_QUESTION, {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    // Answering is still better than dying — but silence would leave the
+    // operator reading a degraded answer as an authoritative one.
+    assert(r.modelCalled, "a broken keyword index must not stop the answer");
+    assert(r.note !== undefined, "the degradation must be reported");
+    assert(
+      r.note!.includes("keyword") && r.note!.includes("FTS5"),
+      `the note must name what was lost, got ${JSON.stringify(r.note)}`,
     );
   },
 );

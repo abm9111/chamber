@@ -113,6 +113,14 @@ export interface UpsertDocumentInput {
 
 export interface VectorHit {
   documentId: string;
+  /**
+   * Cosine similarity against the query in this document's embedding space.
+   *
+   * Deliberately *not* the fused score: `minScore` is expressed on this scale,
+   * every existing caller compares against it on this scale, and a number whose
+   * meaning changes depending on whether a lexical leg happened to run is not a
+   * number anyone can threshold. Ordering uses `fusedScore ?? score`.
+   */
   score: number;
   sourceKind: string;
   sourceRef: string | null;
@@ -120,6 +128,15 @@ export interface VectorHit {
   body: string;
   snapshotHash: string;
   model: string;
+  /**
+   * Share of the query's own idf mass this passage actually contains, in
+   * [0,1]. Absent when the lexical leg did not run. See `lexicalStrength`.
+   */
+  lexicalScore?: number;
+  /** The value results were ranked by. Absent when retrieval was semantic-only. */
+  fusedScore?: number;
+  /** Which leg(s) put this row in the result. Absent when only one leg ran. */
+  retrievedBy?: "semantic" | "lexical" | "both";
 }
 
 export function upsertDocument(
@@ -215,6 +232,177 @@ export function deleteDocument(db: DatabaseSync, id: string): boolean {
   return Number(r.changes ?? 0) > 0;
 }
 
+// ─── lexical leg (FTS5) ──────────────────────────────────────────────────────
+
+/**
+ * Weights of the two legs. They sum to 1 and both legs are mapped onto [0,1]
+ * *before* they are mixed, so the sum is a genuine convex combination rather
+ * than the old `0.7*cosine + 0.3*(1/(1+bm25))`, which mixed a bounded
+ * similarity with a reciprocal of an unbounded, corpus-dependent score.
+ *
+ * The lexical share is the minority share on purpose: an incidental match on a
+ * mid-frequency word must be able to reorder near-ties, never to overturn a
+ * clear semantic winner. See `lexicalStrength` for why 0.3 of a *calibrated*
+ * lexical score is nonetheless enough to lift a rare proper noun.
+ */
+export const SEMANTIC_WEIGHT = 0.7;
+export const LEXICAL_WEIGHT = 0.3;
+
+/** How deep the bm25 candidate list goes before fusion. */
+export const LEXICAL_CANDIDATE_LIMIT = 50;
+
+/**
+ * Cap on tokens taken from user text. A pathological paste would otherwise
+ * become a several-thousand-term OR, and each term costs one df probe.
+ */
+export const MAX_LEXICAL_TERMS = 32;
+
+/**
+ * Ceiling on the rows scanned to establish a term's document frequency.
+ *
+ * df only feeds idf, and idf is flat and near-zero for anything this common, so
+ * stopping early changes the weighting of "the" by a rounding error while
+ * keeping a stopword's probe O(cap) instead of O(corpus).
+ */
+const DF_SCAN_CAP = 10_000;
+
+export type LexicalMode = "terms" | "phrase";
+
+export interface LexicalOptions {
+  /** Raw user text. Sanitised here; never interpolated into SQL. */
+  query: string;
+  /**
+   * `terms` (default): every token becomes a quoted literal OR'd together, so
+   * the leg is a *recall* leg — a passage matching one distinctive token is a
+   * candidate. `phrase`: the tokens become one exact FTS5 phrase.
+   */
+  mode?: LexicalMode;
+  /**
+   * Make the lexical leg authoritative: only lexical matches are returned.
+   * This is the old (wrong-by-default) behaviour, kept because a quoted phrase
+   * or a distinctive identifier genuinely should narrow — but opt-in, because
+   * as a default it discards every passage that answers the question in words
+   * the asker did not happen to use.
+   */
+  require?: boolean;
+  /** bm25 candidate depth (default `LEXICAL_CANDIDATE_LIMIT`). */
+  limit?: number;
+}
+
+/**
+ * The lexical leg could not run.
+ *
+ * `searchVector` throws this rather than degrading, because a lexical leg that
+ * disappears does not fail — it quietly returns worse answers, and the caller
+ * has no way to tell that from "the corpus does not contain it". A caller that
+ * would rather answer semantically than not at all opts in by passing
+ * `onLexicalError`, and then owes the user a visible note.
+ */
+export class LexicalSearchError extends Error {
+  readonly matchExpr: string;
+  constructor(matchExpr: string, cause: unknown) {
+    super(
+      `lexical retrieval failed for MATCH ${matchExpr}: ` +
+        (cause instanceof Error ? cause.message : String(cause)),
+    );
+    this.name = "LexicalSearchError";
+    this.matchExpr = matchExpr;
+    this.cause = cause;
+  }
+}
+
+/**
+ * Split user text into FTS5-safe tokens.
+ *
+ * Unicode letters, digits and `_` only. Everything else — quotes, hyphens,
+ * parentheses, colons, `*` — is a separator, which is what makes the result
+ * safe: the characters that carry meaning in the MATCH grammar cannot appear
+ * in a token, so quoting a token can never be escaped out of. `_` is kept so
+ * `snake_case` survives as a phrase (FTS5's unicode61 tokenizer splits on it
+ * on both the query and the indexing side, so the two still agree).
+ */
+function lexicalTokens(text: string): string[] {
+  const found = text.normalize("NFKC").match(/[\p{L}\p{N}_]+/gu) ?? [];
+  return found.slice(0, MAX_LEXICAL_TERMS);
+}
+
+/**
+ * Translate user text into an FTS5 MATCH expression, or null if there is
+ * nothing to match on.
+ *
+ * Every token is wrapped in double quotes, which in FTS5 makes it a string
+ * literal: `AND`, `OR`, `NOT`, `NEAR` and a trailing `-` stop being operators
+ * and become the words the user typed. The reported query
+ * `gbrain Hindsight memory bolt-ons revealed preference` is a syntax error
+ * verbatim (`no such column: ons`); sanitised it is a plain 7-term disjunction.
+ */
+export function toMatchExpression(
+  text: string,
+  mode: LexicalMode = "terms",
+): string | null {
+  const tokens = lexicalTokens(text);
+  if (tokens.length === 0) return null;
+  if (mode === "phrase") return `"${tokens.join(" ")}"`;
+  return tokens.map((t) => `"${t}"`).join(" OR ");
+}
+
+/**
+ * The idf SQLite's fts5 `bm25()` uses, reproduced exactly.
+ *
+ * Classic Robertson idf, floored at 1e-6 where it would go non-positive — i.e.
+ * a term in more than about half the corpus contributes essentially nothing.
+ * "Exactly" is the point: this value is the denominator of `lexicalStrength`,
+ * whose numerator is a sum of these same idfs weighted by term-frequency
+ * saturation. Use the `log(1 + x)` variant instead and the ratio stops being a
+ * fraction of anything — verified against fts5 directly (a single term with
+ * tf=1 in an average-length document returns `bm25 = -idf`).
+ */
+function bm25Idf(total: number, df: number): number {
+  const idf = Math.log((total - df + 0.5) / (df + 0.5));
+  return idf <= 0 ? 1e-6 : idf;
+}
+
+function documentFrequency(db: DatabaseSync, token: string): number {
+  const row = db
+    .prepare(
+      `SELECT count(*) AS c FROM (
+         SELECT rowid FROM vector_document_fts
+         WHERE vector_document_fts MATCH ? LIMIT ?
+       )`,
+    )
+    .get(`"${token}"`, DF_SCAN_CAP) as { c: number };
+  return row?.c ?? 0;
+}
+
+/**
+ * Normalise SQLite's bm25 onto [0,1] *without* looking at the other candidates.
+ *
+ * The denominator is the query's own idf mass — the total information content
+ * of the terms the user typed, measured against this corpus. So the score reads
+ * as "what fraction of what you asked for does this passage actually contain",
+ * which is an absolute quantity: adding or removing decoys does not rescale
+ * anybody, and a query nothing matches well produces uniformly small numbers
+ * instead of anointing its own least-bad candidate 1.0.
+ *
+ * That last property is why this is not min-max fusion. Min-max normalisation
+ * of either leg makes the top candidate 1.0 and the bottom 0.0 *by definition*,
+ * so a natural-language question whose answer shares no wording with it would
+ * see some irrelevant passage that happens to contain one of its function words
+ * promoted to a perfect lexical score — fixing lexical recall by breaking
+ * semantic recall. It is also why this is not reciprocal-rank fusion: RRF sees
+ * only ordinal position, so "matched the one rare proper noun in the corpus"
+ * and "matched the word `for`" are both just rank 1, and the second would carry
+ * exactly as much weight as the first. The magnitude of bm25 is the signal here
+ * — it is idf-weighted, so rarity is already priced in — and RRF throws it away.
+ *
+ * `min(1, …)` because bm25's term-frequency saturation can push a single term's
+ * contribution above its idf (up to k1+1) when a passage repeats it.
+ */
+function lexicalStrength(bm25Score: number, idfMass: number): number {
+  if (idfMass <= 0) return 0;
+  return Math.min(1, Math.abs(bm25Score) / idfMass);
+}
+
 export interface SearchOptions {
   k?: number;
   minScore?: number;
@@ -229,8 +417,16 @@ export interface SearchOptions {
    */
   sourceKinds?: readonly VectorSourceKind[];
   model?: string;
-  /** Hybrid: also require FTS5 match; rank = 0.7*cosine + 0.3*fts_boost */
-  ftsQuery?: string;
+  /**
+   * Run the lexical leg as well. Omitted, retrieval is vector-only and byte-for
+   * -byte what it always was.
+   */
+  lexical?: LexicalOptions;
+  /**
+   * Opt in to degrading to semantic-only when the lexical leg fails, instead of
+   * the default `throw`. Whatever is passed here is obliged to tell the user.
+   */
+  onLexicalError?: (err: LexicalSearchError) => void;
 }
 
 export function searchVector(
@@ -258,25 +454,31 @@ export function searchVector(
     model = opts.model ?? emb.model;
   }
 
-  let sql = `
-    SELECT d.id, d.source_kind, d.source_ref, d.title, d.body, d.snapshot_hash,
-           e.model, e.dims, e.vector_blob
-    FROM vector_embedding e
-    JOIN vector_document d ON d.id = e.document_id
-    WHERE e.model = ? AND e.dims = ?
-  `;
-  const params: (string | number)[] = [model, qVec.length];
+  // The eligibility filters are built once and applied to *both* legs. The
+  // lexical leg reusing them is what keeps the citable-kind gate fail-closed:
+  // a bm25 match on a `note` must not become a passage the model can see just
+  // because it was found by a different index.
+  let where = ` AND e.model = ? AND e.dims = ?`;
+  const filterParams: (string | number)[] = [model, qVec.length];
   if (opts.sourceKind) {
-    sql += ` AND d.source_kind = ?`;
-    params.push(opts.sourceKind);
+    where += ` AND d.source_kind = ?`;
+    filterParams.push(opts.sourceKind);
   }
   if (opts.sourceKinds) {
     if (opts.sourceKinds.length === 0) return [];
-    sql += ` AND d.source_kind IN (${opts.sourceKinds.map(() => "?").join(",")})`;
-    params.push(...opts.sourceKinds);
+    where += ` AND d.source_kind IN (${opts.sourceKinds.map(() => "?").join(",")})`;
+    filterParams.push(...opts.sourceKinds);
   }
 
-  const rows = db.prepare(sql).all(...params) as {
+  const rows = db
+    .prepare(
+      `SELECT d.id, d.source_kind, d.source_ref, d.title, d.body, d.snapshot_hash,
+              e.model, e.dims, e.vector_blob
+       FROM vector_embedding e
+       JOIN vector_document d ON d.id = e.document_id
+       WHERE 1 = 1${where}`,
+    )
+    .all(...filterParams) as {
     id: string;
     source_kind: string;
     source_ref: string | null;
@@ -288,34 +490,10 @@ export function searchVector(
     vector_blob: Buffer;
   }[];
 
-  // Optional FTS candidate set
-  let ftsBoost = new Map<string, number>();
-  if (opts.ftsQuery && opts.ftsQuery.trim()) {
-    try {
-      const ftsRows = db
-        .prepare(
-          `SELECT d.id AS id, bm25(vector_document_fts) AS rank
-           FROM vector_document_fts
-           JOIN vector_document d ON d.rowid = vector_document_fts.rowid
-           WHERE vector_document_fts MATCH ?
-           ORDER BY rank
-           LIMIT 50`,
-        )
-        .all(opts.ftsQuery) as { id: string; rank: number }[];
-      // bm25: lower is better — convert to 0..1-ish boost
-      for (const fr of ftsRows) {
-        const boost = 1 / (1 + Math.max(0, fr.rank));
-        ftsBoost.set(fr.id, boost);
-      }
-    } catch {
-      // FTS query syntax errors — ignore hybrid leg
-      ftsBoost = new Map();
-    }
-  }
-
-  const scored: VectorHit[] = [];
+  type Row = (typeof rows)[number];
+  const rowById = new Map<string, Row>();
+  const cosine = new Map<string, number>();
   for (const row of rows) {
-    if (ftsBoost.size > 0 && !ftsBoost.has(row.id)) continue;
     let vec: Float32Array;
     try {
       vec = blobToFloat32(row.vector_blob);
@@ -323,26 +501,194 @@ export function searchVector(
       continue;
     }
     if (vec.length !== qVec.length) continue;
-    let score = cosineSimilarity(qVec, vec);
-    if (ftsBoost.size > 0) {
-      const boost = ftsBoost.get(row.id) ?? 0;
-      score = 0.7 * score + 0.3 * boost;
-    }
-    if (score < minScore) continue;
-    scored.push({
+    rowById.set(row.id, row);
+    cosine.set(row.id, cosineSimilarity(qVec, vec));
+  }
+
+  const toHit = (id: string, extra?: Partial<VectorHit>): VectorHit => {
+    const row = rowById.get(id)!;
+    return {
       documentId: row.id,
-      score,
+      score: cosine.get(id)!,
       sourceKind: row.source_kind,
       sourceRef: row.source_ref,
       title: row.title,
       body: row.body,
       snapshotHash: row.snapshot_hash,
       model: row.model,
-    });
+      ...extra,
+    };
+  };
+
+  // Semantic candidates, best first. `minScore` gates this leg and only this
+  // leg — see the union below.
+  const semantic = [...cosine.entries()]
+    .filter(([, c]) => c >= minScore)
+    .sort((a, b) => b[1] - a[1])
+    .map(([id]) => id);
+
+  if (!opts.lexical) {
+    return semantic.slice(0, k).map((id) => toHit(id));
   }
 
-  scored.sort((a, b) => b.score - a.score);
+  const lexical = runLexicalLeg(db, opts, where, filterParams, rowById);
+
+  // The union, not the intersection. A passage the query's own words cannot
+  // reach is still the passage that answers it; a passage whose cosine is under
+  // the threshold but which contains the rare token the user typed is still
+  // the one they meant. Requiring both was the defect.
+  const candidates = opts.lexical.require
+    ? [...lexical.keys()]
+    : [...new Set([...semantic, ...lexical.keys()])];
+
+  const semanticSet = new Set(semantic);
+  const scored = candidates.map((id) => {
+    const cos = cosine.get(id)!;
+    const lex = lexical.get(id) ?? 0;
+    return toHit(id, {
+      lexicalScore: lex,
+      // Both terms are already in [0,1]: cosine clamped at 0 (a negative
+      // cosine means "unrelated", not "anti-relevant"), lexical normalised
+      // against the query's idf mass.
+      fusedScore: SEMANTIC_WEIGHT * Math.max(0, cos) + LEXICAL_WEIGHT * lex,
+      retrievedBy: lexical.has(id)
+        ? semanticSet.has(id)
+          ? "both"
+          : "lexical"
+        : "semantic",
+    });
+  });
+
+  scored.sort(
+    (a, b) =>
+      b.fusedScore! - a.fusedScore! ||
+      b.score - a.score ||
+      a.documentId.localeCompare(b.documentId),
+  );
   return scored.slice(0, k);
+}
+
+/**
+ * Run the FTS5 leg and return documentId -> normalised lexical strength.
+ *
+ * Returns an empty map when the query has no usable tokens, when none of them
+ * appear in the corpus, or when the caller opted into degradation and the leg
+ * failed. Throws `LexicalSearchError` otherwise — a silently absent leg is a
+ * quality regression that looks exactly like an honest miss.
+ */
+function runLexicalLeg(
+  db: DatabaseSync,
+  opts: SearchOptions,
+  where: string,
+  filterParams: (string | number)[],
+  rowById: ReadonlyMap<string, unknown>,
+): Map<string, number> {
+  const lex = opts.lexical!;
+  const out = new Map<string, number>();
+  const expr = toMatchExpression(lex.query, lex.mode ?? "terms");
+  if (expr === null) return out;
+
+  try {
+    const total = countDocuments(db);
+    // Sum the idf of the terms that actually occur. A term nobody wrote
+    // contributes to no passage's bm25, so counting it in the denominator
+    // would deflate every real match for no reason.
+    let idfMass = 0;
+    for (const token of lexicalTokens(lex.query)) {
+      const df = documentFrequency(db, token);
+      if (df > 0) idfMass += bm25Idf(total, df);
+    }
+    if (idfMass <= 0) return out;
+
+    const ftsRows = db
+      .prepare(
+        `SELECT d.id AS id, bm25(vector_document_fts) AS rank
+         FROM vector_document_fts
+         JOIN vector_document d ON d.rowid = vector_document_fts.rowid
+         JOIN vector_embedding e ON e.document_id = d.id
+         WHERE vector_document_fts MATCH ?${where}
+         ORDER BY rank
+         LIMIT ?`,
+      )
+      .all(expr, ...filterParams, lex.limit ?? LEXICAL_CANDIDATE_LIMIT) as {
+      id: string;
+      rank: number;
+    }[];
+
+    for (const fr of ftsRows) {
+      // A row whose embedding blob failed to parse is not retrievable at all;
+      // it must not re-enter through the lexical door.
+      if (!rowById.has(fr.id)) continue;
+      out.set(fr.id, lexicalStrength(fr.rank, idfMass));
+    }
+  } catch (err) {
+    const e = new LexicalSearchError(expr, err);
+    if (!opts.onLexicalError) throw e;
+    opts.onLexicalError(e);
+    return new Map();
+  }
+  return out;
+}
+
+// ─── CLI argument parsing ────────────────────────────────────────────────────
+
+export interface ParsedSearchArgs {
+  query: string;
+  /** Run the lexical leg. Default true — hybrid is the default, not a mode. */
+  hybrid: boolean;
+  /** Narrow to exact-phrase matches (implies hybrid). */
+  exact: boolean;
+}
+
+export type ParseSearchResult =
+  | ({ ok: true } & ParsedSearchArgs)
+  | { ok: false; error: string };
+
+/**
+ * Parse `chamber search` arguments.
+ *
+ * Unknown flags are refused rather than folded into the query: `--hybird` would
+ * otherwise search for the literal string "--hybird" and report no hits, which
+ * reads as an empty corpus. `--semantic --exact` is refused for the same
+ * reason — one of them would have to lose silently.
+ */
+export function parseSearchArgs(argv: string[]): ParseSearchResult {
+  const words: string[] = [];
+  let semantic = false;
+  let exact = false;
+  let flagsEnded = false;
+
+  for (const arg of argv) {
+    if (!flagsEnded && arg.startsWith("-")) {
+      if (arg === "--") {
+        flagsEnded = true;
+        continue;
+      }
+      // `--hybrid` is now the default. It stays accepted so that an existing
+      // invocation keeps working and keeps meaning what it says.
+      if (arg === "--hybrid") continue;
+      if (arg === "--semantic") {
+        semantic = true;
+        continue;
+      }
+      if (arg === "--exact") {
+        exact = true;
+        continue;
+      }
+      return { ok: false, error: `unknown flag: ${arg}` };
+    }
+    words.push(arg);
+  }
+
+  if (semantic && exact) {
+    return {
+      ok: false,
+      error: "--semantic and --exact contradict: --exact is a lexical filter",
+    };
+  }
+  const query = words.join(" ").trim();
+  if (query === "") return { ok: false, error: "a query is required" };
+  return { ok: true, query, hybrid: !semantic, exact };
 }
 
 export function getDocument(

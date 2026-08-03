@@ -171,6 +171,7 @@ import {
 } from "../src/chunk.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
 import {
   chmodSync,
@@ -201,6 +202,7 @@ type Suite =
   | "slack"
   | "discord"
   | "pins"
+  | "cli"
   | "all";
 
 interface TestResult {
@@ -282,6 +284,7 @@ function suiteFromArg(): Suite {
     "slack",
     "discord",
     "pins",
+    "cli",
     "all",
   ].includes(v)
     ? v
@@ -6117,6 +6120,79 @@ test(
     );
   },
 );
+
+// ─── cli process smoke tests ────────────────────────────────────────────────
+
+// `src/cli.ts` calls `main()` at module scope, so importing it (as every
+// other test in this file does with `../src/...`) would run a command as a
+// side effect of the import — not a safe way to check the file parses. The
+// only honest check is to actually launch it the way an operator would: as
+// a subprocess, with the same flag the npm scripts use. This is what a
+// stray backtick inside the `help()` template literal broke twice while
+// this suite stayed green — nothing here ever shelled out to the real
+// entrypoint. spawnSync (not the async spawn) keeps this test synchronous,
+// as the runner requires.
+const CLI_PATH = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "../src/cli.ts",
+);
+
+test("cli", "help_starts_the_real_binary_and_exits_clean", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI_PATH, "help"],
+    { encoding: "utf8", timeout: 15_000 },
+  );
+  assert(
+    r.error === undefined,
+    `failed to launch cli subprocess: ${r.error}`,
+  );
+  assert(
+    r.status === 0,
+    `chamber help exited ${r.status} (signal=${r.signal}); stderr:\n${r.stderr}`,
+  );
+  assert(
+    r.stdout.includes("Chamber CLI"),
+    `help output missing banner text, got:\n${r.stdout}`,
+  );
+  assert(
+    !r.stderr.includes("SyntaxError"),
+    `help printed a SyntaxError:\n${r.stderr}`,
+  );
+});
+
+test("cli", "status_dispatches_against_a_scratch_db", () => {
+  const dbFile = join(
+    mkdtempSync(join(tmpdir(), "chamber-cli-status-")),
+    "chamber.sqlite",
+  );
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI_PATH, "status"],
+    {
+      encoding: "utf8",
+      timeout: 15_000,
+      env: { ...process.env, CHAMBER_DB: dbFile },
+    },
+  );
+  assert(
+    r.error === undefined,
+    `failed to launch cli subprocess: ${r.error}`,
+  );
+  assert(
+    r.status === 0,
+    `chamber status exited ${r.status} (signal=${r.signal}); stderr:\n${r.stderr}`,
+  );
+  // `help` only proves the module parses. `status` proves a command still
+  // dispatches end-to-end: it opens (creating) the sqlite db, runs real
+  // queries against it, and prints the counters below — so this catches a
+  // broken command handler or a dispatch table regression that a
+  // syntax-only smoke test would miss.
+  assert(
+    r.stdout.includes("beliefs:") && r.stdout.includes("audit events:"),
+    `status output missing expected counters, got:\n${r.stdout}`,
+  );
+});
 
 // ─── report ──────────────────────────────────────────────────────────────────
 

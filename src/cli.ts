@@ -636,7 +636,7 @@ Usage:
       neither invent a document id nor supply a snapshot hash. Each claim is
       gated on its own citations. --strict refuses an unsourced assertion
       instead of committing it with citation debt. Retrieval is hybrid by
-      default; --exact / --semantic mean what they mean for `search`.
+      default; --exact / --semantic mean what they mean for 'search'.
   chamber verify [--since <ISO date>]        re-check stored pins against the corpus
       A pin is written when a belief commits; the corpus can move after that
       (an edited, re-ingested note). verify re-derives every stored pin from

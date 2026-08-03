@@ -13,11 +13,18 @@
  * No live LLM — turn uses deterministic heuristics so gates are the product.
  */
 
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 import { openChamberDb } from "./db.ts";
-import { loadConfig, type ChamberConfig } from "./config.ts";
+import {
+  loadConfig,
+  explainConfig,
+  configPath,
+  type ChamberConfig,
+  type ResolvedSetting,
+} from "./config.ts";
 import { sha256, newId } from "./hash.ts";
 import { commitBelief } from "./commit_belief.ts";
 import { recordSpend, spendLastHours, formatSpendFooter } from "./spend.ts";
@@ -637,10 +644,90 @@ function cmdSearch(db: DatabaseSync, args: ParsedSearchArgs): void {
   }
 }
 
+/**
+ * `chamber init` — write a starter config file.
+ *
+ * Deliberately does not depend on `loadConfig()`/`explainConfig()` succeeding
+ * first, and never opens the database: `init` exists to create or repair the
+ * file those two read, so a broken (or absent) config must never stand in
+ * its own way, and a command whose only job is writing one JSON file has no
+ * business creating `~/.local/share/chamber/chamber.sqlite` as a side effect
+ * of being asked to write a config. (See the dispatch in `main()`, which
+ * routes this — and `cmdConfig` — around the loadConfig()/open() prelude for
+ * exactly that reason.)
+ *
+ * No field here can hold an API key: CHAMBER_API_KEY is env-only, read by
+ * src/model.ts and nowhere else, and the starter only ever sets
+ * `model.base`. `model.name` is left unset rather than `""` — config.ts
+ * rejects a *present but blank* string the same way it rejects a blank
+ * `database` (see parseModel/parseDatabase in src/config.ts), so writing
+ * `name: ""` here would hand the user a config that fails validation the
+ * moment anything else — including this file's own `config show` — reads it.
+ */
+function cmdInit(rest: string[]): void {
+  const target = configPath();
+  const force = rest.includes("--force");
+  if (existsSync(target) && !force) {
+    console.error(`config already exists: ${target}`);
+    console.error("  pass --force to overwrite it");
+    process.exitCode = 1;
+    return;
+  }
+  mkdirSync(dirname(target), { recursive: true });
+  const starter: ChamberConfig = {
+    database: join(homedir(), ".local", "share", "chamber", "chamber.sqlite"),
+    model: { base: "http://127.0.0.1:8087/v1" },
+    ingest: [],
+  };
+  writeFileSync(target, `${JSON.stringify(starter, null, 2)}\n`);
+  console.log(`wrote ${target}`);
+  console.log("  set model.name, then add ingest roots with their excludes");
+  console.log("  API keys are read from CHAMBER_API_KEY, never from this file");
+  console.log("  run `chamber config show` to see what is in effect");
+}
+
+/**
+ * `chamber config show` — print every resolved setting and where it came
+ * from.
+ *
+ * `explainConfig()` now validates exactly as strictly as `loadConfig()` (see
+ * `parseFile` in src/config.ts) and throws on a malformed file instead of
+ * reporting a config as healthy that Chamber could not actually load. A
+ * broken config is exactly the situation someone runs `config show` to
+ * diagnose, so that throw is caught here and turned into a message naming
+ * the file and the problem — never a bare stack trace escaping to the
+ * terminal. `formatErrorChain` renders `name: message`, never `.stack`, so
+ * this cannot leak one either. Like `cmdInit`, this never opens the database.
+ */
+function cmdConfig(rest: string[]): void {
+  if (rest[0] !== "show") {
+    console.error("usage: chamber config show");
+    process.exitCode = 1;
+    return;
+  }
+  let rows: ResolvedSetting[];
+  try {
+    rows = explainConfig();
+  } catch (err) {
+    console.error(
+      `chamber: cannot show config — ${formatErrorChain(err).join("; ")}`,
+    );
+    console.error("  fix the file, or run `chamber init --force` to replace it");
+    process.exitCode = 1;
+    return;
+  }
+  for (const row of rows) {
+    const conflict = row.conflict ? `  (config says ${row.conflict})` : "";
+    console.log(`  ${row.key} = ${row.value}   [from ${row.source}]${conflict}`);
+  }
+}
+
 function help(): void {
   console.log(`Chamber CLI — minimal vertical slice
 
 Usage:
+  init [--force]                     write a starter config file
+  config show                        print every setting and where it came from
   chamber turn "<message>"     Run one gated turn (stub model)
   chamber status               Spend + queue + counts
   chamber queue                List pending writes
@@ -705,6 +792,22 @@ async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   if (!cmd || cmd === "help" || cmd === "-h" || cmd === "--help") {
     help();
+    return;
+  }
+
+  // `init` and `config show` exist to create or diagnose the file the block
+  // below loads, so neither may depend on that load succeeding first:
+  // routed through it, a broken config would block `init --force` from ever
+  // reaching the fix, and `config show`'s own legible, file-naming error
+  // (see cmdConfig) would never fire — the generic top-level handler at the
+  // bottom of this file would print instead. Both return here, and neither
+  // opens the database (see cmdInit's and cmdConfig's doc comments).
+  if (cmd === "init") {
+    cmdInit(rest);
+    return;
+  }
+  if (cmd === "config") {
+    cmdConfig(rest);
     return;
   }
 

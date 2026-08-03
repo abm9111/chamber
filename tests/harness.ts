@@ -186,6 +186,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -7156,6 +7157,137 @@ test("config", "a config located by XDG_CONFIG_HOME is reported as env-sourced",
       rmSync(xdg, { recursive: true, force: true });
     }
   });
+});
+
+// ─── cli config commands (chamber init, chamber config show) ───────────────
+//
+// Like the "cli process smoke tests" above, these launch the real compiled
+// binary as a subprocess rather than calling functions in-process: `init`
+// and `config show` are meta-commands about configuration itself, and the
+// interesting behavior lives in how the actual entrypoint reads env vars and
+// files end to end — not in a function call that never touches argv or a
+// subprocess environment.
+
+test("config", "init writes a config that loadConfig accepts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-init-"));
+  const cfgFile = join(dir, "config.json");
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI_PATH, "init"],
+    {
+      encoding: "utf8",
+      timeout: 15_000,
+      env: { ...process.env, CHAMBER_CONFIG: cfgFile },
+    },
+  );
+  assert(r.status === 0, `init failed: ${r.stderr}`);
+  assert(existsSync(cfgFile), "init must write the config file");
+  const parsed = JSON.parse(readFileSync(cfgFile, "utf8")) as Record<string, unknown>;
+  assert("database" in parsed, "starter config must set a database");
+  // The test's name is a claim about loadConfig(), not just about the raw
+  // JSON shape — so it must actually call loadConfig() against the written
+  // file, not merely check for a "database" key. This is what catches a
+  // starter config that looks plausible but fails the moment anything reads
+  // it — e.g. writing `model.name: ""`, which parseModel (src/config.ts)
+  // rejects the same way it rejects a blank `database`, because a
+  // present-but-empty string is never a valid setting there.
+  loadConfig({ path: cfgFile });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("config", "init refuses to overwrite without --force", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-init2-"));
+  const cfgFile = join(dir, "config.json");
+  writeFileSync(cfgFile, `{"database":"/tmp/keep.sqlite"}`);
+  const env = { ...process.env, CHAMBER_CONFIG: cfgFile };
+  const bin = ["--experimental-strip-types", CLI_PATH];
+  const refused = spawnSync(process.execPath, [...bin, "init"], {
+    encoding: "utf8",
+    timeout: 15_000,
+    env,
+  });
+  assert(refused.status !== 0, "init must refuse to overwrite");
+  assert(
+    readFileSync(cfgFile, "utf8").includes("keep.sqlite"),
+    "the existing config must be untouched",
+  );
+  const forced = spawnSync(process.execPath, [...bin, "init", "--force"], {
+    encoding: "utf8",
+    timeout: 15_000,
+    env,
+  });
+  assert(forced.status === 0, `init --force failed: ${forced.stderr}`);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("config", "config show reports the source of each setting", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-show-"));
+  const cfgFile = join(dir, "config.json");
+  writeFileSync(cfgFile, `{"database":"/tmp/from-config.sqlite"}`);
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI_PATH, "config", "show"],
+    {
+      encoding: "utf8",
+      timeout: 15_000,
+      env: {
+        ...process.env,
+        CHAMBER_CONFIG: cfgFile,
+        CHAMBER_DB: "/tmp/from-env.sqlite",
+      },
+    },
+  );
+  assert(r.status === 0, `config show failed: ${r.stderr}`);
+  assert(r.stdout.includes("from-env.sqlite"), "must show the winning value");
+  assert(r.stdout.includes("env"), "must name the source");
+  assert(r.stdout.includes("from-config.sqlite"), "must show the losing value on conflict");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// Not in the brief: a review of Task 1 found that `explainConfig()` used to
+// validate less than `loadConfig()`, so it could call a config "healthy"
+// that Chamber could not actually load. It was fixed to validate identically
+// — which means it now throws on a malformed file, same as `loadConfig()`.
+// `config show` is the one command whose entire purpose is diagnosing a
+// broken configuration, so it is the one place that throw must become a
+// legible, file-naming message instead of an escaped stack trace.
+test("config", "config show reports a malformed config legibly, not a stack trace", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-showBad-"));
+  try {
+    const cfgFile = join(dir, "config.json");
+    writeFileSync(cfgFile, "{ not json");
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "config", "show"],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: { ...process.env, CHAMBER_CONFIG: cfgFile },
+      },
+    );
+    assert(
+      r.status !== 0,
+      `config show on a malformed config must exit non-zero, got ${r.status}`,
+    );
+    assert(
+      r.stderr.includes(cfgFile),
+      `error must name the config file, got stderr:\n${r.stderr}`,
+    );
+    assert(
+      r.stderr.includes("not valid JSON"),
+      `error must say what is wrong, got stderr:\n${r.stderr}`,
+    );
+    // Node renders an uncaught throw's stack as lines indented "    at ".
+    // formatErrorChain() (src/error_chain.ts) never emits that shape, so its
+    // presence here would mean the real Error — stack included — escaped
+    // instead of being caught in cmdConfig and reformatted.
+    assert(
+      !r.stderr.includes("\n    at ") && !r.stdout.includes("\n    at "),
+      `output must not contain a stack trace, got stderr:\n${r.stderr}\nstdout:\n${r.stdout}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────

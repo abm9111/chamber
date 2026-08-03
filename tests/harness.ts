@@ -178,7 +178,7 @@ import {
   loadConfig,
   explainConfig,
 } from "../src/config.ts";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
@@ -7761,6 +7761,88 @@ test("config", "parseIngestArgs says which form flags belong to", () => {
   // keeps the terser message.
   const empty = parseIngestArgs([]);
   assert(!empty.ok && empty.error === "missing <path>", "empty argv keeps the short message");
+});
+
+// ── IMPORTANT: a relative `database` was never resolved ────────────────────
+//
+// `expandTilde` was applied, `resolve` was not — while `parseIngest`'s
+// `canonical()` resolves every root, so the two fields disagreed inside one
+// module and `database` broke the contract its own type states.
+test("config", "a relative database in the config is resolved to an absolute path", () => {
+  withConfig(`{"database":"relative.sqlite"}`, () => {
+    const cfg = loadConfig();
+    assert(
+      isAbsolute(cfg.database),
+      `database must be absolute, got ${JSON.stringify(cfg.database)}`,
+    );
+    assert(
+      cfg.database === resolve("relative.sqlite"),
+      `must resolve against the working directory, got ${cfg.database}`,
+    );
+    const row = explainConfig().find((r) => r.key === "database");
+    assert(
+      row !== undefined && isAbsolute(row.value),
+      `config show must report an absolute path too, got ${row?.value}`,
+    );
+  });
+  // Env-supplied too — one rule, not one per source.
+  withConfig(null, () => {
+    process.env.CHAMBER_DB = "from-env.sqlite";
+    assert(
+      isAbsolute(loadConfig().database),
+      "a relative CHAMBER_DB must be resolved as well",
+    );
+  });
+  // `:memory:` is a SQLite sentinel `openChamberDb` already treats specially;
+  // resolving it would create a file literally named `:memory:` in the cwd.
+  withConfig(`{"database":":memory:"}`, () => {
+    assert(
+      loadConfig().database === ":memory:",
+      "the in-memory sentinel must pass through unresolved",
+    );
+  });
+});
+
+test("cli", "the same relative database names one file regardless of cwd", () => {
+  // The symptom: `chamber status` from two directories opened two unrelated
+  // databases and reported the bare word `relative.sqlite` for both — a string
+  // that names no file the operator can go and check.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-relcwd-"));
+  try {
+    const home = join(dir, "home");
+    const elsewhere = join(dir, "elsewhere");
+    mkdirSync(home);
+    mkdirSync(elsewhere);
+    const cfgFile = join(dir, "config.json");
+    writeFileSync(cfgFile, JSON.stringify({ database: "relative.sqlite" }));
+    const run = (cwd: string): string =>
+      spawnSync(
+        process.execPath,
+        ["--experimental-strip-types", CLI_PATH, "status"],
+        {
+          cwd,
+          encoding: "utf8",
+          timeout: 15_000,
+          env: { ...process.env, CHAMBER_CONFIG: cfgFile, CHAMBER_DB: "" },
+        },
+      ).stdout;
+    const a = run(home);
+    assert(
+      a.includes(join(home, "relative.sqlite")),
+      `the banner must name an absolute path, got:\n${a}`,
+    );
+    assert(
+      !a.split("\n").some((l) => l.trim() === "db: relative.sqlite"),
+      `the banner must not report a bare relative fragment, got:\n${a}`,
+    );
+    const b = run(elsewhere);
+    assert(
+      b.includes(join(elsewhere, "relative.sqlite")),
+      `the banner must name the path this run actually used, got:\n${b}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────

@@ -76,6 +76,39 @@ export function expandTilde(p: string): string {
   return p;
 }
 
+/**
+ * The database setting as an absolute path — the same treatment `canonical()`
+ * gives an ingest root, and what `ChamberConfig.database` has always claimed.
+ *
+ * `expandTilde` alone left a relative value relative, so `database` broke the
+ * contract its own type states, and this module disagreed with itself: an
+ * ingest root goes through `canonical()`, which resolves. Measured before this
+ * existed — `{"database":"relative.sqlite"}` run from two directories opened
+ * two unrelated databases while the banner reported the bare word
+ * `relative.sqlite` for both, which names no file an operator can go and find.
+ *
+ * `resolve` is against the working directory, so it does not make a relative
+ * value *safe* — under launchd (cwd `/`) it resolves to `/relative.sqlite`,
+ * which nothing can write, and `openChamberDb` still redirects to `/tmp`. What
+ * it does is make the value mean one nameable file per run instead of a
+ * different one per caller, and make every report of it a path rather than a
+ * fragment. The redirect itself is now reported honestly too; see `open()` in
+ * src/cli.ts.
+ *
+ * `resolve` only, deliberately — not `realpathSync`. Roots need canonical
+ * identity because they are compared against each other for overlap; a
+ * database path is only ever opened, so resolving symlinks would buy nothing
+ * and would report a path (`/private/var/…`) the operator never wrote.
+ *
+ * `:memory:` is a SQLite sentinel, not a path — `openChamberDb` already treats
+ * it as one — so it passes through untouched rather than becoming a file
+ * literally named `:memory:` in the working directory.
+ */
+function resolveDatabase(p: string): string {
+  if (p === ":memory:") return p;
+  return resolve(expandTilde(p));
+}
+
 export function configPath(): string {
   const explicit = envSetting("CHAMBER_CONFIG");
   if (explicit) return explicit;
@@ -421,7 +454,7 @@ export function loadConfig(opts: { path?: string } = {}): ChamberConfig {
   const path = opts.path ?? configPath();
   const file = parseFile(path);
 
-  const database = expandTilde(
+  const database = resolveDatabase(
     envSetting("CHAMBER_DB") ?? file.database ?? defaultDatabase(),
   );
 
@@ -478,8 +511,8 @@ export function explainConfig(): ResolvedSetting[] {
   const envDb = envSetting("CHAMBER_DB");
   const db = resolveOne(
     "database",
-    envDb === undefined ? undefined : expandTilde(envDb),
-    file.database === undefined ? undefined : expandTilde(file.database),
+    envDb === undefined ? undefined : resolveDatabase(envDb),
+    file.database === undefined ? undefined : resolveDatabase(file.database),
     defaultDatabase(),
   );
   if (db) out.push(db);

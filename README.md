@@ -16,7 +16,7 @@ sql/schema_spend_approvals.sql       spend_event + pending_write + policies
 sql/schema_approval_workflows.sql    automated approval rules + audit
 src/types.ts
 src/hash.ts
-src/db.ts                            loads all three schemas
+src/db.ts                            loads all 14 schemas
 src/commit_belief.ts
 src/try_activate_skill.ts
 src/spend.ts
@@ -24,7 +24,7 @@ src/approvals.ts                     propose / decide / queue
 src/approval_workflows.ts            evaluateWorkflows (auto approve/reject)
 src/audit.ts                         hash-chained audit trail
 src/merkle.ts                        Merkle checkpoints + inclusion proofs
-tests/harness.ts                     **runnable** acceptance suite (22 tests)
+tests/harness.ts                     **runnable** acceptance suite (287 tests)
 tests/ACCEPTANCE_TESTS.md
 tests/SPEND_APPROVALS.md
 tests/APPROVAL_WORKFLOWS.md
@@ -42,7 +42,7 @@ npm test
 # suites: --suite=gates|spend|approvals|audit
 ```
 
-**Last run: 22/22 passed.** Specs are no longer paper-only.
+**Last run: 287/287 passed.** Specs are no longer paper-only.
 
 ## Gates (week-1)
 

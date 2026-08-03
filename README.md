@@ -6,6 +6,8 @@ Governable cognition for a premium agent that must beat Hermes on **epistemic in
 
 > No assertion may become executable, citable, or load-bearing except through a gate whose check and write commit in one transaction — anything else may decay, park, or be defeated, but it may never silently pass.
 
+Where that invariant does not yet hold, and what a verified citation does and does not prove: [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md). Read it before trusting any output.
+
 ## Layout
 
 ```text

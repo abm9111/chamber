@@ -7,14 +7,26 @@ import type { DatabaseSync } from "node:sqlite";
 import type { McpTool } from "./mcp_client.ts";
 import { appendAudit } from "./audit.ts";
 
+/**
+ * `description` is a nullable field on the wire (absent, JSON `null`, or `""`
+ * are all distinct signals a server can send). `tool.description ?? ""`
+ * coalesced the first two into the third *before* JSON.stringify ever saw
+ * them, so a description flipping between `null` and `""` — a change a
+ * server can make silently — produced byte-identical pin input and
+ * therefore an unchanged hash: invisible drift, in the one check whose job
+ * is detecting it. Passing `?? null` through instead costs nothing, because
+ * JSON.stringify already renders `null` and `""` as different strings
+ * (`null` vs `""`) — the same fix already applied to the citation pin
+ * formula in src/pins.ts, for the identical reason.
+ */
 export function hashToolSchema(tool: {
   name: string;
-  description?: string;
+  description?: string | null;
   inputSchema?: unknown;
 }): string {
   const payload = JSON.stringify({
     name: tool.name,
-    description: tool.description ?? "",
+    description: tool.description ?? null,
     inputSchema: tool.inputSchema ?? null,
   });
   return createHash("sha256").update(payload).digest("hex");
@@ -24,7 +36,7 @@ export function hashToolsList(tools: McpTool[]): string {
   const normalized = tools
     .map((t) => ({
       name: t.name,
-      description: t.description ?? "",
+      description: t.description ?? null,
       inputSchema: t.inputSchema ?? null,
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -78,8 +90,13 @@ export function pinToolsList(
       endpoint,
       t.name,
       h,
+      // Same collision as hashToolSchema/hashToolsList above, in a second,
+      // independent hash over the same nullable field: hashing the raw
+      // string after `?? ""` erased null vs "" before the hash ever saw it.
+      // JSON.stringify distinguishes them (`null` vs `""`) the same way it
+      // does above, so wrap the value instead of coalescing it away.
       createHash("sha256")
-        .update(t.description ?? "")
+        .update(JSON.stringify(t.description ?? null))
         .digest("hex"),
       now,
     );

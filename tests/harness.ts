@@ -172,19 +172,26 @@ import {
   passageSourceRef,
   splitPassages,
 } from "../src/chunk.ts";
+import {
+  expandTilde,
+  loadConfig,
+  explainConfig,
+} from "../src/config.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import type { DatabaseSync } from "node:sqlite";
 
 // ─── mini test runner ────────────────────────────────────────────────────────
@@ -207,6 +214,7 @@ type Suite =
   | "discord"
   | "pins"
   | "cli"
+  | "config"
   | "all";
 
 interface TestResult {
@@ -289,6 +297,7 @@ function suiteFromArg(): Suite {
     "discord",
     "pins",
     "cli",
+    "config",
     "all",
   ].includes(v)
     ? v
@@ -6487,6 +6496,163 @@ test("cli", "status_dispatches_against_a_scratch_db", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ─── CONFIG (file-based settings resolution, src/config.ts) ────────────────
+//
+// Chamber has 25+ CHAMBER_* env vars and nothing that reads a file, so
+// nothing survives a shell session. These tests pin the precedence
+// (env > config file > default), the fail-closed validation (unknown keys,
+// malformed JSON, overlapping ingest roots), and the hard requirement that
+// no field in the resolved config can carry an API key.
+
+function withConfig<T>(json: string | null, fn: () => T): T {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-cfg-"));
+  const p = join(dir, "config.json");
+  if (json !== null) writeFileSync(p, json);
+  const prevCfg = process.env.CHAMBER_CONFIG;
+  const prevDb = process.env.CHAMBER_DB;
+  const prevBase = process.env.CHAMBER_API_BASE;
+  process.env.CHAMBER_CONFIG = p;
+  delete process.env.CHAMBER_DB;
+  delete process.env.CHAMBER_API_BASE;
+  try {
+    return fn();
+  } finally {
+    if (prevCfg === undefined) delete process.env.CHAMBER_CONFIG;
+    else process.env.CHAMBER_CONFIG = prevCfg;
+    if (prevDb === undefined) delete process.env.CHAMBER_DB;
+    else process.env.CHAMBER_DB = prevDb;
+    if (prevBase === undefined) delete process.env.CHAMBER_API_BASE;
+    else process.env.CHAMBER_API_BASE = prevBase;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("config", "expandTilde resolves a leading tilde to the home directory", () => {
+  const out = expandTilde("~/x/y.sqlite");
+  assert(out.startsWith(homedir()), `expected home prefix, got ${out}`);
+  assert(!out.includes("~"), `tilde survived: ${out}`);
+  assert(expandTilde("/abs/path") === "/abs/path", "absolute paths must pass through");
+  assert(expandTilde("rel/path") === "rel/path", "relative paths must pass through");
+});
+
+test("config", "a missing config file yields defaults without throwing", () => {
+  withConfig(null, () => {
+    const cfg = loadConfig();
+    assert(cfg.database.length > 0, "database must have a default");
+    assert(cfg.ingest.length === 0, "ingest defaults to empty");
+  });
+});
+
+test("config", "config supplies the database when no env var is set", () => {
+  withConfig(`{"database":"/tmp/from-config.sqlite"}`, () => {
+    assert(
+      loadConfig().database === "/tmp/from-config.sqlite",
+      "config value must win over the default",
+    );
+  });
+});
+
+test("config", "env beats config and the disagreement is reported", () => {
+  withConfig(`{"database":"/tmp/from-config.sqlite"}`, () => {
+    process.env.CHAMBER_DB = "/tmp/from-env.sqlite";
+    try {
+      assert(loadConfig().database === "/tmp/from-env.sqlite", "env must win");
+      const row = explainConfig().find((r) => r.key === "database");
+      assert(row?.source === "env", `expected source=env, got ${row?.source}`);
+      assert(
+        row?.conflict === "/tmp/from-config.sqlite",
+        `expected the losing value reported, got ${row?.conflict}`,
+      );
+    } finally {
+      delete process.env.CHAMBER_DB;
+    }
+  });
+});
+
+test("config", "identical env and config values report no conflict", () => {
+  withConfig(`{"database":"/tmp/same.sqlite"}`, () => {
+    process.env.CHAMBER_DB = "/tmp/same.sqlite";
+    try {
+      const row = explainConfig().find((r) => r.key === "database");
+      assert(row?.conflict === undefined, `expected no conflict, got ${row?.conflict}`);
+    } finally {
+      delete process.env.CHAMBER_DB;
+    }
+  });
+});
+
+test("config", "an unknown top-level key is rejected", () => {
+  withConfig(`{"database":"/tmp/x.sqlite","excludes":["oops"]}`, () => {
+    let msg = "";
+    try { loadConfig(); } catch (e) { msg = e instanceof Error ? e.message : String(e); }
+    assert(msg.includes("excludes"), `error must name the unknown key, got: ${msg}`);
+  });
+});
+
+test("config", "malformed JSON throws and names the file", () => {
+  withConfig(`{ not json`, () => {
+    let msg = "";
+    try { loadConfig(); } catch (e) { msg = e instanceof Error ? e.message : String(e); }
+    assert(msg.includes("config.json"), `error must name the file, got: ${msg}`);
+  });
+});
+
+test("config", "overlapping ingest roots are rejected, naming both", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-roots-"));
+  mkdirSync(join(dir, "sub"), { recursive: true });
+  const json = JSON.stringify({ ingest: [{ root: dir }, { root: join(dir, "sub") }] });
+  withConfig(json, () => {
+    let msg = "";
+    try { loadConfig(); } catch (e) { msg = e instanceof Error ? e.message : String(e); }
+    assert(msg.includes("sub"), `error must name the nested root, got: ${msg}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("config", "sibling roots that share a name prefix are not treated as overlapping", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-sib-"));
+  mkdirSync(join(dir, "notes"), { recursive: true });
+  mkdirSync(join(dir, "notes-archive"), { recursive: true });
+  const json = JSON.stringify({
+    ingest: [{ root: join(dir, "notes") }, { root: join(dir, "notes-archive") }],
+  });
+  withConfig(json, () => {
+    const cfg = loadConfig();
+    assert(cfg.ingest.length === 2, "sibling roots must both survive");
+  });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// The overlap check compares canonicalised root paths with `b === a ||
+// b.startsWith(a + sep)`. Two entries pointing at the *identical* root are
+// caught by the `b === a` clause — same as a nested root, they duplicate the
+// same file and strand rows when one shrinks, so this is deliberately
+// rejected rather than silently deduplicated. (A lone root is never compared
+// against itself: the loop skips `i === j`, so a single ingest entry never
+// self-triggers this.)
+test("config", "the same root listed twice is rejected as a self-overlap", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-dup-"));
+  const json = JSON.stringify({ ingest: [{ root: dir }, { root: dir }] });
+  withConfig(json, () => {
+    let msg = "";
+    try { loadConfig(); } catch (e) { msg = e instanceof Error ? e.message : String(e); }
+    assert(msg.includes("overlap"), `duplicate root must be rejected, got: ${msg}`);
+    assert(msg.includes(dir), `error must name the duplicated root, got: ${msg}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("config", "no config field can supply an API key", () => {
+  withConfig(`{"database":"/tmp/x.sqlite"}`, () => {
+    const cfg = loadConfig() as unknown as Record<string, unknown>;
+    assert(!("apiKey" in cfg), "ChamberConfig must not carry an apiKey field");
+    assert(
+      JSON.stringify(cfg).toLowerCase().includes("key") === false,
+      "no resolved config value may look like a key field",
+    );
+  });
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────

@@ -138,6 +138,7 @@ import {
   handleChamberSlash,
   slackApprove,
   slackScopeId,
+  openSlackDb,
 } from "../src/slack_ops.ts";
 import {
   canDiscordApprove,
@@ -148,7 +149,10 @@ import {
   formatAttachmentMeta,
   chunkDiscordMessage,
   isDiscordFreeResponseChannel,
+  openDiscordDb,
 } from "../src/discord_ops.ts";
+// Importing this module must not start a gateway; see `invokedDirectly` there.
+import { openGatewayDb } from "../src/gateway_runner.ts";
 import {
   checkRateLimit,
   resetRateLimits,
@@ -300,6 +304,7 @@ function suiteFromArg(): Suite {
     "pins",
     "cli",
     "config",
+    "daemon",
     "all",
   ].includes(v)
     ? v
@@ -7892,6 +7897,283 @@ test("cli", "the banner names /tmp when the data went to /tmp", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
     if (!tmpFallbackPreexisted) rmSync(TMP_FALLBACK, { force: true });
+  }
+});
+
+// ── IMPORTANT: durability was a CLI-only property ────────────────────────────
+//
+// `chamber` resolved its database through loadConfig() and wrote to
+// ~/.local/share/chamber/chamber.sqlite. Every daemon — the HTTP server, the
+// gateway runner, the Slack and Discord op surfaces — read
+// `process.env.CHAMBER_DB ?? "/tmp/chamber.sqlite"` instead. So the CLI and the
+// daemons kept two unrelated corpora, and the daemons' evaporated on reboot.
+//
+// The `??` carried the second half of the defect: it falls through on nullish
+// only, so `export CHAMBER_DB="$UNSET_THING"` resolved to "" and won the
+// precedence race against both the config file and the default. That is not a
+// visible failure — `new DatabaseSync("")` succeeds, SQLite opens a private
+// temporary database, the schemas apply, and every row written disappears at
+// exit. config.ts's envSetting() has treated blank as unset since the CLI hit
+// this; these call sites never received it.
+//
+// The tests below hold each entry point to the resolver the CLI uses.
+
+/** The three daemon openers that can be exercised without a network. */
+const DAEMON_OPENERS: ReadonlyArray<{
+  readonly name: string;
+  readonly open: () => DatabaseSync;
+}> = [
+  { name: "openSlackDb", open: openSlackDb },
+  { name: "openDiscordDb", open: openDiscordDb },
+  { name: "openGatewayDb", open: openGatewayDb },
+];
+
+/**
+ * A scratch config naming a database, plus a second path the environment can
+ * name instead.
+ *
+ * The configured path sits one level below a directory that does not exist
+ * yet, because that is the case that separates "resolved the path" from
+ * "opened it": `openChamberDb` creates the parent, and a caller that resolved
+ * a path but could not create it would land in /tmp and pass a weaker test.
+ *
+ * `withConfig` clears CHAMBER_CONFIG, CHAMBER_DB and XDG_CONFIG_HOME before
+ * the body runs and restores them after, so nothing in here can read or write
+ * a real ~/.config/chamber.
+ */
+function withDaemonDb<T>(
+  fn: (p: { configured: string; fromEnv: string }) => T,
+): T {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-daemondb-"));
+  try {
+    const configured = join(dir, "durable", "chamber.sqlite");
+    const fromEnv = join(dir, "from-env.sqlite");
+    return withConfig(JSON.stringify({ database: configured }), () =>
+      fn({ configured, fromEnv }),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+for (const { name, open } of DAEMON_OPENERS) {
+  test("daemon", `${name} opens the configured database when CHAMBER_DB is unset`, () => {
+    withDaemonDb(({ configured }) => {
+      open().close();
+      assert(
+        existsSync(configured),
+        `${name} must open the database the config names (${configured}); ` +
+          `it did not, so this daemon and the CLI hold different corpora`,
+      );
+    });
+  });
+
+  test("daemon", `${name} still lets CHAMBER_DB win over the config file`, () => {
+    withDaemonDb(({ configured, fromEnv }) => {
+      process.env.CHAMBER_DB = fromEnv;
+      open().close();
+      assert(
+        existsSync(fromEnv),
+        `${name} must honour CHAMBER_DB=${fromEnv}; nothing was created there`,
+      );
+      assert(
+        !existsSync(configured),
+        `${name} used the config file while CHAMBER_DB was set — ` +
+          `environment outranks file, and that precedence must not change`,
+      );
+    });
+  });
+
+  test("daemon", `${name} treats an empty CHAMBER_DB as unset`, () => {
+    withDaemonDb(({ configured }) => {
+      process.env.CHAMBER_DB = "";
+      open().close();
+      assert(
+        existsSync(configured),
+        `an empty CHAMBER_DB must fall through to the config file. ` +
+          `${configured} was never created, which means the path resolved to ` +
+          `"" — a request node:sqlite honours as a private temporary database ` +
+          `that is discarded when the process exits`,
+      );
+    });
+  });
+}
+
+const SERVER_PATH = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "../src/server.ts",
+);
+
+/**
+ * Run src/server.ts far enough to bind and print its startup lines, then stop.
+ *
+ * The server opens its database and calls `listen()` at module scope, so there
+ * is nothing to import and call: it has to be a process. `-e` with a dynamic
+ * import gets the module evaluated, and the timer fires after the listen
+ * callback has printed — which is the thing under test, since the `db=` line
+ * is what an operator reads to learn where their data went.
+ *
+ * PORT=0 asks the kernel for a free port, so this can never collide with a
+ * server the owner already has running on 8787.
+ *
+ * The environment is built by *removing* every config-deciding variable from
+ * the parent's before the overrides are applied, so a stray CHAMBER_CONFIG in
+ * the ambient shell cannot make these tests read a real user config.
+ */
+function runServer(overrides: Record<string, string>): {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+} {
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of CONFIG_ENV_KEYS) delete env[key];
+  const r = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "-e",
+      `await import(${JSON.stringify(SERVER_PATH)});` +
+        `setTimeout(() => process.exit(0), 700);`,
+    ],
+    {
+      encoding: "utf8",
+      timeout: 20_000,
+      env: { ...env, PORT: "0", CHAMBER_BIND: "127.0.0.1", ...overrides },
+    },
+  );
+  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+/** A config file in its own temp dir, plus the paths the test cares about. */
+function withServerFixture<T>(
+  fn: (p: { configPath: string; configured: string; fromEnv: string }) => T,
+): T {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-serverdb-"));
+  try {
+    const configured = join(dir, "durable", "chamber.sqlite");
+    const configPath = join(dir, "config.json");
+    writeFileSync(configPath, JSON.stringify({ database: configured }));
+    return fn({ configPath, configured, fromEnv: join(dir, "from-env.sqlite") });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("daemon", "the server opens the configured database when CHAMBER_DB is unset", () => {
+  withServerFixture(({ configPath, configured }) => {
+    const r = runServer({ CHAMBER_CONFIG: configPath });
+    assert(r.status === 0, `server exited ${r.status}; stderr:\n${r.stderr}`);
+    assert(
+      existsSync(configured),
+      `the server must open the database the config names (${configured}); ` +
+        `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`,
+    );
+    assert(
+      r.stdout.includes(`db=${configured}`),
+      `the startup line must name that database, got:\n${r.stdout}`,
+    );
+  });
+});
+
+test("daemon", "the server still lets CHAMBER_DB win over the config file", () => {
+  withServerFixture(({ configPath, configured, fromEnv }) => {
+    const r = runServer({ CHAMBER_CONFIG: configPath, CHAMBER_DB: fromEnv });
+    assert(r.status === 0, `server exited ${r.status}; stderr:\n${r.stderr}`);
+    assert(existsSync(fromEnv), `CHAMBER_DB=${fromEnv} was not honoured`);
+    assert(
+      !existsSync(configured),
+      "the config file beat CHAMBER_DB — environment outranks file",
+    );
+    assert(
+      r.stdout.includes(`db=${fromEnv}`),
+      `the startup line must name the environment's database, got:\n${r.stdout}`,
+    );
+  });
+});
+
+test("daemon", "the server treats an empty CHAMBER_DB as unset", () => {
+  withServerFixture(({ configPath, configured }) => {
+    const r = runServer({ CHAMBER_CONFIG: configPath, CHAMBER_DB: "" });
+    assert(r.status === 0, `server exited ${r.status}; stderr:\n${r.stderr}`);
+    assert(
+      existsSync(configured),
+      `an empty CHAMBER_DB must fall through to the config file; ` +
+        `${configured} was never created. stdout:\n${r.stdout}`,
+    );
+    assert(
+      !r.stdout.includes("db=\n") && !r.stdout.includes("db= "),
+      `the startup line must never report an empty path, got:\n${r.stdout}`,
+    );
+  });
+});
+
+// The banner-truth defect, one layer down: `openChamberDb` relocates to /tmp
+// when it cannot use the location it was given, and the server's own startup
+// line is the only thing a daemon operator sees. Reporting the requested path
+// after a redirect makes that line a confident lie — the same failure
+// `chamber status 2>/dev/null` had before `onRedirect` existed.
+test("daemon", "the server's startup line names /tmp when the data went to /tmp", () => {
+  const TMP_FALLBACK = "/tmp/chamber.sqlite";
+  const tmpFallbackPreexisted = existsSync(TMP_FALLBACK);
+  withServerFixture(({ configPath, configured }) => {
+    try {
+      // A directory as the database path: an unusable location that fails the
+      // same way for root as for anyone else.
+      const requested = join(dirname(configured), "iam-a-directory");
+      mkdirSync(requested, { recursive: true });
+      const r = runServer({ CHAMBER_CONFIG: configPath, CHAMBER_DB: requested });
+      assert(r.status === 0, `server exited ${r.status}; stderr:\n${r.stderr}`);
+      assert(
+        r.stdout.includes(`db=${TMP_FALLBACK}`),
+        `stdout must name where the rows actually went, got:\n${r.stdout}`,
+      );
+      assert(
+        !r.stdout.includes(`db=${requested}`),
+        `stdout must not claim the path it failed to open, got:\n${r.stdout}`,
+      );
+      assert(
+        r.stderr.includes(requested) && r.stderr.includes(TMP_FALLBACK),
+        `stderr must still name both paths, got:\n${r.stderr}`,
+      );
+    } finally {
+      if (!tmpFallbackPreexisted) rmSync(TMP_FALLBACK, { force: true });
+    }
+  });
+});
+
+// A source assertion, deliberately. server.ts prints its database path from
+// two places, and the second is inside the systemd socket-activation branch —
+// reached only when LISTEN_FDS is set and LISTEN_PID equals the child's own
+// pid, which a parent cannot arrange in advance. That branch is therefore the
+// one place this defect could quietly come back, so what is checked here is
+// the defect's shape rather than its behaviour: no daemon may reach for
+// CHAMBER_DB itself, and none may carry the /tmp default that made durability
+// a CLI-only property. Both belong to src/config.ts now.
+test("daemon", "no daemon resolves its own database path", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  for (const file of [
+    "src/server.ts",
+    "src/gateway_runner.ts",
+    "src/slack_ops.ts",
+    "src/discord_ops.ts",
+  ]) {
+    const text = readFileSync(join(root, file), "utf8");
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      if (line.trimStart().startsWith("*")) continue; // prose in a doc comment
+      assert(
+        !line.includes("process.env.CHAMBER_DB"),
+        `${file}:${i + 1} reads CHAMBER_DB directly — precedence and the ` +
+          `blank-is-unset rule live in src/config.ts:\n  ${line.trim()}`,
+      );
+      assert(
+        !line.includes(`"/tmp/chamber.sqlite"`),
+        `${file}:${i + 1} carries its own /tmp default, so this daemon's ` +
+          `data does not survive a reboot:\n  ${line.trim()}`,
+      );
+    }
   }
 });
 

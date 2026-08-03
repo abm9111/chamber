@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadConfig } from "./config.ts";
 import { formatErrorChain } from "./error_chain.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -173,4 +174,35 @@ export function openChamberDb(
     }
   }
   throw lastErr;
+}
+
+/**
+ * Open the database Chamber's *settings* name — environment, then config file,
+ * then the durable default — rather than one the caller chose for itself.
+ *
+ * Every entry point that is not a test or a probe belongs here. Four of them
+ * did not: src/server.ts, src/gateway_runner.ts, src/slack_ops.ts and
+ * src/discord_ops.ts each read `process.env.CHAMBER_DB ?? "/tmp/chamber.sqlite"`
+ * and none imported loadConfig. So `chamber ask` and the HTTP server held two
+ * unrelated corpora, and the daemons' one — the audit chain included — was
+ * gone after a reboot. Durability was a property of the CLI, not of Chamber.
+ *
+ * The `??` was the second half of it: it falls through on nullish only, so
+ * `export CHAMBER_DB="$UNSET"` resolved to "", beat both the config file and
+ * the default, and opened a private temporary SQLite database that discards
+ * every row at exit. `envSetting` in src/config.ts has treated blank as unset
+ * since the CLI hit this; routing through it is what extends that rule here.
+ *
+ * `onRedirect` is passed straight through, because a daemon that *prints* its
+ * database path has the same obligation the CLI banner does — see
+ * `openChamberDb` above and `listenServer` in src/server.ts.
+ *
+ * A function, not a module-level constant: config is read at the moment of
+ * opening, so a caller that opens twice in one process sees the settings as
+ * they are, and importing this module still costs no filesystem access.
+ */
+export function openConfiguredDb(
+  onRedirect?: (actual: string) => void,
+): DatabaseSync {
+  return openChamberDb(loadConfig().database, onRedirect);
 }

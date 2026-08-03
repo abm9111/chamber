@@ -5,7 +5,7 @@
 
 import { spawnSync } from "node:child_process";
 import type { DatabaseSync } from "node:sqlite";
-import { openChamberDb } from "./db.ts";
+import { openConfiguredDb } from "./db.ts";
 import { newId, sha256 } from "./hash.ts";
 import { appendAudit } from "./audit.ts";
 import { startSession, appendMessage } from "./sessions.ts";
@@ -32,8 +32,13 @@ import {
   surfaceRateKey,
 } from "./surface_harden.ts";
 
+/**
+ * The same database the CLI uses. This read CHAMBER_DB itself and defaulted to
+ * /tmp, so a belief committed over Slack and one committed over `chamber ask`
+ * landed in different files — and the Slack side did not survive a reboot.
+ */
 export function openSlackDb(): DatabaseSync {
-  return openChamberDb(process.env.CHAMBER_DB ?? "/tmp/chamber.sqlite");
+  return openConfiguredDb();
 }
 
 export function canSlackApprove(userId: string): boolean {

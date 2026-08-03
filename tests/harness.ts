@@ -8411,6 +8411,91 @@ test("daemon", "no daemon resolves its own database path", () => {
   }
 });
 
+// ── The other direction of `invokedDirectly` ────────────────────────────────
+//
+// The negative direction is already live in this file: line 155 imports
+// `openGatewayDb` from src/gateway_runner.ts, and TELEGRAM_BOT_TOKEN is set on
+// this machine, so if the guard ever stopped working that import would open a
+// real long-poll against Telegram and this suite would hang rather than fail.
+//
+// Nothing held the positive direction, and its failure mode is the quiet one.
+// If `invokedDirectly()` returns false for the real entry point — a refactor
+// that moves this file, a bundler that rewrites argv[1], a switch to
+// `import.meta.main` on a Node that reports it `undefined` — then
+// `npm run gateway` exits 0 having done absolutely nothing, and a suite that
+// only checks the negative stays green while the runner is dead.
+//
+// So: launch it as a subprocess, never import it, with every messenger token
+// removed from the environment. Scrubbing the token is what keeps this test
+// off the network — with one present, `main()` reaches TelegramGateway.start()
+// and long-polls until the timeout kills it. With none, `main()` falls into
+// its console-gateway branch, prints, and returns. That branch is the whole
+// assertion: those two lines exist nowhere but inside `main()`, so seeing them
+// proves `main()` ran, and the process terminating proves it was reached the
+// way an operator reaches it rather than by hanging somewhere earlier.
+//
+// CHAMBER_CONFIG names a file that does not exist and CHAMBER_DB is the
+// in-memory sentinel, so no real `~/.config/chamber/` is read and no real
+// database is touched. This branch opens no database at all; both are belt and
+// braces against a future `main()` that resolves one before dispatching.
+test("daemon", "gateway_runner runs main() when it is the program invoked", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-gwmain-"));
+  try {
+    const env: Record<string, string | undefined> = { ...process.env };
+    for (const key of [
+      "TELEGRAM_BOT_TOKEN",
+      "DISCORD_BOT_TOKEN",
+      "SLACK_BOT_TOKEN",
+      "CHAMBER_GATEWAY",
+    ]) {
+      delete env[key];
+    }
+    env.CHAMBER_CONFIG = join(dir, "no-such-config.json");
+    env.CHAMBER_DB = ":memory:";
+
+    const runner = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "../src/gateway_runner.ts",
+    );
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", runner],
+      { encoding: "utf8", timeout: 30_000, env },
+    );
+
+    assert(r.error === undefined, `failed to launch gateway_runner: ${r.error}`);
+    // A killed process means it did not take the console branch — the most
+    // likely reason is a token that survived the scrub and opened a long-poll.
+    assert(
+      r.signal === null,
+      `gateway_runner did not terminate and was killed (signal=${r.signal}) — ` +
+        `it should have taken the tokenless console branch and returned; ` +
+        `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`,
+    );
+    assert(
+      r.status === 0,
+      `gateway_runner exited ${r.status}; stderr:\n${r.stderr}`,
+    );
+    assert(
+      r.stdout.includes("No messenger tokens — console gateway only."),
+      `main() did not run: nothing on stdout could only have come from inside ` +
+        `it, so \`invokedDirectly()\` returned false for the real entry point ` +
+        `and \`npm run gateway\` is a no-op that exits 0. stdout:\n${r.stdout}`,
+    );
+    assert(
+      r.stdout.includes("Set TELEGRAM_BOT_TOKEN"),
+      `main() started but did not reach the end of its console branch; ` +
+        `stdout:\n${r.stdout}`,
+    );
+    assert(
+      !r.stderr.includes("SyntaxError"),
+      `gateway_runner printed a SyntaxError:\n${r.stderr}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ─── report ──────────────────────────────────────────────────────────────────
 
 // Drain the async queue sequentially: invoke a thunk, await it fully,

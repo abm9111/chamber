@@ -183,6 +183,7 @@ import { spawnSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -6574,6 +6575,173 @@ test("cli", "a malformed config is a hard error, not a silent fallback", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// The branch this lives on exists to make Chamber survive a reboot: the
+// database moved off `/tmp` to `~/.local/share/chamber/chamber.sqlite`. That
+// directory does not exist on a fresh machine, and nothing created it — so
+// `openChamberDb` failed to open it, its own fallback chain read the failure
+// as a disk error, and it stored everything in `/tmp/chamber.sqlite` while
+// `status` kept reporting the durable path. The branch's whole purpose,
+// defeated one layer down, silently. These two tests pin both halves of the
+// fix; the third pins the constraint that the fix must stay quiet on the
+// path every other test in this file takes.
+test("cli", "the database's parent directory is created, not fallen back from", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-mkParent-"));
+  try {
+    // Three levels that do not exist, so this cannot pass by accident on a
+    // machine where some prefix happens to be there already.
+    const dbFile = join(dir, "share", "chamber", "nested", "chamber.sqlite");
+    const cfgFile = join(dir, "config.json");
+    writeFileSync(cfgFile, JSON.stringify({ database: dbFile }));
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "status"],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: { ...process.env, CHAMBER_CONFIG: cfgFile, CHAMBER_DB: "" },
+      },
+    );
+    assert(r.status === 0, `status failed: ${r.stderr}`);
+    // The load-bearing assertion. Reporting the path proves only that
+    // `dbPath()` resolved it; the file existing proves the data went there.
+    assert(
+      existsSync(dbFile),
+      `no database at the reported path — data went somewhere else. ` +
+        `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`,
+    );
+    assert(
+      r.stdout.includes(dbFile),
+      `status must report the path it actually opened, got:\n${r.stdout}`,
+    );
+    // A successful open of the requested path must not warn about anything.
+    assert(
+      !r.stderr.includes("WARNING"),
+      `nothing was redirected, so nothing should warn, got:\n${r.stderr}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cli", "a database that cannot be opened is redirected out loud, naming both paths", () => {
+  // A directory as the database path, rather than `chmod 0500` on its parent:
+  // node:sqlite reports a missing directory, an unwritable directory and a
+  // path that is itself a directory with the same code and the same message
+  // (SQLITE_CANTOPEN, "unable to open database file" — measured), so this is
+  // the identical failure, and unlike a permission bit it also fails when the
+  // suite runs as root.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-loud-"));
+  // `openChamberDb`'s first fallback is a fixed `/tmp/chamber.sqlite`. Leave
+  // the machine as we found it: remove that file afterwards only if this test
+  // is what brought it into being.
+  const TMP_FALLBACK = "/tmp/chamber.sqlite";
+  const tmpFallbackPreexisted = existsSync(TMP_FALLBACK);
+  try {
+    const dbPath = join(dir, "iam-a-directory");
+    mkdirSync(dbPath);
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "status"],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: {
+          ...process.env,
+          CHAMBER_DB: dbPath,
+          CHAMBER_CONFIG: join(dir, "config.json"), // never written
+        },
+      },
+    );
+    assert(r.status === 0, `status should still run: ${r.stderr}`);
+    assert(
+      r.stderr.includes("WARNING"),
+      `a redirect must announce itself, got stderr:\n${r.stderr}`,
+    );
+    // Both paths, or the operator cannot act on it: one tells them what they
+    // asked for, the other tells them where to actually find their data.
+    assert(
+      r.stderr.includes(dbPath),
+      `the warning must name the path that failed, got:\n${r.stderr}`,
+    );
+    assert(
+      r.stderr.includes(TMP_FALLBACK),
+      `the warning must name where the data actually went, got:\n${r.stderr}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (!tmpFallbackPreexisted) rmSync(TMP_FALLBACK, { force: true });
+  }
+});
+
+test("cli", "a broken database is reported, not quietly relocated to /tmp", () => {
+  // The other half of the old `isDiskError`: it accepted `ERR_SQLITE_ERROR`,
+  // the code node:sqlite stamps on *every* error it throws — so a corrupt
+  // database file, or a typo in one of this repo's own `sql/*.sql` files,
+  // counted as a disk failure and moved the operator's data to
+  // `/tmp/chamber.sqlite` without a word. Measured before the fix: exit 0,
+  // empty stderr, a fresh `/tmp/chamber.sqlite`. A broken database is not a
+  // broken disk, and it must never be answered by writing somewhere else.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-corrupt-"));
+  try {
+    const dbFile = join(dir, "corrupt.sqlite");
+    writeFileSync(dbFile, "this is not a sqlite database".repeat(50));
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "status"],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: {
+          ...process.env,
+          CHAMBER_DB: dbFile,
+          CHAMBER_CONFIG: join(dir, "config.json"), // never written
+        },
+      },
+    );
+    assert(
+      r.stderr.includes("WARNING") && r.stderr.includes(dbFile),
+      `a broken database must be reported, naming it, got:\n${r.stderr}`,
+    );
+    // Asserting on the warning rather than on the filesystem deliberately:
+    // `/tmp/chamber.sqlite` may already exist on the machine running this, so
+    // its presence proves nothing. A `/tmp` relocation would have *announced*
+    // `/tmp` — the absence of that name is the proof it did not happen.
+    assert(
+      !r.stderr.includes("/tmp/chamber.sqlite"),
+      `a broken database must not be answered by relocating to /tmp, got:\n${r.stderr}`,
+    );
+    assert(
+      r.stderr.includes(":memory:"),
+      `the warning must name where the data went instead, got:\n${r.stderr}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Not a regression test for the fix above — a guard on its blast radius.
+// Nearly every test in this file opens `:memory:` through `freshDb()`, and a
+// warning that fired there would bury the suite's output in noise and, worse,
+// train a reader to ignore the one message that means their data moved.
+test("cli", "opening :memory: says nothing at all", () => {
+  const written: string[] = [];
+  const real = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: unknown): boolean => {
+    written.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    openChamberDb(":memory:").close();
+    openChamberDb().close(); // the default argument takes the same path
+  } finally {
+    process.stderr.write = real;
+  }
+  assert(
+    written.length === 0,
+    `opening :memory: must be silent, got:\n${written.join("")}`,
+  );
 });
 
 // ─── CONFIG (file-based settings resolution, src/config.ts) ────────────────

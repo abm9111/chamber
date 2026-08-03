@@ -178,11 +178,30 @@ function dbPath(): string {
   return resolvedDbPath;
 }
 
-/** openChamberDb falls back to /tmp then :memory: on a disk I/O error opening the resolved path. */
+/**
+ * Open the resolved database.
+ *
+ * `openChamberDb` creates the parent directory, and on a location it cannot
+ * use falls back to `/tmp/chamber.sqlite` then `:memory:` — announcing every
+ * such redirect on stderr, naming both paths. This catch is the last one:
+ * anything that reaches it (a corrupt database, a broken `sql/*.sql`) is a
+ * failure `openChamberDb` deliberately refuses to relocate. Dropping into
+ * `:memory:` here keeps a command from dying outright, but it must not do so
+ * quietly — every write this run makes is discarded at exit, and `banner()`
+ * would otherwise still print the durable path it never opened.
+ */
 function open(): DatabaseSync {
+  const requested = dbPath();
   try {
-    return openChamberDb(dbPath());
-  } catch {
+    return openChamberDb(requested);
+  } catch (err) {
+    process.stderr.write(
+      `chamber: WARNING — could not open the database at ${requested}: ` +
+        `${formatErrorChain(err).join("; ")}\n` +
+        `chamber: WARNING — storing data at :memory: instead. ` +
+        `Data written now will NOT be in ${requested}; it is discarded when ` +
+        `this command exits.\n`,
+    );
     resolvedDbPath = ":memory:";
     return openChamberDb(":memory:");
   }

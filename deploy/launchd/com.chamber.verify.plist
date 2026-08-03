@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.chamber.verify</string>
+
+  <!--
+    The chaining is `||` + `;`, not `&&`, and that is the whole point of this
+    job surviving contact with a real machine.
+
+    `chamber ingest` exits non-zero for reasons that have nothing to do with
+    drift: no roots configured yet, or a configured root that has moved or is
+    on an unmounted volume (it ingests the remaining roots and still exits 1).
+    Under `ingest && verify` any of those silently skips `verify` entirely —
+    the scheduled check stops running, and the only trace is a log line that
+    looks like an ordinary ingest complaint. A drift check that quietly stops
+    checking is worse than no drift check, because the silence reads as health.
+
+    So `verify` runs unconditionally, and the ingest failure is announced on
+    its own line instead of being inferred from an absence.
+
+    The job's exit status is therefore `verify`'s, which preserves verify's
+    contract exactly: non-zero iff a belief has no verified support left. If
+    ingest's status were folded in, exit 1 would mean either "your evidence
+    moved" or "a disk wasn't mounted" — two findings that call for completely
+    different responses, collapsed into one indistinguishable number.
+
+    The leading `date` line matters because launchd appends to this log
+    forever. Without it, today's run and last month's run are the same
+    undifferentiated text.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-lc</string>
+    <string>echo "=== chamber $(date '+%Y-%m-%dT%H:%M:%S%z') ==="; chamber ingest || echo "!! ingest FAILED (exit $?) - verifying against the corpus as it stands, which may be stale"; chamber verify</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>8</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>REPLACE_WITH_HOME/Library/Logs/chamber-verify.log</string>
+  <key>StandardErrorPath</key>
+  <string>REPLACE_WITH_HOME/Library/Logs/chamber-verify.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

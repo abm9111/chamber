@@ -7285,6 +7285,21 @@ test("config", "config show reports a malformed config legibly, not a stack trac
       !r.stderr.includes("\n    at ") && !r.stdout.includes("\n    at "),
       `output must not contain a stack trace, got stderr:\n${r.stderr}\nstdout:\n${r.stdout}`,
     );
+    // The three assertions above would all still pass even if cmdConfig had
+    // no try/catch of its own: main() now dispatches "config" before the
+    // loadConfig()/open() prelude, so nothing else in this file's call chain
+    // would catch the throw either — it would reach main()'s top-level
+    // handler at the bottom of cli.ts, which also runs errors through
+    // formatErrorChain and also names the file (the message itself contains
+    // the path). That handler exists for arbitrary uncaught failures across
+    // every command, not for this one; this assertion pins the thing only
+    // cmdConfig's own catch adds — the actionable, command-specific
+    // suggestion — so the test fails if that catch is deleted, not just if
+    // its message stopped naming the file.
+    assert(
+      r.stderr.includes("chamber init --force"),
+      `a config-specific catch should suggest the fix, got stderr:\n${r.stderr}`,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

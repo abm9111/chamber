@@ -13,10 +13,18 @@
  * No live LLM — turn uses deterministic heuristics so gates are the product.
  */
 
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 import { openChamberDb } from "./db.ts";
+import {
+  loadConfig,
+  explainConfig,
+  configPath,
+  type ChamberConfig,
+  type ResolvedSetting,
+} from "./config.ts";
 import { sha256, newId } from "./hash.ts";
 import { commitBelief } from "./commit_belief.ts";
 import { recordSpend, spendLastHours, formatSpendFooter } from "./spend.ts";
@@ -134,6 +142,7 @@ import type { EpistemicType, CommittedPath } from "./types.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let resolvedDbPath: string | null = null;
+let loadedConfig: ChamberConfig | null = null;
 
 const INGEST_USAGE =
   "usage: chamber ingest <path> [--exclude <name-or-path>]… " +
@@ -156,21 +165,60 @@ const NOTABLE_SKIP_KINDS: ReadonlySet<IngestSkipKind> = new Set<IngestSkipKind>(
   "cycle",
 ]);
 
-/** Prefer env → /tmp (writable) → cwd. openChamberDb also falls back on I/O errors. */
+/**
+ * Config-resolved path. Precedence: CHAMBER_DB > config file > default.
+ *
+ * By the time this runs, `main()` has already resolved `loadedConfig` (see
+ * there for why that happens before `open()` rather than here) — so the
+ * `loadConfig()` below normally just reuses that cached result, and this
+ * function itself throwing is not the path a malformed config surfaces on.
+ * An empty or whitespace-only CHAMBER_DB is treated as unset by config.ts's
+ * envSetting(), so it falls through to the config file rather than
+ * resolving to an empty path — an empty path is not a no-op, it is a
+ * request node:sqlite honors as a private temp database that vanishes
+ * silently when the process exits.
+ */
 function dbPath(): string {
   if (resolvedDbPath) return resolvedDbPath;
-  if (process.env.CHAMBER_DB) {
-    resolvedDbPath = process.env.CHAMBER_DB;
-    return resolvedDbPath;
-  }
-  resolvedDbPath = "/tmp/chamber.sqlite";
+  loadedConfig ??= loadConfig();
+  resolvedDbPath = loadedConfig.database;
   return resolvedDbPath;
 }
 
+/**
+ * Open the resolved database.
+ *
+ * `openChamberDb` creates the parent directory, and on a location it cannot
+ * use falls back to `/tmp/chamber.sqlite` then `:memory:` — announcing every
+ * such redirect on stderr, naming both paths. This catch is the last one:
+ * anything that reaches it (a corrupt database, a broken `sql/*.sql`) is a
+ * failure `openChamberDb` deliberately refuses to relocate. Dropping into
+ * `:memory:` here keeps a command from dying outright, but it must not do so
+ * quietly — every write this run makes is discarded at exit, and `banner()`
+ * would otherwise still print the durable path it never opened.
+ *
+ * `openChamberDb`'s own fallbacks needed the same treatment and were not
+ * getting it. The `:memory:` leg below repoints `resolvedDbPath`, so `banner()`
+ * follows the data; the `/tmp` leg inside `openChamberDb` updated nothing, so
+ * stdout kept announcing the durable path while rows landed in
+ * `/tmp/chamber.sqlite` and only stderr disagreed — which made
+ * `chamber status 2>/dev/null` a confident lie. The `onRedirect` callback
+ * closes that: wherever the data actually goes, that is what gets printed.
+ */
 function open(): DatabaseSync {
+  const requested = dbPath();
   try {
-    return openChamberDb(dbPath());
-  } catch {
+    return openChamberDb(requested, (actual) => {
+      resolvedDbPath = actual;
+    });
+  } catch (err) {
+    process.stderr.write(
+      `chamber: WARNING — could not open the database at ${requested}: ` +
+        `${formatErrorChain(err).join("; ")}\n` +
+        `chamber: WARNING — storing data at :memory: instead. ` +
+        `Data written now will NOT be in ${requested}; it is discarded when ` +
+        `this command exits.\n`,
+    );
     resolvedDbPath = ":memory:";
     return openChamberDb(":memory:");
   }
@@ -606,10 +654,98 @@ function cmdSearch(db: DatabaseSync, args: ParsedSearchArgs): void {
   }
 }
 
+/**
+ * `chamber init` — write a starter config file.
+ *
+ * Deliberately does not depend on `loadConfig()`/`explainConfig()` succeeding
+ * first, and never opens the database: `init` exists to create or repair the
+ * file those two read, so a broken (or absent) config must never stand in
+ * its own way, and a command whose only job is writing one JSON file has no
+ * business creating `~/.local/share/chamber/chamber.sqlite` as a side effect
+ * of being asked to write a config. (See the dispatch in `main()`, which
+ * routes this — and `cmdConfig` — around the loadConfig()/open() prelude for
+ * exactly that reason.)
+ *
+ * No field here can hold an API key: CHAMBER_API_KEY is env-only, read by
+ * src/model.ts and nowhere else, and the starter only ever sets
+ * `model.base` — which is the one field that could *send* that key
+ * somewhere, and is therefore restricted to this machine when it comes from
+ * a file (see `assertFileBaseIsLocal` in src/config.ts). The loopback
+ * starter below is written for that reason as much as for local-first
+ * defaults. `model.name` is left unset rather than `""` — config.ts
+ * rejects a *present but blank* string the same way it rejects a blank
+ * `database` (see parseModel/parseDatabase in src/config.ts), so writing
+ * `name: ""` here would hand the user a config that fails validation the
+ * moment anything else — including this file's own `config show` — reads it.
+ */
+function cmdInit(rest: string[]): void {
+  const target = configPath();
+  const force = rest.includes("--force");
+  if (existsSync(target) && !force) {
+    console.error(`config already exists: ${target}`);
+    console.error("  pass --force to overwrite it");
+    process.exitCode = 1;
+    return;
+  }
+  mkdirSync(dirname(target), { recursive: true });
+  const starter: ChamberConfig = {
+    database: join(homedir(), ".local", "share", "chamber", "chamber.sqlite"),
+    model: { base: "http://127.0.0.1:8087/v1" },
+    ingest: [],
+  };
+  writeFileSync(target, `${JSON.stringify(starter, null, 2)}\n`);
+  console.log(`wrote ${target}`);
+  console.log("  set model.name, then add ingest roots with their excludes");
+  console.log("  API keys are read from CHAMBER_API_KEY, never from this file");
+  console.log(
+    "  model.base here must stay on this machine; for a remote one, " +
+      "export CHAMBER_API_BASE",
+  );
+  console.log("  run `chamber config show` to see what is in effect");
+}
+
+/**
+ * `chamber config show` — print every resolved setting and where it came
+ * from.
+ *
+ * `explainConfig()` now validates exactly as strictly as `loadConfig()` (see
+ * `parseFile` in src/config.ts) and throws on a malformed file instead of
+ * reporting a config as healthy that Chamber could not actually load. A
+ * broken config is exactly the situation someone runs `config show` to
+ * diagnose, so that throw is caught here and turned into a message naming
+ * the file and the problem — never a bare stack trace escaping to the
+ * terminal. `formatErrorChain` renders `name: message`, never `.stack`, so
+ * this cannot leak one either. Like `cmdInit`, this never opens the database.
+ */
+function cmdConfig(rest: string[]): void {
+  if (rest[0] !== "show") {
+    console.error("usage: chamber config show");
+    process.exitCode = 1;
+    return;
+  }
+  let rows: ResolvedSetting[];
+  try {
+    rows = explainConfig();
+  } catch (err) {
+    console.error(
+      `chamber: cannot show config — ${formatErrorChain(err).join("; ")}`,
+    );
+    console.error("  fix the file, or run `chamber init --force` to replace it");
+    process.exitCode = 1;
+    return;
+  }
+  for (const row of rows) {
+    const conflict = row.conflict ? `  (config says ${row.conflict})` : "";
+    console.log(`  ${row.key} = ${row.value}   [from ${row.source}]${conflict}`);
+  }
+}
+
 function help(): void {
   console.log(`Chamber CLI — minimal vertical slice
 
 Usage:
+  init [--force]                     write a starter config file
+  config show                        print every setting and where it came from
   chamber turn "<message>"     Run one gated turn (stub model)
   chamber status               Spend + queue + counts
   chamber queue                List pending writes
@@ -677,6 +813,54 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `init` and `config show` exist to create or diagnose the file the block
+  // below loads, so neither may depend on that load succeeding first:
+  // routed through it, a broken config would block `init --force` from ever
+  // reaching the fix, and `config show`'s own legible, file-naming error
+  // (see cmdConfig) would never fire — the generic top-level handler at the
+  // bottom of this file would print instead. Both return here, and neither
+  // opens the database (see cmdInit's and cmdConfig's doc comments).
+  if (cmd === "init") {
+    cmdInit(rest);
+    return;
+  }
+  if (cmd === "config") {
+    cmdConfig(rest);
+    return;
+  }
+
+  // Resolved here, before open() — deliberately, not just "somewhere before
+  // the switch". open() wraps its database open in a try/catch that falls
+  // back to an in-memory database on any failure. Placed after open()
+  // instead, a malformed config would still exit non-zero, but only by
+  // accident: dbPath()'s loadConfig() call (made from inside open()'s try)
+  // would throw first and be swallowed by that catch-all, silently opening
+  // a throwaway :memory: db with a full schema applied and nothing that
+  // will ever use it — then this same loadConfig() call would run again
+  // (loadedConfig is still null; the failed assignment never completed) and
+  // throw a second time, this time unguarded, which is what would actually
+  // reach `main().catch` below. That "works" but only because open()'s catch
+  // happens to be a blind catch-all and loadedConfig happens to stay unset
+  // after a failed load — verified by moving this block after open() and
+  // confirming the malformed-config test still passed, for exactly that
+  // reason. Loading config here removes the dependency on that coincidence:
+  // dbPath() then always finds loadedConfig already resolved, a bad config
+  // throws exactly once, and open()'s catch is left doing only what it says
+  // — falling back on a genuine disk I/O error opening the resolved path,
+  // not laundering an unrelated config error into a silent :memory:.
+  //
+  // The model layer reads CHAMBER_API_BASE / CHAMBER_API_MODEL from the
+  // environment directly. Seeding only where unset preserves precedence by
+  // construction, since env already outranks config. This is a seam, not an
+  // architecture: close it when complete() takes explicit options.
+  loadedConfig ??= loadConfig();
+  if (!process.env.CHAMBER_API_BASE && loadedConfig.model.base) {
+    process.env.CHAMBER_API_BASE = loadedConfig.model.base;
+  }
+  if (!process.env.CHAMBER_API_MODEL && loadedConfig.model.name) {
+    process.env.CHAMBER_API_MODEL = loadedConfig.model.name;
+  }
+
   const db = open();
 
   switch (cmd) {
@@ -741,6 +925,122 @@ async function main(): Promise<void> {
       break;
     }
     case "ingest": {
+      // Shared by both the configured-roots loop and the explicit-path call
+      // below, so a configured root is reported — skips included — exactly
+      // as an explicit path would be. That parity matters beyond cosmetics:
+      // Task 6 runs this unattended from launchd, and a scheduled log an
+      // operator only skims after the fact must read the same as a manual
+      // run they watched live.
+      const runOne = (
+        path: string,
+        opts: { exclude: string[]; includeDotted: boolean; requireExcludeMatch: boolean },
+      ): boolean => {
+        const r = ingestDirectory(db, path, opts);
+        // An exclude that matched nothing aborts the run before anything is
+        // stored: on a privacy control a no-op pattern is a typo far more
+        // often than an intent, and a warning buried in output is not a
+        // control.
+        if (r.aborted) {
+          console.error(`ingest refused: ${r.abortReason}`);
+          console.error(
+            r.abortKind === "unmatched_exclude"
+              ? "  nothing was ingested. Fix the pattern, or pass --allow-unmatched-exclude to proceed anyway."
+              : "  nothing was ingested. Fix the pattern.",
+          );
+          return false;
+        }
+        console.log(
+          `ingested ${r.ingested} file(s) as ${r.passages} passage(s) from ${path}`,
+        );
+        // A shrunken note's stale passages are deleted rather than left to keep
+        // answering from content the note no longer holds. That is a corpus
+        // deletion, so it is reported rather than done quietly.
+        if (r.removed > 0) {
+          console.log(
+            `  removed ${r.removed} stale passage(s) from notes that shrank`,
+          );
+        }
+        for (const e of r.excludes) {
+          console.log(
+            `  exclude ${e.raw} → pruned ${e.matched} entr${e.matched === 1 ? "y" : "ies"}`,
+          );
+        }
+        if (r.unmatchedExcludes.length > 0) {
+          console.error(
+            `  ⚠ --exclude matched nothing: ${r.unmatchedExcludes.join(", ")} (allowed via --allow-unmatched-exclude)`,
+          );
+        }
+        if (r.skipped.length > 0) {
+          // Privacy-relevant skips first, then the rest, so a vault full of
+          // attachments cannot push an escaping symlink off the bottom.
+          const ranked = [
+            ...r.skipped.filter((s) => NOTABLE_SKIP_KINDS.has(s.kind)),
+            ...r.skipped.filter((s) => !NOTABLE_SKIP_KINDS.has(s.kind)),
+          ];
+          console.log(`  skipped ${ranked.length} entr${ranked.length === 1 ? "y" : "ies"}:`);
+          for (const s of ranked.slice(0, INGEST_SKIP_PRINT_LIMIT)) {
+            console.log(`    [${s.kind}] ${s.path}: ${s.reason}`);
+          }
+          const hidden = ranked.length - INGEST_SKIP_PRINT_LIMIT;
+          if (hidden > 0) console.log(`    … and ${hidden} more`);
+        }
+        for (const c of r.collisions) {
+          console.error(
+            `  ⚠ cross-root collision on ${c.sourceRef}: already ingested from ${c.existingRoots.join(", ")} — stored as a separate document, not overwritten`,
+          );
+        }
+        return true;
+      };
+
+      // Bare `chamber ingest` — and only bare — takes the configured roots.
+      //
+      // This used to ask "is any argument not `--`-prefixed?", which answered
+      // no for `chamber ingest --exclude=public`: the configured-roots branch
+      // ran, the exclude was dropped without a word, `public/` was ingested,
+      // and the output read like a clean success at exit 0.
+      // `--include-dotted`, `--allow-unmatched-exclude` and `--totally-bogus`
+      // were all swallowed the same way — the last command path that did not
+      // reject unknown flags, and the privacy-relevant one, repeating the
+      // shape of the historical bug `parseIngestArgs` documents.
+      //
+      // Refusing rather than applying them, because there is no honest way to
+      // apply them: excludes are per-root in the config file, and a single
+      // CLI `--exclude` spread across N roots has no defined meaning —
+      // `--allow-unmatched-exclude` would have to guess between "unmatched
+      // against every root" and "against any", and both guesses silently
+      // weaken a privacy control. Any argument at all therefore selects the
+      // explicit-path form, whose parser already rejects an unknown flag and
+      // a missing path out loud.
+      if (rest.length === 0) {
+        const cfg = loadConfig();
+        if (cfg.ingest.length === 0) {
+          console.error("ingest: no path given and no roots configured");
+          console.error("  add roots to the config file, or pass a path");
+          console.error("  run `chamber config show` to find the config file");
+          process.exitCode = 1;
+          break;
+        }
+        let allOk = true;
+        for (const entry of cfg.ingest) {
+          if (!existsSync(entry.root)) {
+            console.error(`  skipped ${entry.root}: does not exist`);
+            allOk = false;
+            continue;
+          }
+          if (
+            !runOne(entry.root, {
+              exclude: entry.exclude,
+              includeDotted: false,
+              requireExcludeMatch: true,
+            })
+          ) {
+            allOk = false;
+          }
+        }
+        if (!allOk) process.exitCode = 1;
+        break;
+      }
+
       const parsed = parseIngestArgs(rest);
       if (!parsed.ok) {
         console.error(`ingest: ${parsed.error}`);
@@ -748,63 +1048,14 @@ async function main(): Promise<void> {
         process.exitCode = 1;
         break;
       }
-      const r = ingestDirectory(db, parsed.path, {
-        exclude: parsed.exclude,
-        includeDotted: parsed.includeDotted,
-        requireExcludeMatch: !parsed.allowUnmatchedExclude,
-      });
-      // An exclude that matched nothing aborts the run before anything is
-      // stored: on a privacy control a no-op pattern is a typo far more often
-      // than an intent, and a warning buried in output is not a control.
-      if (r.aborted) {
-        console.error(`ingest refused: ${r.abortReason}`);
-        console.error(
-          r.abortKind === "unmatched_exclude"
-            ? "  nothing was ingested. Fix the pattern, or pass --allow-unmatched-exclude to proceed anyway."
-            : "  nothing was ingested. Fix the pattern.",
-        );
+      if (
+        !runOne(parsed.path, {
+          exclude: parsed.exclude,
+          includeDotted: parsed.includeDotted,
+          requireExcludeMatch: !parsed.allowUnmatchedExclude,
+        })
+      ) {
         process.exitCode = 1;
-        break;
-      }
-      console.log(
-        `ingested ${r.ingested} file(s) as ${r.passages} passage(s) from ${parsed.path}`,
-      );
-      // A shrunken note's stale passages are deleted rather than left to keep
-      // answering from content the note no longer holds. That is a corpus
-      // deletion, so it is reported rather than done quietly.
-      if (r.removed > 0) {
-        console.log(
-          `  removed ${r.removed} stale passage(s) from notes that shrank`,
-        );
-      }
-      for (const e of r.excludes) {
-        console.log(
-          `  exclude ${e.raw} → pruned ${e.matched} entr${e.matched === 1 ? "y" : "ies"}`,
-        );
-      }
-      if (r.unmatchedExcludes.length > 0) {
-        console.error(
-          `  ⚠ --exclude matched nothing: ${r.unmatchedExcludes.join(", ")} (allowed via --allow-unmatched-exclude)`,
-        );
-      }
-      if (r.skipped.length > 0) {
-        // Privacy-relevant skips first, then the rest, so a vault full of
-        // attachments cannot push an escaping symlink off the bottom.
-        const ranked = [
-          ...r.skipped.filter((s) => NOTABLE_SKIP_KINDS.has(s.kind)),
-          ...r.skipped.filter((s) => !NOTABLE_SKIP_KINDS.has(s.kind)),
-        ];
-        console.log(`  skipped ${ranked.length} entr${ranked.length === 1 ? "y" : "ies"}:`);
-        for (const s of ranked.slice(0, INGEST_SKIP_PRINT_LIMIT)) {
-          console.log(`    [${s.kind}] ${s.path}: ${s.reason}`);
-        }
-        const hidden = ranked.length - INGEST_SKIP_PRINT_LIMIT;
-        if (hidden > 0) console.log(`    … and ${hidden} more`);
-      }
-      for (const c of r.collisions) {
-        console.error(
-          `  ⚠ cross-root collision on ${c.sourceRef}: already ingested from ${c.existingRoots.join(", ")} — stored as a separate document, not overwritten`,
-        );
       }
       break;
     }

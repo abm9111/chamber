@@ -883,7 +883,20 @@ export function parseIngestArgs(argv: string[]): ParseIngestResult {
   }
 
   if (path === undefined || path.trim() === "") {
-    return { ok: false, error: `missing <path>` };
+    // Arguments but no path means flags were passed to a form that has none.
+    // `chamber ingest --exclude=public` used to reach the configured-roots
+    // branch in src/cli.ts and drop the exclude in silence; the caller now
+    // routes anything non-empty here, so this message is what the operator
+    // sees and it has to say which form the flags belong to.
+    return {
+      ok: false,
+      error:
+        argv.length === 0
+          ? `missing <path>`
+          : `missing <path> — flags apply only to the explicit-path form. ` +
+            `Bare \`chamber ingest\` ingests the configured roots and takes no ` +
+            `flags; put per-root excludes in the config file's "ingest" entries.`,
+    };
   }
   return { ok: true, path, exclude, includeDotted, allowUnmatchedExclude };
 }

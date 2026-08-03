@@ -6780,6 +6780,66 @@ test("cli", "opening :memory: says nothing at all", () => {
   );
 });
 
+// ── IMPORTANT: a blank database path was total, silent data loss ────────────
+//
+// `openChamberDb("")` opened. It applied every schema, accepted an INSERT,
+// returned the row back on a SELECT, and did not fire `onRedirect` — because
+// the empty string is also the path that was *asked for*, so the redirect test
+// inside the fallback loop is false and neither warning nor callback runs.
+// SQLite reads an empty filename as a private temporary database and deletes
+// it at exit. Every row written was gone, and nothing anywhere said so.
+//
+// The class was closed at four daemon call sites plus the CLI, all of which
+// route through `envSetting`'s blank-is-unset trim in src/config.ts — but by
+// convention only. Ten call sites open this database. These tests hold the
+// rule at the open itself, so the eleventh call site inherits it.
+test("cli", "a blank database path is refused, not silently discarded", () => {
+  for (const blank of ["", " ", "\t", "\n", "   "]) {
+    let msg: string | null = null;
+    try {
+      openChamberDb(blank).close();
+    } catch (e) {
+      msg = e instanceof Error ? e.message : String(e);
+    }
+    assert(
+      msg !== null,
+      `openChamberDb(${JSON.stringify(blank)}) must throw — SQLite opens it as ` +
+        `a private temporary database and discards every row at exit, with no ` +
+        `warning and no onRedirect callback`,
+    );
+    // The operator has to be able to act on this without reading db.ts: what
+    // was passed, what SQLite would have done with it, and how to ask for a
+    // throwaway database on purpose.
+    assert(
+      msg!.includes(JSON.stringify(blank)),
+      `the refusal must quote the value it refused, got: ${msg}`,
+    );
+    assert(
+      msg!.includes(":memory:"),
+      `the refusal must name the way to ask for a throwaway database, got: ${msg}`,
+    );
+  }
+});
+
+// The guard's blast radius, in the one direction that would matter: `:memory:`
+// is passed by nearly every test in this file and by `freshDb()`, and a
+// trim-based check that over-fired would take the whole suite with it.
+test("cli", "the blank-path guard does not catch :memory: or a real path", () => {
+  openChamberDb(":memory:").close();
+  openChamberDb().close(); // the default argument
+  const dir = mkdtempSync(join(tmpdir(), "chamber-blankguard-"));
+  try {
+    const file = join(dir, "nested", "chamber.sqlite");
+    openChamberDb(file).close();
+    assert(
+      existsSync(file),
+      `a real path must still open (and still have its parent created), ${file} was not created`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ─── CONFIG (file-based settings resolution, src/config.ts) ────────────────
 //
 // Chamber has 25+ CHAMBER_* env vars and nothing that reads a file, so

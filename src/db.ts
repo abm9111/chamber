@@ -150,6 +150,52 @@ export function openChamberDb(
   path = ":memory:",
   onRedirect?: (actual: string) => void,
 ): DatabaseSync {
+  // A blank path is the one input that loses everything without saying so.
+  //
+  // `new DatabaseSync("")` does not fail. SQLite reads an empty filename as a
+  // request for a *private temporary database*: it opens, `applySchemas`
+  // applies, INSERTs succeed, and the entire thing is discarded when the
+  // process exits. Measured, not assumed — an open, an INSERT and a SELECT
+  // all succeed against `""`. And because the empty string is also the path
+  // that was *asked for*, the `p !== path` test below is false, so neither
+  // `warnRedirect` nor `onRedirect` fires. Total data loss, announced nowhere.
+  //
+  // The `/tmp` and `:memory:` legs below exist for a location that turned out
+  // unusable at runtime — an environment failure the operator did not cause
+  // and should not lose a command to. A blank path is not that. It is a
+  // caller or configuration bug, there is no location to fall back *from*,
+  // and so it throws instead. Three reasons, in order of weight:
+  //
+  //  - Falling back to `:memory:` with a warning would reproduce the exact
+  //    failure this guard exists to stop. The process would still exit 0
+  //    having stored nothing, and under the scheduled job a warning in a log
+  //    nobody reads is indistinguishable from silence. A throw is the one
+  //    signal a scheduler can act on.
+  //  - No caller can mean it. In-memory is spelled `:memory:` and every real
+  //    path is non-empty, so there is no blank-path behaviour to preserve and
+  //    nothing that legitimately passes `""` to break.
+  //  - The class is closed today only by convention. Every daemon and the CLI
+  //    reach this function through `envSetting`'s blank-is-unset trim in
+  //    src/config.ts — but ten call sites open this database, and an eleventh
+  //    added tomorrow inherits none of that discipline. The rule belongs at
+  //    the open, once, not at each place a path is resolved.
+  //
+  // Whitespace-only is refused on the same terms and for a second reason:
+  // SQLite reads `"  "` as an ordinary relative filename and quietly creates
+  // a file literally called `"  "` in the working directory. The value is
+  // only *tested* trimmed, never used trimmed — a real path may legally carry
+  // a trailing space, and silently rewriting it would be a different quiet
+  // bug in place of this one.
+  if (path.trim() === "") {
+    throw new Error(
+      `openChamberDb: refusing to open a blank database path (${JSON.stringify(path)}). ` +
+        `SQLite accepts this and opens a private temporary database whose every row ` +
+        `is discarded when the process exits — it does not fail, so nothing downstream ` +
+        `would report the loss. Pass a filesystem path, or ":memory:" if a throwaway ` +
+        `database is what you meant.`,
+    );
+  }
+
   const candidates =
     path === ":memory:"
       ? [":memory:"]

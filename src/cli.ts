@@ -196,11 +196,21 @@ function dbPath(): string {
  * `:memory:` here keeps a command from dying outright, but it must not do so
  * quietly — every write this run makes is discarded at exit, and `banner()`
  * would otherwise still print the durable path it never opened.
+ *
+ * `openChamberDb`'s own fallbacks needed the same treatment and were not
+ * getting it. The `:memory:` leg below repoints `resolvedDbPath`, so `banner()`
+ * follows the data; the `/tmp` leg inside `openChamberDb` updated nothing, so
+ * stdout kept announcing the durable path while rows landed in
+ * `/tmp/chamber.sqlite` and only stderr disagreed — which made
+ * `chamber status 2>/dev/null` a confident lie. The `onRedirect` callback
+ * closes that: wherever the data actually goes, that is what gets printed.
  */
 function open(): DatabaseSync {
   const requested = dbPath();
   try {
-    return openChamberDb(requested);
+    return openChamberDb(requested, (actual) => {
+      resolvedDbPath = actual;
+    });
   } catch (err) {
     process.stderr.write(
       `chamber: WARNING — could not open the database at ${requested}: ` +

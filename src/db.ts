@@ -135,8 +135,20 @@ function warnRedirect(requested: string, actual: string, cause: unknown): void {
  *
  * On failure it still falls back to `/tmp` then `:memory:` — but never
  * silently; see `warnRedirect`.
+ *
+ * `onRedirect` is called with the path actually opened whenever that is not
+ * the path asked for, immediately after the warning. stderr told the truth
+ * already; this is how a caller that *prints* a database path can tell it too.
+ * `src/cli.ts` uses it to repoint the path its banner reports, which otherwise
+ * kept naming the durable location while every row went to `/tmp` — so
+ * `chamber status 2>/dev/null` read as a confident success. A callback rather
+ * than a changed return type on purpose: ten call sites open this database and
+ * exactly one of them prints a path.
  */
-export function openChamberDb(path = ":memory:"): DatabaseSync {
+export function openChamberDb(
+  path = ":memory:",
+  onRedirect?: (actual: string) => void,
+): DatabaseSync {
   const candidates =
     path === ":memory:"
       ? [":memory:"]
@@ -150,7 +162,10 @@ export function openChamberDb(path = ":memory:"): DatabaseSync {
       if (p !== ":memory:") mkdirSync(dirname(p), { recursive: true });
       const db = new DatabaseSync(p);
       applySchemas(db);
-      if (p !== path) warnRedirect(path, p, lastErr);
+      if (p !== path) {
+        warnRedirect(path, p, lastErr);
+        onRedirect?.(p);
+      }
       return db;
     } catch (err) {
       lastErr = err;

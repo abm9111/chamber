@@ -7845,6 +7845,56 @@ test("cli", "the same relative database names one file regardless of cwd", () =>
   }
 });
 
+// ── IMPORTANT: the banner reported the requested path after a /tmp redirect ──
+//
+// `openChamberDb`'s `:memory:` leg repointed `resolvedDbPath`; its `/tmp` leg
+// updated nothing. So stdout announced the durable path while every row landed
+// in `/tmp/chamber.sqlite`, and only stderr disagreed — which made
+// `chamber status 2>/dev/null` a confident lie.
+test("cli", "the banner names /tmp when the data went to /tmp", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-bannertruth-"));
+  const TMP_FALLBACK = "/tmp/chamber.sqlite";
+  const tmpFallbackPreexisted = existsSync(TMP_FALLBACK);
+  try {
+    // A directory as the database path — the same unusable-location failure
+    // the existing redirect test uses, and one that fails as root too.
+    const requested = join(dir, "iam-a-directory");
+    mkdirSync(requested);
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "status"],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: {
+          ...process.env,
+          CHAMBER_DB: requested,
+          CHAMBER_CONFIG: join(dir, "config.json"), // never written
+        },
+      },
+    );
+    assert(r.status === 0, `status should still run: ${r.stderr}`);
+    // stdout alone — this is exactly what `chamber status 2>/dev/null` sees.
+    assert(
+      r.stdout.includes(`db: ${TMP_FALLBACK}`),
+      `stdout must name where the rows actually went, got:\n${r.stdout}`,
+    );
+    assert(
+      !r.stdout.includes(`db: ${requested}`),
+      `stdout must not claim the path it failed to open, got:\n${r.stdout}`,
+    );
+    // stderr keeps naming both paths: the operator still needs to know which
+    // location they asked for and lost.
+    assert(
+      r.stderr.includes(requested) && r.stderr.includes(TMP_FALLBACK),
+      `stderr must still name both paths, got:\n${r.stderr}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    if (!tmpFallbackPreexisted) rmSync(TMP_FALLBACK, { force: true });
+  }
+});
+
 // ─── report ──────────────────────────────────────────────────────────────────
 
 // Drain the async queue sequentially: invoke a thunk, await it fully,

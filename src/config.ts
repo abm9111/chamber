@@ -242,15 +242,29 @@ function canonical(p: string): CanonicalPath {
 /**
  * Reject roots that are the same directory or nested one inside the other.
  * Comparison runs on the canonical keys; the message names the paths the
- * operator actually wrote.
+ * operator actually wrote — plus, when a symlink or case-folding volume made
+ * those differ from what they resolved to, what they resolved to as well.
+ *
+ * `roots[i].root` used to be what got named here, and by the time this runs
+ * `parseIngest` has already overwritten it with the canonical path — so this
+ * comment's claim was false whenever a symlink or case-folding was the actual
+ * cause of the overlap: the message named two paths that appear nowhere in
+ * the config file, leaving no way to tell which entry to remove. `written`
+ * carries the string exactly as `parseIngest` read it from the file, parallel
+ * to `roots` and `keys`, so both forms can be named.
  */
 function assertNoOverlap(
   roots: IngestRootConfig[],
   keys: string[],
+  written: string[],
   path: string,
 ): void {
   const why =
     `Overlapping roots duplicate the same file and strand rows when one shrinks.`;
+  const name = (i: number): string =>
+    written[i] === roots[i]!.root
+      ? `"${written[i]}"`
+      : `"${written[i]}" (resolved: "${roots[i]!.root}")`;
   for (let i = 0; i < roots.length; i++) {
     for (let j = 0; j < roots.length; j++) {
       if (i === j) continue;
@@ -258,15 +272,15 @@ function assertNoOverlap(
       const b = keys[j]!;
       if (b === a) {
         throw new Error(
-          `config ${path}: ingest roots overlap — "${roots[j]!.root}" and ` +
-            `"${roots[i]!.root}" are the same directory. ${why}`,
+          `config ${path}: ingest roots overlap — ${name(j)} and ` +
+            `${name(i)} are the same directory. ${why}`,
         );
       }
       // Compare on a separator boundary so "notes" does not swallow
       // "notes-archive".
       if (b.startsWith(a.endsWith(sep) ? a : a + sep)) {
         throw new Error(
-          `config ${path}: ingest roots overlap — "${roots[j]!.root}" is inside "${roots[i]!.root}". ` +
+          `config ${path}: ingest roots overlap — ${name(j)} is inside ${name(i)}. ` +
             why,
         );
       }
@@ -279,6 +293,7 @@ function parseIngest(raw: unknown, path: string): IngestRootConfig[] {
   if (!Array.isArray(raw)) throw new Error(`config ${path}: "ingest" must be an array`);
   const out: IngestRootConfig[] = [];
   const keys: string[] = [];
+  const written: string[] = [];
   for (const entry of raw) {
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
       throw new Error(`config ${path}: each "ingest" entry must be an object`);
@@ -304,8 +319,9 @@ function parseIngest(raw: unknown, path: string): IngestRootConfig[] {
     const c = canonical(e.root);
     out.push({ root: c.path, exclude });
     keys.push(c.key);
+    written.push(e.root);
   }
-  assertNoOverlap(out, keys, path);
+  assertNoOverlap(out, keys, written, path);
   return out;
 }
 
@@ -535,6 +551,28 @@ export function explainConfig(): ResolvedSetting[] {
     undefined,
   );
   if (name) out.push(name);
+
+  // Ingest roots and their excludes are the privacy boundary that keeps
+  // `chamber ingest` out of restricted folders — the setting an operator
+  // most needs to see without opening the file by hand, and the one
+  // `explainConfig` used to omit entirely. There is no environment override
+  // for `ingest`, so every row here is config-sourced; an empty list is
+  // reported explicitly rather than by omission, so "print every setting"
+  // includes "there are none" as an answer. `file.ingest` is already
+  // canonicalised and overlap-checked by `parseFile`, so what is printed
+  // here is exactly what `loadConfig().ingest` resolves to.
+  if (file.ingest.length === 0) {
+    out.push({ key: "ingest", value: "(none configured)", source: "default" });
+  } else {
+    file.ingest.forEach((entry, i) => {
+      out.push({ key: `ingest[${i}].root`, value: entry.root, source: "config" });
+      out.push({
+        key: `ingest[${i}].exclude`,
+        value: entry.exclude.length > 0 ? entry.exclude.join(", ") : "(none)",
+        source: "config",
+      });
+    });
+  }
 
   // XDG_CONFIG_HOME is an environment variable like any other: when it decides
   // where the config lives, the source is the environment, not a default.

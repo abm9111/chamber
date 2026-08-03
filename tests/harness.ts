@@ -184,7 +184,7 @@ import {
 } from "../src/config.ts";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn, execFileSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
 import {
   chmodSync,
@@ -6467,6 +6467,35 @@ test("cli", "help_starts_the_real_binary_and_exits_clean", () => {
   );
 });
 
+// The no-argument `chamber ingest` form — the one the scheduled job runs — was
+// undocumented: help() only ever described `chamber ingest <path>`. Checked
+// the same way the backtick regression above is checked, by actually
+// launching the binary, because that regression is exactly what a purely
+// static check on this file would not have caught.
+test("cli", "help documents the no-argument configured-roots form of ingest", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI_PATH, "help"],
+    { encoding: "utf8", timeout: 15_000 },
+  );
+  assert(
+    r.status === 0,
+    `chamber help exited ${r.status} (signal=${r.signal}); stderr:\n${r.stderr}`,
+  );
+  assert(
+    r.stdout.includes("chamber ingest") && r.stdout.includes("(no path)"),
+    `help must document the bare "chamber ingest" form, got:\n${r.stdout}`,
+  );
+  assert(
+    r.stdout.includes("scheduled job"),
+    `help must say this is the form the scheduled job runs, got:\n${r.stdout}`,
+  );
+  assert(
+    !r.stderr.includes("SyntaxError"),
+    `help printed a SyntaxError:\n${r.stderr}`,
+  );
+});
+
 test("cli", "status_dispatches_against_a_scratch_db", () => {
   // Removed in `finally`, because the asserts below throw: this test used to
   // leave a `chamber-cli-status-*` directory (holding a real sqlite file) in
@@ -7098,6 +7127,47 @@ test("config", "two spellings of one directory are rejected on a case-folding vo
   rmSync(dir, { recursive: true, force: true });
 });
 
+// assertNoOverlap's own comment claims the message "names the paths the
+// operator actually wrote" — but it read roots[i].root, which parseIngest has
+// already replaced with the canonical path. When a symlink (or case-folding)
+// is what caused the overlap, that canonical path appears nowhere in the
+// config file, so the message named two strings the operator cannot grep for
+// to find which entry to delete. This reuses the exact symlinked-prefix
+// fixture above — the one case where written and resolved genuinely differ —
+// and asserts both forms are named.
+test(
+  "config",
+  "the overlap error names the path as the operator wrote it, not only its canonical form",
+  () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-symover-")));
+    mkdirSync(join(dir, "notes"), { recursive: true });
+    symlinkSync(join(dir, "notes"), join(dir, "link"));
+    const writtenLeaf = join(dir, "link", "notyet");
+    const resolvedLeaf = join(dir, "notes", "notyet");
+    const json = JSON.stringify({
+      ingest: [{ root: join(dir, "notes") }, { root: writtenLeaf }],
+    });
+    withConfig(json, () => {
+      let msg = "";
+      try {
+        loadConfig();
+      } catch (e) {
+        msg = e instanceof Error ? e.message : String(e);
+      }
+      assert(
+        msg.includes(writtenLeaf),
+        `error must name the entry exactly as it is spelled in the config file ` +
+          `(${writtenLeaf}) so the operator can find it there, got: ${msg}`,
+      );
+      assert(
+        msg.includes(resolvedLeaf),
+        `error must also name what the symlink resolved to, got: ${msg}`,
+      );
+    });
+    rmSync(dir, { recursive: true, force: true });
+  },
+);
+
 test("config", "a symlinked prefix is resolved even when the leaf does not exist", () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-leaf-")));
   mkdirSync(join(dir, "notes"), { recursive: true });
@@ -7254,6 +7324,56 @@ test("config", "config show reports the source of each setting", () => {
   assert(r.stdout.includes("env"), "must name the source");
   assert(r.stdout.includes("from-config.sqlite"), "must show the losing value on conflict");
   rmSync(dir, { recursive: true, force: true });
+});
+
+// `explainConfig()` used to emit database, model.base, model.name and config
+// — nothing about ingest. The excludes are the deny-list that keeps `chamber
+// ingest` out of restricted folders, so an operator being unable to see them
+// without opening the file by hand is the gap that matters most: criterion 5
+// of the design spec says `config show` prints every setting.
+test("config", "config show prints every ingest root and its excludes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-showingest-"));
+  const vaultA = join(dir, "vault-a");
+  const vaultB = join(dir, "vault-b");
+  mkdirSync(vaultA, { recursive: true });
+  mkdirSync(vaultB, { recursive: true });
+  const cfgFile = join(dir, "config.json");
+  writeFileSync(
+    cfgFile,
+    JSON.stringify({
+      ingest: [
+        { root: vaultA, exclude: ["Private", ".trash"] },
+        { root: vaultB, exclude: [] },
+      ],
+    }),
+  );
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI_PATH, "config", "show"],
+    { encoding: "utf8", timeout: 15_000, env: { ...process.env, CHAMBER_CONFIG: cfgFile } },
+  );
+  assert(r.status === 0, `config show failed: ${r.stderr}`);
+  assert(r.stdout.includes(vaultA), `must print the first ingest root, got:\n${r.stdout}`);
+  assert(r.stdout.includes(vaultB), `must print the second ingest root, got:\n${r.stdout}`);
+  assert(
+    r.stdout.includes("Private") && r.stdout.includes(".trash"),
+    `must print every exclude entry — this is the privacy boundary — got:\n${r.stdout}`,
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("config", "config show says explicitly when no ingest roots are configured", () => {
+  withConfig(null, () => {
+    const rows = explainConfig();
+    const said = rows.some(
+      (row) => row.key.startsWith("ingest") && /none/i.test(row.value),
+    );
+    assert(
+      said,
+      `explainConfig must say explicitly that no roots are configured, not omit ` +
+        `the setting, got: ${JSON.stringify(rows)}`,
+    );
+  });
 });
 
 // Not in the brief: a review of Task 1 found that `explainConfig()` used to
@@ -7449,6 +7569,60 @@ test(
       `nothing may be stored when a configured exclude matched nothing, got ${stored}`,
     );
     rmSync(dir, { recursive: true, force: true });
+  },
+);
+
+// `case "ingest"`'s no-argument branch used to call `loadConfig()` directly
+// instead of reusing the module-level value `main()` already resolved before
+// dispatch — a redundant JSON parse plus a realpath/stat pass over every
+// configured root, paid on every scheduled run. Read-count is not observable
+// from stdout, so this proves it structurally: a FIFO can only be opened for
+// read once per writer. A background `cat` supplies exactly one writer, which
+// satisfies exactly one open+read. If the config file is read a second time,
+// that second open() blocks forever waiting for a writer that will never
+// come, and the subprocess below hangs until spawnSync's timeout kills it —
+// deterministic, no sleeps, no timing race: whichever side (reader or writer)
+// arrives first simply waits for the other.
+test(
+  "cli",
+  "ingest with no path reads the config file exactly once",
+  () => {
+    const dir = mkdtempSync(join(tmpdir(), "chamber-onceread-"));
+    const vault = join(dir, "vault");
+    mkdirSync(vault, { recursive: true });
+    writeFileSync(join(vault, "a.md"), "alpha body\n");
+    const dbFile = join(dir, "c.sqlite");
+    const fifo = join(dir, "config.fifo");
+    const payload = join(dir, "config.json");
+    writeFileSync(
+      payload,
+      JSON.stringify({ database: dbFile, ingest: [{ root: vault, exclude: [] }] }),
+    );
+    execFileSync("mkfifo", [fifo]);
+    const writer = spawn("sh", ["-c", `cat "${payload}" > "${fifo}"`], {
+      stdio: "ignore",
+      detached: true,
+    });
+    writer.unref();
+    try {
+      const r = spawnSync(
+        process.execPath,
+        ["--experimental-strip-types", CLI_PATH, "ingest"],
+        {
+          encoding: "utf8",
+          timeout: 5_000,
+          env: { ...process.env, CHAMBER_CONFIG: fifo, CHAMBER_DB: "" },
+        },
+      );
+      assert(
+        r.signal === null,
+        `ingest hung and was killed (signal=${r.signal}) — the config file ` +
+          `was opened for reading more than once`,
+      );
+      assert(r.status === 0, `ingest failed: ${r.stderr}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   },
 );
 

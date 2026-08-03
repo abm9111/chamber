@@ -113,9 +113,19 @@ export function proposeDebtPayment(
     model: opts.model,
   });
   if (opts.useCode !== false) {
+    // Deliberately *not* hybrid, unlike `ask` and `search`.
+    //
+    // Auto-pay below is a gate: it closes a debt with no human in the loop when
+    // `best.score >= 0.35`, and that threshold is expressed on the cosine
+    // scale. Hybrid retrieval reorders by a fused score while leaving `score`
+    // as cosine, so the row landing at index 0 would no longer be the
+    // highest-cosine row and a calibrated gate constant would silently start
+    // meaning something else. Recalibrating an auto-pay threshold is its own
+    // change with its own evidence; it is not a free rider on a retrieval fix.
     const codeHits = searchCode(db, debt.claim_text, {
       k: 3,
       model: opts.model,
+      hybrid: false,
     });
     // The code corpus is written by indexCodeTree in its own default space
     // (local-hash-v1) regardless of what the vault corpus used, so scores from

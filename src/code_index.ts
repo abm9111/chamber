@@ -16,7 +16,12 @@ import { join, relative, extname } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { sha256 } from "./hash.ts";
 import { merkleParent, buildMerkleLayers } from "./merkle.ts";
-import { upsertDocument, searchVector, type VectorHit } from "./vector.ts";
+import {
+  upsertDocument,
+  searchVector,
+  type VectorHit,
+  type LexicalSearchError,
+} from "./vector.ts";
 
 export interface CodeChunk {
   path: string;
@@ -242,18 +247,31 @@ export function indexCodeTree(
   return { files: files.length, chunks, roots };
 }
 
-/** Search code corpus (hybrid optional). */
+/**
+ * Search code corpus.
+ *
+ * Hybrid by default, and more obviously right here than anywhere else: a code
+ * query is usually a *symbol* — `verifyBeliefSources`, `CITABLE_SOURCE_KINDS` —
+ * which is the exact case a sentence embedder has no representation for and an
+ * inverted index nails. `hybrid: false` opts out.
+ */
 export function searchCode(
   db: DatabaseSync,
   query: string,
-  opts: { k?: number; hybrid?: boolean; model?: string } = {},
+  opts: {
+    k?: number;
+    hybrid?: boolean;
+    model?: string;
+    onLexicalError?: (err: LexicalSearchError) => void;
+  } = {},
 ): VectorHit[] {
   return searchVector(db, query, {
     k: opts.k ?? 8,
     minScore: 0.02,
     sourceKind: "vault_page",
-    ftsQuery: opts.hybrid ? query : undefined,
+    lexical: opts.hybrid === false ? undefined : { query },
     model: opts.model ?? "local-hash-v1",
+    onLexicalError: opts.onLexicalError,
   });
 }
 

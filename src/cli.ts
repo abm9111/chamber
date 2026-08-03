@@ -34,6 +34,7 @@ import {
   searchVector,
   countDocuments,
   parseSearchArgs,
+  lexicalQueryNotices,
   type VectorSourceKind,
   type ParsedSearchArgs,
   type LexicalSearchError,
@@ -558,6 +559,11 @@ function cmdIndex(
 
 function cmdSearch(db: DatabaseSync, args: ParsedSearchArgs): void {
   const { query, hybrid, exact } = args;
+  if (hybrid) {
+    for (const n of lexicalQueryNotices(query)) {
+      console.error(`warning: ${n.message}`);
+    }
+  }
   let degraded: LexicalSearchError | undefined;
   const hits = searchVector(db, query, {
     k: 5,
@@ -1006,11 +1012,37 @@ async function main(): Promise<void> {
         process.exitCode = 1;
         break;
       }
-      const hits = searchCode(db, q, { k: 5, hybrid: true });
+      for (const n of lexicalQueryNotices(q)) {
+        console.error(`warning: ${n.message}`);
+      }
+      // Degrade-and-warn, like `search` and `ask`. A missing FTS index used to
+      // abort this command with exit 1 while its two siblings answered on
+      // vectors alone, so the same corpus was searchable by one command and
+      // broken by another.
+      let degraded: LexicalSearchError | undefined;
+      const hits = searchCode(db, q, {
+        k: 5,
+        hybrid: true,
+        onLexicalError: (e) => {
+          degraded = e;
+        },
+      });
+      if (degraded) {
+        console.error(
+          `warning: keyword leg unavailable, ranking on vectors alone — ${degraded.message}`,
+        );
+      }
       if (!hits.length) console.log("no hits");
       for (const h of hits) {
+        // The fused score, because that is what the rows are ordered by.
+        // Printing the raw cosine next to a fused ordering made the column
+        // read out of order and looked like a sorting bug.
+        const detail =
+          h.fusedScore === undefined
+            ? ""
+            : `  (cos=${h.score.toFixed(3)} lex=${(h.lexicalScore ?? 0).toFixed(3)} via=${h.retrievedBy})`;
         console.log(
-          `  ${h.score.toFixed(3)}  ${h.title}  ${h.sourceRef ?? ""}`,
+          `  ${(h.fusedScore ?? h.score).toFixed(3)}  ${h.title}  ${h.sourceRef ?? ""}${detail}`,
         );
       }
       break;

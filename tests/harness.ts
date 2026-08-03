@@ -46,7 +46,10 @@ import {
   countDocuments,
   toMatchExpression,
   parseSearchArgs,
+  lexicalQueryNotices,
   LexicalSearchError,
+  LEXICAL_TAPER_FACTOR,
+  MAX_LEXICAL_TERMS,
 } from "../src/vector.ts";
 import {
   verifyPin,
@@ -177,6 +180,7 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -1461,6 +1465,292 @@ test("vector", "H10_parseSearchArgs_defaults_to_hybrid_and_refuses_typos", () =>
   assert(!empty.ok, "empty query refused");
   const contradiction = parseSearchArgs(["--semantic", "--exact", "q"]);
   assert(!contradiction.ok, "--semantic --exact is contradictory, not silent");
+});
+
+/**
+ * Pad every passage to the same token count so bm25's length normalisation
+ * cannot reorder them, leaving term frequency as the only thing that can.
+ */
+const PAD_WIDTH = 24;
+
+function paddedBody(token: string, reps: number): string {
+  return [
+    ...Array<string>(reps).fill(token),
+    ...Array<string>(PAD_WIDTH - reps).fill("padding"),
+  ].join(" ");
+}
+
+/** The corpus's own bm25 ordering for a single token, best first. */
+function bm25Order(db: DatabaseSync, token: string): string[] {
+  return (
+    db
+      .prepare(
+        `SELECT d.id AS id
+         FROM vector_document_fts
+         JOIN vector_document d ON d.rowid = vector_document_fts.rowid
+         WHERE vector_document_fts MATCH ?
+         ORDER BY bm25(vector_document_fts)
+         LIMIT 500`,
+      )
+      .all(`"${token}"`) as { id: string }[]
+  ).map((r) => r.id);
+}
+
+/** Bulk filler so `total` is a real corpus size and df means something. */
+function seedFiller(db: DatabaseSync, count: number, cos: number): void {
+  for (let i = 0; i < count; i++) {
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      title: `filler ${i}`,
+      body: paddedBody("padding", 0),
+      embedding: vecAtCosine(cos),
+      model: "injected-test",
+    });
+  }
+}
+
+test("vector", "H11_a_common_word_cannot_buy_the_full_lexical_weight", () => {
+  // The defect: `lexicalStrength` divides bm25 by the query's *own* idf mass,
+  // so for a one-term query the term's idf cancels and every passage
+  // containing it scores exactly 1.0 — `the` and a hapax alike. On the real
+  // 20,447-passage corpus `chamber search memory` returned 50 candidates whose
+  // lexicalScore was 1.0000 to four decimals, each collecting the whole
+  // LEXICAL_WEIGHT. Here "system" is in a third of the corpus and "zarvox" in
+  // one passage; the two must not be worth the same.
+  const db = freshDb();
+  const weak = upsertDocument(db, {
+    sourceKind: "vault_page",
+    title: "weak-but-matches",
+    body: paddedBody("system", 1),
+    embedding: vecAtCosine(0.05),
+    model: "injected-test",
+  }).id;
+  for (let i = 0; i < 19; i++) {
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      title: `common ${i}`,
+      body: paddedBody("system", 1),
+      embedding: vecAtCosine(0.02),
+      model: "injected-test",
+    });
+  }
+  // Clearly the better answer on the vector leg, and it contains neither term.
+  const strong = upsertDocument(db, {
+    sourceKind: "vault_page",
+    title: "strong-semantic",
+    body: paddedBody("padding", 0),
+    embedding: vecAtCosine(0.4),
+    model: "injected-test",
+  }).id;
+  // Same weak cosine as `weak`, but its one term is a genuine hapax.
+  const rare = upsertDocument(db, {
+    sourceKind: "vault_page",
+    title: "weak-but-rare",
+    body: paddedBody("zarvox", 1),
+    embedding: vecAtCosine(0.05),
+    model: "injected-test",
+  }).id;
+  seedFiller(db, 38, 0.01);
+  // 20 of 60 contain "system"; 1 of 60 contains "zarvox".
+  assert(countDocuments(db) === 60, `corpus size ${countDocuments(db)}`);
+
+  const byCommon = searchVector(db, probeVector(), {
+    k: 30,
+    minScore: 0,
+    model: "injected-test",
+    lexical: { query: "system" },
+  });
+  const byRare = searchVector(db, probeVector(), {
+    k: 30,
+    minScore: 0,
+    model: "injected-test",
+    lexical: { query: "zarvox" },
+  });
+
+  const rankIn = (hits: typeof byCommon, id: string): number =>
+    hits.findIndex((h) => h.documentId === id);
+  const lexOf = (hits: typeof byCommon, id: string): number =>
+    hits.find((h) => h.documentId === id)?.lexicalScore ?? 0;
+
+  // The consequence, stated as ranking: matching one common word must not
+  // overturn a clear semantic winner. 0.7*0.05 + 0.3*1.0 = 0.335 used to beat
+  // 0.7*0.40 = 0.28, so `weak` led and `strong` was pushed to rank 21.
+  assert(
+    rankIn(byCommon, strong) < rankIn(byCommon, weak),
+    `a passage sharing only a common word outranked a much better semantic ` +
+      `match: strong at ${rankIn(byCommon, strong)}, weak at ${rankIn(byCommon, weak)}`,
+  );
+  // …and the mirror image, which is the whole reason the lexical leg exists:
+  // the *rare* term at that same weak cosine must still win. A fix that
+  // damped every lexical contribution would pass the assertion above and fail
+  // this one.
+  assert(
+    rankIn(byRare, rare) < rankIn(byRare, strong),
+    `a hapax must still lift a weak-cosine passage: rare at ` +
+      `${rankIn(byRare, rare)}, strong at ${rankIn(byRare, strong)}`,
+  );
+
+  // The saturation itself, read straight off the reported score: a term in a
+  // third of the corpus and a term in one passage of it cannot both be 1.0.
+  const lexCommon = lexOf(byCommon, weak);
+  const lexRare = lexOf(byRare, rare);
+  assert(
+    lexRare > 0.9,
+    `a hapax should still score near the top of the scale, got ${lexRare}`,
+  );
+  assert(
+    lexCommon < 0.4,
+    `a word in a third of the corpus must not score near 1.0, got ${lexCommon}`,
+  );
+  assert(
+    lexRare > 3 * lexCommon,
+    `lexicalScore must discriminate by rarity: common=${lexCommon} rare=${lexRare}`,
+  );
+  // No candidate at all may reach the top of the scale on a common word —
+  // the reported symptom was all 50 of them doing exactly that.
+  const maxCommon = Math.max(
+    ...byCommon.map((h) => h.lexicalScore ?? 0),
+  );
+  assert(
+    maxCommon < 0.4,
+    `every "system" candidate should be damped, max was ${maxCommon}`,
+  );
+});
+
+test("vector", "H12_the_bm25_candidate_cut_is_a_taper_not_a_cliff", () => {
+  // The defect: the lexical contribution was full weight inside the candidate
+  // LIMIT and zero one row past it. On the real corpus bm25 at candidate #50
+  // was -5.6674 and at #51 -5.6652 — 0.04% apart, and a whole LEXICAL_WEIGHT
+  // apart after fusion. `limit: 3` reproduces the boundary at test scale; the
+  // pool now runs LEXICAL_TAPER_FACTOR times deeper and decays to zero at its
+  // edge, so crossing the boundary costs a rounding error.
+  assert(
+    LEXICAL_TAPER_FACTOR > 1,
+    "the pool must run deeper than the full-weight core, or there is no taper",
+  );
+  const db = freshDb();
+  const MATCHES = 14;
+  const CORE = 3;
+  const POOL = CORE * LEXICAL_TAPER_FACTOR;
+  assert(POOL === 12 && MATCHES > POOL, `pool=${POOL} matches=${MATCHES}`);
+
+  // Cosine by intended bm25 rank. Rank 2 is inside the core and weak; rank 4
+  // is outside it and clearly better; ranks 12-13 fall outside the pool
+  // entirely and must receive nothing.
+  const cosByRank = (r: number): number =>
+    r === 2 ? 0.3 : r === 4 ? 0.38 : r >= POOL ? 0.2 : 0.03;
+  const ids: string[] = [];
+  for (let r = 0; r < MATCHES; r++) {
+    ids.push(
+      upsertDocument(db, {
+        sourceKind: "vault_page",
+        title: `match ${r}`,
+        // Descending term frequency at constant length pins the bm25 order.
+        body: paddedBody("quixotic", MATCHES - r),
+        embedding: vecAtCosine(cosByRank(r)),
+        model: "injected-test",
+      }).id,
+    );
+  }
+  seedFiller(db, 60 - MATCHES, 0.01);
+
+  // Never assumed: if fts5 ordered these differently the cosines below would
+  // be attached to the wrong rows and this test would prove nothing.
+  const order = bm25Order(db, "quixotic");
+  assert(
+    order.length === MATCHES && order.every((id, i) => id === ids[i]),
+    `bm25 order is not the constructed order: ${JSON.stringify(order.slice(0, 5))}`,
+  );
+
+  const hits = searchVector(db, probeVector(), {
+    k: 60,
+    minScore: 0,
+    model: "injected-test",
+    lexical: { query: "quixotic", limit: CORE },
+  });
+  const rankOf = (id: string): number =>
+    hits.findIndex((h) => h.documentId === id);
+  const lexOf = (id: string): number =>
+    hits.find((h) => h.documentId === id)?.lexicalScore ?? 0;
+
+  // The cliff, as a ranking inversion: rank 4 has the better cosine by 0.08
+  // and used to lose to rank 2 purely for being on the wrong side of the cut.
+  assert(
+    rankOf(ids[4]!) < rankOf(ids[2]!),
+    `a stronger passage just outside the cut was leapfrogged by a weaker one ` +
+      `just inside it: outside at ${rankOf(ids[4]!)}, inside at ${rankOf(ids[2]!)}`,
+  );
+
+  // The cut is continuous: the last row still inside the pool carries almost
+  // nothing, so the rows outside it — which carry exactly nothing — are its
+  // neighbours rather than a step down. Before, the last included row carried
+  // full weight.
+  const lexValues = hits
+    .map((h) => h.lexicalScore ?? 0)
+    .filter((v) => v > 0);
+  const maxLex = Math.max(...lexValues);
+  const minLex = Math.min(...lexValues);
+  assert(
+    minLex <= 0.2 * maxLex,
+    `the pool edge must decay to near zero, got min=${minLex} max=${maxLex} ` +
+      `over ${lexValues.length} contributing rows`,
+  );
+  assert(
+    lexOf(ids[0]!) === maxLex && lexOf(ids[POOL - 1]!) === minLex,
+    "the taper must be ordered by bm25 rank, strongest first",
+  );
+
+  // Past the pool there is no contribution and no lexical label to imply one.
+  for (const r of [POOL, MATCHES - 1]) {
+    const h = hits.find((x) => x.documentId === ids[r]!);
+    assert(h !== undefined, `row at bm25 rank ${r} should still be retrieved`);
+    assert(
+      h!.lexicalScore === 0 && h!.retrievedBy === "semantic",
+      `row at bm25 rank ${r} is outside the pool: got lex=${h!.lexicalScore} ` +
+        `via=${h!.retrievedBy}`,
+    );
+  }
+});
+
+test("vector", "H13_a_silently_mangled_lexical_query_says_so", () => {
+  // Both cases reach the corpus as something other than what the user typed
+  // and come back looking like an honest "the corpus does not contain that".
+  const nothing = lexicalQueryNotices("((()))");
+  assert(
+    nothing.length === 1 && nothing[0]!.kind === "no_terms",
+    `punctuation-only query must be reported, got ${JSON.stringify(nothing)}`,
+  );
+  assert(
+    lexicalQueryNotices("​​")[0]?.kind === "no_terms",
+    "a zero-width space is not a search term",
+  );
+  assert(
+    lexicalQueryNotices("🙂🙂🙂")[0]?.kind === "no_terms",
+    "an emoji-only query is not a search term",
+  );
+  // Exactly the boundary: the cap itself is fine, one past it is not.
+  const atCap = Array.from({ length: MAX_LEXICAL_TERMS }, (_, i) => `t${i}`);
+  assert(
+    lexicalQueryNotices(atCap.join(" ")).length === 0,
+    "a query at the cap is not truncated and must not warn",
+  );
+  const overCap = [...atCap, "zarvox", "keycloak"];
+  const truncated = lexicalQueryNotices(overCap.join(" "));
+  assert(
+    truncated.length === 1 && truncated[0]!.kind === "truncated",
+    `a query past the cap must be reported, got ${JSON.stringify(truncated)}`,
+  );
+  // The message has to name what was dropped — "2 terms were ignored" does
+  // not tell the user that the identifier they pasted was one of them.
+  assert(
+    truncated[0]!.message.includes("zarvox") &&
+      truncated[0]!.message.includes("2 were not searched for"),
+    `the notice must name the dropped terms, got: ${truncated[0]!.message}`,
+  );
+  assert(
+    lexicalQueryNotices("courier reconciliation").length === 0,
+    "an ordinary query must not warn about anything",
+  );
 });
 
 // ─── PINS (content-pin verification, src/pins.ts) ────────────────────────────
@@ -6162,36 +6452,41 @@ test("cli", "help_starts_the_real_binary_and_exits_clean", () => {
 });
 
 test("cli", "status_dispatches_against_a_scratch_db", () => {
-  const dbFile = join(
-    mkdtempSync(join(tmpdir(), "chamber-cli-status-")),
-    "chamber.sqlite",
-  );
-  const r = spawnSync(
-    process.execPath,
-    ["--experimental-strip-types", CLI_PATH, "status"],
-    {
-      encoding: "utf8",
-      timeout: 15_000,
-      env: { ...process.env, CHAMBER_DB: dbFile },
-    },
-  );
-  assert(
-    r.error === undefined,
-    `failed to launch cli subprocess: ${r.error}`,
-  );
-  assert(
-    r.status === 0,
-    `chamber status exited ${r.status} (signal=${r.signal}); stderr:\n${r.stderr}`,
-  );
-  // `help` only proves the module parses. `status` proves a command still
-  // dispatches end-to-end: it opens (creating) the sqlite db, runs real
-  // queries against it, and prints the counters below — so this catches a
-  // broken command handler or a dispatch table regression that a
-  // syntax-only smoke test would miss.
-  assert(
-    r.stdout.includes("beliefs:") && r.stdout.includes("audit events:"),
-    `status output missing expected counters, got:\n${r.stdout}`,
-  );
+  // Removed in `finally`, because the asserts below throw: this test used to
+  // leave a `chamber-cli-status-*` directory (holding a real sqlite file) in
+  // the system temp dir on every single run, passing or failing.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-cli-status-"));
+  try {
+    const dbFile = join(dir, "chamber.sqlite");
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "status"],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: { ...process.env, CHAMBER_DB: dbFile },
+      },
+    );
+    assert(
+      r.error === undefined,
+      `failed to launch cli subprocess: ${r.error}`,
+    );
+    assert(
+      r.status === 0,
+      `chamber status exited ${r.status} (signal=${r.signal}); stderr:\n${r.stderr}`,
+    );
+    // `help` only proves the module parses. `status` proves a command still
+    // dispatches end-to-end: it opens (creating) the sqlite db, runs real
+    // queries against it, and prints the counters below — so this catches a
+    // broken command handler or a dispatch table regression that a
+    // syntax-only smoke test would miss.
+    assert(
+      r.stdout.includes("beliefs:") && r.stdout.includes("audit events:"),
+      `status output missing expected counters, got:\n${r.stdout}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────

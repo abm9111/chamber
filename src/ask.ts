@@ -16,6 +16,7 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   searchVector,
   countDocuments,
+  lexicalQueryNotices,
   type LexicalOptions,
   type LexicalSearchError,
 } from "./vector.ts";
@@ -282,6 +283,16 @@ export async function runAsk(
           mode: opts.exact === true ? "phrase" : "terms",
           require: opts.exact === true,
         };
+  // What the lexical leg quietly did to the question before searching for it —
+  // dropped its tail at MAX_LEXICAL_TERMS, or found nothing in it to search
+  // for at all. Neither is an error, and neither is visible in the answer, so
+  // both ride along on the same note as the other retrieval caveats.
+  const lexicalNotice =
+    lexical === undefined
+      ? undefined
+      : lexicalQueryNotices(question)
+          .map((n) => n.message)
+          .join("; ") || undefined;
   let lexicalError: LexicalSearchError | undefined;
   // Answering semantically is better than not answering, but only if the user
   // is told the answer was formed without the lexical leg — otherwise a broken
@@ -331,6 +342,7 @@ export async function runAsk(
       note: joinNotes(
         emptyRetrievalNote(db, uncitable),
         lexicalError && lexicalDegradedNote(lexicalError),
+        lexicalNotice,
       ),
     };
   }
@@ -454,6 +466,7 @@ export async function runAsk(
     note: joinNotes(
       uncitable.length > 0 ? withheldNote(uncitable) : undefined,
       lexicalError && lexicalDegradedNote(lexicalError),
+      lexicalNotice,
     ),
   };
 }

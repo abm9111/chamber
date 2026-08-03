@@ -129,8 +129,15 @@ export interface VectorHit {
   snapshotHash: string;
   model: string;
   /**
-   * Share of the query's own idf mass this passage actually contains, in
-   * [0,1]. Absent when the lexical leg did not run. See `lexicalStrength`.
+   * The lexical leg's contribution for this passage, in [0,1]. Absent when the
+   * lexical leg did not run.
+   *
+   * Three factors: the share of the query's own idf mass the passage contains
+   * (`lexicalStrength`), how rare the rarest term in the query is against this
+   * corpus (`queryRarity`), and a taper that zeroes the contribution at the
+   * edge of the bm25 pool (`candidateTaper`). The first alone saturates at 1.0
+   * for any single-term query; the second is what keeps a common word from
+   * buying the full `LEXICAL_WEIGHT`.
    */
   lexicalScore?: number;
   /** The value results were ranked by. Absent when retrieval was semantic-only. */
@@ -248,8 +255,30 @@ export function deleteDocument(db: DatabaseSync, id: string): boolean {
 export const SEMANTIC_WEIGHT = 0.7;
 export const LEXICAL_WEIGHT = 0.3;
 
-/** How deep the bm25 candidate list goes before fusion. */
+/**
+ * How deep the bm25 candidate list keeps its *full* lexical contribution.
+ *
+ * Rows past this depth are still retrieved — see `LEXICAL_TAPER_FACTOR` — but
+ * their contribution decays, because a hard edge here is a ranking cliff. Two
+ * adjacent bm25 scores differing in the fourth decimal used to differ by the
+ * whole `LEXICAL_WEIGHT` in the fused score purely because one of them was the
+ * 50th row and the other the 51st.
+ */
 export const LEXICAL_CANDIDATE_LIMIT = 50;
+
+/**
+ * The bm25 pool runs this many times deeper than `LEXICAL_CANDIDATE_LIMIT`,
+ * and the lexical contribution tapers linearly to exactly zero across the
+ * extra depth.
+ *
+ * The taper exists to make the truncation continuous, not to rank: inside the
+ * first `LEXICAL_CANDIDATE_LIMIT` rows the contribution is untouched, so bm25
+ * magnitude remains the only signal there. Past it the factor slides to 0 at
+ * the pool edge, which is what the rows *outside* the pool already get. A
+ * passage one row on the wrong side of the boundary therefore loses a rounding
+ * error rather than the entire lexical weight.
+ */
+export const LEXICAL_TAPER_FACTOR = 4;
 
 /**
  * Cap on tokens taken from user text. A pathological paste would otherwise
@@ -263,6 +292,23 @@ export const MAX_LEXICAL_TERMS = 32;
  * df only feeds idf, and idf is flat and near-zero for anything this common, so
  * stopping early changes the weighting of "the" by a rounding error while
  * keeping a stopword's probe O(cap) instead of O(corpus).
+ *
+ * The error it can introduce is one-directional, and deliberately so. A capped
+ * df is never larger than the true df, and both consumers are monotone in the
+ * safe direction:
+ *
+ *  - `bm25Idf` decreases in df, so an under-counted df *raises* idf, *raises*
+ *    the `idfMass` denominator, and therefore *lowers* `lexicalStrength`. A
+ *    capped term can only under-sell a passage, never over-sell one.
+ *  - `queryRarity` would move the other way — an under-counted df reads as
+ *    rarer — so a df that actually reached the cap is treated there as
+ *    maximally common instead of being trusted. See `queryRarity`.
+ *
+ * So the cap can only deflate the lexical contribution, and a deflated lexical
+ * contribution cannot promote anything: the semantic leg is untouched and the
+ * fusion is a sum of non-negative terms. It also does not fire on any corpus
+ * near this size — the cap is ~49% of the 20,447-passage vault corpus, whose
+ * most common indexed token ("the") reaches df 8,963.
  */
 const DF_SCAN_CAP = 10_000;
 
@@ -285,7 +331,11 @@ export interface LexicalOptions {
    * the asker did not happen to use.
    */
   require?: boolean;
-  /** bm25 candidate depth (default `LEXICAL_CANDIDATE_LIMIT`). */
+  /**
+   * bm25 depth kept at full contribution (default `LEXICAL_CANDIDATE_LIMIT`).
+   * The pool actually scanned is `LEXICAL_TAPER_FACTOR` times this, with the
+   * contribution tapering to zero across the remainder.
+   */
   limit?: number;
 }
 
@@ -321,9 +371,72 @@ export class LexicalSearchError extends Error {
  * `snake_case` survives as a phrase (FTS5's unicode61 tokenizer splits on it
  * on both the query and the indexing side, so the two still agree).
  */
+function allLexicalTokens(text: string): string[] {
+  return text.normalize("NFKC").match(/[\p{L}\p{N}_]+/gu) ?? [];
+}
+
+/**
+ * The same tokens, capped at `MAX_LEXICAL_TERMS` — what the leg actually
+ * searches for. The gap between this and `allLexicalTokens` is a silent
+ * degradation, which is why `lexicalQueryNotices` reports it.
+ */
 function lexicalTokens(text: string): string[] {
-  const found = text.normalize("NFKC").match(/[\p{L}\p{N}_]+/gu) ?? [];
-  return found.slice(0, MAX_LEXICAL_TERMS);
+  return allLexicalTokens(text).slice(0, MAX_LEXICAL_TERMS);
+}
+
+/**
+ * Something the lexical leg silently did to the user's query.
+ *
+ * Both cases below are indistinguishable from an honest empty result at the
+ * point where the user reads it — the same failure mode `LexicalSearchError`
+ * exists to prevent, one level earlier in the pipeline. They are not errors
+ * (the search still runs and still returns its best answer), so they are
+ * reported rather than thrown, and every command that runs a lexical leg is
+ * expected to print them.
+ */
+export interface LexicalNotice {
+  kind: "truncated" | "no_terms";
+  message: string;
+}
+
+/**
+ * Report what `toMatchExpression` will quietly do to `text`.
+ *
+ * - `no_terms`: sanitisation left nothing to match on. `--exact "((()))"`, an
+ *   emoji-only query and a zero-width space all reach the corpus as *no query
+ *   at all* and come back "no hits", which reads as "the corpus does not
+ *   contain that phrase" — a claim this search never actually tested.
+ * - `truncated`: the query ran past `MAX_LEXICAL_TERMS` and the tail was
+ *   dropped. A distinctive identifier pasted at word 40 of a wall of text is
+ *   then not searched for, and it is exactly the term the user was counting on.
+ */
+export function lexicalQueryNotices(text: string): LexicalNotice[] {
+  const all = allLexicalTokens(text);
+  if (all.length === 0) {
+    return [
+      {
+        kind: "no_terms",
+        message:
+          "the keyword leg had nothing to search for: no letters or digits " +
+          "survived sanitisation, so any 'no hits' below is about the query, " +
+          "not about the corpus",
+      },
+    ];
+  }
+  if (all.length > MAX_LEXICAL_TERMS) {
+    const dropped = all.slice(MAX_LEXICAL_TERMS);
+    const shown = dropped.slice(0, 5).join(", ");
+    return [
+      {
+        kind: "truncated",
+        message:
+          `the keyword leg used the first ${MAX_LEXICAL_TERMS} of ` +
+          `${all.length} terms; ${dropped.length} were not searched for ` +
+          `(${shown}${dropped.length > 5 ? ", …" : ""})`,
+      },
+    ];
+  }
+  return [];
 }
 
 /**
@@ -362,6 +475,7 @@ function bm25Idf(total: number, df: number): number {
   return idf <= 0 ? 1e-6 : idf;
 }
 
+/** Document frequency of `token`, saturating at `DF_SCAN_CAP` — see there. */
 function documentFrequency(db: DatabaseSync, token: string): number {
   const row = db
     .prepare(
@@ -397,10 +511,81 @@ function documentFrequency(db: DatabaseSync, token: string): number {
  *
  * `min(1, …)` because bm25's term-frequency saturation can push a single term's
  * contribution above its idf (up to k1+1) when a passage repeats it.
+ *
+ * That last paragraph about rarity is only true because `queryRarity` enforces
+ * it; this ratio on its own does not, and the clamp above is where it breaks.
+ * The denominator is the query's *own* idf mass, so for a one-term query the
+ * ratio is `idf(t)·tfSat / idf(t)` — the term drops out, tfSat pushes the rest
+ * past 1, and essentially every passage containing the term clamps to exactly
+ * 1.0 whether the term is `zarvox` or `the`. That is precisely the RRF failure
+ * disclaimed above, plus a cliff at the candidate cut that RRF does not have.
+ * Measured on the 20,447-passage vault corpus, `memory` returned 50 candidates
+ * all at 1.0000. Relative strength *within* a query is what this function
+ * measures; it cannot express how much the query was worth asking, and
+ * `queryRarity` supplies that missing absolute factor.
  */
 function lexicalStrength(bm25Score: number, idfMass: number): number {
   if (idfMass <= 0) return 0;
   return Math.min(1, Math.abs(bm25Score) / idfMass);
+}
+
+/**
+ * How much lexical weight this query has *earned*, in [0,1].
+ *
+ * `lexicalStrength` is a share of the query's own idf mass, which makes it
+ * blind in exactly one place: a query whose terms all have similar df
+ * normalises that df away. Every passage containing the single word `the`
+ * scored a perfect lexical 1.0 and collected the full `LEXICAL_WEIGHT`, so
+ * 50 essentially arbitrary passages were each handed a 0.3 fused-score bonus
+ * over the rest of the corpus. This factor is the absolute counterweight: it
+ * asks how rare the *rarest* term the user typed actually is, against this
+ * corpus, on a scale that does not move when the query changes.
+ *
+ * The rarest term is the right one to ask about because the leg is a
+ * disjunction — a passage becomes a candidate by matching any single term, so
+ * the best case for the query as a whole is the best term in it. Padding a
+ * distinctive identifier with stopwords must not dilute it.
+ *
+ * The gauge is classic idf `log(N/df)` over its own maximum `log(N)`, i.e. the
+ * rarity of a term appearing in exactly one document. Deliberately *not* the
+ * Robertson `bm25Idf` used inside bm25: that variant goes non-positive for any
+ * term in more than about half the corpus and is floored at 1e-6, so on a small
+ * corpus it collapses to the floor and would zero out the lexical leg for terms
+ * that discriminate perfectly there (a codename in 2 of 3 passages). Classic
+ * idf is monotone in df across the whole range and lands exactly on 1.0 at
+ * df = 1 for every corpus size, so the reading — "how close to unique is the
+ * best word you gave me" — holds on a 3-document corpus and a 20,447-document
+ * one alike. Reproducing fts5 exactly matters for the bm25 denominator, where
+ * the units have to cancel; it does not matter for a gauge.
+ *
+ * `minDf` at or above `DF_SCAN_CAP` returns 0: the true df is then unknown and
+ * only ever larger, and guessing "rare" from a truncated scan is the one way
+ * this could inflate a score. A term in ≥ 10,000 documents has no rarity worth
+ * defending anyway.
+ */
+function queryRarity(total: number, minDf: number): number {
+  // A corpus of 0 or 1 documents cannot be reordered by anything, so the gauge
+  // has nothing to say and `log(total)` is not usable as a denominator.
+  if (total <= 1) return 1;
+  if (minDf <= 0) return 1;
+  if (minDf >= DF_SCAN_CAP) return 0;
+  const rarity = Math.log(total / minDf) / Math.log(total);
+  return Math.min(1, Math.max(0, rarity));
+}
+
+/**
+ * Weight of a bm25 candidate at 0-indexed rank `rank` in a pool of `pool` rows.
+ *
+ * Flat 1 for the first `core` rows, then linear to 0 at the pool edge. The
+ * point is continuity at the truncation, not ranking: rows outside the pool
+ * contribute 0, so a taper that reaches 0 there makes crossing the boundary
+ * cost nothing. Before this, candidate #50 and #51 on the vault corpus differed
+ * by 0.04% of bm25 and by the entire `LEXICAL_WEIGHT` after fusion.
+ */
+function candidateTaper(rank: number, core: number, pool: number): number {
+  if (rank < core) return 1;
+  if (rank >= pool) return 0;
+  return (pool - rank) / (pool - core);
 }
 
 export interface SearchOptions {
@@ -593,12 +778,29 @@ function runLexicalLeg(
     // Sum the idf of the terms that actually occur. A term nobody wrote
     // contributes to no passage's bm25, so counting it in the denominator
     // would deflate every real match for no reason.
+    //
+    // The same pass records the smallest df seen, which is the rarest term the
+    // user actually typed and the input to `queryRarity`. Terms nobody wrote
+    // are excluded from that too: an unmatched word says nothing about how
+    // discriminating the words that *did* match are.
     let idfMass = 0;
+    let minDf = Infinity;
     for (const token of lexicalTokens(lex.query)) {
       const df = documentFrequency(db, token);
-      if (df > 0) idfMass += bm25Idf(total, df);
+      if (df > 0) {
+        idfMass += bm25Idf(total, df);
+        if (df < minDf) minDf = df;
+      }
     }
     if (idfMass <= 0) return out;
+    // Scales the contribution, never the membership: a rarity of 0 must still
+    // leave the matched rows in the map, or `require: true` — where the map
+    // *is* the candidate set — would turn `--exact "the team"` into "no hits"
+    // rather than into "these are the passages, ranked semantically".
+    const rarity = queryRarity(total, minDf);
+
+    const core = lex.limit ?? LEXICAL_CANDIDATE_LIMIT;
+    const pool = core * LEXICAL_TAPER_FACTOR;
 
     const ftsRows = db
       .prepare(
@@ -610,16 +812,24 @@ function runLexicalLeg(
          ORDER BY rank
          LIMIT ?`,
       )
-      .all(expr, ...filterParams, lex.limit ?? LEXICAL_CANDIDATE_LIMIT) as {
+      .all(expr, ...filterParams, pool) as {
       id: string;
       rank: number;
     }[];
 
-    for (const fr of ftsRows) {
+    for (let i = 0; i < ftsRows.length; i++) {
+      const fr = ftsRows[i]!;
       // A row whose embedding blob failed to parse is not retrievable at all;
-      // it must not re-enter through the lexical door.
+      // it must not re-enter through the lexical door. Its bm25 position is
+      // still consumed — `i` indexes the pool as fts5 ordered it, so the taper
+      // does not shift under an unrelated corruption.
       if (!rowById.has(fr.id)) continue;
-      out.set(fr.id, lexicalStrength(fr.rank, idfMass));
+      out.set(
+        fr.id,
+        lexicalStrength(fr.rank, idfMass) *
+          rarity *
+          candidateTaper(i, core, pool),
+      );
     }
   } catch (err) {
     const e = new LexicalSearchError(expr, err);

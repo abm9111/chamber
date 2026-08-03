@@ -974,8 +974,26 @@ async function main(): Promise<void> {
         return true;
       };
 
-      const hasPath = rest.some((a) => !a.startsWith("--"));
-      if (!hasPath) {
+      // Bare `chamber ingest` — and only bare — takes the configured roots.
+      //
+      // This used to ask "is any argument not `--`-prefixed?", which answered
+      // no for `chamber ingest --exclude=public`: the configured-roots branch
+      // ran, the exclude was dropped without a word, `public/` was ingested,
+      // and the output read like a clean success at exit 0.
+      // `--include-dotted`, `--allow-unmatched-exclude` and `--totally-bogus`
+      // were all swallowed the same way — the last command path that did not
+      // reject unknown flags, and the privacy-relevant one, repeating the
+      // shape of the historical bug `parseIngestArgs` documents.
+      //
+      // Refusing rather than applying them, because there is no honest way to
+      // apply them: excludes are per-root in the config file, and a single
+      // CLI `--exclude` spread across N roots has no defined meaning —
+      // `--allow-unmatched-exclude` would have to guess between "unmatched
+      // against every root" and "against any", and both guesses silently
+      // weaken a privacy control. Any argument at all therefore selects the
+      // explicit-path form, whose parser already rejects an unknown flag and
+      // a missing path out loud.
+      if (rest.length === 0) {
         const cfg = loadConfig();
         if (cfg.ingest.length === 0) {
           console.error("ingest: no path given and no roots configured");

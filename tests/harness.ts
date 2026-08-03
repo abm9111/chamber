@@ -7649,6 +7649,120 @@ test("cli", "a config naming a remote model.base stops the CLI before it runs", 
   }
 });
 
+// ── IMPORTANT: `ingest` with flags but no path silently ignored every flag ──
+//
+// `hasPath` asked "is any argument not `--`-prefixed?", so
+// `chamber ingest --exclude=public` answered no, took the configured-roots
+// branch, dropped the exclude without a word, ingested `public/`, and exited 0
+// with output that read like success. This was the one command path that did
+// not reject unknown flags, and the privacy-relevant one.
+test("config", "ingest refuses flags passed without an explicit path", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-ingflags-"));
+  try {
+    const vault = join(dir, "vault");
+    mkdirSync(join(vault, "public"), { recursive: true });
+    writeFileSync(join(vault, "public", "p.md"), "public body\n");
+    writeFileSync(join(vault, "keep.md"), "keep body\n");
+    const dbFile = join(dir, "c.sqlite");
+    const cfgFile = join(dir, "config.json");
+    writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        database: dbFile,
+        ingest: [{ root: vault, exclude: [] }],
+      }),
+    );
+    for (const flag of [
+      "--exclude=public",
+      "--include-dotted",
+      "--allow-unmatched-exclude",
+      "--totally-bogus",
+    ]) {
+      const r = spawnSync(
+        process.execPath,
+        ["--experimental-strip-types", CLI_PATH, "ingest", flag],
+        {
+          encoding: "utf8",
+          timeout: 15_000,
+          env: { ...process.env, CHAMBER_CONFIG: cfgFile, CHAMBER_DB: "" },
+        },
+      );
+      assert(
+        r.status !== 0,
+        `\`ingest ${flag}\` must exit non-zero, got ${r.status}; stdout:\n${r.stdout}`,
+      );
+      assert(
+        !r.stdout.includes("ingested"),
+        `\`ingest ${flag}\` must not report a successful run, got:\n${r.stdout}`,
+      );
+      // The load-bearing assertion. Exit status alone would not catch a run
+      // that ingested first and complained second — and before the fix this is
+      // exactly what happened: `public/p.md` was in the corpus at exit 0.
+      // Asserting the file does not exist would be wrong rather than strict:
+      // `main()` opens (and so creates) the database before it dispatches, for
+      // every command, including ones that then refuse their arguments.
+      const db = openChamberDb(dbFile);
+      const refs = ingestedPaths(db);
+      db.close();
+      assert(
+        refs.length === 0,
+        `\`ingest ${flag}\` must store nothing, got ${JSON.stringify(refs)}`,
+      );
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "bare ingest still uses the configured roots", () => {
+  // The other half of the rule above: refusing flags must not have cost the
+  // no-argument form, which is what launchd runs.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-ingbare-"));
+  try {
+    const vault = join(dir, "vault");
+    mkdirSync(vault, { recursive: true });
+    writeFileSync(join(vault, "a.md"), "alpha body\n");
+    const dbFile = join(dir, "c.sqlite");
+    const cfgFile = join(dir, "config.json");
+    writeFileSync(
+      cfgFile,
+      JSON.stringify({ database: dbFile, ingest: [{ root: vault, exclude: [] }] }),
+    );
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "ingest"],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: { ...process.env, CHAMBER_CONFIG: cfgFile, CHAMBER_DB: "" },
+      },
+    );
+    assert(r.status === 0, `bare ingest must still work: ${r.stderr}`);
+    const db = openChamberDb(dbFile);
+    const refs = ingestedPaths(db);
+    db.close();
+    assert(
+      refs.length === 1 && refs[0] === "a.md",
+      `bare ingest must ingest the configured root, got ${JSON.stringify(refs)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "parseIngestArgs says which form flags belong to", () => {
+  const r = parseIngestArgs(["--exclude=public"]);
+  assert(!r.ok, "flags with no path must not parse");
+  assert(
+    !r.ok && r.error.includes("explicit-path form"),
+    `the error must point at the form flags belong to, got: ${!r.ok && r.error}`,
+  );
+  // An empty argv is a different situation — no flags were misplaced — and
+  // keeps the terser message.
+  const empty = parseIngestArgs([]);
+  assert(!empty.ok && empty.error === "missing <path>", "empty argv keeps the short message");
+});
+
 // ─── report ──────────────────────────────────────────────────────────────────
 
 // Drain the async queue sequentially: invoke a thunk, await it fully,

@@ -117,6 +117,7 @@ import {
   verifyToolsAgainstPin,
   quarantineToolDescription,
   hashToolsList,
+  hashToolSchema,
 } from "../src/mcp_trust.ts";
 import { ensureDefaultScope, createScope, effectivePolicy, globalPosture } from "../src/scope.ts";
 import { enqueueJob, processJobQueue, listJobs } from "../src/job_queue.ts";
@@ -3621,6 +3622,73 @@ test("oauth", "O13_quarantine_wrapper", () => {
   assert(q.includes("UNTRUSTED"), q);
   assert(q.includes("NOT INSTRUCTIONS"), q);
 });
+
+test(
+  "oauth",
+  "O14_hashToolSchema_null_vs_empty_description_are_distinct",
+  () => {
+    // `tool.description ?? ""` coalesced an absent/null description into ""
+    // before JSON.stringify ever saw it, so a server flipping its
+    // description between the two produced a byte-identical pin input and
+    // therefore an unchanged hash — invisible drift in the one check whose
+    // job is detecting it. Same collision class as the vault-page snapshot
+    // pin fixed in src/pins.ts.
+    const withNull = hashToolSchema({ name: "t", description: null as unknown as undefined });
+    const withEmpty = hashToolSchema({ name: "t", description: "" });
+    assert(
+      withNull !== withEmpty,
+      "a null description and an empty-string description must not hash the same",
+    );
+  },
+);
+
+test(
+  "oauth",
+  "O15_hashToolsList_null_vs_empty_description_are_distinct",
+  () => {
+    // Same collision, the whole-list formula used by pinToolsList /
+    // verifyToolsAgainstPin — this is the hash actually compared on every
+    // tools/call to detect a rug-pull.
+    const withNull = hashToolsList([
+      { name: "t", description: null as unknown as undefined },
+    ]);
+    const withEmpty = hashToolsList([{ name: "t", description: "" }]);
+    assert(
+      withNull !== withEmpty,
+      "a tools/list with a null description must not hash the same as one with an empty-string description",
+    );
+  },
+);
+
+test(
+  "oauth",
+  "O16_pinToolsList_description_hash_null_vs_empty_are_distinct",
+  () => {
+    // pinToolsList computes a second, independent hash per tool
+    // (mcp_tool_pin.description_hash) straight from the raw description
+    // string. That hash had the identical `?? ""`-before-hashing defect,
+    // one level down from the list-hash defect above.
+    const ep = "https://mcp.example.com/mcp";
+    const dbNull = freshDb();
+    const dbEmpty = freshDb();
+    pinToolsList(dbNull, ep, [
+      { name: "t", description: null as unknown as undefined },
+    ]);
+    pinToolsList(dbEmpty, ep, [{ name: "t", description: "" }]);
+    const hashOf = (db: DatabaseSync): string =>
+      (
+        db
+          .prepare(
+            `SELECT description_hash FROM mcp_tool_pin WHERE endpoint = ? AND tool_name = ?`,
+          )
+          .get(ep, "t") as { description_hash: string }
+      ).description_hash;
+    assert(
+      hashOf(dbNull) !== hashOf(dbEmpty),
+      "description_hash must not collide between a null and an empty-string description",
+    );
+  },
+);
 
 
 test("qm", "Q1_default_scope", () => {

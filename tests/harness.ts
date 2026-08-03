@@ -174,6 +174,7 @@ import {
 } from "../src/chunk.ts";
 import {
   expandTilde,
+  isLoopbackBase,
   loadConfig,
   explainConfig,
 } from "../src/config.ts";
@@ -6981,12 +6982,18 @@ test("config", "a whitespace-only CHAMBER_DB falls through to the default", () =
 });
 
 test("config", "empty CHAMBER_API_BASE and CHAMBER_API_MODEL fall through", () => {
-  withConfig(`{"model":{"base":"https://from-config","name":"from-config"}}`, () => {
+  // Loopback, not the `https://from-config` this fixture used to carry: a
+  // file-sourced base is now restricted to this machine, and a blank env var
+  // is treated as unset, so the file's value is the one that wins and gets
+  // checked. The subject under test is unchanged — blank must not blank the
+  // model — and using a base the gate accepts keeps it testing that rather
+  // than the gate.
+  withConfig(`{"model":{"base":"http://127.0.0.1:9999/v1","name":"from-config"}}`, () => {
     process.env.CHAMBER_API_BASE = "";
     process.env.CHAMBER_API_MODEL = "  ";
     const { model } = loadConfig();
     assert(
-      model.base === "https://from-config" && model.name === "from-config",
+      model.base === "http://127.0.0.1:9999/v1" && model.name === "from-config",
       `blank env must not blank the model, got ${JSON.stringify(model)}`,
     );
   });
@@ -7439,6 +7446,208 @@ test(
     rmSync(dir, { recursive: true, force: true });
   },
 );
+
+// ── CRITICAL: a config file must not be able to steer an env-supplied key ──
+//
+// The config file cannot *hold* an API key — that constraint was met, and the
+// test above pins it. But `src/cli.ts` seeds CHAMBER_API_BASE from the file's
+// `model.base`, and `src/model.ts` sends `Authorization: Bearer
+// $CHAMBER_API_KEY` to whatever that names. A mode-644 JSON file could
+// therefore redirect a real key to a host of its choosing. Proven before the
+// fix by standing up a listener and reading `Bearer sk-REAL-SECRET-FROM-ENV`
+// off it; after the fix the listener sees nothing.
+//
+// The gate is loopback-only for a file-sourced base. These tests pin both
+// directions, because a gate that refuses everything would also "pass" the
+// refusal half while breaking the local-first setup the product is built for.
+
+test("config", "a config file may not point model.base at a remote host", () => {
+  for (const hostile of [
+    "https://evil.example.com/v1",
+    "http://192.0.2.7:8097/v1", // TEST-NET-1: routable shape, never routed
+    "http://127.0.0.1.evil.example.com/v1", // loopback-looking, resolves out
+    "http://[2001:db8::1]:8097/v1",
+    "http://0.0.0.0:8087/v1", // not in 127/8 — refused by the crisp rule
+  ]) {
+    withConfig(JSON.stringify({ model: { base: hostile } }), () => {
+      let msg = "";
+      try {
+        loadConfig();
+      } catch (e) {
+        msg = e instanceof Error ? e.message : String(e);
+      }
+      assert(
+        msg !== "",
+        `a file-sourced base of ${hostile} must be refused, not resolved`,
+      );
+      assert(
+        msg.includes("model.base") && msg.includes(hostile),
+        `the refusal must name the field and the value, got: ${msg}`,
+      );
+      assert(
+        msg.includes("CHAMBER_API_BASE"),
+        `the refusal must name the env var that is the sanctioned way to do ` +
+          `this deliberately, got: ${msg}`,
+      );
+    });
+  }
+});
+
+test("config", "a config file may point model.base at this machine", () => {
+  // The working local-first setup, and every spelling of it a local server is
+  // likely to print. `chamber init` writes the first of these, so refusing any
+  // of them would make the starter config Chamber's own `init` produces fail
+  // to load.
+  for (const local of [
+    "http://127.0.0.1:8087/v1",
+    "http://localhost:8087/v1",
+    "http://[::1]:8087/v1",
+    "http://127.0.0.1:11434/v1",
+    "https://localhost:8443/v1",
+  ]) {
+    withConfig(JSON.stringify({ model: { base: local } }), () => {
+      const cfg = loadConfig();
+      assert(
+        cfg.model.base === local,
+        `a loopback base must survive intact, got ${JSON.stringify(cfg.model.base)} for ${local}`,
+      );
+    });
+  }
+});
+
+test("config", "an env-supplied CHAMBER_API_BASE may still name any host", () => {
+  // The user's own explicit act, not a file's. This is the sanctioned escape
+  // hatch the refusal message points at, so it must actually work — including
+  // when the file also carries a base, where env simply outranks it.
+  withConfig(`{"model":{"base":"http://127.0.0.1:8087/v1"}}`, () => {
+    process.env.CHAMBER_API_BASE = "https://api.openai.com/v1";
+    const cfg = loadConfig();
+    assert(
+      cfg.model.base === "https://api.openai.com/v1",
+      `env must win and must not be gated, got ${JSON.stringify(cfg.model.base)}`,
+    );
+  });
+  // And a file value that never wins is never checked: refusing on a string
+  // with no effect on any request would break a working setup for nothing.
+  withConfig(`{"model":{"base":"https://evil.example.com/v1"}}`, () => {
+    process.env.CHAMBER_API_BASE = "http://127.0.0.1:8087/v1";
+    const cfg = loadConfig();
+    assert(
+      cfg.model.base === "http://127.0.0.1:8087/v1",
+      `env must win, got ${JSON.stringify(cfg.model.base)}`,
+    );
+  });
+});
+
+test("config", "config show refuses the same remote base loadConfig refuses", () => {
+  // Same invariant `parseFile` exists to hold: `config show` must never call a
+  // config healthy that Chamber cannot load. This one is resolved after
+  // precedence rather than inside parseFile, so it needs its own pin.
+  withConfig(`{"model":{"base":"https://evil.example.com/v1"}}`, () => {
+    let loadMsg = "";
+    try {
+      loadConfig();
+    } catch (e) {
+      loadMsg = e instanceof Error ? e.message : String(e);
+    }
+    let explainMsg = "";
+    try {
+      explainConfig();
+    } catch (e) {
+      explainMsg = e instanceof Error ? e.message : String(e);
+    }
+    assert(loadMsg !== "", "loadConfig must refuse a remote file-sourced base");
+    assert(
+      explainMsg !== "",
+      `explainConfig accepted a base loadConfig refused with: ${loadMsg}`,
+    );
+    assert(
+      explainMsg.includes("model.base"),
+      `explainConfig must name the field, got: ${explainMsg}`,
+    );
+  });
+});
+
+test("config", "isLoopbackBase is not fooled by an alternate spelling", () => {
+  // WHATWG URL normalises every IPv4 form to dotted-quad before the predicate
+  // sees it, so these decimal/hex/short spellings of 127.0.0.1 are accepted by
+  // the same branch as the plain one — and a hostname that merely *starts*
+  // with 127.0.0.1 is not.
+  for (const local of [
+    "http://127.1/v1",
+    "http://0x7f.0.0.1/v1",
+    "http://2130706433/v1",
+    "http://127.0.0.2:8087/v1",
+    "http://LOCALHOST:8087/v1",
+    "http://anyone@127.0.0.1:8087/v1",
+  ]) {
+    assert(isLoopbackBase(local), `${local} names this machine and must pass`);
+  }
+  for (const remote of [
+    "http://127.0.0.1.evil.example.com/v1",
+    "http://128.0.0.1/v1",
+    "http://999.0.0.1/v1",
+    "https://api.openai.com/v1",
+    "file:///etc/passwd",
+    "not a url",
+    "",
+    "//127.0.0.1/v1",
+  ]) {
+    assert(!isLoopbackBase(remote), `${remote} must not pass as loopback`);
+  }
+});
+
+// End-to-end through the real binary: the unit tests above prove loadConfig
+// refuses, this proves nothing downstream re-opens the hole — the CLI seeds
+// CHAMBER_API_BASE from config, so the refusal has to happen before that seam.
+test("cli", "a config naming a remote model.base stops the CLI before it runs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-basegate-"));
+  try {
+    const cfgFile = join(dir, "config.json");
+    writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        database: join(dir, "c.sqlite"),
+        model: { base: "http://192.0.2.7:8097/v1" },
+      }),
+    );
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "status"],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: {
+          ...process.env,
+          CHAMBER_CONFIG: cfgFile,
+          CHAMBER_DB: "",
+          CHAMBER_API_BASE: "",
+          CHAMBER_API_KEY: "sk-REAL-SECRET-FROM-ENV",
+        },
+      },
+    );
+    assert(
+      r.status !== 0,
+      `a remote file-sourced base must fail closed, got status=${r.status}, stdout:\n${r.stdout}`,
+    );
+    assert(
+      r.stderr.includes("model.base"),
+      `the error must name the field, got:\n${r.stderr}`,
+    );
+    // The whole point: the key must not appear anywhere the run could leak it,
+    // and the command must not proceed to print status as though all is well.
+    assert(
+      !r.stdout.includes("beliefs:"),
+      `a refused config must not also run the command, got:\n${r.stdout}`,
+    );
+    assert(
+      !(r.stdout + r.stderr).includes("sk-REAL-SECRET-FROM-ENV"),
+      `the key must never be echoed, got:\n${r.stdout}\n${r.stderr}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 // ─── report ──────────────────────────────────────────────────────────────────
 

@@ -6,7 +6,9 @@
  *
  * There is deliberately no field for an API key. CHAMBER_API_KEY is read from
  * the environment by src/model.ts and nowhere else, so a key cannot reach a
- * config file by accident.
+ * config file by accident — and `model.base`, the one field that could send
+ * that key somewhere, is restricted to this machine when it comes from a file.
+ * See `assertFileBaseIsLocal`.
  */
 
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -319,6 +321,79 @@ function parseModel(raw: unknown, path: string): { base?: string; name?: string 
   return { base: m.base as string | undefined, name: m.name as string | undefined };
 }
 
+/**
+ * Whether `base` names a server on this machine.
+ *
+ * The parse is left to WHATWG `URL`, which normalises every spelling of an
+ * IPv4 literal to dotted-quad before this sees it — `127.1`, `0x7f.0.0.1` and
+ * `2130706433` all arrive as `127.0.0.1`, so one regex covers the family
+ * instead of the four it looks like. It also strips userinfo, so
+ * `http://anything@127.0.0.1/` reports the host the request actually goes to,
+ * and it does not confuse `127.0.0.1.evil.com` with a loopback address.
+ *
+ * Accepted: `http:`/`https:` to `localhost`, `[::1]`, or anything in
+ * `127.0.0.0/8`. Everything else is refused, including forms that are
+ * loopback-equivalent but rare enough not to be worth widening the rule for
+ * (`[::ffff:127.0.0.1]`, `0.0.0.0`) — this predicate errs toward refusing, the
+ * direction a gate is supposed to err in.
+ *
+ * `localhost` is accepted as written. It is resolver-dependent, so an attacker
+ * who can already edit `/etc/hosts` can point it elsewhere — but that attacker
+ * has root and does not need this route. Refusing the most common spelling of
+ * a local endpoint would cost every honest operator something to buy nothing.
+ */
+export function isLoopbackBase(base: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(base);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  const host = url.hostname; // already lowercased by URL
+  if (host === "localhost" || host === "[::1]") return true;
+  const quad = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!quad) return false;
+  const octets = quad.slice(1).map(Number);
+  if (octets.some((o) => o > 255)) return false;
+  return octets[0] === 127;
+}
+
+/**
+ * Refuse a file-sourced `model.base` that names anything but this machine.
+ *
+ * This is the decision the NOTE in `loadConfig` used to defer. Of the three
+ * options it named, loopback is the only one that satisfies both constraints
+ * at once. "Refuse a file-sourced base while a key is present" would break the
+ * documented local-first setup outright — `src/model.ts` *requires*
+ * CHAMBER_API_KEY in `openai` mode even when the server is a local one that
+ * ignores it, so a key is always present and the rule would refuse every
+ * config `chamber init` writes. "Require an explicit opt-in" cannot take the
+ * opt-in from the config file, because the file is the thing being gated; an
+ * opt-in from outside the file is precisely what CHAMBER_API_BASE already is.
+ *
+ * So: the file may name a local server, and only the operator's own
+ * environment may name a remote one. A stray or hostile mode-644 JSON file can
+ * still redirect the request — but only to a listener on this machine, which
+ * is a host the operator already controls, and never off the box.
+ *
+ * Enforced only when the file's value is the one that wins. An env-supplied
+ * CHAMBER_API_BASE outranks the file, so the file's value never reaches a
+ * request and refusing on it would break a working setup over a string with no
+ * effect.
+ */
+function assertFileBaseIsLocal(base: string, path: string): void {
+  if (isLoopbackBase(base)) return;
+  throw new Error(
+    `config ${path}: "model.base" from a config file must name this machine ` +
+      `(http://127.0.0.1:PORT/…, http://localhost:PORT/…, http://[::1]:PORT/…) — ` +
+      `got ${JSON.stringify(base)}. CHAMBER_API_KEY is read from the environment ` +
+      `and sent as "Authorization: Bearer <key>" to whatever this names, so a ` +
+      `config file naming a remote host can redirect your key to it. To use a ` +
+      `remote base, say so yourself: export CHAMBER_API_BASE=${base}`,
+  );
+}
+
 interface ParsedFile {
   database?: string;
   model: { base?: string; name?: string };
@@ -350,17 +425,24 @@ export function loadConfig(opts: { path?: string } = {}): ChamberConfig {
     envSetting("CHAMBER_DB") ?? file.database ?? defaultDatabase(),
   );
 
-  // NOTE — the config file cannot *hold* an API key, but `model.base` lets it
-  // *steer* one. src/model.ts reads CHAMBER_API_KEY from the environment and
-  // sends it as `Authorization: Bearer <key>` to whatever CHAMBER_API_BASE
-  // names. The moment this resolved `model.base` is wired into that request,
-  // a config file gains the power to redirect an environment-supplied key to
-  // an arbitrary host — a file that is not itself a secret becomes able to
-  // exfiltrate one. Whoever wires it in owes this a decision: either refuse a
-  // file-sourced base while a key is present, restrict it to loopback, or
-  // require an explicit opt-in. Do not let it default quietly.
+  // The config file cannot *hold* an API key, but `model.base` lets it *steer*
+  // one: src/model.ts reads CHAMBER_API_KEY from the environment and sends it
+  // as `Authorization: Bearer <key>` to whatever CHAMBER_API_BASE names, and
+  // src/cli.ts seeds CHAMBER_API_BASE from this value. A file that is not
+  // itself a secret can therefore point an environment-supplied key at a host
+  // of its choosing — proven by pointing a mode-644 config at a local listener
+  // and watching the real key arrive on it.
+  //
+  // So a base that comes from the file is restricted to this machine, and only
+  // an env-supplied CHAMBER_API_BASE may name a remote host. See
+  // `assertFileBaseIsLocal` for why loopback rather than the alternatives, and
+  // why the check runs only when the file's value is the one that wins.
+  const envBase = envSetting("CHAMBER_API_BASE");
+  if (envBase === undefined && file.model.base !== undefined) {
+    assertFileBaseIsLocal(file.model.base, path);
+  }
   const model = {
-    base: envSetting("CHAMBER_API_BASE") ?? file.model.base,
+    base: envBase ?? file.model.base,
     name: envSetting("CHAMBER_API_MODEL") ?? file.model.name,
   };
 
@@ -402,12 +484,15 @@ export function explainConfig(): ResolvedSetting[] {
   );
   if (db) out.push(db);
 
-  const base = resolveOne(
-    "model.base",
-    envSetting("CHAMBER_API_BASE"),
-    file.model.base,
-    undefined,
-  );
+  // Refused on exactly the terms loadConfig refuses it on, for the same reason
+  // `parseFile` is shared: a config `config show` calls healthy must be a
+  // config Chamber can actually load. `cmdConfig` catches this throw and names
+  // the file, so the diagnosis path stays legible.
+  const envBase = envSetting("CHAMBER_API_BASE");
+  if (envBase === undefined && file.model.base !== undefined) {
+    assertFileBaseIsLocal(file.model.base, path);
+  }
+  const base = resolveOne("model.base", envBase, file.model.base, undefined);
   if (base) out.push(base);
 
   const name = resolveOne(

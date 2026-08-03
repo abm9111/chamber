@@ -668,7 +668,11 @@ function cmdSearch(db: DatabaseSync, args: ParsedSearchArgs): void {
  *
  * No field here can hold an API key: CHAMBER_API_KEY is env-only, read by
  * src/model.ts and nowhere else, and the starter only ever sets
- * `model.base`. `model.name` is left unset rather than `""` — config.ts
+ * `model.base` — which is the one field that could *send* that key
+ * somewhere, and is therefore restricted to this machine when it comes from
+ * a file (see `assertFileBaseIsLocal` in src/config.ts). The loopback
+ * starter below is written for that reason as much as for local-first
+ * defaults. `model.name` is left unset rather than `""` — config.ts
  * rejects a *present but blank* string the same way it rejects a blank
  * `database` (see parseModel/parseDatabase in src/config.ts), so writing
  * `name: ""` here would hand the user a config that fails validation the
@@ -693,6 +697,10 @@ function cmdInit(rest: string[]): void {
   console.log(`wrote ${target}`);
   console.log("  set model.name, then add ingest roots with their excludes");
   console.log("  API keys are read from CHAMBER_API_KEY, never from this file");
+  console.log(
+    "  model.base here must stay on this machine; for a remote one, " +
+      "export CHAMBER_API_BASE",
+  );
   console.log("  run `chamber config show` to see what is in effect");
 }
 

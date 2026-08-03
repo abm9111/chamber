@@ -7305,6 +7305,141 @@ test("config", "config show reports a malformed config legibly, not a stack trac
   }
 });
 
+test("config", "ingest with no path uses the configured roots", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-cfging-"));
+  const vault = join(dir, "vault");
+  mkdirSync(vault, { recursive: true });
+  writeFileSync(join(vault, "a.md"), "alpha body\n");
+  const dbFile = join(dir, "c.sqlite");
+  const cfgFile = join(dir, "config.json");
+  writeFileSync(
+    cfgFile,
+    JSON.stringify({ database: dbFile, ingest: [{ root: vault, exclude: [] }] }),
+  );
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI_PATH, "ingest"],
+    {
+      encoding: "utf8",
+      timeout: 15_000,
+      env: { ...process.env, CHAMBER_CONFIG: cfgFile, CHAMBER_DB: "" },
+    },
+  );
+  assert(r.status === 0, `ingest failed: ${r.stderr}`);
+  assert(r.stdout.includes("a.md") || r.stdout.includes("1 file"), `unexpected output:\n${r.stdout}`);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("config", "ingest with no path and no configured roots explains itself", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-noroots-"));
+  const cfgFile = join(dir, "config.json");
+  writeFileSync(cfgFile, JSON.stringify({ database: join(dir, "c.sqlite") }));
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI_PATH, "ingest"],
+    {
+      encoding: "utf8",
+      timeout: 15_000,
+      env: { ...process.env, CHAMBER_CONFIG: cfgFile, CHAMBER_DB: "" },
+    },
+  );
+  assert(r.status !== 0, "no roots configured must be an error, not a silent no-op");
+  assert(
+    (r.stderr + r.stdout).includes("ingest"),
+    "the message must point at how to configure roots",
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// Beyond the brief: the configured-roots path is a privacy control (see the
+// module doc), and it must provide identical guarantees to the explicit-path
+// form it now shares a helper with. Asserting only on stdout would not catch
+// a runOne() that ingested first and reported second, so this reopens the
+// database the CLI subprocess just wrote and checks the actual rows.
+test(
+  "config",
+  "ingest with no path honours each configured root's exclude list",
+  () => {
+    const dir = mkdtempSync(join(tmpdir(), "chamber-cfgexcl-"));
+    const vault = join(dir, "vault");
+    mkdirSync(join(vault, "Private"), { recursive: true });
+    writeFileSync(join(vault, "Private", "secret.md"), "secret body\n");
+    writeFileSync(join(vault, "public.md"), "public body\n");
+    const dbFile = join(dir, "c.sqlite");
+    const cfgFile = join(dir, "config.json");
+    writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        database: dbFile,
+        ingest: [{ root: vault, exclude: ["Private"] }],
+      }),
+    );
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "ingest"],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: { ...process.env, CHAMBER_CONFIG: cfgFile, CHAMBER_DB: "" },
+      },
+    );
+    assert(r.status === 0, `ingest failed: ${r.stderr}`);
+    const db = openChamberDb(dbFile);
+    const refs = ingestedPaths(db);
+    db.close();
+    assert(
+      refs.length === 1 && refs[0] === "public.md",
+      `a configured exclude must prune the same as the explicit-path form, got ${JSON.stringify(refs)}`,
+    );
+    rmSync(dir, { recursive: true, force: true });
+  },
+);
+
+test(
+  "config",
+  "ingest with no path aborts when a configured exclude matches nothing, storing nothing",
+  () => {
+    const dir = mkdtempSync(join(tmpdir(), "chamber-cfgnomatch-"));
+    const vault = join(dir, "vault");
+    mkdirSync(vault, { recursive: true });
+    writeFileSync(join(vault, "a.md"), "alpha body\n");
+    const dbFile = join(dir, "c.sqlite");
+    const cfgFile = join(dir, "config.json");
+    writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        database: dbFile,
+        ingest: [{ root: vault, exclude: ["NoSuchFolder"] }],
+      }),
+    );
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "ingest"],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: { ...process.env, CHAMBER_CONFIG: cfgFile, CHAMBER_DB: "" },
+      },
+    );
+    assert(
+      r.status !== 0,
+      "an unmatched configured exclude must abort the run, exactly as it does for the explicit-path form",
+    );
+    assert(
+      (r.stderr + r.stdout).includes("matched nothing"),
+      `must explain why it aborted, got stderr:\n${r.stderr}\nstdout:\n${r.stdout}`,
+    );
+    const db = openChamberDb(dbFile);
+    const stored = countDocuments(db);
+    db.close();
+    assert(
+      stored === 0,
+      `nothing may be stored when a configured exclude matched nothing, got ${stored}`,
+    );
+    rmSync(dir, { recursive: true, force: true });
+  },
+);
+
 // ─── report ──────────────────────────────────────────────────────────────────
 
 // Drain the async queue sequentially: invoke a thunk, await it fully,

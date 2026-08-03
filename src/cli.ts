@@ -907,6 +907,104 @@ async function main(): Promise<void> {
       break;
     }
     case "ingest": {
+      // Shared by both the configured-roots loop and the explicit-path call
+      // below, so a configured root is reported — skips included — exactly
+      // as an explicit path would be. That parity matters beyond cosmetics:
+      // Task 6 runs this unattended from launchd, and a scheduled log an
+      // operator only skims after the fact must read the same as a manual
+      // run they watched live.
+      const runOne = (
+        path: string,
+        opts: { exclude: string[]; includeDotted: boolean; requireExcludeMatch: boolean },
+      ): boolean => {
+        const r = ingestDirectory(db, path, opts);
+        // An exclude that matched nothing aborts the run before anything is
+        // stored: on a privacy control a no-op pattern is a typo far more
+        // often than an intent, and a warning buried in output is not a
+        // control.
+        if (r.aborted) {
+          console.error(`ingest refused: ${r.abortReason}`);
+          console.error(
+            r.abortKind === "unmatched_exclude"
+              ? "  nothing was ingested. Fix the pattern, or pass --allow-unmatched-exclude to proceed anyway."
+              : "  nothing was ingested. Fix the pattern.",
+          );
+          return false;
+        }
+        console.log(
+          `ingested ${r.ingested} file(s) as ${r.passages} passage(s) from ${path}`,
+        );
+        // A shrunken note's stale passages are deleted rather than left to keep
+        // answering from content the note no longer holds. That is a corpus
+        // deletion, so it is reported rather than done quietly.
+        if (r.removed > 0) {
+          console.log(
+            `  removed ${r.removed} stale passage(s) from notes that shrank`,
+          );
+        }
+        for (const e of r.excludes) {
+          console.log(
+            `  exclude ${e.raw} → pruned ${e.matched} entr${e.matched === 1 ? "y" : "ies"}`,
+          );
+        }
+        if (r.unmatchedExcludes.length > 0) {
+          console.error(
+            `  ⚠ --exclude matched nothing: ${r.unmatchedExcludes.join(", ")} (allowed via --allow-unmatched-exclude)`,
+          );
+        }
+        if (r.skipped.length > 0) {
+          // Privacy-relevant skips first, then the rest, so a vault full of
+          // attachments cannot push an escaping symlink off the bottom.
+          const ranked = [
+            ...r.skipped.filter((s) => NOTABLE_SKIP_KINDS.has(s.kind)),
+            ...r.skipped.filter((s) => !NOTABLE_SKIP_KINDS.has(s.kind)),
+          ];
+          console.log(`  skipped ${ranked.length} entr${ranked.length === 1 ? "y" : "ies"}:`);
+          for (const s of ranked.slice(0, INGEST_SKIP_PRINT_LIMIT)) {
+            console.log(`    [${s.kind}] ${s.path}: ${s.reason}`);
+          }
+          const hidden = ranked.length - INGEST_SKIP_PRINT_LIMIT;
+          if (hidden > 0) console.log(`    … and ${hidden} more`);
+        }
+        for (const c of r.collisions) {
+          console.error(
+            `  ⚠ cross-root collision on ${c.sourceRef}: already ingested from ${c.existingRoots.join(", ")} — stored as a separate document, not overwritten`,
+          );
+        }
+        return true;
+      };
+
+      const hasPath = rest.some((a) => !a.startsWith("--"));
+      if (!hasPath) {
+        const cfg = loadConfig();
+        if (cfg.ingest.length === 0) {
+          console.error("ingest: no path given and no roots configured");
+          console.error("  add roots to the config file, or pass a path");
+          console.error("  run `chamber config show` to find the config file");
+          process.exitCode = 1;
+          break;
+        }
+        let allOk = true;
+        for (const entry of cfg.ingest) {
+          if (!existsSync(entry.root)) {
+            console.error(`  skipped ${entry.root}: does not exist`);
+            allOk = false;
+            continue;
+          }
+          if (
+            !runOne(entry.root, {
+              exclude: entry.exclude,
+              includeDotted: false,
+              requireExcludeMatch: true,
+            })
+          ) {
+            allOk = false;
+          }
+        }
+        if (!allOk) process.exitCode = 1;
+        break;
+      }
+
       const parsed = parseIngestArgs(rest);
       if (!parsed.ok) {
         console.error(`ingest: ${parsed.error}`);
@@ -914,63 +1012,14 @@ async function main(): Promise<void> {
         process.exitCode = 1;
         break;
       }
-      const r = ingestDirectory(db, parsed.path, {
-        exclude: parsed.exclude,
-        includeDotted: parsed.includeDotted,
-        requireExcludeMatch: !parsed.allowUnmatchedExclude,
-      });
-      // An exclude that matched nothing aborts the run before anything is
-      // stored: on a privacy control a no-op pattern is a typo far more often
-      // than an intent, and a warning buried in output is not a control.
-      if (r.aborted) {
-        console.error(`ingest refused: ${r.abortReason}`);
-        console.error(
-          r.abortKind === "unmatched_exclude"
-            ? "  nothing was ingested. Fix the pattern, or pass --allow-unmatched-exclude to proceed anyway."
-            : "  nothing was ingested. Fix the pattern.",
-        );
+      if (
+        !runOne(parsed.path, {
+          exclude: parsed.exclude,
+          includeDotted: parsed.includeDotted,
+          requireExcludeMatch: !parsed.allowUnmatchedExclude,
+        })
+      ) {
         process.exitCode = 1;
-        break;
-      }
-      console.log(
-        `ingested ${r.ingested} file(s) as ${r.passages} passage(s) from ${parsed.path}`,
-      );
-      // A shrunken note's stale passages are deleted rather than left to keep
-      // answering from content the note no longer holds. That is a corpus
-      // deletion, so it is reported rather than done quietly.
-      if (r.removed > 0) {
-        console.log(
-          `  removed ${r.removed} stale passage(s) from notes that shrank`,
-        );
-      }
-      for (const e of r.excludes) {
-        console.log(
-          `  exclude ${e.raw} → pruned ${e.matched} entr${e.matched === 1 ? "y" : "ies"}`,
-        );
-      }
-      if (r.unmatchedExcludes.length > 0) {
-        console.error(
-          `  ⚠ --exclude matched nothing: ${r.unmatchedExcludes.join(", ")} (allowed via --allow-unmatched-exclude)`,
-        );
-      }
-      if (r.skipped.length > 0) {
-        // Privacy-relevant skips first, then the rest, so a vault full of
-        // attachments cannot push an escaping symlink off the bottom.
-        const ranked = [
-          ...r.skipped.filter((s) => NOTABLE_SKIP_KINDS.has(s.kind)),
-          ...r.skipped.filter((s) => !NOTABLE_SKIP_KINDS.has(s.kind)),
-        ];
-        console.log(`  skipped ${ranked.length} entr${ranked.length === 1 ? "y" : "ies"}:`);
-        for (const s of ranked.slice(0, INGEST_SKIP_PRINT_LIMIT)) {
-          console.log(`    [${s.kind}] ${s.path}: ${s.reason}`);
-        }
-        const hidden = ranked.length - INGEST_SKIP_PRINT_LIMIT;
-        if (hidden > 0) console.log(`    … and ${hidden} more`);
-      }
-      for (const c of r.collisions) {
-        console.error(
-          `  ⚠ cross-root collision on ${c.sourceRef}: already ingested from ${c.existingRoots.join(", ")} — stored as a separate document, not overwritten`,
-        );
       }
       break;
     }

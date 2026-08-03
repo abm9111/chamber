@@ -3,8 +3,9 @@
 Chamber's premise is that a system which reasons about evidence should be honest about
 its own. This file is where that applies to Chamber itself.
 
-Everything below was verified against the code on 2026-08-04, at commit `0bc883b`, by
-reading the named source or running the named probe. Each entry says what the limitation
+Everything below was verified against the code on 2026-08-04, at commit `da801fd`, by
+reading the named source or running the named probe — including every line citation,
+which is re-checked rather than carried forward. Each entry says what the limitation
 is, what it actually costs you, and what would fix it. Where a fix is already planned,
 the entry points at `docs/NEXT_LEVEL_PLAN.md`; where nothing is planned, it says so.
 
@@ -94,7 +95,7 @@ citation says it says," never as "this claim is true."
 `chamber checkpoint` writes a Merkle receipt over the audit chain. Three things limit
 what that receipt is worth. It is never invoked automatically — no cron entry, no
 launchd job, no queue kind calls it, and `maybeAutoCheckpoint` (`src/merkle.ts:388`) has
-no callers at all. It is unsigned: `src/checkpoint_export.ts:39-47` is a bare
+no callers at all. It is unsigned: `src/checkpoint_export.ts:41-48` is a bare
 `writeFileSync` of JSON, and there is no signing key, HMAC, or ed25519 anywhere in the
 tree. And its output path still defaults to `/tmp/chamber-checkpoint.json`
 (`src/cli.ts:1677`) — the recent work that moved the *database* onto a durable
@@ -126,7 +127,7 @@ has wedged, a remote endpoint that black-holes the request — hangs the command
 indefinitely with no output and no error. Under the scheduled job this is worse than a
 crash: a hung run produces no log line at all, so the absence of a failure reads as
 success. Note the inconsistency, which is a useful signal that this is an oversight
-rather than a decision: MCP calls are bounded (`curl -m 30`, `src/mcp_client.ts:53-56`)
+rather than a decision: MCP calls are bounded (`curl -m 30`, `src/mcp_client.ts:53-58`)
 and embedding subprocesses are bounded (`src/embedder.ts:140,163`). Only the model call
 is not.
 
@@ -136,12 +137,15 @@ of code.
 
 ## 5. The corpus has no notion of deletion
 
-Re-ingesting a directory updates and adds rows. It never removes rows for files that
-have disappeared. The walk builds its list from files that exist, so a deleted file is
-simply never visited and its rows are never reconsidered. This is deliberate and
-documented at `src/ingest.ts:763-766`: a file absent from the walk is indistinguishable
-from one an `--exclude` pattern pruned, and deleting rows on that basis would let a
-mistyped exclude silently destroy corpus.
+Re-ingesting a directory does delete, and the boundary is worth stating precisely,
+because an earlier revision of this entry said flatly that it never removes rows. For a
+file it actually walked and read, the shrink sweep (`src/ingest.ts:758-775`) removes the
+tail rows a shortened note no longer covers — that is entry 6's subject. What it never
+removes is the rows of a file that has *disappeared*. The walk builds its list from files
+that exist, so a deleted file is simply never visited and its rows are never reconsidered.
+This is deliberate and documented at `src/ingest.ts:763-766`: a file absent from the walk
+is indistinguishable from one an `--exclude` pattern pruned, and deleting rows on that
+basis would let a mistyped exclude silently destroy corpus.
 
 A rename is the same problem wearing a different hat. Document identity is
 `(root, relative path)`, so a renamed file is ingested fresh under its new path while
@@ -186,7 +190,7 @@ needed for this already exists. Unplanned.
 
 `mcp_tool_pin` stores a `schema_hash` and a `description_hash` for every tool an MCP
 server declares (`sql/schema_mcp_pin.sql:14-15`). They are written by `pinToolsList`
-(`src/mcp_trust.ts:83-101`) and read by nothing. The only `SELECT` touching either
+(`src/mcp_trust.ts:82-102`) and read by nothing. The only `SELECT` touching either
 column anywhere in the repository is a test assertion. Correspondingly, `tool_drift` —
 declared as a failure reason in the `PinCheck` union at `src/mcp_trust.ts:118` — is
 never constructed at runtime; `verifyToolsAgainstPin` can only ever return `no_pin` or
@@ -215,7 +219,7 @@ Note that the analogous code in `src/mcp_bridge.ts:83` does the right thing —
 `sha256(body)` — so this is a single site, not a pattern.
 
 **What it costs.** Nothing today, and the reason it costs nothing is fragile.
-`activateSkillRegistry` (`src/skills_registry.ts:114-128`) is a bare status `UPDATE`
+`activateSkillRegistry` (`src/skills_registry.ts:114-127`) is a bare status `UPDATE`
 that never reads `content_hash`, so the bad value is inert. But `tryActivateSkill` — the
 real gate — does compare content hashes, refusing activation when the current hash does
 not match the last critic-cleared one (`src/try_activate_skill.ts:225`). The moment
@@ -255,9 +259,10 @@ check against that record on every explicit-path run, not only on config parse. 
 
 ## 10. Ingest has no default exclude list
 
-The only unconditional filter in the directory walk is a skip for dot-prefixed entries
-(`src/ingest.ts:365-372`). Nothing else is pruned. `ingest.exclude` defaults to an empty
-array in both the CLI and the config file.
+The directory walk prunes one thing by default, and even that is switchable: dot-prefixed
+entries are skipped unless `--include-dotted` is passed (`src/ingest.ts:365-372`). Beyond
+that skip and whatever the operator supplies, nothing is filtered — `ingest.exclude`
+defaults to an empty array in both the CLI and the config file.
 
 **What it costs.** Point `chamber ingest` at a large directory and it descends into every
 non-hidden folder there, ingesting every `.md`, `.markdown`, and `.mdx` file it finds —
@@ -297,7 +302,7 @@ would be better and would cost a dependency Chamber does not currently have. Unp
 This entry was narrower than first recorded, and the correction is worth stating: the
 hybrid-retrieval tests *do* assert rank order, not merely presence. They pin a target
 passage to an exact rank under semantic-only scoring and assert hybrid moves it to rank 1
-(`tests/harness.ts:1186-1197`), assert that lexical overlap cannot float an unrelated
+(`tests/harness.ts:1186-1202`), assert that lexical overlap cannot float an unrelated
 passage past a correct answer (`:1261-1266`), and assert the bm25 candidate cut tapers
 rather than cliffs (`:1636`). A change to the semantic/lexical weights or the idf math
 would break them.
@@ -317,29 +322,34 @@ most load-bearing path.
 as a scored eval with a floor that fails the build. Fifty queries would catch most of
 what matters. Unplanned.
 
-## 13. The scheduled job's log does not record its own finding
+## 13. The scheduled job's log names neither its database nor its exit status
 
-This entry was also recorded too broadly and has been corrected. The launchd job
-(`deploy/launchd/com.chamber.verify.plist`) *does* log ingest's exit code — the `||`
+This entry has now been corrected twice, and both corrections narrowed it. The launchd
+job (`deploy/launchd/com.chamber.verify.plist`) *does* log ingest's exit code — the `||`
 branch prints `!! ingest FAILED (exit $?)` — and that chaining is deliberate and well
 reasoned, so that a missing root cannot silently disable the drift check.
 
-What is missing is the exit code that carries the finding. The job's status is `chamber
-verify`'s, which is non-zero exactly when a belief has no verified support left, and
-launchd does not write a job's exit status to its log. `chamber verify` prints only a
-summary line — confirmed by running it: `0 belief(s) checked, 0 with no verified support
-left`. Neither `ingest` nor `verify` names the database it used; the banner that prints
-`db: <path>` is only shown by `status` and `turn`.
+The finding itself also reaches the log, which an earlier revision of this entry denied.
+`chamber verify` prints the belief id, its text, and a `hash_mismatch` or `not_found` line
+per failed pin, each with a paragraph saying what that reason means, and closes with a
+count (`src/cli.ts:1202-1250`). On a clean run that count is all there is — `0 belief(s)
+checked, 0 with no verified support left` — but a run that found drift does not look like
+one that did not.
 
-**What it costs.** The log is the only artifact of an unattended run, and it cannot answer
-either question you would go to it with. You cannot tell from the log whether the run
-found drift, and you cannot tell which corpus it checked. That second one is not
-hypothetical: `chamber` is installed as a symlink into a working tree, so it runs
-whichever branch is checked out, and `openChamberDb` will fall back to `/tmp` and then to
-`:memory:` if the configured location is unusable. A run that checked an empty in-memory
-database prints exactly the same clean summary as a run that checked the real corpus and
-found nothing wrong.
+Two things are genuinely missing. The job's exit status is `chamber verify`'s, non-zero
+exactly when a belief has no verified support left (`src/cli.ts:1250`); launchd does not
+write a job's exit status to its log, and the job does not echo it. And no run names the
+database it used: the banner that prints `db: <path>` belongs to `status`, `turn` and
+`queue` (`src/cli.ts:553,878,886`), and neither `ingest` nor `verify` calls it.
 
-**What would fix it.** Have `verify` print the resolved database path and an explicit
-verdict line, and have the job echo its own exit status after `verify` returns.
-Unplanned.
+**What it costs.** Anything monitoring this job by exit status rather than by reading its
+prose has nothing to key on, and no run states which corpus it checked. The second one is
+not hypothetical: `chamber` is installed as a symlink into a working tree, so it runs
+whichever branch is checked out. A *redirect* would at least announce itself — a fallback
+to `/tmp` or `:memory:` writes two `chamber: WARNING —` lines naming both paths
+(`src/db.ts:212-215`, `src/cli.ts:215-221`), and this job points `StandardErrorPath` at
+the same file as `StandardOutPath`, so they land in this log — but the ordinary case
+states the path nowhere.
+
+**What would fix it.** Have `verify` print the resolved database path, and have the job
+echo verify's exit status after it returns. Unplanned.

@@ -183,10 +183,9 @@ import { spawnSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
 import {
   chmodSync,
-  existsSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -6506,25 +6505,42 @@ test("cli", "status_dispatches_against_a_scratch_db", () => {
 // malformed JSON, overlapping ingest roots), and the hard requirement that
 // no field in the resolved config can carry an API key.
 
-function withConfig<T>(json: string | null, fn: () => T): T {
+/**
+ * Run `fn` against a throwaway config file, with every environment variable
+ * that steers config resolution saved, cleared, and restored.
+ *
+ * Every one of these must be listed. A variable that is cleared but not
+ * restored — or restored but never cleared — makes a later test depend on the
+ * order it happens to run in, and on the ambient shell. CHAMBER_CONFIG and
+ * XDG_CONFIG_HOME are the two that decide *which file is read*, so clearing
+ * them is also what guarantees no test can touch a real `~/.config/chamber/`.
+ * The callback receives the temporary config path.
+ */
+const CONFIG_ENV_KEYS = [
+  "CHAMBER_CONFIG",
+  "CHAMBER_DB",
+  "CHAMBER_API_BASE",
+  "CHAMBER_API_MODEL",
+  "XDG_CONFIG_HOME",
+] as const;
+
+function withConfig<T>(json: string | null, fn: (configPath: string) => T): T {
   const dir = mkdtempSync(join(tmpdir(), "chamber-cfg-"));
   const p = join(dir, "config.json");
   if (json !== null) writeFileSync(p, json);
-  const prevCfg = process.env.CHAMBER_CONFIG;
-  const prevDb = process.env.CHAMBER_DB;
-  const prevBase = process.env.CHAMBER_API_BASE;
+  const saved = new Map<string, string | undefined>();
+  for (const key of CONFIG_ENV_KEYS) {
+    saved.set(key, process.env[key]);
+    delete process.env[key];
+  }
   process.env.CHAMBER_CONFIG = p;
-  delete process.env.CHAMBER_DB;
-  delete process.env.CHAMBER_API_BASE;
   try {
-    return fn();
+    return fn(p);
   } finally {
-    if (prevCfg === undefined) delete process.env.CHAMBER_CONFIG;
-    else process.env.CHAMBER_CONFIG = prevCfg;
-    if (prevDb === undefined) delete process.env.CHAMBER_DB;
-    else process.env.CHAMBER_DB = prevDb;
-    if (prevBase === undefined) delete process.env.CHAMBER_API_BASE;
-    else process.env.CHAMBER_API_BASE = prevBase;
+    for (const [key, prev] of saved) {
+      if (prev === undefined) delete process.env[key];
+      else process.env[key] = prev;
+    }
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -6644,14 +6660,254 @@ test("config", "the same root listed twice is rejected as a self-overlap", () =>
   rmSync(dir, { recursive: true, force: true });
 });
 
-test("config", "no config field can supply an API key", () => {
-  withConfig(`{"database":"/tmp/x.sqlite"}`, () => {
+// The resolved config's surface is an allow-list, asserted as an exact set.
+// The previous form of this test searched the serialised config for the
+// substring "key", which tested one spelling rather than the property: a
+// smuggled `token: "sk-LEAKED-SECRET"` survived it untouched, as did widening
+// KNOWN_TOP_LEVEL to admit a `credential` field and passing the file's value
+// through. It also failed on an innocent database path containing "keychain".
+// An exact key set kills all three and has no opinion about spelling.
+test("config", "the resolved config exposes exactly the three known fields", () => {
+  withConfig(`{"database":"/tmp/keychain-backup.sqlite","model":{"name":"m"}}`, () => {
     const cfg = loadConfig() as unknown as Record<string, unknown>;
-    assert(!("apiKey" in cfg), "ChamberConfig must not carry an apiKey field");
+    const keys = Object.keys(cfg).sort().join(",");
     assert(
-      JSON.stringify(cfg).toLowerCase().includes("key") === false,
-      "no resolved config value may look like a key field",
+      keys === "database,ingest,model",
+      `resolved config must expose exactly database,ingest,model — got: ${keys}`,
     );
+    const modelKeys = Object.keys(cfg.model as object).sort().join(",");
+    assert(
+      modelKeys === "base,name",
+      `model must expose exactly base,name — got: ${modelKeys}`,
+    );
+    assert(
+      cfg.database === "/tmp/keychain-backup.sqlite",
+      "a legitimate path containing 'key' must survive intact",
+    );
+  });
+});
+
+test("config", "a config file that names an API key is rejected", () => {
+  withConfig(`{"database":"/tmp/x.sqlite","apiKey":"sk-LEAKED-SECRET"}`, () => {
+    let msg = "";
+    try { loadConfig(); } catch (e) { msg = e instanceof Error ? e.message : String(e); }
+    assert(msg.includes("apiKey"), `apiKey must be rejected by name, got: ${msg}`);
+  });
+});
+
+// ── CRITICAL: an exported-but-empty variable is not a setting ──────────────
+//
+// `??` falls through only on nullish, so `export CHAMBER_DB=` used to beat both
+// the config file and the default and resolve `database` to "". Nothing
+// complains about that: `new DatabaseSync("")` succeeds, SQLite opens a private
+// temporary on-disk database, schemas apply, writes commit, and the whole
+// database is unlinked when the process exits. No error, no fallback, no clue —
+// just an operator whose data is gone. Blank must fall through.
+test("config", "an empty CHAMBER_DB falls through to the config file", () => {
+  withConfig(`{"database":"/tmp/from-config.sqlite"}`, () => {
+    process.env.CHAMBER_DB = "";
+    const cfg = loadConfig();
+    assert(
+      cfg.database === "/tmp/from-config.sqlite",
+      `empty env must not win; got ${JSON.stringify(cfg.database)}`,
+    );
+    assert(cfg.database.trim() !== "", "a blank database path is never resolvable");
+    const row = explainConfig().find((r) => r.key === "database");
+    assert(
+      row?.source === "config",
+      `explainConfig must agree the file won, got source=${row?.source}`,
+    );
+  });
+});
+
+test("config", "a whitespace-only CHAMBER_DB falls through to the default", () => {
+  withConfig(null, () => {
+    process.env.CHAMBER_DB = "   ";
+    const cfg = loadConfig();
+    assert(cfg.database.trim() !== "", "a blank database path is never resolvable");
+    assert(
+      cfg.database.endsWith(join("chamber", "chamber.sqlite")),
+      `expected the built-in default, got ${cfg.database}`,
+    );
+  });
+});
+
+test("config", "empty CHAMBER_API_BASE and CHAMBER_API_MODEL fall through", () => {
+  withConfig(`{"model":{"base":"https://from-config","name":"from-config"}}`, () => {
+    process.env.CHAMBER_API_BASE = "";
+    process.env.CHAMBER_API_MODEL = "  ";
+    const { model } = loadConfig();
+    assert(
+      model.base === "https://from-config" && model.name === "from-config",
+      `blank env must not blank the model, got ${JSON.stringify(model)}`,
+    );
+  });
+});
+
+test("config", "a blank database in the config file is rejected", () => {
+  for (const value of ["", "   "]) {
+    withConfig(JSON.stringify({ database: value }), () => {
+      let msg = "";
+      try { loadConfig(); } catch (e) { msg = e instanceof Error ? e.message : String(e); }
+      assert(
+        msg.includes("database") && msg.includes("empty"),
+        `blank database ${JSON.stringify(value)} must be rejected, got: ${msg}`,
+      );
+    });
+  }
+});
+
+// ── IMPORTANT 1: explainConfig must validate exactly what loadConfig does ──
+//
+// `config show` reporting a config healthy that Chamber cannot load is worse
+// than no report at all. A `database` of 123 used to reach the caller as a
+// number in a field the type declares string, which crashes the first
+// formatter that calls .padEnd() on it.
+test("config", "explainConfig rejects everything loadConfig rejects", () => {
+  const cases: Array<[string, string]> = [
+    [`{"database":123}`, "database"],
+    [`{"ingest":["/tmp"]}`, "ingest"],
+    [`{"database":""}`, "database"],
+    [`{"model":{"base":7}}`, "model.base"],
+  ];
+  for (const [json, needle] of cases) {
+    withConfig(json, () => {
+      let loadMsg = "";
+      try { loadConfig(); } catch (e) { loadMsg = e instanceof Error ? e.message : String(e); }
+      let explainMsg = "";
+      try { explainConfig(); } catch (e) { explainMsg = e instanceof Error ? e.message : String(e); }
+      assert(loadMsg !== "", `loadConfig must reject ${json}`);
+      assert(
+        explainMsg !== "",
+        `explainConfig accepted ${json} that loadConfig rejected with: ${loadMsg}`,
+      );
+      assert(
+        explainMsg.includes(needle),
+        `explainConfig must name ${needle} for ${json}, got: ${explainMsg}`,
+      );
+    });
+  }
+});
+
+test("config", "explainConfig rejects overlapping ingest roots too", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-xroots-"));
+  mkdirSync(join(dir, "sub"), { recursive: true });
+  const json = JSON.stringify({ ingest: [{ root: dir }, { root: join(dir, "sub") }] });
+  withConfig(json, () => {
+    let msg = "";
+    try { explainConfig(); } catch (e) { msg = e instanceof Error ? e.message : String(e); }
+    assert(msg.includes("overlap"), `explainConfig must reject overlap, got: ${msg}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// ── IMPORTANT 2: overlap detection must see through case and missing leaves ──
+//
+// Both of these are the same directory twice, which is exactly the
+// double-ingest the check exists to prevent.
+test("config", "two spellings of one directory are rejected on a case-folding volume", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-case-")));
+  mkdirSync(join(dir, "Vault"), { recursive: true });
+  // Only meaningful where the filesystem actually folds case; on a
+  // case-sensitive volume "VAULT" is a different directory and does not exist,
+  // so there is nothing to detect.
+  let folds = false;
+  try { folds = realpathSync(join(dir, "VAULT")).length > 0; } catch { folds = false; }
+  if (folds) {
+    const json = JSON.stringify({
+      ingest: [{ root: join(dir, "Vault") }, { root: join(dir, "VAULT") }],
+    });
+    withConfig(json, () => {
+      let msg = "";
+      try { loadConfig(); } catch (e) { msg = e instanceof Error ? e.message : String(e); }
+      assert(
+        msg.includes("overlap"),
+        `"Vault" and "VAULT" are one directory here and must be rejected, got: ${msg}`,
+      );
+    });
+  }
+  // Distinct directories must survive whatever the volume does.
+  mkdirSync(join(dir, "alpha"), { recursive: true });
+  mkdirSync(join(dir, "beta"), { recursive: true });
+  withConfig(
+    JSON.stringify({ ingest: [{ root: join(dir, "alpha") }, { root: join(dir, "beta") }] }),
+    () => {
+      assert(loadConfig().ingest.length === 2, "distinct roots must both survive");
+    },
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("config", "a symlinked prefix is resolved even when the leaf does not exist", () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-leaf-")));
+  mkdirSync(join(dir, "notes"), { recursive: true });
+  symlinkSync(join(dir, "notes"), join(dir, "link"));
+  // "link/notyet" does not exist, so realpathSync throws on the whole path.
+  // Giving up there leaves the symlinked *prefix* unresolved and the two roots
+  // look unrelated — while they are one directory apart by one missing folder.
+  const json = JSON.stringify({
+    ingest: [{ root: join(dir, "notes") }, { root: join(dir, "link", "notyet") }],
+  });
+  withConfig(json, () => {
+    let msg = "";
+    try { loadConfig(); } catch (e) { msg = e instanceof Error ? e.message : String(e); }
+    assert(
+      msg.includes("overlap"),
+      `a missing leaf under a symlinked prefix must still overlap, got: ${msg}`,
+    );
+  });
+  // A not-yet-created root that genuinely sits elsewhere must still be allowed.
+  withConfig(
+    JSON.stringify({
+      ingest: [{ root: join(dir, "notes") }, { root: join(dir, "elsewhere", "later") }],
+    }),
+    () => {
+      const cfg = loadConfig();
+      assert(cfg.ingest.length === 2, "a distinct not-yet-created root must survive");
+      assert(
+        cfg.ingest[1]!.root === join(dir, "elsewhere", "later"),
+        `missing segments must be preserved, got ${cfg.ingest[1]!.root}`,
+      );
+    },
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// ── MINOR: report the value that is actually used, and where it came from ──
+test("config", "explainConfig reports the tilde-expanded database path", () => {
+  withConfig(`{"database":"~/chamber-explain.sqlite"}`, () => {
+    const row = explainConfig().find((r) => r.key === "database");
+    assert(
+      row?.value === join(homedir(), "chamber-explain.sqlite"),
+      `explainConfig must report the expanded path, got ${row?.value}`,
+    );
+    assert(
+      row?.value === loadConfig().database,
+      "explainConfig and loadConfig must report the same path",
+    );
+  });
+});
+
+test("config", "a config located by XDG_CONFIG_HOME is reported as env-sourced", () => {
+  withConfig(null, () => {
+    const xdg = mkdtempSync(join(tmpdir(), "chamber-xdg-"));
+    mkdirSync(join(xdg, "chamber"), { recursive: true });
+    writeFileSync(join(xdg, "chamber", "config.json"), `{"database":"/tmp/xdg.sqlite"}`);
+    delete process.env.CHAMBER_CONFIG;
+    process.env.XDG_CONFIG_HOME = xdg;
+    try {
+      const row = explainConfig().find((r) => r.key === "config");
+      assert(
+        row?.source === "env",
+        `XDG_CONFIG_HOME chose the path, so source must be env, got ${row?.source}`,
+      );
+      assert(
+        row?.value === join(xdg, "chamber", "config.json"),
+        `expected the XDG path, got ${row?.value}`,
+      );
+    } finally {
+      rmSync(xdg, { recursive: true, force: true });
+    }
   });
 });
 

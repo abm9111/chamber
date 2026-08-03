@@ -17,6 +17,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openChamberDb } from "./db.ts";
+import { loadConfig, type ChamberConfig } from "./config.ts";
 import { sha256, newId } from "./hash.ts";
 import { commitBelief } from "./commit_belief.ts";
 import { recordSpend, spendLastHours, formatSpendFooter } from "./spend.ts";
@@ -134,6 +135,7 @@ import type { EpistemicType, CommittedPath } from "./types.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let resolvedDbPath: string | null = null;
+let loadedConfig: ChamberConfig | null = null;
 
 const INGEST_USAGE =
   "usage: chamber ingest <path> [--exclude <name-or-path>]… " +
@@ -156,17 +158,27 @@ const NOTABLE_SKIP_KINDS: ReadonlySet<IngestSkipKind> = new Set<IngestSkipKind>(
   "cycle",
 ]);
 
-/** Prefer env → /tmp (writable) → cwd. openChamberDb also falls back on I/O errors. */
+/**
+ * Config-resolved path. Precedence: CHAMBER_DB > config file > default.
+ *
+ * By the time this runs, `main()` has already resolved `loadedConfig` (see
+ * there for why that happens before `open()` rather than here) — so the
+ * `loadConfig()` below normally just reuses that cached result, and this
+ * function itself throwing is not the path a malformed config surfaces on.
+ * An empty or whitespace-only CHAMBER_DB is treated as unset by config.ts's
+ * envSetting(), so it falls through to the config file rather than
+ * resolving to an empty path — an empty path is not a no-op, it is a
+ * request node:sqlite honors as a private temp database that vanishes
+ * silently when the process exits.
+ */
 function dbPath(): string {
   if (resolvedDbPath) return resolvedDbPath;
-  if (process.env.CHAMBER_DB) {
-    resolvedDbPath = process.env.CHAMBER_DB;
-    return resolvedDbPath;
-  }
-  resolvedDbPath = "/tmp/chamber.sqlite";
+  loadedConfig ??= loadConfig();
+  resolvedDbPath = loadedConfig.database;
   return resolvedDbPath;
 }
 
+/** openChamberDb falls back to /tmp then :memory: on a disk I/O error opening the resolved path. */
 function open(): DatabaseSync {
   try {
     return openChamberDb(dbPath());
@@ -675,6 +687,38 @@ async function main(): Promise<void> {
   if (!cmd || cmd === "help" || cmd === "-h" || cmd === "--help") {
     help();
     return;
+  }
+
+  // Resolved here, before open() — deliberately, not just "somewhere before
+  // the switch". open() wraps its database open in a try/catch that falls
+  // back to an in-memory database on any failure. Placed after open()
+  // instead, a malformed config would still exit non-zero, but only by
+  // accident: dbPath()'s loadConfig() call (made from inside open()'s try)
+  // would throw first and be swallowed by that catch-all, silently opening
+  // a throwaway :memory: db with a full schema applied and nothing that
+  // will ever use it — then this same loadConfig() call would run again
+  // (loadedConfig is still null; the failed assignment never completed) and
+  // throw a second time, this time unguarded, which is what would actually
+  // reach `main().catch` below. That "works" but only because open()'s catch
+  // happens to be a blind catch-all and loadedConfig happens to stay unset
+  // after a failed load — verified by moving this block after open() and
+  // confirming the malformed-config test still passed, for exactly that
+  // reason. Loading config here removes the dependency on that coincidence:
+  // dbPath() then always finds loadedConfig already resolved, a bad config
+  // throws exactly once, and open()'s catch is left doing only what it says
+  // — falling back on a genuine disk I/O error opening the resolved path,
+  // not laundering an unrelated config error into a silent :memory:.
+  //
+  // The model layer reads CHAMBER_API_BASE / CHAMBER_API_MODEL from the
+  // environment directly. Seeding only where unset preserves precedence by
+  // construction, since env already outranks config. This is a seam, not an
+  // architecture: close it when complete() takes explicit options.
+  loadedConfig ??= loadConfig();
+  if (!process.env.CHAMBER_API_BASE && loadedConfig.model.base) {
+    process.env.CHAMBER_API_BASE = loadedConfig.model.base;
+  }
+  if (!process.env.CHAMBER_API_MODEL && loadedConfig.model.name) {
+    process.env.CHAMBER_API_MODEL = loadedConfig.model.name;
   }
 
   const db = open();

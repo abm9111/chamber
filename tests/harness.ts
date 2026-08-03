@@ -6472,7 +6472,20 @@ test("cli", "status_dispatches_against_a_scratch_db", () => {
       {
         encoding: "utf8",
         timeout: 15_000,
-        env: { ...process.env, CHAMBER_DB: dbFile },
+        // main() now resolves the config file on every command, not just
+        // ones that ask for it. Without an explicit CHAMBER_CONFIG this
+        // subprocess would inherit the ambient default and read whatever
+        // real file sits at ~/.config/chamber/config.json on the machine
+        // running the suite — never present on this machine today, but a
+        // test must not depend on that staying true. Pointing at a config
+        // path inside this test's own (never-written) temp dir guarantees
+        // loadConfig() sees no file, same as before this test ever touched
+        // config resolution.
+        env: {
+          ...process.env,
+          CHAMBER_DB: dbFile,
+          CHAMBER_CONFIG: join(dir, "config.json"),
+        },
       },
     );
     assert(
@@ -6491,6 +6504,72 @@ test("cli", "status_dispatches_against_a_scratch_db", () => {
     assert(
       r.stdout.includes("beliefs:") && r.stdout.includes("audit events:"),
       `status output missing expected counters, got:\n${r.stdout}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cli", "cli_uses_the_configured_database", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-cliCfg-"));
+  const dbFile = join(dir, "configured.sqlite");
+  const cfgFile = join(dir, "config.json");
+  writeFileSync(cfgFile, JSON.stringify({ database: dbFile }));
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI_PATH, "status"],
+    {
+      encoding: "utf8",
+      timeout: 15_000,
+      env: { ...process.env, CHAMBER_CONFIG: cfgFile, CHAMBER_DB: "" },
+    },
+  );
+  assert(r.status === 0, `status failed: ${r.stderr}`);
+  assert(
+    r.stdout.includes(dbFile),
+    `status should report the configured db path, got:\n${r.stdout}`,
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// Not in the brief's step list, added because "fail closed" is a binding
+// global constraint here, not just a comment on the code: main() now loads
+// config before open(), specifically so a malformed config cannot be
+// swallowed by open()'s catch-all into a silent :memory: fallback. That
+// reasoning is only worth trusting if it is proven end to end through the
+// real subprocess, the same standard the positive-path test above is held
+// to — a one-off manual check would not survive the next refactor.
+test("cli", "a malformed config is a hard error, not a silent fallback", () => {
+  // try/finally, unlike the brief-prescribed test above: this one is mine,
+  // not transcribed verbatim, so it is held to the same standard as
+  // status_dispatches_against_a_scratch_db — an assertion failure here must
+  // not leak a chamber-cliBadCfg-* directory into the system temp dir.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-cliBadCfg-"));
+  try {
+    const cfgFile = join(dir, "config.json");
+    writeFileSync(cfgFile, "{ not json");
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "status"],
+      {
+        encoding: "utf8",
+        timeout: 15_000,
+        env: { ...process.env, CHAMBER_CONFIG: cfgFile },
+      },
+    );
+    assert(
+      r.status !== 0,
+      `a malformed config must exit non-zero, got status=${r.status}, stdout:\n${r.stdout}`,
+    );
+    assert(
+      r.stderr.includes(cfgFile) && r.stderr.includes("not valid JSON"),
+      `error must name the config file and the problem, got:\n${r.stderr}`,
+    );
+    // The failure must be reported, not partially applied: a silent fallback
+    // would still print a banner and counters on stdout.
+    assert(
+      !r.stdout.includes("beliefs:"),
+      `a hard error must not also print status output, got:\n${r.stdout}`,
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });

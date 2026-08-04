@@ -30,12 +30,34 @@
     The leading `date` line matters because launchd appends to this log
     forever. Without it, today's run and last month's run are the same
     undifferentiated text.
+
+    The run records the database it checked and verify's exit code, because a
+    log that omits both cannot answer the only two questions worth asking of
+    it: which corpus was this, and did it pass. An operator reading a wall of
+    belief output otherwise has to infer the verdict from the prose.
+
+    Drift raises a notification; a clean run raises nothing. This check
+    correctly reports nothing on almost every day, so a log file the operator
+    must remember to open is a check they will stop reading. Silence stays
+    silent and drift interrupts exactly once. `exit $rc` is load-bearing: an
+    `if` whose condition fails would otherwise leave the script exiting 0 and
+    quietly destroy verify's exit contract.
   -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
     <string>-lc</string>
-    <string>echo "=== chamber $(date '+%Y-%m-%dT%H:%M:%S%z') ==="; chamber ingest || echo "!! ingest FAILED (exit $?) - verifying against the corpus as it stands, which may be stale"; chamber verify</string>
+    <string>echo "=== chamber $(date '+%Y-%m-%dT%H:%M:%S%z') ==="
+chamber config show 2>/dev/null | grep database
+chamber ingest || echo "!! ingest FAILED (exit $?) - verifying against the corpus as it stands, which may be stale"
+chamber verify
+rc=$?
+echo "=== verify exit $rc ==="
+if [ "$rc" -ne 0 ]; then
+  msg="A belief has lost its evidence (verify exit $rc). See Library/Logs/chamber-verify.log"
+  osascript -e "display notification \"$msg\" with title \"Chamber: evidence drift\"" >/dev/null
+fi
+exit $rc</string>
   </array>
 
   <key>StartCalendarInterval</key>

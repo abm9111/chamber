@@ -2,10 +2,16 @@
  * Unified gateway runner — Telegram / Discord / Slack / console.
  * Every inbound message runs through a provided turn handler (Chamber gates).
  *
- *   CHAMBER_DB=... TELEGRAM_BOT_TOKEN=... node --experimental-strip-types src/gateway_runner.ts
+ *   TELEGRAM_BOT_TOKEN=... node --experimental-strip-types src/gateway_runner.ts
+ *
+ * The database is whichever one Chamber's settings name (CHAMBER_DB, then the
+ * config file, then the durable default) — see `openConfiguredDb` in src/db.ts.
  */
 
-import { openChamberDb } from "./db.ts";
+import type { DatabaseSync } from "node:sqlite";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { openConfiguredDb } from "./db.ts";
 import {
   type GatewayAdapter,
   type InboundMessage,
@@ -109,8 +115,19 @@ class SlackGateway implements GatewayAdapter {
   }
 }
 
+/**
+ * The database this runner writes to.
+ *
+ * Extracted from `gatedTurn` so it can be exercised without starting a
+ * gateway: `gatedTurn` reaches the network on its second line, so a test that
+ * wants to know *which file the rows land in* could not get at it otherwise.
+ */
+export function openGatewayDb(): DatabaseSync {
+  return openConfiguredDb();
+}
+
 function gatedTurn(message: string, channel: string, chatId: string): string {
-  const db = openChamberDb(process.env.CHAMBER_DB ?? "/tmp/chamber.sqlite");
+  const db = openGatewayDb();
   runExpiryJob(db);
   const turnId = newId("trn");
   const sessionId = startSession(db, {
@@ -238,7 +255,39 @@ async function main(): Promise<void> {
   );
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+/**
+ * Whether this file is the program being run, rather than a module someone
+ * imported.
+ *
+ * `main()` used to be called unconditionally at module scope, so *importing*
+ * this file started a daemon: with TELEGRAM_BOT_TOKEN set in the environment —
+ * which is the normal state on a machine that runs the gateway — an `import`
+ * from a test or a tool opened a real long-poll against Telegram. That made
+ * the one line in here worth testing (which database `gatedTurn` writes to)
+ * untestable, because reaching it meant launching the thing.
+ *
+ * `process.argv[1]` is the script node was pointed at. Compared through
+ * `realpathSync` so a symlinked entry point still matches — `chamber` is
+ * installed as a symlink into the working tree, and the same is possible here.
+ * `import.meta.main` would say this more directly but only on Node 24.2+, and
+ * package.json still declares `>=23.6`, where it is `undefined` — which would
+ * make the runner silently do nothing rather than fail. argv works everywhere.
+ */
+function invokedDirectly(): boolean {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  const self = fileURLToPath(import.meta.url);
+  if (entry === self) return true;
+  try {
+    return realpathSync(entry) === realpathSync(self);
+  } catch {
+    return false;
+  }
+}
+
+if (invokedDirectly()) {
+  main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}

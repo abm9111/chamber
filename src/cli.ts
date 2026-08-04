@@ -765,6 +765,10 @@ Usage:
       pattern, case-insensitively, at any depth. A pattern that matches
       nothing aborts the run — quote multi-word names. Dotted entries
       (.trash, .obsidian) and symlinks leaving the root are skipped.
+  chamber ingest                     (no path) ingest every root listed in the
+                        config file's ingest array, honoring each root's own
+                        exclude list. This is the form the scheduled job runs.
+                        Run 'chamber config show' to see the configured roots.
   chamber search [--exact|--semantic] <query>   Hybrid (vector + FTS5) search
       Hybrid is the default: results are the union of the two legs, ranked by
       0.7*cosine + 0.3*(share of the query's idf mass this passage contains).
@@ -1012,7 +1016,16 @@ async function main(): Promise<void> {
       // explicit-path form, whose parser already rejects an unknown flag and
       // a missing path out loud.
       if (rest.length === 0) {
-        const cfg = loadConfig();
+        // Reuse the config `main()` already resolved rather than parsing the
+        // file a second time: this used to call loadConfig() directly, which
+        // re-ran the JSON parse plus a realpath/stat pass over every
+        // configured root — paid twice on every scheduled run for no reason,
+        // since loadedConfig is already the answer. The non-null assertion
+        // is sound because every path into this case runs after `main()`'s
+        // unconditional `loadedConfig ??= loadConfig()`; "init" and "config"
+        // are the only commands that skip that prelude, and neither reaches
+        // this switch at all — both return before it.
+        const cfg = loadedConfig!;
         if (cfg.ingest.length === 0) {
           console.error("ingest: no path given and no roots configured");
           console.error("  add roots to the config file, or pass a path");

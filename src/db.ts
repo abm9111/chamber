@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadConfig } from "./config.ts";
 import { formatErrorChain } from "./error_chain.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -149,6 +150,52 @@ export function openChamberDb(
   path = ":memory:",
   onRedirect?: (actual: string) => void,
 ): DatabaseSync {
+  // A blank path is the one input that loses everything without saying so.
+  //
+  // `new DatabaseSync("")` does not fail. SQLite reads an empty filename as a
+  // request for a *private temporary database*: it opens, `applySchemas`
+  // applies, INSERTs succeed, and the entire thing is discarded when the
+  // process exits. Measured, not assumed — an open, an INSERT and a SELECT
+  // all succeed against `""`. And because the empty string is also the path
+  // that was *asked for*, the `p !== path` test below is false, so neither
+  // `warnRedirect` nor `onRedirect` fires. Total data loss, announced nowhere.
+  //
+  // The `/tmp` and `:memory:` legs below exist for a location that turned out
+  // unusable at runtime — an environment failure the operator did not cause
+  // and should not lose a command to. A blank path is not that. It is a
+  // caller or configuration bug, there is no location to fall back *from*,
+  // and so it throws instead. Three reasons, in order of weight:
+  //
+  //  - Falling back to `:memory:` with a warning would reproduce the exact
+  //    failure this guard exists to stop. The process would still exit 0
+  //    having stored nothing, and under the scheduled job a warning in a log
+  //    nobody reads is indistinguishable from silence. A throw is the one
+  //    signal a scheduler can act on.
+  //  - No caller can mean it. In-memory is spelled `:memory:` and every real
+  //    path is non-empty, so there is no blank-path behaviour to preserve and
+  //    nothing that legitimately passes `""` to break.
+  //  - The class is closed today only by convention. Every daemon and the CLI
+  //    reach this function through `envSetting`'s blank-is-unset trim in
+  //    src/config.ts — but ten call sites open this database, and an eleventh
+  //    added tomorrow inherits none of that discipline. The rule belongs at
+  //    the open, once, not at each place a path is resolved.
+  //
+  // Whitespace-only is refused on the same terms and for a second reason:
+  // SQLite reads `"  "` as an ordinary relative filename and quietly creates
+  // a file literally called `"  "` in the working directory. The value is
+  // only *tested* trimmed, never used trimmed — a real path may legally carry
+  // a trailing space, and silently rewriting it would be a different quiet
+  // bug in place of this one.
+  if (path.trim() === "") {
+    throw new Error(
+      `openChamberDb: refusing to open a blank database path (${JSON.stringify(path)}). ` +
+        `SQLite accepts this and opens a private temporary database whose every row ` +
+        `is discarded when the process exits — it does not fail, so nothing downstream ` +
+        `would report the loss. Pass a filesystem path, or ":memory:" if a throwaway ` +
+        `database is what you meant.`,
+    );
+  }
+
   const candidates =
     path === ":memory:"
       ? [":memory:"]
@@ -173,4 +220,35 @@ export function openChamberDb(
     }
   }
   throw lastErr;
+}
+
+/**
+ * Open the database Chamber's *settings* name — environment, then config file,
+ * then the durable default — rather than one the caller chose for itself.
+ *
+ * Every entry point that is not a test or a probe belongs here. Four of them
+ * did not: src/server.ts, src/gateway_runner.ts, src/slack_ops.ts and
+ * src/discord_ops.ts each read `process.env.CHAMBER_DB ?? "/tmp/chamber.sqlite"`
+ * and none imported loadConfig. So `chamber ask` and the HTTP server held two
+ * unrelated corpora, and the daemons' one — the audit chain included — was
+ * gone after a reboot. Durability was a property of the CLI, not of Chamber.
+ *
+ * The `??` was the second half of it: it falls through on nullish only, so
+ * `export CHAMBER_DB="$UNSET"` resolved to "", beat both the config file and
+ * the default, and opened a private temporary SQLite database that discards
+ * every row at exit. `envSetting` in src/config.ts has treated blank as unset
+ * since the CLI hit this; routing through it is what extends that rule here.
+ *
+ * `onRedirect` is passed straight through, because a daemon that *prints* its
+ * database path has the same obligation the CLI banner does — see
+ * `openChamberDb` above and `listenServer` in src/server.ts.
+ *
+ * A function, not a module-level constant: config is read at the moment of
+ * opening, so a caller that opens twice in one process sees the settings as
+ * they are, and importing this module still costs no filesystem access.
+ */
+export function openConfiguredDb(
+  onRedirect?: (actual: string) => void,
+): DatabaseSync {
+  return openChamberDb(loadConfig().database, onRedirect);
 }

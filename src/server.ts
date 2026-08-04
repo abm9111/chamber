@@ -1,8 +1,12 @@
 /**
  * Minimal HTTP surface for Chamber.
  *
- *   CHAMBER_DB=/tmp/chamber.sqlite node --experimental-strip-types src/server.ts
+ *   node --experimental-strip-types src/server.ts
  *   PORT=8787
+ *
+ * The database is whichever one Chamber's settings name — CHAMBER_DB, then the
+ * config file, then the durable default — so this process and the CLI share
+ * one corpus. See src/config.ts and `openConfiguredDb` in src/db.ts.
  *
  * Routes:
  *   GET  /health
@@ -16,7 +20,10 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { DatabaseSync } from "node:sqlite";
 import { openChamberDb } from "./db.ts";
+import { configPath, loadConfig } from "./config.ts";
+import { formatErrorChain } from "./error_chain.ts";
 import { sha256, newId } from "./hash.ts";
 import { commitBelief } from "./commit_belief.ts";
 import { completeSync } from "./model.ts";
@@ -47,7 +54,58 @@ const PORT = Number(process.env.PORT ?? process.env.CHAMBER_PORT ?? 8787);
 const API_TOKEN = process.env.CHAMBER_API_TOKEN?.trim() || "";
 /** Bind host: default loopback; compose may use 0.0.0.0 on internal network only. */
 const BIND = process.env.CHAMBER_BIND ?? "127.0.0.1";
-const db = openChamberDb(process.env.CHAMBER_DB ?? "/tmp/chamber.sqlite");
+/**
+ * The database this process actually opened.
+ *
+ * Starts as the path the settings resolve to and is repointed by `onRedirect`
+ * if `openChamberDb` had to store the data somewhere else. Read only by the
+ * startup lines in `listenServer`, which used to print
+ * `process.env.CHAMBER_DB ?? "/tmp/chamber.sqlite"` — a *request*, and after a
+ * redirect not even that. An operator reads that line to learn where their
+ * data is; it has to name the file the rows are in.
+ */
+let dbPath = "";
+
+/**
+ * Open the configured database, or refuse to start.
+ *
+ * The open is at module scope, which means a malformed config throws during
+ * import rather than somewhere a request handler could catch it. That is the
+ * right shape for a server and it stays: this process exists to hold an audit
+ * chain, and the alternatives to failing here are all worse. Deferring the
+ * open to the first request would leave a listening socket that answers
+ * `GET /health` with 200 while no database exists — a server that looks alive
+ * and cannot record anything. Falling back to a scratch database would accept
+ * writes and discard them, which is the exact failure this whole change is
+ * about. So it fails closed, before the port is bound, and nothing can send it
+ * work it will lose.
+ *
+ * What was missing is not the failure but its legibility: an uncaught throw
+ * during module evaluation prints a stack trace through node's ESM loader,
+ * which does not say "your config file is bad" to anyone who is not reading
+ * the source. This catch names the config file, the reason, and what the
+ * server did about it, then exits non-zero so a supervisor sees a failure
+ * rather than a silent daemon. It deliberately does not retry or relocate —
+ * `openChamberDb` has already exhausted the relocations that are safe, and
+ * everything that reaches here (a config that will not parse, a corrupt
+ * database, a broken schema file) is a fault an operator has to see.
+ */
+const db: DatabaseSync = ((): DatabaseSync => {
+  try {
+    dbPath = loadConfig().database;
+    return openChamberDb(dbPath, (actual) => {
+      dbPath = actual;
+    });
+  } catch (err) {
+    process.stderr.write(
+      `chamber-server: FATAL — cannot open Chamber's database: ` +
+        `${formatErrorChain(err).join("; ")}\n` +
+        `chamber-server: config is ${configPath()}; CHAMBER_DB overrides it. ` +
+        `Not starting — a server that cannot record is worse than one that is down.\n`,
+    );
+    process.exit(1);
+  }
+})();
 
 function extractToken(req: IncomingMessage): string {
   const auth = req.headers.authorization ?? "";
@@ -414,7 +472,7 @@ function listenServer(): void {
   if (listenFds > 0 && listenPid === process.pid) {
     server.listen({ fd: 3 }, () => {
       console.log(`Chamber HTTP  (socket activation fd=3, LISTEN_FDS=${listenFds})`);
-      console.log(`db=${process.env.CHAMBER_DB ?? "/tmp/chamber.sqlite"}`);
+      console.log(`db=${dbPath}`);
       console.log(
         `auth=${API_TOKEN ? "token-required" : "open (set CHAMBER_API_TOKEN)"}`,
       );
@@ -423,7 +481,7 @@ function listenServer(): void {
   }
   server.listen(PORT, BIND, () => {
     console.log(`Chamber HTTP  http://${BIND}:${PORT}`);
-    console.log(`db=${process.env.CHAMBER_DB ?? "/tmp/chamber.sqlite"}`);
+    console.log(`db=${dbPath}`);
     console.log(
       `auth=${API_TOKEN ? "token-required" : "open (set CHAMBER_API_TOKEN)"}`,
     );

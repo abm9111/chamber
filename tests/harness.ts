@@ -138,6 +138,7 @@ import {
   handleChamberSlash,
   slackApprove,
   slackScopeId,
+  openSlackDb,
 } from "../src/slack_ops.ts";
 import {
   canDiscordApprove,
@@ -148,7 +149,10 @@ import {
   formatAttachmentMeta,
   chunkDiscordMessage,
   isDiscordFreeResponseChannel,
+  openDiscordDb,
 } from "../src/discord_ops.ts";
+// Importing this module must not start a gateway; see `invokedDirectly` there.
+import { openGatewayDb } from "../src/gateway_runner.ts";
 import {
   checkRateLimit,
   resetRateLimits,
@@ -180,7 +184,7 @@ import {
 } from "../src/config.ts";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn, execFileSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
 import {
   chmodSync,
@@ -300,6 +304,7 @@ function suiteFromArg(): Suite {
     "pins",
     "cli",
     "config",
+    "daemon",
     "all",
   ].includes(v)
     ? v
@@ -6462,6 +6467,35 @@ test("cli", "help_starts_the_real_binary_and_exits_clean", () => {
   );
 });
 
+// The no-argument `chamber ingest` form — the one the scheduled job runs — was
+// undocumented: help() only ever described `chamber ingest <path>`. Checked
+// the same way the backtick regression above is checked, by actually
+// launching the binary, because that regression is exactly what a purely
+// static check on this file would not have caught.
+test("cli", "help documents the no-argument configured-roots form of ingest", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI_PATH, "help"],
+    { encoding: "utf8", timeout: 15_000 },
+  );
+  assert(
+    r.status === 0,
+    `chamber help exited ${r.status} (signal=${r.signal}); stderr:\n${r.stderr}`,
+  );
+  assert(
+    r.stdout.includes("chamber ingest") && r.stdout.includes("(no path)"),
+    `help must document the bare "chamber ingest" form, got:\n${r.stdout}`,
+  );
+  assert(
+    r.stdout.includes("scheduled job"),
+    `help must say this is the form the scheduled job runs, got:\n${r.stdout}`,
+  );
+  assert(
+    !r.stderr.includes("SyntaxError"),
+    `help printed a SyntaxError:\n${r.stderr}`,
+  );
+});
+
 test("cli", "status_dispatches_against_a_scratch_db", () => {
   // Removed in `finally`, because the asserts below throw: this test used to
   // leave a `chamber-cli-status-*` directory (holding a real sqlite file) in
@@ -6744,6 +6778,66 @@ test("cli", "opening :memory: says nothing at all", () => {
     written.length === 0,
     `opening :memory: must be silent, got:\n${written.join("")}`,
   );
+});
+
+// ── IMPORTANT: a blank database path was total, silent data loss ────────────
+//
+// `openChamberDb("")` opened. It applied every schema, accepted an INSERT,
+// returned the row back on a SELECT, and did not fire `onRedirect` — because
+// the empty string is also the path that was *asked for*, so the redirect test
+// inside the fallback loop is false and neither warning nor callback runs.
+// SQLite reads an empty filename as a private temporary database and deletes
+// it at exit. Every row written was gone, and nothing anywhere said so.
+//
+// The class was closed at four daemon call sites plus the CLI, all of which
+// route through `envSetting`'s blank-is-unset trim in src/config.ts — but by
+// convention only. Ten call sites open this database. These tests hold the
+// rule at the open itself, so the eleventh call site inherits it.
+test("cli", "a blank database path is refused, not silently discarded", () => {
+  for (const blank of ["", " ", "\t", "\n", "   "]) {
+    let msg: string | null = null;
+    try {
+      openChamberDb(blank).close();
+    } catch (e) {
+      msg = e instanceof Error ? e.message : String(e);
+    }
+    assert(
+      msg !== null,
+      `openChamberDb(${JSON.stringify(blank)}) must throw — SQLite opens it as ` +
+        `a private temporary database and discards every row at exit, with no ` +
+        `warning and no onRedirect callback`,
+    );
+    // The operator has to be able to act on this without reading db.ts: what
+    // was passed, what SQLite would have done with it, and how to ask for a
+    // throwaway database on purpose.
+    assert(
+      msg!.includes(JSON.stringify(blank)),
+      `the refusal must quote the value it refused, got: ${msg}`,
+    );
+    assert(
+      msg!.includes(":memory:"),
+      `the refusal must name the way to ask for a throwaway database, got: ${msg}`,
+    );
+  }
+});
+
+// The guard's blast radius, in the one direction that would matter: `:memory:`
+// is passed by nearly every test in this file and by `freshDb()`, and a
+// trim-based check that over-fired would take the whole suite with it.
+test("cli", "the blank-path guard does not catch :memory: or a real path", () => {
+  openChamberDb(":memory:").close();
+  openChamberDb().close(); // the default argument
+  const dir = mkdtempSync(join(tmpdir(), "chamber-blankguard-"));
+  try {
+    const file = join(dir, "nested", "chamber.sqlite");
+    openChamberDb(file).close();
+    assert(
+      existsSync(file),
+      `a real path must still open (and still have its parent created), ${file} was not created`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ─── CONFIG (file-based settings resolution, src/config.ts) ────────────────
@@ -7093,6 +7187,47 @@ test("config", "two spellings of one directory are rejected on a case-folding vo
   rmSync(dir, { recursive: true, force: true });
 });
 
+// assertNoOverlap's own comment claims the message "names the paths the
+// operator actually wrote" — but it read roots[i].root, which parseIngest has
+// already replaced with the canonical path. When a symlink (or case-folding)
+// is what caused the overlap, that canonical path appears nowhere in the
+// config file, so the message named two strings the operator cannot grep for
+// to find which entry to delete. This reuses the exact symlinked-prefix
+// fixture above — the one case where written and resolved genuinely differ —
+// and asserts both forms are named.
+test(
+  "config",
+  "the overlap error names the path as the operator wrote it, not only its canonical form",
+  () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-symover-")));
+    mkdirSync(join(dir, "notes"), { recursive: true });
+    symlinkSync(join(dir, "notes"), join(dir, "link"));
+    const writtenLeaf = join(dir, "link", "notyet");
+    const resolvedLeaf = join(dir, "notes", "notyet");
+    const json = JSON.stringify({
+      ingest: [{ root: join(dir, "notes") }, { root: writtenLeaf }],
+    });
+    withConfig(json, () => {
+      let msg = "";
+      try {
+        loadConfig();
+      } catch (e) {
+        msg = e instanceof Error ? e.message : String(e);
+      }
+      assert(
+        msg.includes(writtenLeaf),
+        `error must name the entry exactly as it is spelled in the config file ` +
+          `(${writtenLeaf}) so the operator can find it there, got: ${msg}`,
+      );
+      assert(
+        msg.includes(resolvedLeaf),
+        `error must also name what the symlink resolved to, got: ${msg}`,
+      );
+    });
+    rmSync(dir, { recursive: true, force: true });
+  },
+);
+
 test("config", "a symlinked prefix is resolved even when the leaf does not exist", () => {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-leaf-")));
   mkdirSync(join(dir, "notes"), { recursive: true });
@@ -7249,6 +7384,56 @@ test("config", "config show reports the source of each setting", () => {
   assert(r.stdout.includes("env"), "must name the source");
   assert(r.stdout.includes("from-config.sqlite"), "must show the losing value on conflict");
   rmSync(dir, { recursive: true, force: true });
+});
+
+// `explainConfig()` used to emit database, model.base, model.name and config
+// — nothing about ingest. The excludes are the deny-list that keeps `chamber
+// ingest` out of restricted folders, so an operator being unable to see them
+// without opening the file by hand is the gap that matters most: criterion 5
+// of the design spec says `config show` prints every setting.
+test("config", "config show prints every ingest root and its excludes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-showingest-"));
+  const vaultA = join(dir, "vault-a");
+  const vaultB = join(dir, "vault-b");
+  mkdirSync(vaultA, { recursive: true });
+  mkdirSync(vaultB, { recursive: true });
+  const cfgFile = join(dir, "config.json");
+  writeFileSync(
+    cfgFile,
+    JSON.stringify({
+      ingest: [
+        { root: vaultA, exclude: ["Private", ".trash"] },
+        { root: vaultB, exclude: [] },
+      ],
+    }),
+  );
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI_PATH, "config", "show"],
+    { encoding: "utf8", timeout: 15_000, env: { ...process.env, CHAMBER_CONFIG: cfgFile } },
+  );
+  assert(r.status === 0, `config show failed: ${r.stderr}`);
+  assert(r.stdout.includes(vaultA), `must print the first ingest root, got:\n${r.stdout}`);
+  assert(r.stdout.includes(vaultB), `must print the second ingest root, got:\n${r.stdout}`);
+  assert(
+    r.stdout.includes("Private") && r.stdout.includes(".trash"),
+    `must print every exclude entry — this is the privacy boundary — got:\n${r.stdout}`,
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("config", "config show says explicitly when no ingest roots are configured", () => {
+  withConfig(null, () => {
+    const rows = explainConfig();
+    const said = rows.some(
+      (row) => row.key.startsWith("ingest") && /none/i.test(row.value),
+    );
+    assert(
+      said,
+      `explainConfig must say explicitly that no roots are configured, not omit ` +
+        `the setting, got: ${JSON.stringify(rows)}`,
+    );
+  });
 });
 
 // Not in the brief: a review of Task 1 found that `explainConfig()` used to
@@ -7444,6 +7629,60 @@ test(
       `nothing may be stored when a configured exclude matched nothing, got ${stored}`,
     );
     rmSync(dir, { recursive: true, force: true });
+  },
+);
+
+// `case "ingest"`'s no-argument branch used to call `loadConfig()` directly
+// instead of reusing the module-level value `main()` already resolved before
+// dispatch — a redundant JSON parse plus a realpath/stat pass over every
+// configured root, paid on every scheduled run. Read-count is not observable
+// from stdout, so this proves it structurally: a FIFO can only be opened for
+// read once per writer. A background `cat` supplies exactly one writer, which
+// satisfies exactly one open+read. If the config file is read a second time,
+// that second open() blocks forever waiting for a writer that will never
+// come, and the subprocess below hangs until spawnSync's timeout kills it —
+// deterministic, no sleeps, no timing race: whichever side (reader or writer)
+// arrives first simply waits for the other.
+test(
+  "cli",
+  "ingest with no path reads the config file exactly once",
+  () => {
+    const dir = mkdtempSync(join(tmpdir(), "chamber-onceread-"));
+    const vault = join(dir, "vault");
+    mkdirSync(vault, { recursive: true });
+    writeFileSync(join(vault, "a.md"), "alpha body\n");
+    const dbFile = join(dir, "c.sqlite");
+    const fifo = join(dir, "config.fifo");
+    const payload = join(dir, "config.json");
+    writeFileSync(
+      payload,
+      JSON.stringify({ database: dbFile, ingest: [{ root: vault, exclude: [] }] }),
+    );
+    execFileSync("mkfifo", [fifo]);
+    const writer = spawn("sh", ["-c", `cat "${payload}" > "${fifo}"`], {
+      stdio: "ignore",
+      detached: true,
+    });
+    writer.unref();
+    try {
+      const r = spawnSync(
+        process.execPath,
+        ["--experimental-strip-types", CLI_PATH, "ingest"],
+        {
+          encoding: "utf8",
+          timeout: 5_000,
+          env: { ...process.env, CHAMBER_CONFIG: fifo, CHAMBER_DB: "" },
+        },
+      );
+      assert(
+        r.signal === null,
+        `ingest hung and was killed (signal=${r.signal}) — the config file ` +
+          `was opened for reading more than once`,
+      );
+      assert(r.status === 0, `ingest failed: ${r.stderr}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   },
 );
 
@@ -7892,6 +8131,368 @@ test("cli", "the banner names /tmp when the data went to /tmp", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
     if (!tmpFallbackPreexisted) rmSync(TMP_FALLBACK, { force: true });
+  }
+});
+
+// ── IMPORTANT: durability was a CLI-only property ────────────────────────────
+//
+// `chamber` resolved its database through loadConfig() and wrote to
+// ~/.local/share/chamber/chamber.sqlite. Every daemon — the HTTP server, the
+// gateway runner, the Slack and Discord op surfaces — read
+// `process.env.CHAMBER_DB ?? "/tmp/chamber.sqlite"` instead. So the CLI and the
+// daemons kept two unrelated corpora, and the daemons' evaporated on reboot.
+//
+// The `??` carried the second half of the defect: it falls through on nullish
+// only, so `export CHAMBER_DB="$UNSET_THING"` resolved to "" and won the
+// precedence race against both the config file and the default. That is not a
+// visible failure — `new DatabaseSync("")` succeeds, SQLite opens a private
+// temporary database, the schemas apply, and every row written disappears at
+// exit. config.ts's envSetting() has treated blank as unset since the CLI hit
+// this; these call sites never received it.
+//
+// The tests below hold each entry point to the resolver the CLI uses.
+
+/** The three daemon openers that can be exercised without a network. */
+const DAEMON_OPENERS: ReadonlyArray<{
+  readonly name: string;
+  readonly open: () => DatabaseSync;
+}> = [
+  { name: "openSlackDb", open: openSlackDb },
+  { name: "openDiscordDb", open: openDiscordDb },
+  { name: "openGatewayDb", open: openGatewayDb },
+];
+
+/**
+ * A scratch config naming a database, plus a second path the environment can
+ * name instead.
+ *
+ * The configured path sits one level below a directory that does not exist
+ * yet, because that is the case that separates "resolved the path" from
+ * "opened it": `openChamberDb` creates the parent, and a caller that resolved
+ * a path but could not create it would land in /tmp and pass a weaker test.
+ *
+ * `withConfig` clears CHAMBER_CONFIG, CHAMBER_DB and XDG_CONFIG_HOME before
+ * the body runs and restores them after, so nothing in here can read or write
+ * a real ~/.config/chamber.
+ */
+function withDaemonDb<T>(
+  fn: (p: { configured: string; fromEnv: string }) => T,
+): T {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-daemondb-"));
+  try {
+    const configured = join(dir, "durable", "chamber.sqlite");
+    const fromEnv = join(dir, "from-env.sqlite");
+    return withConfig(JSON.stringify({ database: configured }), () =>
+      fn({ configured, fromEnv }),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+for (const { name, open } of DAEMON_OPENERS) {
+  test("daemon", `${name} opens the configured database when CHAMBER_DB is unset`, () => {
+    withDaemonDb(({ configured }) => {
+      open().close();
+      assert(
+        existsSync(configured),
+        `${name} must open the database the config names (${configured}); ` +
+          `it did not, so this daemon and the CLI hold different corpora`,
+      );
+    });
+  });
+
+  test("daemon", `${name} still lets CHAMBER_DB win over the config file`, () => {
+    withDaemonDb(({ configured, fromEnv }) => {
+      process.env.CHAMBER_DB = fromEnv;
+      open().close();
+      assert(
+        existsSync(fromEnv),
+        `${name} must honour CHAMBER_DB=${fromEnv}; nothing was created there`,
+      );
+      assert(
+        !existsSync(configured),
+        `${name} used the config file while CHAMBER_DB was set — ` +
+          `environment outranks file, and that precedence must not change`,
+      );
+    });
+  });
+
+  test("daemon", `${name} treats an empty CHAMBER_DB as unset`, () => {
+    withDaemonDb(({ configured }) => {
+      process.env.CHAMBER_DB = "";
+      open().close();
+      assert(
+        existsSync(configured),
+        `an empty CHAMBER_DB must fall through to the config file. ` +
+          `${configured} was never created, which means the path resolved to ` +
+          `"" — a request node:sqlite honours as a private temporary database ` +
+          `that is discarded when the process exits`,
+      );
+    });
+  });
+}
+
+const SERVER_PATH = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "../src/server.ts",
+);
+
+/**
+ * Run src/server.ts far enough to bind and print its startup lines, then stop.
+ *
+ * The server opens its database and calls `listen()` at module scope, so there
+ * is nothing to import and call: it has to be a process. `-e` with a dynamic
+ * import gets the module evaluated, and the timer fires after the listen
+ * callback has printed — which is the thing under test, since the `db=` line
+ * is what an operator reads to learn where their data went.
+ *
+ * PORT=0 asks the kernel for a free port, so this can never collide with a
+ * server the owner already has running on 8787.
+ *
+ * The environment is built by *removing* every config-deciding variable from
+ * the parent's before the overrides are applied, so a stray CHAMBER_CONFIG in
+ * the ambient shell cannot make these tests read a real user config.
+ */
+function runServer(overrides: Record<string, string>): {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+} {
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of CONFIG_ENV_KEYS) delete env[key];
+  const r = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "-e",
+      `await import(${JSON.stringify(SERVER_PATH)});` +
+        `setTimeout(() => process.exit(0), 700);`,
+    ],
+    {
+      encoding: "utf8",
+      timeout: 20_000,
+      env: { ...env, PORT: "0", CHAMBER_BIND: "127.0.0.1", ...overrides },
+    },
+  );
+  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+/** A config file in its own temp dir, plus the paths the test cares about. */
+function withServerFixture<T>(
+  fn: (p: { configPath: string; configured: string; fromEnv: string }) => T,
+): T {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-serverdb-"));
+  try {
+    const configured = join(dir, "durable", "chamber.sqlite");
+    const configPath = join(dir, "config.json");
+    writeFileSync(configPath, JSON.stringify({ database: configured }));
+    return fn({ configPath, configured, fromEnv: join(dir, "from-env.sqlite") });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("daemon", "the server opens the configured database when CHAMBER_DB is unset", () => {
+  withServerFixture(({ configPath, configured }) => {
+    const r = runServer({ CHAMBER_CONFIG: configPath });
+    assert(r.status === 0, `server exited ${r.status}; stderr:\n${r.stderr}`);
+    assert(
+      existsSync(configured),
+      `the server must open the database the config names (${configured}); ` +
+        `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`,
+    );
+    assert(
+      r.stdout.includes(`db=${configured}`),
+      `the startup line must name that database, got:\n${r.stdout}`,
+    );
+  });
+});
+
+test("daemon", "the server still lets CHAMBER_DB win over the config file", () => {
+  withServerFixture(({ configPath, configured, fromEnv }) => {
+    const r = runServer({ CHAMBER_CONFIG: configPath, CHAMBER_DB: fromEnv });
+    assert(r.status === 0, `server exited ${r.status}; stderr:\n${r.stderr}`);
+    assert(existsSync(fromEnv), `CHAMBER_DB=${fromEnv} was not honoured`);
+    assert(
+      !existsSync(configured),
+      "the config file beat CHAMBER_DB — environment outranks file",
+    );
+    assert(
+      r.stdout.includes(`db=${fromEnv}`),
+      `the startup line must name the environment's database, got:\n${r.stdout}`,
+    );
+  });
+});
+
+test("daemon", "the server treats an empty CHAMBER_DB as unset", () => {
+  withServerFixture(({ configPath, configured }) => {
+    const r = runServer({ CHAMBER_CONFIG: configPath, CHAMBER_DB: "" });
+    assert(r.status === 0, `server exited ${r.status}; stderr:\n${r.stderr}`);
+    assert(
+      existsSync(configured),
+      `an empty CHAMBER_DB must fall through to the config file; ` +
+        `${configured} was never created. stdout:\n${r.stdout}`,
+    );
+    assert(
+      !r.stdout.includes("db=\n") && !r.stdout.includes("db= "),
+      `the startup line must never report an empty path, got:\n${r.stdout}`,
+    );
+  });
+});
+
+// The banner-truth defect, one layer down: `openChamberDb` relocates to /tmp
+// when it cannot use the location it was given, and the server's own startup
+// line is the only thing a daemon operator sees. Reporting the requested path
+// after a redirect makes that line a confident lie — the same failure
+// `chamber status 2>/dev/null` had before `onRedirect` existed.
+test("daemon", "the server's startup line names /tmp when the data went to /tmp", () => {
+  const TMP_FALLBACK = "/tmp/chamber.sqlite";
+  const tmpFallbackPreexisted = existsSync(TMP_FALLBACK);
+  withServerFixture(({ configPath, configured }) => {
+    try {
+      // A directory as the database path: an unusable location that fails the
+      // same way for root as for anyone else.
+      const requested = join(dirname(configured), "iam-a-directory");
+      mkdirSync(requested, { recursive: true });
+      const r = runServer({ CHAMBER_CONFIG: configPath, CHAMBER_DB: requested });
+      assert(r.status === 0, `server exited ${r.status}; stderr:\n${r.stderr}`);
+      assert(
+        r.stdout.includes(`db=${TMP_FALLBACK}`),
+        `stdout must name where the rows actually went, got:\n${r.stdout}`,
+      );
+      assert(
+        !r.stdout.includes(`db=${requested}`),
+        `stdout must not claim the path it failed to open, got:\n${r.stdout}`,
+      );
+      assert(
+        r.stderr.includes(requested) && r.stderr.includes(TMP_FALLBACK),
+        `stderr must still name both paths, got:\n${r.stderr}`,
+      );
+    } finally {
+      if (!tmpFallbackPreexisted) rmSync(TMP_FALLBACK, { force: true });
+    }
+  });
+});
+
+// A source assertion, deliberately. server.ts prints its database path from
+// two places, and the second is inside the systemd socket-activation branch —
+// reached only when LISTEN_FDS is set and LISTEN_PID equals the child's own
+// pid, which a parent cannot arrange in advance. That branch is therefore the
+// one place this defect could quietly come back, so what is checked here is
+// the defect's shape rather than its behaviour: no daemon may reach for
+// CHAMBER_DB itself, and none may carry the /tmp default that made durability
+// a CLI-only property. Both belong to src/config.ts now.
+test("daemon", "no daemon resolves its own database path", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  for (const file of [
+    "src/server.ts",
+    "src/gateway_runner.ts",
+    "src/slack_ops.ts",
+    "src/discord_ops.ts",
+  ]) {
+    const text = readFileSync(join(root, file), "utf8");
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      if (line.trimStart().startsWith("*")) continue; // prose in a doc comment
+      assert(
+        !line.includes("process.env.CHAMBER_DB"),
+        `${file}:${i + 1} reads CHAMBER_DB directly — precedence and the ` +
+          `blank-is-unset rule live in src/config.ts:\n  ${line.trim()}`,
+      );
+      assert(
+        !line.includes(`"/tmp/chamber.sqlite"`),
+        `${file}:${i + 1} carries its own /tmp default, so this daemon's ` +
+          `data does not survive a reboot:\n  ${line.trim()}`,
+      );
+    }
+  }
+});
+
+// ── The other direction of `invokedDirectly` ────────────────────────────────
+//
+// The negative direction is already live in this file: line 155 imports
+// `openGatewayDb` from src/gateway_runner.ts, and TELEGRAM_BOT_TOKEN is set on
+// this machine, so if the guard ever stopped working that import would open a
+// real long-poll against Telegram and this suite would hang rather than fail.
+//
+// Nothing held the positive direction, and its failure mode is the quiet one.
+// If `invokedDirectly()` returns false for the real entry point — a refactor
+// that moves this file, a bundler that rewrites argv[1], a switch to
+// `import.meta.main` on a Node that reports it `undefined` — then
+// `npm run gateway` exits 0 having done absolutely nothing, and a suite that
+// only checks the negative stays green while the runner is dead.
+//
+// So: launch it as a subprocess, never import it, with every messenger token
+// removed from the environment. Scrubbing the token is what keeps this test
+// off the network — with one present, `main()` reaches TelegramGateway.start()
+// and long-polls until the timeout kills it. With none, `main()` falls into
+// its console-gateway branch, prints, and returns. That branch is the whole
+// assertion: those two lines exist nowhere but inside `main()`, so seeing them
+// proves `main()` ran, and the process terminating proves it was reached the
+// way an operator reaches it rather than by hanging somewhere earlier.
+//
+// CHAMBER_CONFIG names a file that does not exist and CHAMBER_DB is the
+// in-memory sentinel, so no real `~/.config/chamber/` is read and no real
+// database is touched. This branch opens no database at all; both are belt and
+// braces against a future `main()` that resolves one before dispatching.
+test("daemon", "gateway_runner runs main() when it is the program invoked", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-gwmain-"));
+  try {
+    const env: Record<string, string | undefined> = { ...process.env };
+    for (const key of [
+      "TELEGRAM_BOT_TOKEN",
+      "DISCORD_BOT_TOKEN",
+      "SLACK_BOT_TOKEN",
+      "CHAMBER_GATEWAY",
+    ]) {
+      delete env[key];
+    }
+    env.CHAMBER_CONFIG = join(dir, "no-such-config.json");
+    env.CHAMBER_DB = ":memory:";
+
+    const runner = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "../src/gateway_runner.ts",
+    );
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", runner],
+      { encoding: "utf8", timeout: 30_000, env },
+    );
+
+    assert(r.error === undefined, `failed to launch gateway_runner: ${r.error}`);
+    // A killed process means it did not take the console branch — the most
+    // likely reason is a token that survived the scrub and opened a long-poll.
+    assert(
+      r.signal === null,
+      `gateway_runner did not terminate and was killed (signal=${r.signal}) — ` +
+        `it should have taken the tokenless console branch and returned; ` +
+        `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`,
+    );
+    assert(
+      r.status === 0,
+      `gateway_runner exited ${r.status}; stderr:\n${r.stderr}`,
+    );
+    assert(
+      r.stdout.includes("No messenger tokens — console gateway only."),
+      `main() did not run: nothing on stdout could only have come from inside ` +
+        `it, so \`invokedDirectly()\` returned false for the real entry point ` +
+        `and \`npm run gateway\` is a no-op that exits 0. stdout:\n${r.stdout}`,
+    );
+    assert(
+      r.stdout.includes("Set TELEGRAM_BOT_TOKEN"),
+      `main() started but did not reach the end of its console branch; ` +
+        `stdout:\n${r.stdout}`,
+    );
+    assert(
+      !r.stderr.includes("SyntaxError"),
+      `gateway_runner printed a SyntaxError:\n${r.stderr}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

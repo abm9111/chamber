@@ -4,7 +4,7 @@
 
 import { spawnSync } from "node:child_process";
 import type { DatabaseSync } from "node:sqlite";
-import { openChamberDb } from "./db.ts";
+import { openConfiguredDb } from "./db.ts";
 import { newId, sha256 } from "./hash.ts";
 import { appendAudit } from "./audit.ts";
 import { startSession, appendMessage } from "./sessions.ts";
@@ -32,8 +32,9 @@ import {
 } from "./surface_harden.ts";
 import { parseChamberSlash } from "./slack_ops.ts";
 
+/** The same database the CLI uses; see `openSlackDb`. */
 export function openDiscordDb(): DatabaseSync {
-  return openChamberDb(process.env.CHAMBER_DB ?? "/tmp/chamber.sqlite");
+  return openConfiguredDb();
 }
 
 /** Fail-closed: empty allowlist → no approve. */

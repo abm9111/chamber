@@ -132,13 +132,26 @@ export function enforceClaimContract(
       path: "deep",
       turnId: opts.turnId,
     });
-    return {
-      ok: r.ok,
-      status: "APORIA",
-      reason: r.reason ?? "recorded as unknown",
-      beliefId: r.beliefId,
-      rejectedSources: dropped(r),
-    };
+    // `CommitResult` is a discriminated union: `beliefId` exists only on the
+    // ok branch and `reason` only on the failure branch. Reading both off `r`
+    // without narrowing compiled to `undefined` at runtime rather than
+    // throwing, so this returned `beliefId: undefined` whenever the commit
+    // failed while its own signature promises a string — and 300 passing tests
+    // never saw it, because nothing crashes when you read a missing property.
+    return r.ok
+      ? {
+          ok: true,
+          status: "APORIA",
+          reason: "recorded as unknown",
+          beliefId: r.beliefId,
+          rejectedSources: dropped(r),
+        }
+      : {
+          ok: false,
+          status: "APORIA",
+          reason: r.reason,
+          rejectedSources: dropped(r),
+        };
   }
 
   if (claim.kind === "assertion") {

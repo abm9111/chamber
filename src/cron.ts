@@ -60,7 +60,7 @@ export function listCronJobs(db: DatabaseSync): CronJob[] {
               last_run_at AS lastRunAt, next_run_at AS nextRunAt, last_status AS lastStatus
        FROM cron_job ORDER BY name`,
     )
-    .all() as CronJob[];
+    .all() as unknown as CronJob[];
 }
 
 export function setCronEnabled(db: DatabaseSync, id: string, enabled: boolean): void {
@@ -84,7 +84,7 @@ export function runDueCronJobs(
        FROM cron_job
        WHERE enabled = 1 AND (next_run_at IS NULL OR next_run_at <= ?)`,
     )
-    .all(iso) as CronJob[];
+    .all(iso) as unknown as CronJob[];
 
   const results: { id: string; status: string }[] = [];
   for (const job of due) {

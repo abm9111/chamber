@@ -1965,12 +1965,24 @@ async function main(): Promise<void> {
     }
     case "skills": {
       if (rest[0] === "add") {
+        // `chamber skills add` with no name registered a skill literally named
+        // `undefined`, with a body of "# undefined". Nothing rejected it.
         const name = rest[1];
+        if (!name) {
+          console.error("usage: chamber skills add <name> [body…]");
+          process.exitCode = 1;
+          break;
+        }
         const body = rest.slice(2).join(" ") || `# ${name}\n`;
         const r = registerSkill(db, { name, body, source: "human", activate: true });
         console.log(r.status, r.id, r.writeId ?? "");
       } else if (rest[0] === "learn") {
         const name = rest[1];
+        if (!name) {
+          console.error("usage: chamber skills learn <name> [body…]");
+          process.exitCode = 1;
+          break;
+        }
         const body = rest.slice(2).join(" ") || `# ${name}\n`;
         const r = proposeLearnedSkill(db, { name, body, evidence: "cli learn" });
         console.log("proposal", r.proposalId, r.writeId ?? "");

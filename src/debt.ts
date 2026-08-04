@@ -34,7 +34,7 @@ export function listOpenDebts(db: DatabaseSync, limit = 20): OpenDebt[] {
        ORDER BY created_at ASC
        LIMIT ?`,
     )
-    .all(limit) as OpenDebt[];
+    .all(limit) as unknown as OpenDebt[];
 }
 
 export interface DebtPaymentProposal {

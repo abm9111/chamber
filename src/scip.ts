@@ -283,7 +283,7 @@ export function queryCallers(db: DatabaseSync, symbol: string): SymbolEdge[] {
        FROM scip_relationship
        WHERE to_symbol = ? AND kind IN ('calls','references')`,
     )
-    .all(symbol) as SymbolEdge[];
+    .all(symbol) as unknown as SymbolEdge[];
 }
 
 export function queryCallees(db: DatabaseSync, symbol: string): SymbolEdge[] {
@@ -293,7 +293,7 @@ export function queryCallees(db: DatabaseSync, symbol: string): SymbolEdge[] {
        FROM scip_relationship
        WHERE from_symbol = ? AND kind IN ('calls','references')`,
     )
-    .all(symbol) as SymbolEdge[];
+    .all(symbol) as unknown as SymbolEdge[];
 }
 
 export function findSymbol(

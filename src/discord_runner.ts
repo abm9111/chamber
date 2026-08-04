@@ -120,7 +120,10 @@ async function main(): Promise<void> {
   client.on(Events.Error, (err) => {
     console.error("[discord] client error:", String(err).slice(0, 300));
   });
-  client.on(Events.ShardReconnect, () => {
+  // `Events.ShardReconnect` does not exist -- the member is `ShardReconnecting`.
+  // The typo evaluated to `undefined`, so this registered a listener for no
+  // event and the reconnect line has never once been printed.
+  client.on(Events.ShardReconnecting, () => {
     console.log("[discord] shard reconnecting…");
   });
   client.on(Events.ShardResume, () => {
@@ -136,11 +139,11 @@ async function main(): Promise<void> {
   ): Promise<void> {
     const chunks = chunkDiscordMessage(text);
     const allowedMentions = { parse: [] as string[] }; // no @everyone/@here/@roles
-    for (let i = 0; i < chunks.length; i++) {
+    for (const [i, content] of chunks.entries()) {
       if (i === 0) {
-        await message.reply({ content: chunks[i], allowedMentions });
+        await message.reply({ content, allowedMentions });
       } else {
-        await message.channel.send({ content: chunks[i], allowedMentions });
+        await message.channel.send({ content, allowedMentions });
       }
     }
   }
@@ -302,7 +305,11 @@ async function main(): Promise<void> {
       const content = reaction.message.content ?? "";
       const m = content.match(/\b(pw_[a-f0-9]+)\b/i);
       if (!m) return;
+      // Guarding the group rather than the match: `m` being truthy does not
+      // type the capture as present, and this id decides which pending write
+      // gets approved.
       const writeId = m[1];
+      if (!writeId) return;
       const r =
         emoji === "✅"
           ? discordApprove(db, writeId, user.id)

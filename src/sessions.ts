@@ -103,7 +103,7 @@ export function searchSessions(
          ORDER BY rank
          LIMIT ?`,
       )
-      .all(query, limit) as SessionHit[];
+      .all(query, limit) as unknown as SessionHit[];
     return rows;
   } catch {
     // Fallback LIKE
@@ -115,7 +115,7 @@ export function searchSessions(
          WHERE content LIKE ?
          ORDER BY created_at DESC LIMIT ?`,
       )
-      .all(`%${query}%`, limit) as SessionHit[];
+      .all(`%${query}%`, limit) as unknown as SessionHit[];
     return rows;
   }
 }

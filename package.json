@@ -31,7 +31,9 @@
     "node": ">=23.6"
   },
   "devDependencies": {
+    "@slack/bolt": "^5.0.0",
     "@types/node": "^24.13.3",
+    "discord.js": "^14.27.0",
     "typescript": "^5.9.3"
   }
 }

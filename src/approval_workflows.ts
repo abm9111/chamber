@@ -156,7 +156,7 @@ function loadEnabledWorkflows(db: DatabaseSync): WorkflowRow[] {
        WHERE enabled = 1
        ORDER BY priority ASC, name ASC`,
     )
-    .all() as WorkflowRow[];
+    .all() as unknown as WorkflowRow[];
 }
 
 /**

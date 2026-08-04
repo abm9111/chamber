@@ -146,7 +146,7 @@ export function listMemory(
          FROM memory_item WHERE layer = ? AND status = ?
          ORDER BY salience DESC, created_at DESC LIMIT ?`,
       )
-      .all(opts.layer, status, limit) as MemoryItem[];
+      .all(opts.layer, status, limit) as unknown as MemoryItem[];
   }
   return db
     .prepare(
@@ -155,7 +155,7 @@ export function listMemory(
        FROM memory_item WHERE status = ?
        ORDER BY layer, salience DESC LIMIT ?`,
     )
-    .all(status, limit) as MemoryItem[];
+    .all(status, limit) as unknown as MemoryItem[];
 }
 
 export function touchMemory(db: DatabaseSync, id: string): void {
@@ -424,5 +424,5 @@ export function listMemoryProposals(
       `SELECT id, kind, memory_id AS memoryId, rationale, status
        FROM memory_proposal WHERE status = ? ORDER BY created_at DESC LIMIT 50`,
     )
-    .all(status) as DreamProposal[];
+    .all(status) as unknown as DreamProposal[];
 }

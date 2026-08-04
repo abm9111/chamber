@@ -205,7 +205,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 
 // ─── mini test runner ────────────────────────────────────────────────────────
 
@@ -375,7 +375,18 @@ function test(
   }
 }
 
-function assert(cond: unknown, msg: string): asserts cond {
+/**
+ * The message is optional because 38 call sites in this file legitimately omit
+ * it — `assert(workspaceLock(db, "shared/plan", "agent_a"))` says what it
+ * checks. Requiring one made the signature disagree with the file's own usage,
+ * and JavaScript let every one of those calls through regardless, so the
+ * mismatch was invisible until the first typecheck.
+ *
+ * The default is deliberately blunt rather than clever: a bare `assert` that
+ * fails prints "assertion failed", which is a prompt to add a message to that
+ * line, not an explanation of what went wrong.
+ */
+function assert(cond: unknown, msg = "assertion failed"): asserts cond {
   if (!cond) throw new Error(msg);
 }
 
@@ -419,7 +430,14 @@ function seedPinnedDoc(
   };
 }
 
-function count(db: DatabaseSync, sql: string, ...params: unknown[]): number {
+/** The first ingested document id, asserted present rather than indexed blind. */
+function firstDocId(ids: readonly string[]): string {
+  const id = ids[0];
+  assert(id !== undefined, "expected at least one ingested document");
+  return id;
+}
+
+function count(db: DatabaseSync, sql: string, ...params: SQLInputValue[]): number {
   const row = db.prepare(sql).get(...params) as { c: number };
   return row?.c ?? 0;
 }
@@ -2410,7 +2428,7 @@ test(
     );
     const row = db
       .prepare(`SELECT body FROM vector_document WHERE id = ?`)
-      .get(second.documentIds[0]) as { body: string };
+      .get(firstDocId(second.documentIds)) as { body: string };
     // Passages are assembled from paragraphs, so a body arrives without the
     // file's incidental trailing newline. The claim under test is that the
     // *same id* now holds the *new content*, which is what this checks.
@@ -3595,7 +3613,7 @@ test(
     );
     const rowA = db
       .prepare(`SELECT body FROM vector_document WHERE id = ?`)
-      .get(a.documentIds[0]) as { body: string };
+      .get(firstDocId(a.documentIds)) as { body: string };
     // Trailing newline dropped by paragraph assembly — see the note on the
     // re-ingest test above. What matters here is *whose* body it is.
     assert(
@@ -3673,7 +3691,7 @@ test(
     assert(r.ingested === 1, `expected the note to be ingested, got ${r.ingested}`);
     const row = db
       .prepare(`SELECT body FROM vector_document WHERE id = ?`)
-      .get(r.documentIds[0]) as { body: string };
+      .get(firstDocId(r.documentIds)) as { body: string };
     assert(
       row.body.includes("this paragraph must survive"),
       `the stored body lost the opening paragraph: ${JSON.stringify(row.body)}`,
@@ -4671,6 +4689,7 @@ test("gates", "conflict_apply_while_pending", () => {
     payload: { body: "x" },
     origin: "foreground",
   });
+  assert(q.status !== "rejected_by_policy", `expected a queued write, got ${q.status}`);
   const m = markApplied(db, q.writeId);
   assert(!m.ok && m.code === "cannot_apply", JSON.stringify(m));
 });
@@ -8210,7 +8229,7 @@ test("cli", "a configured model.mode reaches the model layer", () => {
         model: { base: "http://127.0.0.1:8087/v1", mode: "openai" },
       }),
     );
-    const env = { ...process.env, CHAMBER_CONFIG: cfgFile };
+    const env: NodeJS.ProcessEnv = { ...process.env, CHAMBER_CONFIG: cfgFile };
     for (const k of CONFIG_ENV_KEYS) if (k !== "CHAMBER_CONFIG") delete env[k];
     const out = execFileSync(process.execPath, ["--experimental-strip-types", CLI_PATH, "config", "show"], {
       encoding: "utf8",
@@ -8230,7 +8249,7 @@ test("cli", "chamber init writes a config that does not silently stub", () => {
   // form of the bug this field exists to end.
   const dir = mkdtempSync(join(tmpdir(), "chamber-init-mode-"));
   try {
-    const env = { ...process.env, XDG_CONFIG_HOME: dir };
+    const env: NodeJS.ProcessEnv = { ...process.env, XDG_CONFIG_HOME: dir };
     for (const k of CONFIG_ENV_KEYS) if (k !== "XDG_CONFIG_HOME") delete env[k];
     execFileSync(process.execPath, ["--experimental-strip-types", CLI_PATH, "init"], { encoding: "utf8", env });
     const written = JSON.parse(
@@ -8852,17 +8871,20 @@ test("server", "an allowlisted origin gets that exact origin plus Vary", () => {
     { path: "/status", origin: "https://evil.example" },
   ]);
   const rows = probeRows(r.out);
+  const allowed = rows[0];
+  const other = rows[1];
+  assert(allowed !== undefined && other !== undefined, `expected two probe rows, got ${rows.length}`);
   assert(
-    rows[0].acao === "https://good.example",
-    `allowlisted origin must be echoed, got ${rows[0].acao}`,
+    allowed.acao === "https://good.example",
+    `allowlisted origin must be echoed, got ${allowed.acao}`,
   );
   assert(
-    (rows[0].vary ?? "").toLowerCase().includes("origin"),
-    `Vary: Origin is required once the value varies by request, got ${rows[0].vary}`,
+    (allowed.vary ?? "").toLowerCase().includes("origin"),
+    `Vary: Origin is required once the value varies by request, got ${allowed.vary}`,
   );
   assert(
-    rows[1].acao === null,
-    `a second, unlisted origin must still get nothing, got ${rows[1].acao}`,
+    other.acao === null,
+    `a second, unlisted origin must still get nothing, got ${other.acao}`,
   );
 });
 
@@ -9018,7 +9040,9 @@ test("secret_box", "a truncated blob is refused instead of yielding a short GCM 
 
     // And authentication still does its job on a full-length blob.
     const tampered = Buffer.from(body);
-    tampered[tampered.length - 1] ^= 1;
+    const last = tampered.length - 1;
+    assert(last >= 0, "sealed body must not be empty");
+    tampered[last] = (tampered[last] ?? 0) ^ 1;
     let authThrew = false;
     try {
       openSecret(`enc:v2:${tampered.toString("base64url")}`);

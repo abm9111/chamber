@@ -79,7 +79,11 @@ const support = db
   .prepare(
     `SELECT count(*) n FROM belief_source WHERE belief_id = ?`,
   )
-  .get(fabricated.beliefId ?? "") as { n: number };
+  // `CommitResult` carries `beliefId` only on its ok branch. `?? ""` read it
+  // off the union unnarrowed, which is `undefined` at runtime — so this probe
+  // silently queried for the empty string whenever the commit was rejected,
+  // which is the case it exists to check.
+  .get(fabricated.ok ? fabricated.beliefId : "") as { n: number };
 const beliefs = db
   .prepare("SELECT status, stakes FROM belief WHERE content LIKE 'Aspirin%'")
   .all();

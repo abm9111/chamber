@@ -100,7 +100,7 @@ export function listSkills(
                 status, source, version
          FROM skill_registry WHERE status = ? ORDER BY name`,
       )
-      .all(status) as SkillRecord[];
+      .all(status) as unknown as SkillRecord[];
   }
   return db
     .prepare(
@@ -108,7 +108,7 @@ export function listSkills(
               status, source, version
        FROM skill_registry ORDER BY status, name`,
     )
-    .all() as SkillRecord[];
+    .all() as unknown as SkillRecord[];
 }
 
 export function activateSkillRegistry(

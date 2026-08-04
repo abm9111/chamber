@@ -122,6 +122,13 @@ import {
   formatRefreshError,
 } from "../src/mcp_oauth.ts";
 import { sealSecret, openSecret } from "../src/secret_box.ts";
+// Aliased because the v1-compatibility test has to rebuild the *old* sealed
+// format by hand; nothing else in this file reaches for node:crypto.
+import {
+  createCipheriv as nodeCreateCipheriv,
+  createHash as nodeCreateHash,
+  randomBytes as nodeRandomBytes,
+} from "node:crypto";
 import {
   pinToolsList,
   verifyToolsAgainstPin,
@@ -4138,6 +4145,14 @@ test("parity", "P5_cron_expr_hourly", () => {
 });
 
 
+/**
+ * The OAuth token store refuses to write plaintext now, so the tests that
+ * exercise it configure a key -- which is what a real deployment does anyway.
+ * Before the fix these passed by falling through to a `plain:` write, which
+ * is precisely the behaviour that shipped tokens in the clear.
+ */
+const TEST_TOKEN_KEY = Buffer.alloc(32, 3).toString("base64");
+
 test("oauth", "O1_pkce_s256", () => {
   const p = generatePkce();
   assert(p.verifier.length >= 43, "verifier");
@@ -4174,6 +4189,7 @@ test("oauth", "O3_token_store_roundtrip", () => {
 
 
 test("oauth", "O4_refresh_mock_ok", () => {
+  process.env.CHAMBER_TOKEN_KEY = TEST_TOKEN_KEY;
   const db = freshDb();
   const res = normalizeResourceUrl("https://mcp.example.com/mcp");
   db.prepare(
@@ -4196,6 +4212,7 @@ test("oauth", "O4_refresh_mock_ok", () => {
     assert(next!.accessToken.startsWith("refreshed_"), next!.accessToken);
   } finally {
     delete process.env.CHAMBER_OAUTH_REFRESH_MOCK;
+    delete process.env.CHAMBER_TOKEN_KEY;
   }
 });
 
@@ -4221,10 +4238,12 @@ test("oauth", "O5_refresh_mock_fail_clears", () => {
     assert(!getStoredToken(db, res), "tokens cleared");
   } finally {
     delete process.env.CHAMBER_OAUTH_REFRESH_MOCK;
+    delete process.env.CHAMBER_TOKEN_KEY;
   }
 });
 
 test("oauth", "O6_ensure_refreshes_expiring", () => {
+  process.env.CHAMBER_TOKEN_KEY = TEST_TOKEN_KEY;
   const db = freshDb();
   const res = normalizeResourceUrl("https://mcp.example.com/mcp");
   db.prepare(
@@ -4245,6 +4264,7 @@ test("oauth", "O6_ensure_refreshes_expiring", () => {
     assert(!!tok && tok.startsWith("refreshed_"), String(tok));
   } finally {
     delete process.env.CHAMBER_OAUTH_REFRESH_MOCK;
+    delete process.env.CHAMBER_TOKEN_KEY;
   }
 });
 
@@ -4264,6 +4284,7 @@ test("oauth", "O7_refresh_network_keeps_token", () => {
     assert(!!getStoredToken(db, res), "token kept on transient");
   } finally {
     delete process.env.CHAMBER_OAUTH_REFRESH_MOCK;
+    delete process.env.CHAMBER_TOKEN_KEY;
   }
 });
 
@@ -4283,11 +4304,13 @@ test("oauth", "O8_refresh_invalid_grant_clears", () => {
     assert(formatRefreshError(r).includes("mcp-auth login"), formatRefreshError(r));
   } finally {
     delete process.env.CHAMBER_OAUTH_REFRESH_MOCK;
+    delete process.env.CHAMBER_TOKEN_KEY;
   }
 });
 
 
 test("oauth", "O9_retry_transient_then_ok", () => {
+  process.env.CHAMBER_TOKEN_KEY = TEST_TOKEN_KEY;
   const db = freshDb();
   const res = normalizeResourceUrl("https://mcp.example.com/mcp");
   db.prepare(
@@ -4326,6 +4349,7 @@ test("oauth", "O10_retry_permanent_no_extra", () => {
     assert(r.attempts === 1, "must not retry permanent: " + r.attempts);
   } finally {
     delete process.env.CHAMBER_OAUTH_REFRESH_MOCK;
+    delete process.env.CHAMBER_TOKEN_KEY;
     delete process.env.CHAMBER_OAUTH_RETRY_DELAY_MS;
   }
 });
@@ -4335,7 +4359,7 @@ test("oauth", "O11_seal_roundtrip", () => {
   process.env.CHAMBER_TOKEN_KEY = Buffer.alloc(32, 7).toString("base64");
   try {
     const s = sealSecret("super-secret-token");
-    assert(s.startsWith("enc:v1:"), s);
+    assert(s.startsWith("enc:v2:"), s);
     assert(openSecret(s) === "super-secret-token");
     const db = freshDb();
     const res = normalizeResourceUrl("https://mcp.example.com/mcp");
@@ -8880,6 +8904,149 @@ test("server", "a non-loopback bind with a token starts, and loopback stays free
     /cors=same-origin only/.test(local.stdout),
     `the banner must state the CORS posture, got:\n${local.stdout}`,
   );
+});
+
+/*
+ * src/secret_box.ts — OAuth tokens at rest.
+ *
+ * Three defects, all live before this block existed:
+ *
+ *  1. `sealSecret` stored plaintext unless *both* NODE_ENV=production and
+ *     CHAMBER_REQUIRE_TOKEN_KEY=1. deploy/Dockerfile set only the first and no
+ *     shipped artifact set the second, so both supported deployments wrote
+ *     access and refresh tokens in the clear, prefixed `plain:`.
+ *  2. No length was checked before slicing. `Buffer.subarray` clamps rather
+ *     than throwing, so a truncated row produced a *short* GCM tag, which Node
+ *     accepts (4, 8, 12-16 bytes are all legal). Weakening the forgery bound is
+ *     within reach of anyone who can truncate stored ciphertext. semgrep:
+ *     javascript.node-crypto.security.gcm-no-tag-length.
+ *  3. A passphrase became a key through one unsalted SHA-256 — one hash per
+ *     guess, and a rainbow table shared with every other user of that phrase.
+ *
+ * The fix for (3) had to be versioned rather than applied in place: changing
+ * the derivation would have made every stored token undecryptable. So the
+ * first test here is the compatibility one.
+ */
+
+test("secret_box", "a v1 blob still opens after the v2 derivation landed", () => {
+  // If this fails, the fix orphaned every OAuth token any deployment had
+  // already stored. Reproduces the old sealSecret exactly: iv|tag|ct, with the
+  // old key rule.
+  const oldSeal = (plaintext: string, rawKeyVal: string): string => {
+    let key: Buffer;
+    if (/^[0-9a-fA-F]{64}$/.test(rawKeyVal)) key = Buffer.from(rawKeyVal, "hex");
+    else {
+      const b = Buffer.from(rawKeyVal, "base64");
+      key = b.length === 32 ? b : nodeCreateHash("sha256").update(rawKeyVal).digest();
+    }
+    const iv = nodeRandomBytes(12);
+    const c = nodeCreateCipheriv("aes-256-gcm", key, iv);
+    const ct = Buffer.concat([c.update(plaintext, "utf8"), c.final()]);
+    return `enc:v1:${Buffer.concat([iv, c.getAuthTag(), ct]).toString("base64url")}`;
+  };
+  const prev = process.env.CHAMBER_TOKEN_KEY;
+  try {
+    for (const k of [
+      Buffer.alloc(32, 7).toString("base64"), // 32 raw bytes
+      "ab".repeat(32), // 64 hex chars
+      "a weak passphrase", // the sha256 path
+    ]) {
+      process.env.CHAMBER_TOKEN_KEY = k;
+      assert(
+        openSecret(oldSeal("legacy-refresh-token", k)) === "legacy-refresh-token",
+        `a v1 blob under key form ${JSON.stringify(k.slice(0, 12))} no longer opens`,
+      );
+    }
+    assert(openSecret("plain:abc") === "abc", "plain: rows must still open");
+    assert(openSecret("raw-legacy") === "raw-legacy", "bare legacy rows must still open");
+  } finally {
+    if (prev === undefined) delete process.env.CHAMBER_TOKEN_KEY;
+    else process.env.CHAMBER_TOKEN_KEY = prev;
+  }
+});
+
+test("secret_box", "no key means refusal, not a silent plaintext write", () => {
+  const prevKey = process.env.CHAMBER_TOKEN_KEY;
+  const prevAllow = process.env.CHAMBER_ALLOW_PLAINTEXT_SECRETS;
+  try {
+    delete process.env.CHAMBER_TOKEN_KEY;
+    delete process.env.CHAMBER_ALLOW_PLAINTEXT_SECRETS;
+    let threw = "";
+    try {
+      sealSecret("an-access-token");
+    } catch (e) {
+      threw = e instanceof Error ? e.message : String(e);
+    }
+    assert(threw !== "", "sealing with no key must throw, not return plain:");
+    assert(
+      threw.includes("CHAMBER_TOKEN_KEY"),
+      `the refusal must name the variable that fixes it, got: ${threw}`,
+    );
+    // The escape hatch stays reachable, but it is now the branch that needs a
+    // flag rather than the one you land in by doing nothing.
+    process.env.CHAMBER_ALLOW_PLAINTEXT_SECRETS = "1";
+    assert(
+      sealSecret("an-access-token").startsWith("plain:"),
+      "the documented opt-in must still work for local use",
+    );
+  } finally {
+    if (prevKey === undefined) delete process.env.CHAMBER_TOKEN_KEY;
+    else process.env.CHAMBER_TOKEN_KEY = prevKey;
+    if (prevAllow === undefined) delete process.env.CHAMBER_ALLOW_PLAINTEXT_SECRETS;
+    else process.env.CHAMBER_ALLOW_PLAINTEXT_SECRETS = prevAllow;
+  }
+});
+
+test("secret_box", "a truncated blob is refused instead of yielding a short GCM tag", () => {
+  const prev = process.env.CHAMBER_TOKEN_KEY;
+  try {
+    process.env.CHAMBER_TOKEN_KEY = Buffer.alloc(32, 7).toString("base64");
+    const sealed = sealSecret("super-secret-token");
+    assert(sealed.startsWith("enc:v2:"), `new seals must be v2, got ${sealed.slice(0, 8)}`);
+    assert(openSecret(sealed) === "super-secret-token", "v2 must round-trip");
+
+    const body = Buffer.from(sealed.slice("enc:v2:".length), "base64url");
+    // 20 bytes is past the salt but short of a full IV+tag: the exact shape
+    // that used to produce a clamped, undersized tag.
+    let threw = "";
+    try {
+      openSecret(`enc:v2:${body.subarray(0, 20).toString("base64url")}`);
+    } catch (e) {
+      threw = e instanceof Error ? e.message : String(e);
+    }
+    assert(/truncated/.test(threw), `a short blob must be refused by length, got: ${threw}`);
+
+    // And authentication still does its job on a full-length blob.
+    const tampered = Buffer.from(body);
+    tampered[tampered.length - 1] ^= 1;
+    let authThrew = false;
+    try {
+      openSecret(`enc:v2:${tampered.toString("base64url")}`);
+    } catch {
+      authThrew = true;
+    }
+    assert(authThrew, "a flipped ciphertext bit must fail authentication");
+  } finally {
+    if (prev === undefined) delete process.env.CHAMBER_TOKEN_KEY;
+    else process.env.CHAMBER_TOKEN_KEY = prev;
+  }
+});
+
+test("secret_box", "a passphrase is salted, so two seals of one secret differ", () => {
+  const prev = process.env.CHAMBER_TOKEN_KEY;
+  try {
+    process.env.CHAMBER_TOKEN_KEY = "a weak passphrase";
+    const a = sealSecret("x");
+    const b = sealSecret("x");
+    assert(a !== b, "a per-blob salt must make identical plaintexts seal differently");
+    assert(
+      openSecret(a) === "x" && openSecret(b) === "x",
+      "both salted blobs must still open",
+    );
+  } finally {
+    if (prev === undefined) delete process.env.CHAMBER_TOKEN_KEY;
+    else process.env.CHAMBER_TOKEN_KEY = prev;
+  }
 });
 
 const passed = results.filter((r) => r.ok).length;

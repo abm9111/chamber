@@ -6864,6 +6864,12 @@ const CONFIG_ENV_KEYS = [
   "CHAMBER_DB",
   "CHAMBER_API_BASE",
   "CHAMBER_API_MODEL",
+  // CHAMBER_MODEL decides whether Chamber talks to a server at all, and
+  // CHAMBER_API_KEY decides whether openai mode is reachable. Left uncleared,
+  // either one exported in the developer's shell would silently change what
+  // these tests prove.
+  "CHAMBER_MODEL",
+  "CHAMBER_API_KEY",
   "XDG_CONFIG_HOME",
 ] as const;
 
@@ -7018,10 +7024,14 @@ test("config", "the resolved config exposes exactly the three known fields", () 
       keys === "database,ingest,model",
       `resolved config must expose exactly database,ingest,model — got: ${keys}`,
     );
+    // The point of this guard is that nothing key-shaped can appear here, so
+    // it enumerates rather than allows. `mode` was added deliberately; a field
+    // arriving without a corresponding edit to this line is the failure it is
+    // meant to catch.
     const modelKeys = Object.keys(cfg.model as object).sort().join(",");
     assert(
-      modelKeys === "base,name",
-      `model must expose exactly base,name — got: ${modelKeys}`,
+      modelKeys === "base,mode,name",
+      `model must expose exactly base,mode,name — got: ${modelKeys}`,
     );
     assert(
       cfg.database === "/tmp/keychain-backup.sqlite",
@@ -8040,6 +8050,183 @@ test("config", "a relative database in the config is resolved to an absolute pat
       "the in-memory sentinel must pass through unresolved",
     );
   });
+});
+
+/*
+ * model.mode — the switch that decides whether Chamber talks to a model.
+ *
+ * Found on a real vault: a config carrying model.base and model.name answered
+ * two questions with canned stub text at $0.000 while the server named by
+ * model.base was up and responding. src/model.ts defaults CHAMBER_MODEL to
+ * "stub" and nothing in the config could reach that default, so the two
+ * settings the operator had set were never used. That failure is silent by
+ * construction — stub answers look like answers.
+ */
+
+test("config", "model.mode is read from the config file", () => {
+  withConfig(`{"model":{"base":"http://127.0.0.1:8087/v1","mode":"openai"}}`, () => {
+    assert(
+      loadConfig().model.mode === "openai",
+      "a configured model.mode must survive loadConfig",
+    );
+  });
+});
+
+test("config", "CHAMBER_MODEL outranks a configured model.mode", () => {
+  withConfig(`{"model":{"mode":"openai"}}`, () => {
+    process.env.CHAMBER_MODEL = "stub";
+    assert(
+      loadConfig().model.mode === "stub",
+      "env must outrank the file, as it does for every other setting",
+    );
+    const row = explainConfig().find((r) => r.key === "model.mode");
+    assert(row?.source === "env", `expected source env, got ${row?.source}`);
+    assert(
+      row?.conflict === "openai",
+      `the losing value must be named, got ${JSON.stringify(row?.conflict)}`,
+    );
+  });
+});
+
+test("config", "config show always reports the live model mode", () => {
+  // Reported even when nothing set it, because the default is the surprising
+  // value. A base and a model name on the lines above read as evidence they
+  // are in use; this is the only line that says whether they are.
+  withConfig(`{"model":{"base":"http://127.0.0.1:8087/v1"}}`, () => {
+    const row = explainConfig().find((r) => r.key === "model.mode");
+    assert(row !== undefined, "model.mode must appear even when unset");
+    assert(row.value === "stub", `default must be stub, got ${row.value}`);
+    assert(row.source === "default", `expected source default, got ${row.source}`);
+  });
+});
+
+test("config", "an unrecognised model.mode is refused, not defaulted", () => {
+  // Falling back to the default here would be the original bug wearing a
+  // typo: "openal" would resolve to stub and answer from canned strings.
+  let threw = "";
+  withConfig(`{"model":{"mode":"openal"}}`, () => {
+    try {
+      loadConfig();
+    } catch (err) {
+      threw = err instanceof Error ? err.message : String(err);
+    }
+  });
+  assert(threw !== "", "a bad model.mode must throw");
+  assert(threw.includes("openal"), `the message must name the value: ${threw}`);
+  assert(
+    threw.includes("stub") && threw.includes("openai"),
+    `the message must name the valid modes: ${threw}`,
+  );
+});
+
+test("config", "model.mode must be a non-empty string like every other model key", () => {
+  for (const bad of [`{"model":{"mode":123}}`, `{"model":{"mode":"  "}}`]) {
+    let threw = "";
+    withConfig(bad, () => {
+      try {
+        loadConfig();
+      } catch (err) {
+        threw = err instanceof Error ? err.message : String(err);
+      }
+    });
+    assert(threw.includes("model.mode"), `${bad} must be refused, got ${threw}`);
+  }
+});
+
+test("config", "the config file still cannot supply an API key", () => {
+  // The waiver below relaxes when a key is *required*, never where one may be
+  // read from. model.mode must not become a second door into the same room.
+  let threw = "";
+  withConfig(`{"model":{"mode":"openai","key":"sk-secret"}}`, () => {
+    try {
+      loadConfig();
+    } catch (err) {
+      threw = err instanceof Error ? err.message : String(err);
+    }
+  });
+  assert(
+    threw.includes("unknown model key") && threw.includes("key"),
+    `an api key in the config must be refused outright, got ${threw}`,
+  );
+});
+
+test("model", "openai mode needs no API key for a loopback base", () => {
+  // Local servers accept any bearer or none. Demanding a key made the
+  // documented "works with no CHAMBER_* variables set" impossible and taught
+  // operators to export a dummy value -- an export that is still live when the
+  // base is later pointed at a remote host.
+  for (const base of [
+    "http://127.0.0.1:8087/v1",
+    "http://localhost:8087/v1",
+    "http://[::1]:8087/v1",
+  ]) {
+    assert(isLoopbackBase(base), `${base} must count as loopback`);
+  }
+  assert(
+    !isLoopbackBase("https://api.openai.com/v1"),
+    "a remote base must still require a key",
+  );
+  assert(
+    !isLoopbackBase("http://127.0.0.1.evil.com/v1"),
+    "a lookalike host must not be waived",
+  );
+});
+
+test("cli", "a configured model.mode reaches the model layer", () => {
+  // The end-to-end claim: with no CHAMBER_* variable set, a config naming a
+  // mode must make `chamber ask` use it. Asserted through `config show`, which
+  // reads the same resolver the CLI seeds the environment from.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-mode-"));
+  try {
+    const cfgFile = join(dir, "config.json");
+    writeFileSync(
+      cfgFile,
+      JSON.stringify({
+        database: join(dir, "db.sqlite"),
+        model: { base: "http://127.0.0.1:8087/v1", mode: "openai" },
+      }),
+    );
+    const env = { ...process.env, CHAMBER_CONFIG: cfgFile };
+    for (const k of CONFIG_ENV_KEYS) if (k !== "CHAMBER_CONFIG") delete env[k];
+    const out = execFileSync(process.execPath, ["--experimental-strip-types", CLI_PATH, "config", "show"], {
+      encoding: "utf8",
+      env,
+    });
+    assert(
+      /model\.mode\s*=\s*openai/.test(out),
+      `config show must report the configured mode, got:\n${out}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cli", "chamber init writes a config that does not silently stub", () => {
+  // A starter naming a base but inheriting the stub default is the shipped
+  // form of the bug this field exists to end.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-init-mode-"));
+  try {
+    const env = { ...process.env, XDG_CONFIG_HOME: dir };
+    for (const k of CONFIG_ENV_KEYS) if (k !== "XDG_CONFIG_HOME") delete env[k];
+    execFileSync(process.execPath, ["--experimental-strip-types", CLI_PATH, "init"], { encoding: "utf8", env });
+    const written = JSON.parse(
+      readFileSync(join(dir, "chamber", "config.json"), "utf8"),
+    ) as { model?: { mode?: string; base?: string } };
+    assert(
+      written.model?.mode === "openai",
+      `init must write an explicit mode, got ${JSON.stringify(written.model)}`,
+    );
+    assert(
+      written.model?.base !== undefined,
+      "init must still write a base for that mode to name",
+    );
+    assert(
+      !JSON.stringify(written).toLowerCase().includes("key"),
+      "init must never write anything key-shaped",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("cli", "the same relative database names one file regardless of cwd", () => {

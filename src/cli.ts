@@ -688,18 +688,28 @@ function cmdInit(rest: string[]): void {
     return;
   }
   mkdirSync(dirname(target), { recursive: true });
+  // `mode` is written as `openai` because the starter also writes a base. The
+  // alternative — omitting it and inheriting the `stub` default — is what made
+  // a fully configured Chamber answer from canned strings while reporting a
+  // live base and model name. A starter that names a server nobody is running
+  // yet fails with a connection error on the first `ask`, which is loud,
+  // specific and fixable; silent stub answers are none of those.
   const starter: ChamberConfig = {
     database: join(homedir(), ".local", "share", "chamber", "chamber.sqlite"),
-    model: { base: "http://127.0.0.1:8087/v1" },
+    model: { base: "http://127.0.0.1:8087/v1", mode: "openai" },
     ingest: [],
   };
   writeFileSync(target, `${JSON.stringify(starter, null, 2)}\n`);
   console.log(`wrote ${target}`);
   console.log("  set model.name, then add ingest roots with their excludes");
   console.log("  API keys are read from CHAMBER_API_KEY, never from this file");
+  console.log("  a loopback model.base needs no key; a remote one requires it");
   console.log(
     "  model.base here must stay on this machine; for a remote one, " +
       "export CHAMBER_API_BASE",
+  );
+  console.log(
+    '  model.mode is "openai" (talks to model.base) or "stub" (canned replies)',
   );
   console.log("  run `chamber config show` to see what is in effect");
 }
@@ -793,14 +803,18 @@ Usage:
       that date.
   chamber expiry                   Run belief expiry job
 
-Env:
-  CHAMBER_MODEL=stub|openai        default stub
-  CHAMBER_API_KEY / CHAMBER_API_BASE / CHAMBER_API_MODEL
+Env (each overrides the matching config file setting):
+  CHAMBER_MODEL=stub|openai        default stub -- stub answers from canned
+      strings and never contacts a server, so set model.mode in the config
+      (or this) before trusting an answer. chamber config show prints which
+      mode is live.
+  CHAMBER_API_BASE / CHAMBER_API_MODEL    config: model.base / model.name
+  CHAMBER_API_KEY                  required only for a non-loopback base;
+      read from the environment alone, never from the config file
   CHAMBER_STRICT_CONTRACT=1        refuse unsourced assertions
-
-Env:
-  CHAMBER_DB       sqlite path
-  CHAMBER_SESSION  session id (default: cli)
+  CHAMBER_DB                       sqlite path -- config: database
+  CHAMBER_CONFIG                   config file path
+  CHAMBER_SESSION                  session id (default: cli)
 
 Examples:
   chamber turn "remember I prefer short answers"
@@ -863,6 +877,9 @@ async function main(): Promise<void> {
   }
   if (!process.env.CHAMBER_API_MODEL && loadedConfig.model.name) {
     process.env.CHAMBER_API_MODEL = loadedConfig.model.name;
+  }
+  if (!process.env.CHAMBER_MODEL && loadedConfig.model.mode) {
+    process.env.CHAMBER_MODEL = loadedConfig.model.mode;
   }
 
   const db = open();

@@ -6,9 +6,20 @@
  *   CHAMBER_MODEL=openai   OpenAI-compatible Chat Completions
  *     CHAMBER_API_KEY, CHAMBER_API_BASE (default https://api.openai.com/v1)
  *     CHAMBER_API_MODEL (default gpt-4o-mini)
+ *
+ * All three, and the mode itself, may also come from `model.mode`/`base`/`name`
+ * in the config file; src/cli.ts seeds them into the environment only where
+ * unset, so env still outranks config. CHAMBER_API_KEY is the exception and is
+ * read from the environment alone — see src/config.ts.
+ *
+ * The default is `stub`, and that default is load-bearing in the wrong
+ * direction: it answers every question with a fixed string. Anything that
+ * reports Chamber's configuration must say which mode is live, or a base and
+ * model name will be read as evidence they are being used.
  */
 
 import type { DatabaseSync } from "node:sqlite";
+import { isLoopbackBase } from "./config.ts";
 import { recordSpend, type SpendChannel } from "./spend.ts";
 
 export interface ChatMessage {
@@ -81,19 +92,35 @@ function stubComplete(input: CompleteInput): Omit<CompleteResult, "spendId"> {
 async function openaiComplete(
   input: CompleteInput,
 ): Promise<Omit<CompleteResult, "spendId">> {
-  const key = process.env.CHAMBER_API_KEY;
-  if (!key) {
-    throw new Error("CHAMBER_MODEL=openai requires CHAMBER_API_KEY");
-  }
   const base = (process.env.CHAMBER_API_BASE ?? "https://api.openai.com/v1").replace(
     /\/$/,
     "",
   );
+  // A key is required for anything off this machine, and optional for a
+  // loopback server — llama.cpp, LM Studio and Ollama accept any bearer or
+  // none, so demanding one made the documented "works with no CHAMBER_*
+  // variables set" impossible and taught operators to export a dummy value.
+  // A habit of exporting a fake CHAMBER_API_KEY is worth removing: the same
+  // export is live when the base is later pointed at a remote host.
+  //
+  // The waiver keys off the base actually being used, not off config, so an
+  // env-supplied remote base still demands a key even when the file's base was
+  // loopback. `isLoopbackBase` is the same predicate that restricts a
+  // file-sourced base, so the two cannot drift apart.
+  const local = isLoopbackBase(base);
+  const key = process.env.CHAMBER_API_KEY;
+  if (!key && !local) {
+    throw new Error(
+      `CHAMBER_MODEL=openai requires CHAMBER_API_KEY for a non-loopback base (${base})`,
+    );
+  }
   const model = process.env.CHAMBER_API_MODEL ?? "gpt-4o-mini";
+  // Omitted entirely rather than sent as "Bearer undefined", which some local
+  // servers reject outright and others log as a credential.
   const res = await fetch(`${base}/chat/completions`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${key}`,
+      ...(key ? { Authorization: `Bearer ${key}` } : {}),
       "Content-Type": "application/json",
     },
     body: JSON.stringify({

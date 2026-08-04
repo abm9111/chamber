@@ -20,9 +20,13 @@ export interface IngestRootConfig {
   exclude: string[];
 }
 
+export type ModelMode = "stub" | "openai";
+
+export const MODEL_MODES: readonly ModelMode[] = ["stub", "openai"];
+
 export interface ChamberConfig {
   database: string;
-  model: { base?: string; name?: string };
+  model: { base?: string; name?: string; mode?: ModelMode };
   ingest: IngestRootConfig[];
 }
 
@@ -35,7 +39,7 @@ export interface ResolvedSetting {
 }
 
 const KNOWN_TOP_LEVEL = new Set(["database", "model", "ingest"]);
-const KNOWN_MODEL_KEYS = new Set(["base", "name"]);
+const KNOWN_MODEL_KEYS = new Set(["base", "name", "mode"]);
 const KNOWN_INGEST_KEYS = new Set(["root", "exclude"]);
 
 function defaultDatabase(): string {
@@ -342,7 +346,10 @@ function parseDatabase(raw: unknown, path: string): string | undefined {
   return raw;
 }
 
-function parseModel(raw: unknown, path: string): { base?: string; name?: string } {
+function parseModel(
+  raw: unknown,
+  path: string,
+): { base?: string; name?: string; mode?: ModelMode } {
   if (raw === undefined) return {};
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error(`config ${path}: "model" must be an object`);
@@ -354,10 +361,11 @@ function parseModel(raw: unknown, path: string): { base?: string; name?: string 
       );
     }
   }
-  const m = raw as { base?: unknown; name?: unknown };
+  const m = raw as { base?: unknown; name?: unknown; mode?: unknown };
   for (const [key, value] of [
     ["base", m.base],
     ["name", m.name],
+    ["mode", m.mode],
   ] as const) {
     if (value === undefined) continue;
     if (typeof value !== "string") {
@@ -367,7 +375,22 @@ function parseModel(raw: unknown, path: string): { base?: string; name?: string 
       throw new Error(`config ${path}: "model.${key}" must not be empty`);
     }
   }
-  return { base: m.base as string | undefined, name: m.name as string | undefined };
+  // An unrecognised mode is refused rather than folded into the default. The
+  // default is `stub`, which answers every question with canned text, so a
+  // typo'd "openal" that silently fell back would leave Chamber returning
+  // fixed strings while `config show` reported a model and a base — which is
+  // exactly the failure this field exists to end.
+  if (m.mode !== undefined && !MODEL_MODES.includes(m.mode as ModelMode)) {
+    throw new Error(
+      `config ${path}: "model.mode" must be one of ${MODEL_MODES.join(", ")} ` +
+        `(got ${JSON.stringify(m.mode)})`,
+    );
+  }
+  return {
+    base: m.base as string | undefined,
+    name: m.name as string | undefined,
+    mode: m.mode as ModelMode | undefined,
+  };
 }
 
 /**
@@ -445,7 +468,7 @@ function assertFileBaseIsLocal(base: string, path: string): void {
 
 interface ParsedFile {
   database?: string;
-  model: { base?: string; name?: string };
+  model: { base?: string; name?: string; mode?: ModelMode };
   ingest: IngestRootConfig[];
 }
 
@@ -490,9 +513,17 @@ export function loadConfig(opts: { path?: string } = {}): ChamberConfig {
   if (envBase === undefined && file.model.base !== undefined) {
     assertFileBaseIsLocal(file.model.base, path);
   }
+  // `mode` is the switch that decides whether Chamber talks to a model at all.
+  // Without it, `model.base` and `model.name` were settings the file could
+  // hold but nothing could act on: src/model.ts defaults CHAMBER_MODEL to
+  // `stub`, so a fully configured Chamber answered every question with canned
+  // text while `config show` reported a live base and model name. Observed on
+  // a real vault — two questions returned fixed strings at $0.000 against a
+  // model that was up and responding the whole time.
   const model = {
     base: envBase ?? file.model.base,
     name: envSetting("CHAMBER_API_MODEL") ?? file.model.name,
+    mode: (envSetting("CHAMBER_MODEL") as ModelMode | undefined) ?? file.model.mode,
   };
 
   return { database, model, ingest: file.ingest };
@@ -551,6 +582,19 @@ export function explainConfig(): ResolvedSetting[] {
     undefined,
   );
   if (name) out.push(name);
+
+  // Always reported, including when it falls back to the default, because the
+  // default is the surprising value: `stub` answers from canned strings and
+  // never contacts the base printed on the line above it. An operator reading
+  // a base and a model name has every reason to assume they are in use, and
+  // this is the only line that says whether they are.
+  const mode = resolveOne(
+    "model.mode",
+    envSetting("CHAMBER_MODEL"),
+    file.model.mode,
+    "stub",
+  );
+  if (mode) out.push(mode);
 
   // Ingest roots and their excludes are the privacy boundary that keeps
   // `chamber ingest` out of restricted folders — the setting an operator

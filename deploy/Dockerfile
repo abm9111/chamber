@@ -1,5 +1,5 @@
 # Minimal Chamber runtime image
-FROM node:22-bookworm-slim
+FROM node:24-bookworm-slim
 
 WORKDIR /app
 
@@ -11,6 +11,11 @@ COPY scripts ./scripts
 COPY fixtures ./fixtures
 
 ENV NODE_ENV=production
+# 0.0.0.0 is required to be reachable from other containers, and src/server.ts
+# refuses to start on a non-loopback bind without CHAMBER_API_TOKEN. That is
+# deliberate: this image previously shipped an unauthenticated port on every
+# interface. docker-compose.yml already supplies the token via
+# ${CHAMBER_API_TOKEN:?}; a bare `docker run` must supply one too.
 ENV CHAMBER_BIND=0.0.0.0
 ENV PORT=8787
 ENV CHAMBER_DB=/data/chamber.sqlite

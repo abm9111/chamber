@@ -54,6 +54,67 @@ const PORT = Number(process.env.PORT ?? process.env.CHAMBER_PORT ?? 8787);
 const API_TOKEN = process.env.CHAMBER_API_TOKEN?.trim() || "";
 /** Bind host: default loopback; compose may use 0.0.0.0 on internal network only. */
 const BIND = process.env.CHAMBER_BIND ?? "127.0.0.1";
+
+/**
+ * Origins allowed to read a response, as an explicit allowlist. Empty by
+ * default, which sends no CORS header at all.
+ *
+ * This used to be a flat `Access-Control-Allow-Origin: *` on every response,
+ * including the ones above the auth check. Proven with curl against a running
+ * server: `OPTIONS /approve` from `https://evil.example` returned 204 with
+ * `ACAO: *`, and `GET /status` returned 200 with the same — so any page the
+ * operator happened to be browsing could drive a loopback Chamber and read
+ * what came back. `POST /turn` completed unauthenticated and committed a
+ * belief.
+ *
+ * A wildcard is not a CORS configuration, it is the absence of one. Same-origin
+ * is the only default that is right without knowing the deployment.
+ */
+const CORS_ORIGINS = new Set(
+  (process.env.CHAMBER_CORS_ORIGIN ?? "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter((o) => o !== ""),
+);
+
+/**
+ * CORS headers for one request, or none.
+ *
+ * Echoes the request's own Origin rather than the allowlist entry, because a
+ * response may name exactly one origin and echoing is what makes an allowlist
+ * of more than one work. `Vary: Origin` is not optional once the value depends
+ * on the request: without it a shared cache can hand one origin's response to
+ * another, which turns a correct allowlist back into a wildcard.
+ */
+function corsHeaders(req: IncomingMessage): Record<string, string> {
+  const origin = req.headers.origin;
+  if (typeof origin !== "string" || !CORS_ORIGINS.has(origin)) return {};
+  return {
+    "Access-Control-Allow-Origin": origin,
+    Vary: "Origin",
+  };
+}
+
+/**
+ * Refuse to serve an unauthenticated port to a network.
+ *
+ * Loopback with no token stays allowed — that is `npm run serve` on a laptop,
+ * and demanding a token there would only teach people to export a fixed one.
+ * Binding somewhere reachable without a token is a different act, and the
+ * shipped Dockerfile set `CHAMBER_BIND=0.0.0.0` while requiring no token, so
+ * the image's own defaults produced exactly that. Fail closed at startup,
+ * where it is one line to fix, rather than at the first unauthenticated
+ * request, where nobody is watching.
+ */
+function assertBindIsSafe(): void {
+  const loopback = BIND === "127.0.0.1" || BIND === "::1" || BIND === "localhost";
+  if (loopback || API_TOKEN) return;
+  throw new Error(
+    `refusing to bind ${BIND} without CHAMBER_API_TOKEN: every route except ` +
+      `GET /health would be open to anyone who can reach this port. ` +
+      `Set CHAMBER_API_TOKEN, or bind 127.0.0.1.`,
+  );
+}
 /**
  * The database this process actually opened.
  *
@@ -171,11 +232,15 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   return JSON.parse(raw) as Record<string, unknown>;
 }
 
+// CORS is applied once per request with `res.setHeader` in the handler below,
+// not named here. Node carries setHeader values through `writeHead` for keys
+// the call does not itself specify, so every response — including the 401 and
+// the error paths — gets the same treatment without threading `req` through
+// each of the twenty-odd call sites and relying on nobody forgetting one.
 function json(res: ServerResponse, status: number, body: unknown): void {
   const data = JSON.stringify(body, null, 2);
   res.writeHead(status, {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
   });
   res.end(data);
 }
@@ -316,12 +381,26 @@ const server = createServer(async (req, res) => {
     const path = url.pathname;
     const method = req.method ?? "GET";
 
+    // Applied before anything branches, so the 401, the 404 and the 500 all
+    // carry the same policy as a 200. An allowlist that covers only the happy
+    // path is not an allowlist.
+    const cors = corsHeaders(req);
+    for (const [k, v] of Object.entries(cors)) res.setHeader(k, v);
+
     if (method === "OPTIONS") {
+      // No allowlist match means no CORS headers, so the preflight fails and
+      // the browser never sends the real request. Previously this answered
+      // every origin with a wildcard, which is what made POST /approve
+      // reachable from any page.
       res.writeHead(204, {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers":
-          "Content-Type, Authorization, X-Chamber-Token",
+        ...cors,
+        ...(Object.keys(cors).length > 0
+          ? {
+              "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+              "Access-Control-Allow-Headers":
+                "Content-Type, Authorization, X-Chamber-Token",
+            }
+          : {}),
       });
       res.end();
       return;
@@ -467,6 +546,7 @@ const server = createServer(async (req, res) => {
 
 function listenServer(): void {
   const listenFds = Number(process.env.LISTEN_FDS ?? 0);
+  assertBindIsSafe();
   const listenPid = Number(process.env.LISTEN_PID ?? 0);
   // systemd socket activation: FDs start at 3 (SD_LISTEN_FDS_START)
   if (listenFds > 0 && listenPid === process.pid) {
@@ -474,7 +554,8 @@ function listenServer(): void {
       console.log(`Chamber HTTP  (socket activation fd=3, LISTEN_FDS=${listenFds})`);
       console.log(`db=${dbPath}`);
       console.log(
-        `auth=${API_TOKEN ? "token-required" : "open (set CHAMBER_API_TOKEN)"}`,
+        `auth=${API_TOKEN ? "token-required" : "open (set CHAMBER_API_TOKEN)"}` +
+          `  cors=${CORS_ORIGINS.size > 0 ? [...CORS_ORIGINS].join(",") : "same-origin only"}`,
       );
     });
     return;
@@ -483,7 +564,8 @@ function listenServer(): void {
     console.log(`Chamber HTTP  http://${BIND}:${PORT}`);
     console.log(`db=${dbPath}`);
     console.log(
-      `auth=${API_TOKEN ? "token-required" : "open (set CHAMBER_API_TOKEN)"}`,
+      `auth=${API_TOKEN ? "token-required" : "open (set CHAMBER_API_TOKEN)"}` +
+        `  cors=${CORS_ORIGINS.size > 0 ? [...CORS_ORIGINS].join(",") : "same-origin only"}`,
     );
   });
 }

@@ -41,3 +41,6 @@ logs/
 probes/seatbelt/work/inside.txt
 probes/seatbelt/work/*.txt
 .superpowers/
+
+# vigil run records (local, content-free; see engines/telemetry.md)
+.vigil/

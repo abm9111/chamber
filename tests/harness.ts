@@ -8743,6 +8743,145 @@ if (missing !== 0) {
   process.exitCode = 1;
 }
 
+/*
+ * The network posture of src/server.ts.
+ *
+ * Both of these were live and proven with curl against a running server on
+ * 2026-08-05, before the fix:
+ *
+ *   OPTIONS /approve, Origin: https://evil.example  -> 204, ACAO: *
+ *   GET     /status,  Origin: https://evil.example  -> 200, ACAO: *
+ *   POST    /turn,    no credentials                -> 200, committed a belief
+ *
+ * `Access-Control-Allow-Origin: *` sat on every response including the ones
+ * above the auth check, and auth defaulted to open, so any page the operator
+ * was browsing could drive a loopback Chamber and read the result. /approve is
+ * the human gate on consequential writes, which makes it the worst possible
+ * route to leave reachable.
+ *
+ * A fix with no test is a fix until someone simplifies it back.
+ */
+
+/** Start the server on a fixed port, curl it from inside, print one JSON line. */
+function serverProbe(
+  overrides: Record<string, string>,
+  port: number,
+  reqs: { path: string; method?: string; origin?: string }[],
+): { status: number | null; out: string; err: string } {
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of CONFIG_ENV_KEYS) delete env[key];
+  const script =
+    `await import(${JSON.stringify(SERVER_PATH)});` +
+    `await new Promise(r => setTimeout(r, 500));` +
+    `const out = [];` +
+    `for (const q of ${JSON.stringify(reqs)}) {` +
+    `  const h = q.origin ? { Origin: q.origin } : {};` +
+    `  const r = await fetch("http://127.0.0.1:${port}" + q.path, { method: q.method ?? "GET", headers: h });` +
+    `  out.push({ path: q.path, status: r.status, acao: r.headers.get("access-control-allow-origin"), vary: r.headers.get("vary") });` +
+    `}` +
+    `console.log("PROBE " + JSON.stringify(out));` +
+    `process.exit(0);`;
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", "--input-type=module", "-e", script],
+    {
+      encoding: "utf8",
+      timeout: 25_000,
+      env: {
+        ...env,
+        PORT: String(port),
+        CHAMBER_BIND: "127.0.0.1",
+        CHAMBER_DB: ":memory:",
+        ...overrides,
+      },
+    },
+  );
+  return { status: r.status, out: r.stdout ?? "", err: r.stderr ?? "" };
+}
+
+function probeRows(out: string): { path: string; status: number; acao: string | null; vary: string | null }[] {
+  const line = out.split("\n").find((l) => l.startsWith("PROBE "));
+  assert(line !== undefined, `no PROBE line in server output:\n${out}`);
+  return JSON.parse(line.slice("PROBE ".length)) as never;
+}
+
+test("server", "an unlisted origin gets no CORS headers, so a browser cannot read the response", () => {
+  const r = serverProbe({}, 18791, [
+    { path: "/status", origin: "https://evil.example" },
+    { path: "/approve", method: "OPTIONS", origin: "https://evil.example" },
+  ]);
+  const rows = probeRows(r.out);
+  for (const row of rows) {
+    assert(
+      row.acao === null,
+      `${row.path} returned Access-Control-Allow-Origin: ${row.acao} to an ` +
+        `unlisted origin — a browser would let any page read this`,
+    );
+  }
+});
+
+test("server", "an allowlisted origin gets that exact origin plus Vary", () => {
+  // The negative test above passes trivially if CORS is simply broken. This is
+  // what distinguishes "correctly restrictive" from "not working".
+  const r = serverProbe({ CHAMBER_CORS_ORIGIN: "https://good.example" }, 18792, [
+    { path: "/status", origin: "https://good.example" },
+    { path: "/status", origin: "https://evil.example" },
+  ]);
+  const rows = probeRows(r.out);
+  assert(
+    rows[0].acao === "https://good.example",
+    `allowlisted origin must be echoed, got ${rows[0].acao}`,
+  );
+  assert(
+    (rows[0].vary ?? "").toLowerCase().includes("origin"),
+    `Vary: Origin is required once the value varies by request, got ${rows[0].vary}`,
+  );
+  assert(
+    rows[1].acao === null,
+    `a second, unlisted origin must still get nothing, got ${rows[1].acao}`,
+  );
+});
+
+test("server", "a non-loopback bind without a token refuses to start", () => {
+  // The shipped Dockerfile sets CHAMBER_BIND=0.0.0.0 and required no token, so
+  // the image's own defaults produced an unauthenticated port on every
+  // interface. Fail closed at startup, not at the first request.
+  const r = runServer({ CHAMBER_BIND: "0.0.0.0", CHAMBER_DB: ":memory:" });
+  assert(r.status !== 0, `server must not start; exited ${r.status}`);
+  assert(
+    /refusing to bind/.test(r.stderr),
+    `the refusal must say why and how to fix it, got:\n${r.stderr.slice(0, 400)}`,
+  );
+  assert(
+    /CHAMBER_API_TOKEN/.test(r.stderr) && /127\.0\.0\.1/.test(r.stderr),
+    `the message must name both remedies, got:\n${r.stderr.slice(0, 400)}`,
+  );
+});
+
+test("server", "a non-loopback bind with a token starts, and loopback stays free", () => {
+  const bound = runServer({
+    CHAMBER_BIND: "0.0.0.0",
+    CHAMBER_API_TOKEN: "t0ken",
+    CHAMBER_DB: ":memory:",
+  });
+  assert(
+    /auth=token-required/.test(bound.stdout),
+    `a token must let 0.0.0.0 bind, got:\n${bound.stdout}${bound.stderr}`,
+  );
+  // Loopback with no token must keep working: that is `npm run serve` on a
+  // laptop, and demanding a token there only teaches people to export a fixed
+  // one.
+  const local = runServer({ CHAMBER_DB: ":memory:" });
+  assert(
+    /auth=open/.test(local.stdout),
+    `loopback without a token must still start, got:\n${local.stdout}${local.stderr}`,
+  );
+  assert(
+    /cors=same-origin only/.test(local.stdout),
+    `the banner must state the CORS posture, got:\n${local.stdout}`,
+  );
+});
+
 const passed = results.filter((r) => r.ok).length;
 const failed = results.filter((r) => !r.ok);
 

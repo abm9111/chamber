@@ -1,0 +1,49 @@
+name: ci
+
+# Nothing ran the suite except a human remembering to. A 300-test suite that
+# only executes when someone types `npm run test` is a suite whose green is an
+# anecdote. Every job here gates: none carries continue-on-error, because a
+# gate that cannot fail is worse than no gate -- it reports safety it never
+# checked.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Must satisfy package.json engines (>=23.6). Node's native type
+          # stripping is what lets src/*.ts run without a build step.
+          node-version: '24'
+      # `npm ci` needs a lockfile; runtime dependencies are deliberately empty,
+      # so this only installs the typecheck toolchain.
+      - run: npm ci
+      - run: npm run test
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: npm run typecheck
+
+  probes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      # Runs every probe and fails if any of them fails. This chained with `;`
+      # until 2026-08-05, so the suite's exit status was only the last probe's
+      # and a failing gate_audit was invisible.
+      - run: npm run probes

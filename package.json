@@ -9,6 +9,7 @@
   },
   "scripts": {
     "test": "node --experimental-strip-types tests/harness.ts",
+    "typecheck": "tsc --noEmit",
     "test:gates": "node --experimental-strip-types tests/harness.ts --suite=gates",
     "test:spend": "node --experimental-strip-types tests/harness.ts --suite=spend",
     "test:approvals": "node --experimental-strip-types tests/harness.ts --suite=approvals",
@@ -28,5 +29,9 @@
   },
   "engines": {
     "node": ">=23.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.3"
   }
 }

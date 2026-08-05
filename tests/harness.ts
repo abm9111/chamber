@@ -4235,6 +4235,7 @@ test("oauth", "O4_refresh_mock_ok", () => {
 });
 
 test("oauth", "O5_refresh_mock_fail_clears", () => {
+  process.env.CHAMBER_TOKEN_KEY = TEST_TOKEN_KEY;
   const db = freshDb();
   const res = normalizeResourceUrl("https://mcp.example.com/mcp");
   db.prepare(
@@ -4288,6 +4289,7 @@ test("oauth", "O6_ensure_refreshes_expiring", () => {
 
 
 test("oauth", "O7_refresh_network_keeps_token", () => {
+  process.env.CHAMBER_TOKEN_KEY = TEST_TOKEN_KEY;
   const db = freshDb();
   const res = normalizeResourceUrl("https://mcp.example.com/mcp");
   db.prepare(
@@ -4307,6 +4309,7 @@ test("oauth", "O7_refresh_network_keeps_token", () => {
 });
 
 test("oauth", "O8_refresh_invalid_grant_clears", () => {
+  process.env.CHAMBER_TOKEN_KEY = TEST_TOKEN_KEY;
   const db = freshDb();
   const res = normalizeResourceUrl("https://mcp.example.com/mcp");
   db.prepare(
@@ -9166,6 +9169,122 @@ test("audit", "a refused activation is chained too, not just an allowed one", ()
   );
   assert(refusals > 0, "a refused or debt-minting decision must appear in the chain");
   assert(verifyAuditChain(db).ok, "the chain must verify after a refusal path");
+});
+
+test("server", "a cross-origin write is refused, not merely made unreadable", () => {
+  // The CORS allowlist decides who may READ a reply. It does not decide who may
+  // cause one: a POST with Content-Type: text/plain is a CORS "simple request",
+  // so a browser sends it with no preflight and only discards the response.
+  // Proven against this build before the fix -- a cross-origin POST /turn
+  // returned 200, started a session, called the model and committed two
+  // beliefs. The reply being unreadable is worth nothing when the route's
+  // purpose is the side effect.
+  const r = serverProbe({ CHAMBER_CORS_ORIGIN: "https://good.example" }, 18795, [
+    { path: "/status", method: "POST", origin: "https://evil.example" },
+    { path: "/status", method: "POST", origin: "https://good.example" },
+    { path: "/status", method: "POST" },
+  ]);
+  const rows = probeRows(r.out);
+  const [evil, good, none] = rows;
+  assert(evil !== undefined && good !== undefined && none !== undefined, "expected three rows");
+  assert(evil.status === 403, `an unlisted Origin must be refused outright, got ${evil.status}`);
+  assert(good.status !== 403, `an allowlisted Origin must not be refused, got ${good.status}`);
+  // curl, the CLI and server-to-server callers send no Origin at all. Refusing
+  // those would break every non-browser client to stop a browser attack.
+  assert(none.status !== 403, `a request with no Origin must pass, got ${none.status}`);
+});
+
+test("server", "socket activation without a token refuses to start", () => {
+  // CHAMBER_BIND does not describe an inherited fd: under systemd the address
+  // comes from the .socket unit. So a unit with ListenStream=0.0.0.0:8787 and
+  // no token served every route to the network while this guard read
+  // CHAMBER_BIND, found the "127.0.0.1" default, and returned happily.
+  // LISTEN_PID must equal the listening process's own pid, so the child sets
+  // it before importing the server -- a parent cannot know the pid in advance.
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const k of CONFIG_ENV_KEYS) delete env[k];
+  const r = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--input-type=module",
+      "-e",
+      `process.env.LISTEN_PID = String(process.pid);` +
+        `await import(${JSON.stringify(SERVER_PATH)});` +
+        `setTimeout(() => process.exit(0), 700);`,
+    ],
+    {
+      encoding: "utf8",
+      timeout: 20_000,
+      env: { ...env, LISTEN_FDS: "1", PORT: "0", CHAMBER_DB: ":memory:" },
+    },
+  );
+  assert(r.status !== 0, `socket activation with no token must not start, exited ${r.status}`);
+  r.stderr = r.stderr ?? "";
+  assert(
+    /refusing socket activation/.test(r.stderr),
+    `the refusal must name socket activation, got:\n${r.stderr.slice(0, 300)}`,
+  );
+});
+
+test("oauth", "a refresh that could not be stored is refused before the grant is spent", () => {
+  // sealSecret throws with no CHAMBER_TOKEN_KEY, and persistToken has no catch.
+  // The throw landed AFTER the token endpoint had already rotated and
+  // invalidated the old refresh token: new tokens issued, old one dead, nothing
+  // written, no retry that could ever succeed. Refusing up front costs one
+  // expired access token instead.
+  const prevKey = process.env.CHAMBER_TOKEN_KEY;
+  const prevAllow = process.env.CHAMBER_ALLOW_PLAINTEXT_SECRETS;
+  try {
+    delete process.env.CHAMBER_TOKEN_KEY;
+    delete process.env.CHAMBER_ALLOW_PLAINTEXT_SECRETS;
+    const db = freshDb();
+    const res = normalizeResourceUrl("https://mcp.example.com/mcp");
+    db.prepare(
+      `INSERT INTO mcp_oauth_token (resource_url, issuer, client_id, access_token, refresh_token, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(res, "https://auth.example", "cli", "old_tok", "refresh_tok",
+      new Date(Date.now() - 1000).toISOString());
+    process.env.CHAMBER_OAUTH_REFRESH_MOCK = "ok";
+    const r = refreshAccessTokenDetailed(db, res);
+    assert(r.ok === false && r.code === "no_token_key",
+      `expected a no_token_key refusal, got ${JSON.stringify(r)}`);
+    const row = db
+      .prepare(`SELECT refresh_token FROM mcp_oauth_token WHERE resource_url = ?`)
+      .get(res) as { refresh_token: string } | undefined;
+    assert(row?.refresh_token === "refresh_tok",
+      "the existing refresh token must survive an unstorable refresh");
+  } finally {
+    delete process.env.CHAMBER_OAUTH_REFRESH_MOCK;
+    if (prevKey === undefined) delete process.env.CHAMBER_TOKEN_KEY;
+    else process.env.CHAMBER_TOKEN_KEY = prevKey;
+    if (prevAllow === undefined) delete process.env.CHAMBER_ALLOW_PLAINTEXT_SECRETS;
+    else process.env.CHAMBER_ALLOW_PLAINTEXT_SECRETS = prevAllow;
+  }
+});
+
+test("audit", "a skill refusal survives the rollback that refuses it", () => {
+  // emitGate ran inside the transaction these paths then ROLLBACK, so the
+  // refusal was discarded from gate_event AND audit_event together. A skill
+  // blocked for carrying a credential pattern left no trace anywhere.
+  const db = freshDb();
+  db.prepare(
+    `INSERT INTO skill_registry (id, name, body, content_hash, status, source)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run("sk1", "s", "body AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE1234", "h1", "active", "human");
+  db.prepare(
+    `INSERT INTO skill_holds (id, skill_id, kind, created_by_gate) VALUES (?, ?, ?, ?)`,
+  ).run("h1", "sk1", "belief_stale", "expiry");
+
+  const r = tryActivateSkill(db, { skillId: "sk1", currentContentHash: "h1" });
+  assert(r.ok === false, `expected a refusal, got ${JSON.stringify(r)}`);
+  assert(count(db, "SELECT count(*) c FROM gate_event") > 0,
+    "the refusal must leave a gate_event row");
+  assert(
+    count(db, "SELECT count(*) c FROM audit_event WHERE category = 'gate'") > 0,
+    "the refusal must also reach the hash chain -- a log that records only successes is worse than none",
+  );
+  assert(verifyAuditChain(db).ok, "the chain must still verify");
 });
 
 const passed = results.filter((r) => r.ok).length;

@@ -15,7 +15,7 @@ import { createServer } from "node:http";
 import { spawnSync } from "node:child_process";
 import type { DatabaseSync } from "node:sqlite";
 import { appendAudit } from "./audit.ts";
-import { sealSecret, openSecret } from "./secret_box.ts";
+import { canSealSecrets, sealSecret, openSecret } from "./secret_box.ts";
 
 const META_TTL_MS = 60 * 60 * 1000;
 
@@ -494,7 +494,13 @@ export type RefreshErrorCode =
   | "unauthorized_client"
   | "server_error"
   | "invalid_response"
-  | "missing_access_token";
+  | "missing_access_token"
+  /**
+   * The refresh was refused *before* contacting the token endpoint, because
+   * the result could not have been stored. Distinct from every other code
+   * here: nothing was spent, and the existing refresh token is still valid.
+   */
+  | "no_token_key";
 
 export interface RefreshResultOk {
   ok: true;
@@ -631,6 +637,31 @@ export function refreshAccessTokenDetailed(
       code: "no_token",
       permanent: true,
       message: "no stored OAuth token for resource",
+    };
+    auditRefreshFail(db, normalized, err);
+    return err;
+  }
+  // Checked before the network call, because the token endpoint rotates and
+  // invalidates the old refresh token the moment it answers. `sealSecret`
+  // throws when no CHAMBER_TOKEN_KEY is configured, and `persistToken` — its
+  // only caller — has no catch, so a failure at *write* time meant the grant
+  // had already been spent: the provider had issued new tokens, the old
+  // refresh token was dead, nothing was stored, and no retry could ever
+  // succeed. The connection was unrecoverable, with no RefreshResultErr and no
+  // audit row to say why.
+  //
+  // Refusing here costs one expired access token and leaves the stored refresh
+  // token intact, so the operator can set the key and try again.
+  if (!canSealSecrets()) {
+    const err: RefreshResultErr = {
+      ok: false,
+      code: "no_token_key",
+      permanent: true,
+      message:
+        "refusing to refresh: the new tokens could not be stored. Set " +
+        "CHAMBER_TOKEN_KEY to encrypt them at rest, or " +
+        "CHAMBER_ALLOW_PLAINTEXT_SECRETS=1 to accept plaintext storage. " +
+        "The existing refresh token has been left untouched.",
     };
     auditRefreshFail(db, normalized, err);
     return err;

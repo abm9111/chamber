@@ -96,6 +96,27 @@ function corsHeaders(req: IncomingMessage): Record<string, string> {
 }
 
 /**
+ * May this request run at all?
+ *
+ * Distinct from `corsHeaders`, which only decides who may read the reply. A
+ * browser will happily *send* a cross-origin POST without asking permission
+ * first — `Content-Type: text/plain` makes it a "simple request" — and discard
+ * the response it is not allowed to read. For a route whose point is the side
+ * effect, discarding the response is no protection at all.
+ *
+ * No Origin header means no browser, so it passes: curl, the CLI and
+ * server-to-server callers never set one. A present Origin must be named in
+ * the allowlist.
+ */
+function originAllowed(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (typeof origin !== "string" || origin === "") return true;
+  // Same-origin form posts and some clients send `Origin: null`; it names no
+  // allowlistable host, so it is treated as untrusted rather than absent.
+  return CORS_ORIGINS.has(origin);
+}
+
+/**
  * Refuse to serve an unauthenticated port to a network.
  *
  * Loopback with no token stays allowed — that is `npm run serve` on a laptop,
@@ -107,8 +128,33 @@ function corsHeaders(req: IncomingMessage): Record<string, string> {
  * request, where nobody is watching.
  */
 function assertBindIsSafe(): void {
+  if (API_TOKEN) return;
+
+  // Socket activation is checked first, because CHAMBER_BIND does not describe
+  // it at all. Under systemd the listening socket is created by the .socket
+  // unit and handed over as fd 3; `server.listen({ fd: 3 })` inherits whatever
+  // address that unit declares. So a deployment whose chamber.socket says
+  // `ListenStream=0.0.0.0:8787` — which deploy/systemd/README.md documents as
+  // the way to expose it — served every route unauthenticated while this guard
+  // read CHAMBER_BIND, found the default "127.0.0.1", and returned happily.
+  //
+  // The address behind an inherited fd cannot be read from the environment, so
+  // there is nothing here to inspect and no safe assumption to make. Refuse
+  // without a token and say why.
+  const socketActivated =
+    Number(process.env.LISTEN_FDS ?? 0) > 0 &&
+    Number(process.env.LISTEN_PID ?? 0) === process.pid;
+  if (socketActivated) {
+    throw new Error(
+      `refusing socket activation without CHAMBER_API_TOKEN: the listening ` +
+        `address comes from the .socket unit, not from CHAMBER_BIND, so this ` +
+        `process cannot tell whether it is about to serve the network. Set ` +
+        `CHAMBER_API_TOKEN in the unit's environment.`,
+    );
+  }
+
   const loopback = BIND === "127.0.0.1" || BIND === "::1" || BIND === "localhost";
-  if (loopback || API_TOKEN) return;
+  if (loopback) return;
   throw new Error(
     `refusing to bind ${BIND} without CHAMBER_API_TOKEN: every route except ` +
       `GET /health would be open to anyone who can reach this port. ` +
@@ -403,6 +449,37 @@ const server = createServer(async (req, res) => {
           : {}),
       });
       res.end();
+      return;
+    }
+
+    // Refuse the request, rather than merely withholding the response.
+    //
+    // The CORS allowlist above decides who may *read* a reply. It does not
+    // decide who may cause one, and those are different questions: a POST with
+    // `Content-Type: text/plain` is a CORS "simple request", so the browser
+    // sends it with no preflight at all and only discards the response
+    // afterwards. The write has already happened by then.
+    //
+    // Proven against this build before the fix: a cross-origin
+    // `POST /turn` with `Content-Type: text/plain;charset=UTF-8` returned 200,
+    // started a session, called the model and committed two beliefs. The reply
+    // was unreadable to the page that sent it, which is worth exactly nothing
+    // when the route's purpose is the side effect. `POST /approve` is the same
+    // shape and decides whether a queued write is applied.
+    //
+    // So an Origin that the allowlist does not name is rejected outright.
+    // Requests with no Origin header — curl, the CLI, a server-to-server call,
+    // any non-browser client — are unaffected, because a browser always sets
+    // Origin on a cross-origin request and it is the browser case this exists
+    // to stop. This runs before requireAuth so the refusal does not depend on
+    // whether a token happens to be configured.
+    if (!originAllowed(req)) {
+      json(res, 403, {
+        error: "origin_not_allowed",
+        hint:
+          "This request carried a browser Origin that is not in CHAMBER_CORS_ORIGIN. " +
+          "Add it there to allow cross-origin use.",
+      });
       return;
     }
 

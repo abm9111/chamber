@@ -57,6 +57,26 @@ function emitGate(
   });
 }
 
+/**
+ * Record a refusal that has just been rolled back.
+ *
+ * Runs outside any transaction, so both the `gate_event` row and the chained
+ * `audit_event` row autocommit and survive. Wrapped because this is the last
+ * act before returning REFUSED: a failure to *write the record* must not
+ * replace a clean refusal with a thrown exception, which would lose the
+ * refusal itself on top of losing its record.
+ */
+function emitRefusal(
+  db: DatabaseSync,
+  row: Parameters<typeof emitGate>[1],
+): void {
+  try {
+    emitGate(db, row);
+  } catch {
+    /* best-effort, as in src/commit_belief.ts */
+  }
+}
+
 function suspensionMode(db: DatabaseSync): "shadow" | "teeth" {
   const flip = db
     .prepare(`SELECT value FROM chamber_config WHERE key = 'suspension_flip_at'`)
@@ -138,7 +158,13 @@ export function tryActivateSkill(
     const holds = openHolds(db, skillId);
     if (holds.length > 0) {
       const ids = holds.map((h) => h.id);
-      emitGate(db, {
+      // Emitted *after* the rollback, not before it. A gate row written inside
+      // this transaction is discarded along with everything else the rollback
+      // undoes — so the refusal landed in neither `gate_event` nor
+      // `audit_event`, and no table anywhere recorded that a skill had been
+      // blocked. src/commit_belief.ts already does it in this order.
+      db.exec("ROLLBACK");
+      emitRefusal(db, {
         turnId,
         gate: "hold",
         action: "blocked",
@@ -146,7 +172,6 @@ export function tryActivateSkill(
         subjectId: skillId,
         detail: { holdIds: ids },
       });
-      db.exec("ROLLBACK");
       return {
         ok: false,
         status: "REFUSED",
@@ -164,7 +189,11 @@ export function tryActivateSkill(
     if (skillRow?.body) {
       const secretRefuse = skillSecretScanRefuse(skillRow.body);
       if (secretRefuse) {
-        emitGate(db, {
+        // After the rollback — see the note on the open-holds path above. This
+        // is the refusal that most needed recording: a skill blocked for
+        // carrying a credential pattern left no trace at all.
+        db.exec("ROLLBACK");
+        emitRefusal(db, {
           turnId,
           gate: "hold",
           action: "blocked",
@@ -172,7 +201,6 @@ export function tryActivateSkill(
           subjectId: skillId,
           detail: { reason: "secret_scan" },
         });
-        db.exec("ROLLBACK");
         return {
           ok: false,
           status: "REFUSED",
@@ -287,7 +315,9 @@ export function tryActivateSkill(
       }
       const over = requestedCapabilities.filter((c) => !manifest.includes(c));
       if (over.length > 0) {
-        emitGate(db, {
+        // After the rollback — see the note on the open-holds path above.
+        db.exec("ROLLBACK");
+        emitRefusal(db, {
           turnId,
           gate: "manifest",
           action: "blocked",
@@ -295,7 +325,6 @@ export function tryActivateSkill(
           subjectId: skillId,
           detail: { over },
         });
-        db.exec("ROLLBACK");
         return {
           ok: false,
           status: "REFUSED",

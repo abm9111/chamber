@@ -89,6 +89,24 @@ export function hasTokenKey(): boolean {
 }
 
 /**
+ * Would `sealSecret` succeed right now?
+ *
+ * Exists so a caller can check *before* doing something it cannot undo.
+ * `sealSecret` throws when no key is configured, and its only caller —
+ * `persistToken` in src/mcp_oauth.ts — runs after the OAuth token endpoint has
+ * already rotated and invalidated the previous refresh token. A throw at that
+ * point destroyed the connection: new tokens issued, old one dead, nothing
+ * written, and no retry that could work.
+ *
+ * Distinct from `hasTokenKey`, which answers whether a key exists. This
+ * answers whether a write will go through, which is also true when the
+ * operator has explicitly opted into plaintext.
+ */
+export function canSealSecrets(): boolean {
+  return rawKey() !== null || process.env.CHAMBER_ALLOW_PLAINTEXT_SECRETS === "1";
+}
+
+/**
  * Encrypt for DB storage.
  *
  * Refuses rather than silently storing plaintext. The old guard demanded

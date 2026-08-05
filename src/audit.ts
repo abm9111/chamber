@@ -99,8 +99,26 @@ export function appendAudit(db: DatabaseSync, input: AuditAppendInput): string {
   try {
     db.exec("BEGIN IMMEDIATE");
     ownTx = true;
-  } catch {
-    // Already in a transaction (e.g. tryActivateSkill) — write in-caller's TX
+  } catch (err) {
+    // "Already in a transaction" and "another process holds the write lock"
+    // both arrive here, and only the first one is safe to continue from.
+    //
+    // SQLite rejects a nested BEGIN with SQLITE_ERROR and the message "cannot
+    // start a transaction within a transaction"; contention gives SQLITE_BUSY.
+    // Treating the second as the first is how a chain append stops being
+    // atomic: the tip SELECT, the audit_event INSERT, the tip UPDATE and the
+    // Merkle leaf each run as their own autocommit statement, so two processes
+    // interleaving there write two rows carrying the same prev_hash — and
+    // `verifyAuditChain` then reports tampering on a chain nobody touched.
+    //
+    // This became reachable when src/db.ts started setting busy_timeout: the
+    // busy case now *waits and succeeds* statement by statement instead of
+    // failing outright, which turns a loud error into a silently forked chain.
+    // Re-thrown rather than degraded, because a caller that cannot record a
+    // decision atomically must not record it at all.
+    const e = err as { code?: string; errcode?: number; message?: string };
+    const nested = /within a transaction/i.test(e.message ?? "");
+    if (!nested) throw err;
     ownTx = false;
   }
   try {

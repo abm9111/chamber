@@ -605,6 +605,110 @@ function cmdIndex(
   console.log(`corpus size: ${countDocuments(db)}`);
 }
 
+/**
+ * `chamber corpus` — what is actually in the index.
+ *
+ * This exists because there was no way to find out. A first real ingest of a
+ * personal vault produced a corpus that was **98.6% exported chat transcripts**
+ * — 28,010 of 28,414 passages — and a later one was 9.5% a vendored third-party
+ * source tree. Neither was a crash. Retrieval worked, pins verified, and every
+ * answer was drawn from the wrong material. Both were found only by running
+ * count queries by hand.
+ *
+ * A citation gate cannot catch this. The transcripts genuinely say what a
+ * citation claims they say, so the gate correctly passes them; the defect is
+ * upstream, in what was indexed at all. So the corpus needs to be *legible*,
+ * and the top contributors are what make an accident like that obvious in one
+ * line rather than after an afternoon of SQL.
+ *
+ * Grouped by the first path segment of `source_ref`, which is root-relative —
+ * that is the granularity an `--exclude` operates on, so the output reads as a
+ * list of things you could act on.
+ */
+function cmdCorpus(db: DatabaseSync): void {
+  const rows = db
+    .prepare(`SELECT source_ref, source_kind, length(body) AS bytes FROM vector_document`)
+    .all() as { source_ref: string; source_kind: string; bytes: number }[];
+
+  if (rows.length === 0) {
+    console.log("corpus is empty — run `chamber ingest`");
+    return;
+  }
+
+  const files = new Set<string>();
+  const byGroup = new Map<string, { passages: number; bytes: number; files: Set<string> }>();
+  const byKind = new Map<string, number>();
+
+  for (const r of rows) {
+    const ref = String(r.source_ref);
+    const file = ref.replace(/#p\d+$/, "");
+    files.add(file);
+    // First path segment, or "(root)" for a file sitting directly in a root.
+    const slash = file.indexOf("/");
+    const group = slash === -1 ? "(root)" : file.slice(0, slash);
+    const g = byGroup.get(group) ?? { passages: 0, bytes: 0, files: new Set<string>() };
+    g.passages += 1;
+    g.bytes += r.bytes ?? 0;
+    g.files.add(file);
+    byGroup.set(group, g);
+    byKind.set(r.source_kind, (byKind.get(r.source_kind) ?? 0) + 1);
+  }
+
+  const totalBytes = rows.reduce((a, r) => a + (r.bytes ?? 0), 0);
+  const kb = (n: number): string => `${Math.round(n / 1024).toLocaleString()} KB`;
+
+  console.log(
+    `${rows.length.toLocaleString()} passages · ${files.size.toLocaleString()} files · ` +
+      `${kb(totalBytes)} · ${(rows.length / files.size).toFixed(1)} passages/file`,
+  );
+
+  // Citability is not cosmetic: only kinds with a registered pin formula can be
+  // retrieved by `ask` at all, so a corpus full of an uncitable kind is a
+  // corpus that answers nothing.
+  const kinds = [...byKind.entries()].sort((a, b) => b[1] - a[1]);
+  console.log(
+    `\nby kind: ${kinds.map(([k, n]) => `${k} ${n.toLocaleString()}`).join(" · ")}` +
+      (kinds.some(([k]) => k !== "vault_page")
+        ? "\n  only vault_page is citable — other kinds are searchable but `ask` will not retrieve them"
+        : ""),
+  );
+
+  const groups = [...byGroup.entries()].sort((a, b) => b[1].passages - a[1].passages);
+  console.log(`\ntop contributors (first path segment, what --exclude matches):`);
+  for (const [name, g] of groups.slice(0, 12)) {
+    const share = ((g.passages / rows.length) * 100).toFixed(1);
+    const bar = "█".repeat(Math.max(1, Math.round((g.passages / groups[0]![1].passages) * 22)));
+    console.log(
+      `  ${String(share).padStart(5)}%  ${bar.padEnd(22)}  ` +
+        `${g.passages.toLocaleString().padStart(7)} passages  ` +
+        `${String(g.files.size).padStart(5)} files  ${name}`,
+    );
+  }
+  if (groups.length > 12) {
+    const rest = groups.slice(12).reduce((a, [, g]) => a + g.passages, 0);
+    console.log(`         …and ${groups.length - 12} more, ${rest.toLocaleString()} passages`);
+  }
+
+  // A single file contributing hundreds of passages is the signature of the
+  // failure above: a 1.5 MB chat export chunks into ~600 passages where an
+  // ordinary note produces ~25.
+  const perFile = new Map<string, number>();
+  for (const r of rows) {
+    const f = String(r.source_ref).replace(/#p\d+$/, "");
+    perFile.set(f, (perFile.get(f) ?? 0) + 1);
+  }
+  const fattest = [...perFile.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+  const median = [...perFile.values()].sort((a, b) => a - b)[Math.floor(perFile.size / 2)] ?? 1;
+  if (fattest[0] && fattest[0][1] > median * 8) {
+    console.log(`\nunusually large files (median is ${median} passages):`);
+    for (const [f, n] of fattest) {
+      if (n <= median * 8) break;
+      console.log(`  ${String(n).padStart(6)} passages  ${f}`);
+    }
+    console.log("  a file far above the median is usually an export, not a note");
+  }
+}
+
 function cmdSearch(db: DatabaseSync, args: ParsedSearchArgs): void {
   const { query, hybrid, exact } = args;
   if (hybrid) {
@@ -779,6 +883,11 @@ Usage:
                         config file's ingest array, honoring each root's own
                         exclude list. This is the form the scheduled job runs.
                         Run 'chamber config show' to see the configured roots.
+  chamber corpus                     what is in the index, and what dominates it
+      Grouped by first path segment -- the granularity --exclude matches -- so an
+      accidentally ingested export folder is one line rather than an afternoon
+      of SQL. Flags files far above the median passage count, which is what an
+      exported chat log looks like next to an ordinary note.
   chamber search [--exact|--semantic] <query>   Hybrid (vector + FTS5) search
       Hybrid is the default: results are the union of the two legs, ranked by
       0.7*cosine + 0.3*(share of the query's idf mass this passage contains).
@@ -1087,6 +1196,10 @@ async function main(): Promise<void> {
       ) {
         process.exitCode = 1;
       }
+      break;
+    }
+    case "corpus": {
+      cmdCorpus(db);
       break;
     }
     case "search": {

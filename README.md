@@ -1,95 +1,150 @@
-# Chamber — week-1 kernel
+# Chamber
 
-Governable cognition for a premium agent that must beat Hermes on **epistemic integrity**, not tool count.
+Ask questions about your own notes. Get answers that cite their sources — and a
+daily check that tells you when a source has changed underneath a conclusion you
+already trusted.
 
-## Invariant
+Zero runtime dependencies. Everything is `node:sqlite` and files on your disk.
+No account, no cloud call unless you point it at one.
 
-> No assertion may become executable, citable, or load-bearing except through a gate whose check and write commit in one transaction — anything else may decay, park, or be defeated, but it may never silently pass.
+## What it actually does
 
-Where that invariant does not yet hold, and what a verified citation does and does not prove: [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md). Read it before trusting any output.
+```
+$ chamber ask "should we lead with cite-or-refuse or drift detection?"
+
+According to the research note, lead with **cite-or-refuse**, treating
+drift detection as a secondary feature.
+
+  * The decision section states "Lead with cite-or-refuse" [3]
+  * Drift is "the quiet differentiator that earns attention" once trusted [3]
+
+  [UNSUPPORTED] According to the research note, lead with cite-or-refuse…
+  [ALLOWED]     The decision section states "Lead with cite-or-refuse…
+     sources: research/2026-08-04__x-demand.md#p5
+  [ALLOWED]     Drift is "the quiet differentiator that earns attention…
+     sources: research/2026-08-04__x-demand.md#p5
+```
+
+Every line is judged on its own citations. The opening summary carries none, so
+it is marked `UNSUPPORTED` — recorded, but not treated as load-bearing. The
+model is shown `[1]`…`[k]` and never a document id or a hash, so it cannot
+fabricate a citation even in principle.
+
+Months later:
+
+```
+$ chamber verify
+
+blf_50c26c3b  1/3 pins verified
+  "All three product lines hit their Q3 numbers."
+  hash_mismatch: committed against ops.md#p0, which now holds something else
+
+1 belief(s) checked, 0 with no verified support left, 1 with some support lost
+```
+
+Exit code is non-zero, so a scheduled job can act on it. The conclusion did not
+change; the ground under it did.
+
+## Quickstart
+
+Requires Node **23.6+** — Chamber runs TypeScript directly, with no build step.
+
+```bash
+git clone <this repo> chamber && cd chamber
+npm link                 # puts `chamber` on your PATH
+chamber init             # writes ~/.config/chamber/config.json
+```
+
+Then edit that config to add a notes folder and a model:
+
+```json
+{
+  "database": "~/.local/share/chamber/chamber.sqlite",
+  "model": { "base": "http://127.0.0.1:8087/v1", "name": "your-model", "mode": "openai" },
+  "ingest": [{ "root": "~/Notes", "exclude": ["transcripts", "attachments"] }]
+}
+```
+
+`model.base` may name any OpenAI-compatible endpoint. A loopback address needs
+no API key; anything else reads `CHAMBER_API_KEY` from the environment, never
+from the file.
+
+```bash
+chamber ingest           # index every configured root
+chamber ask "..."        # ask, with citations
+chamber verify           # re-check stored pins against the corpus
+chamber corpus           # what is actually in the index
+```
+
+**Set your excludes before the first ingest.** There is no default exclude list.
+Pointed at a folder of exported chat logs, Chamber will happily index all of
+them and answer from them — see `chamber corpus` and
+[`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) entry 11.
+
+### Run it daily
+
+`deploy/launchd/com.chamber.verify.plist` (macOS) and `deploy/systemd/`
+(Linux) run ingest and verify on a schedule, and raise a notification only when
+something drifted. A check that correctly reports nothing on most days is a
+check you stop reading, so it stays quiet until it isn't.
+
+## What a verified citation does and does not prove
+
+Chamber proves a cited passage **is the passage it claims to be** — unmodified,
+still present, still saying what the citation says it says.
+
+It cannot tell you the claim follows from the passage. A model can cite a real
+source and misread it, and every layer here will pass it. That is a stated
+non-goal, it has been observed happening, and it is not solved.
+
+Read [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) before trusting
+any output. Fourteen limitations are documented there, including two that are
+unflattering: the sandbox does not isolate, and citation debt blocks a verbatim
+repeat but not a paraphrase.
+
+## The invariant
+
+> No assertion may become executable, citable, or load-bearing except through a
+> gate whose check and write commit in one transaction — anything else may
+> decay, park, or be defeated, but it may never silently pass.
+
+| Gate | Blocks when |
+|------|-------------|
+| `commitBelief` | assertion with open blocking citation debt; missing or unverifiable pins; a defeater used as a source; a belief-typed commit on the fast path |
+| `tryActivateSkill` | open holds; load-bearing stale beliefs; content ≠ last critic-cleared hash; capability manifest over-ask |
+
+Both gates write into a hash-chained audit log — `entry_hash = sha256(prev_hash
+|| canonical JSON)` with an incremental Merkle tree — so altering a past
+decision breaks every hash after it. Retraction types (`defeater`, `unknown`)
+commit freely and never mint blocking debt.
+
+Defaults are refusals: memory and skill writes require approval, learned skills
+land in quarantine rather than applying silently, and a pending write that
+expires is **not** an approved one.
+
+## Development
+
+```bash
+npm test        # 308 tests
+npm run typecheck
+npm run probes  # adversarial probes; each one asserts a defect is absent
+```
+
+`npm run probes` **is expected to fail today.** Two probes report real, open
+defects — `sandbox_escape` and `debt_paraphrase` — and they are wired in
+deliberately. A gate that cannot fail reports safety it never checked.
 
 ## Layout
 
 ```text
-sql/schema.sql                       Week-1 tables + CHECKs
-sql/schema_spend_approvals.sql       spend_event + pending_write + policies
-sql/schema_approval_workflows.sql    automated approval rules + audit
-src/types.ts
-src/hash.ts
-src/db.ts                            loads all 14 schemas
-src/commit_belief.ts
-src/try_activate_skill.ts
-src/spend.ts
-src/approvals.ts                     propose / decide / queue
-src/approval_workflows.ts            evaluateWorkflows (auto approve/reject)
-src/audit.ts                         hash-chained audit trail
-src/merkle.ts                        Merkle checkpoints + inclusion proofs
-tests/harness.ts                     **runnable** acceptance suite (287 tests)
-tests/ACCEPTANCE_TESTS.md
-tests/SPEND_APPROVALS.md
-tests/APPROVAL_WORKFLOWS.md
-tests/AUDIT_TRAIL.md
-tests/MERKLE.md
-package.json
+src/ask.ts              retrieval → prompt → per-claim citation gate
+src/commit_belief.ts    the belief gate; check and write in one transaction
+src/pins.ts             content pins and drift verification
+src/audit.ts            hash-chained log + incremental Merkle
+src/config.ts           settings: flag → env → config file → default
+src/db.ts               opens the database, loads every schema
+probes/                 adversarial probes, run by npm run probes
+docs/KNOWN_LIMITATIONS.md   what does not work, and what it costs
 ```
 
-## Run tests
-
-```bash
-cd artifacts/chamber
-npm test
-# or: node --experimental-strip-types tests/harness.ts
-# suites: --suite=gates|spend|approvals|audit
-```
-
-**Last run: 287/287 passed.** Specs are no longer paper-only.
-
-## Gates (week-1)
-
-| Function | Blocks when |
-|----------|-------------|
-| `commitBelief` | Assertion (`belief`\|`commitment`) with open **blocking** citation debt; missing pins; defeater used as source; fast-path belief-typed commit |
-| `tryActivateSkill` | Open holds; load-bearing stale beliefs (teeth); content ≠ last **critic-cleared** hash; manifest over-ask |
-
-Retraction types (`defeater`, `unknown`) commit freely and do not mint blocking debt (FM-5).
-
-## Faculties (runtime roles — not week-1 model calls on fast path)
-
-| Faculty | Arabic |
-|---------|--------|
-| Mind & Consciousness | فلسفة العقل والوعي |
-| Epistemology | الإبستمولوجيا |
-| Applied Ethics | الأخلاق التطبيقية |
-| Language & Logic | فلسفة اللغة والمنطق |
-| Philosophy of Technology | فلسفة التكنولوجيا |
-
-Fast path = **zero** faculty model calls. Belief-typed commits escalate the **commit**, not necessarily the whole turn.
-
-## Forks locked
-
-- **A** Full defeater exemption + no-citation rider  
-- **B** Epistemology solo waive routine only; human on consequential+  
-- **C** Suspension shadow 7 days → teeth; flip date in `chamber_config`  
-- **D** Critic = different model family  
-
-## Week-1.5 — Hermes field P0
-
-| Default | Value |
-|---------|--------|
-| `memory.write_approval` | **on** |
-| `skills.write_approval` | **on** |
-| `auto_skill_improve` | **quarantine** (background queues, never silent apply) |
-| Pending TTL | 72h — **expire ≠ approve** |
-
-- `recordSpend` / `spendLastHours` / `formatSpendFooter` — burn by channel  
-- `proposeWrite` / `decideWrite` / `listPendingQueue` — human gate  
-
-## Next hardenings (ordered)
-
-1. Waiver budget + mandatory waiver decay  
-2. `capability_manifest` enforced at tool dispatcher  
-3. Hash-chained append-only ledger tip  
-
-## Note on confidence
-
-`belief.confidence` is optional UI metadata. **No gate branches on it.**
+MIT.

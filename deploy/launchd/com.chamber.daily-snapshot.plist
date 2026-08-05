@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.chamber.daily-snapshot</string>
+
+  <!--
+    Runs after com.chamber.verify (08:30) so it can read that run's result
+    rather than racing it.
+
+    This job records; it does not judge. Its exit status is deliberately 0 even
+    when a check inside it fails, because `chamber verify` is the gate and it
+    already runs on its own schedule with its own non-zero contract. A recorder
+    that also failed would produce two alerts for one event and train the
+    operator to ignore both.
+
+    Output is a dated markdown file per day, which is what makes the record
+    survive a session ending -- the analysis half can be written later, by
+    anyone, from a file that is still there.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-lc</string>
+    <string>REPLACE_WITH_HOME/Projects/chamber/scripts/daily-snapshot.sh</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>8</integer>
+    <key>Minute</key><integer>52</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>REPLACE_WITH_HOME/Library/Logs/chamber-daily-snapshot.log</string>
+  <key>StandardErrorPath</key>
+  <string>REPLACE_WITH_HOME/Library/Logs/chamber-daily-snapshot.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

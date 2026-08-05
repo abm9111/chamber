@@ -9073,6 +9073,42 @@ test("secret_box", "a passphrase is salted, so two seals of one secret differ", 
   }
 });
 
+test("db", "a file-backed database opens in WAL with a non-zero busy timeout", () => {
+  // The default journal mode is `delete`, under which a reader and a writer
+  // exclude each other outright, and the default busy timeout is 0 -- fail on
+  // contact rather than wait. Measured on this repository: a second process
+  // opening the database during `chamber ingest` failed the *ingest* with
+  // "database is locked" and lost roughly forty minutes of embedding work. The
+  // 08:30 job runs ingest then verify unattended, so that window is minutes
+  // long and nobody is watching.
+  //
+  // busy_timeout matters as much as WAL here, and for a reason specific to
+  // this codebase: openChamberDb runs applySchemas on every open, which is DDL
+  // and takes a write lock. So even a read-only command contends at open, and
+  // WAL covers readers against a writer, never writer against writer.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-wal-"));
+  try {
+    const db = openChamberDb(join(dir, "w.sqlite"));
+    const mode = db.prepare("PRAGMA journal_mode").get() as { journal_mode?: string };
+    assert(
+      String(mode.journal_mode).toLowerCase() === "wal",
+      `expected WAL, got ${mode.journal_mode}`,
+    );
+    const busy = db.prepare("PRAGMA busy_timeout").get() as { timeout?: number };
+    assert(
+      (busy.timeout ?? 0) > 0,
+      `a zero busy timeout fails on contact instead of waiting, got ${busy.timeout}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("db", ":memory: is left alone, since journal mode names no file", () => {
+  const db = openChamberDb(":memory:");
+  assert(db.prepare("SELECT 1 AS a").get() !== undefined, "in-memory must still open");
+});
+
 const passed = results.filter((r) => r.ok).length;
 const failed = results.filter((r) => !r.ok);
 

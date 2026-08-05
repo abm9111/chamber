@@ -12,7 +12,9 @@ Claims are marked **[verified]** where they were checked against this repository
 
 All five checked directly on 2026-08-04. These are not opinions.
 
-**Per-scope isolation does not exist.** `scope_id` is written on session insert and **never read** — no query filters by it. `requiresHumanForRoutine()` in `src/scope.ts` has **zero production callers**. `benchmarks/QM_PORTING.md` records this capability as delivered. It is not. **[verified]**
+**Per-scope isolation does not exist.** `scope_id` is written on session insert and **never read** — no query filters by it. `requiresHumanForRoutine()` in `src/scope.ts` has **zero production callers**. Re-checked 2026-08-05: still zero. **[verified]**
+
+> **Correction, 2026-08-05.** This entry also asserted that `benchmarks/QM_PORTING.md` "records this capability as delivered", under a **[verified]** tag. That sentence was not verified and is not true — see the correction at the end of this section. A verification mark on an unchecked claim is worse than the claim, because it tells a reader the checking already happened. The rest of the entry stands.
 
 **The job queue wedges permanently on a crash.** `src/job_queue.ts` contains no lease TTL, no heartbeat, and no reaper — zero matches for `heartbeat|lease_expires|reclaim|reap`. A worker that dies mid-job leaves that row in `running` forever. qm evolved past exactly this design. **[verified]**
 
@@ -22,7 +24,13 @@ All five checked directly on 2026-08-04. These are not opinions.
 
 **There is no agent loop.** `runTool` appears twice in `src/` — its definition and one CLI call site. No `tool_call` handling exists anywhere. The gates are excellent; the loop they gate has not been built. **[verified]**
 
-**Pattern worth naming.** This is the second Chamber document found to overstate in a single day — `benchmarks/BENCHMARK.md` cited "Brain VNext", a project that does not exist, and `QM_PORTING.md` records sketched work as delivered. For a project whose thesis is that no claim becomes load-bearing without verifiable evidence, documentation drift is not a cosmetic problem. **Treat every capability claim in `docs/` and `benchmarks/` as needing the same verification a code change gets.**
+**Pattern worth naming.** `benchmarks/BENCHMARK.md` cited "Brain VNext", a project that does not exist. For a project whose thesis is that no claim becomes load-bearing without verifiable evidence, documentation drift is not a cosmetic problem. **Treat every capability claim in `docs/` and `benchmarks/` as needing the same verification a code change gets.**
+
+> **Correction, 2026-08-05.** This paragraph originally read "the second Chamber document found to overstate in a single day" and named `QM_PORTING.md` as recording sketched work as delivered. Checked line by line, that is wrong. `QM_PORTING.md` is a *port map*: it carries a "Chamber today" column stating the current state, a separate "Port?" column answering whether to port, and then "Concrete Chamber modules to add (ordered)" with day estimates and a suggested sprint. It describes work to do, not work done, and its own columns keep the two apart.
+>
+> `BENCHMARK.md`'s retraction stands and is dated 2026-08-02 in that file. So the count was one document, not two.
+>
+> This correction is the point of the paragraph it corrects. An unverified claim about another document's unverified claims is the same defect one level up, and it survived here for three days inside the essay arguing that capability claims need checking. The verified finding below — that `requiresHumanForRoutine` has zero production callers — is unaffected: `QM_PORTING.md` never said otherwise.
 
 ---
 

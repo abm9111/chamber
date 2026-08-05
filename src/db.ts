@@ -146,6 +146,74 @@ function warnRedirect(requested: string, actual: string, cause: unknown): void {
  * than a changed return type on purpose: ten call sites open this database and
  * exactly one of them prints a path.
  */
+/**
+ * Put a file-backed database into WAL mode, and say so if it will not go.
+ *
+ * The default journal mode is `delete`, under which a reader and a writer
+ * exclude each other outright. Measured on this repository: a second process
+ * opening the database during `chamber ingest` failed the *ingest* with
+ * `database is locked` and lost ~40 minutes of embedding work. The scheduled
+ * job at 08:30 runs `ingest` then `verify` unattended, so the window where a
+ * casual `chamber ask` or `chamber status` can kill the run is minutes long
+ * and nobody is watching when it happens.
+ *
+ * WAL lets readers proceed against the last committed snapshot while a writer
+ * appends, which is the access pattern Chamber actually has: one long writer
+ * and several short readers.
+ *
+ * Not fatal when it fails. WAL needs shared memory and cannot be used on some
+ * network filesystems, and a vault on a synced volume is exactly where that
+ * turns up. Falling back to the old mode is strictly no worse than before, so
+ * this warns rather than refusing to open — but it does warn, because a
+ * silent fallback would leave the operator believing in a concurrency
+ * guarantee they do not have.
+ *
+ * `:memory:` is skipped: there is no file, and journal mode is meaningless.
+ */
+function enableWal(db: DatabaseSync, path: string): void {
+  if (path === ":memory:") return;
+  // Wait for a lock instead of failing on contact.
+  //
+  // WAL alone is not enough, and the reason is specific to this codebase:
+  // `openChamberDb` runs `applySchemas` on *every* open, which is DDL and takes
+  // a write lock. So even `chamber ask`, which only reads afterwards, contends
+  // at open — and WAL's concurrency guarantee covers readers against a writer,
+  // never writer against writer.
+  //
+  // SQLite's default busy timeout is 0: the second connection gets
+  // SQLITE_BUSY immediately rather than waiting the moment it could have. Five
+  // seconds is far longer than schema application needs and far shorter than a
+  // person will sit staring at a prompt, so a command issued during an ingest
+  // now waits its turn instead of failing the ingest.
+  //
+  // Set before the WAL pragma because that pragma itself needs the lock.
+  try {
+    db.exec("PRAGMA busy_timeout = 5000");
+  } catch {
+    /* an unsupported pragma is not worth failing an open over */
+  }
+  try {
+    // The pragma *returns* the mode it settled on; it does not throw when it
+    // declines. Reading the result is the only way to know it took.
+    const row = db.prepare("PRAGMA journal_mode = WAL").get() as
+      | { journal_mode?: string }
+      | undefined;
+    const mode = String(row?.journal_mode ?? "").toLowerCase();
+    if (mode !== "wal") {
+      console.warn(
+        `chamber: could not enable WAL on ${path} (mode is "${mode}"). ` +
+          `Readers and writers will block each other, so a command run during ` +
+          `an ingest can fail it. Common on network or synced filesystems.`,
+      );
+    }
+  } catch (err) {
+    console.warn(
+      `chamber: could not enable WAL on ${path}: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 export function openChamberDb(
   path = ":memory:",
   onRedirect?: (actual: string) => void,
@@ -208,6 +276,7 @@ export function openChamberDb(
       // the process's working directory, which has no business being touched.
       if (p !== ":memory:") mkdirSync(dirname(p), { recursive: true });
       const db = new DatabaseSync(p);
+      enableWal(db, p);
       applySchemas(db);
       if (p !== path) {
         warnRedirect(path, p, lastErr);

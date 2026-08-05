@@ -9109,6 +9109,65 @@ test("db", ":memory: is left alone, since journal mode names no file", () => {
   assert(db.prepare("SELECT 1 AS a").get() !== undefined, "in-memory must still open");
 });
 
+test("audit", "a belief-gate decision lands in the hash chain, not only in gate_event", () => {
+  // Chamber has two audit surfaces. `audit_event` is hash-chained with an
+  // incremental Merkle tree over it; `gate_event` is an ordinary table with no
+  // prev_hash and no leaf, so an edit there leaves no trace. Until 2026-08-05
+  // the two flagship gates wrote only to `gate_event`, which
+  // probes/gate_audit.ts measured on a live database as 4 gate_event rows and
+  // 0 audit_event rows.
+  //
+  // That is the sharpest possible gap for this project: tamper-evident audit is
+  // the one capability a survey of qm, jcode and background-agents found in
+  // none of them, and the verdicts it exists to make defensible sat outside it.
+  const db = freshDb();
+  commitBelief(db, {
+    type: "observation",
+    text: "the sky was grey on tuesday",
+    sources: [],
+    authorFamily: "test",
+    path: "deep",
+  });
+
+  const gates = count(db, "SELECT count(*) c FROM gate_event");
+  const audits = count(
+    db,
+    "SELECT count(*) c FROM audit_event WHERE category = 'gate'",
+  );
+  assert(gates > 0, "the gate must emit at least one gate_event to be worth chaining");
+  assert(
+    audits >= gates,
+    `every gate decision must reach the chain: ${gates} gate_event rows, ${audits} chained`,
+  );
+
+  // Populated is not the same as valid: writing into a chain badly is a way to
+  // break it. Gates fire inside a BEGIN IMMEDIATE, after a ROLLBACK and before
+  // any transaction opens, so this is the assertion that those three paths do
+  // not leave a gap or a bad prev_hash behind them.
+  const chain = verifyAuditChain(db);
+  assert(chain.ok, `the chain must still verify after gates write to it: ${JSON.stringify(chain)}`);
+});
+
+test("audit", "a refused activation is chained too, not just an allowed one", () => {
+  // A tamper-evident log that records only successes is worse than none: the
+  // decisions worth reconstructing later are the refusals.
+  const db = freshDb();
+  commitBelief(db, {
+    type: "belief",
+    text: "a consequential claim with no citation at all",
+    sources: [],
+    authorFamily: "test",
+    path: "deep",
+    stakes: "consequential",
+  });
+  const refusals = count(
+    db,
+    "SELECT count(*) c FROM audit_event WHERE category = 'gate' AND action NOT LIKE '%allow%'",
+  );
+  assert(refusals > 0, "a refused or debt-minting decision must appear in the chain");
+  assert(verifyAuditChain(db).ok, "the chain must verify after a refusal path");
+});
+
 const passed = results.filter((r) => r.ok).length;
 const failed = results.filter((r) => !r.ok);
 

@@ -9,11 +9,13 @@ which is re-checked rather than carried forward. Each entry says what the limita
 is, what it actually costs you, and what would fix it. Where a fix is already planned,
 the entry points at `docs/NEXT_LEVEL_PLAN.md`; where nothing is planned, it says so.
 
-**Entry 4 was added on 2026-08-05** and the entries after it renumbered. It is the
-gap this file was most conspicuously missing: `probes/gate_audit.ts` had been exiting
-non-zero on every run, reporting that the two flagship gates write outside the
-tamper-evident chain, and nothing here said so. A limitations document that omits the
-loudest failing probe in the repository is the failure mode it exists to prevent.
+**One entry was added and removed again on 2026-08-05.** The two flagship gates wrote
+outside the tamper-evident chain — `probes/gate_audit.ts` had been exiting non-zero on
+every run, reporting 4 `gate_event` rows against 0 `audit_event` rows, and this file
+did not mention it. Writing it down made it obvious enough to fix the same day, so the
+entry is gone and the probe now reports `gates are chained`. Recorded here because the
+sequence is the argument for keeping this file honest: the gap survived as long as it
+was undocumented.
 
 Two of these are not defects in the ordinary sense and should be read carefully rather
 than skimmed: the sandbox does not isolate, and a citation can be genuine and still be
@@ -121,38 +123,7 @@ it on a schedule rather than on request. `docs/NEXT_LEVEL_PLAN.md` Phase 1.4 spe
 the signing work and flags it as net-new code that is droppable if the phase overruns —
 so it is planned, but it is the first thing scheduled to be cut.
 
-## 4. The two flagship gates write outside the tamper-evident chain
-
-Chamber has two audit surfaces. `audit_event` is hash-chained —
-`entry_hash = sha256(prev_hash || canonical JSON)` — with an incremental Merkle tree
-over it, and sixteen modules call `appendAudit` to write there. `gate_event` is an
-ordinary table with no chaining at all.
-
-The two decisions the whole design exists to make — `commit_belief.ts` (does this claim
-have evidence?) and `try_activate_skill.ts` (may this skill mutate anything?) — write
-only to `gate_event`.
-
-This is not inferred. `probes/gate_audit.ts` measures it on a live database and exits
-non-zero: **4 `gate_event` rows, 0 `audit_event` rows.** `npm run probes` has reported
-it on every run.
-
-**What it costs.** The tamper-evident audit chain is the one capability a survey of qm,
-jcode and background-agents found in none of them — it is the strongest claim Chamber
-makes. Every gate decision sits outside it. So the chain covers the surrounding
-bookkeeping while the verdicts it exists to make defensible are stored in a table
-anyone with write access can edit, reorder or delete without leaving a trace. This is
-distinct from entry 3: that one says the chain's *tail* can be truncated, this one says
-the gate decisions never enter the chain in the first place. Fixing the checkpoint
-signing would not touch it.
-
-**What would fix it.** Route both gates through `appendAuditInTx` — the in-transaction
-variant exists precisely so an audit row can be written inside the gate's own
-transaction, which is what makes the record atomic with the decision. `gate_event` can
-stay as the queryable projection. `docs/NEXT_LEVEL_PLAN.md:12` records the gap; the work
-is small, because the sixteen existing `appendAudit` callers already establish the
-pattern.
-
-## 5. A stalled model endpoint hangs the process forever
+## 4. A stalled model endpoint hangs the process forever
 
 `src/model.ts:93-104` calls `fetch` with no `signal`, no `AbortController`, and no
 timeout. There is no `CHAMBER_TURN_DEADLINE_MS` or any other implemented deadline on the
@@ -172,12 +143,12 @@ is not.
 clock. Specified in `docs/NEXT_LEVEL_PLAN.md` Phase 2A, which calls out this exact line
 of code.
 
-## 6. The corpus has no notion of deletion
+## 5. The corpus has no notion of deletion
 
 Re-ingesting a directory does delete, and the boundary is worth stating precisely,
 because an earlier revision of this entry said flatly that it never removes rows. For a
 file it actually walked and read, the shrink sweep (`src/ingest.ts:758-775`) removes the
-tail rows a shortened note no longer covers — that is entry 7's subject. What it never
+tail rows a shortened note no longer covers — that is entry 6's subject. What it never
 removes is the rows of a file that has *disappeared*. The walk builds its list from files
 that exist, so a deleted file is simply never visited and its rows are never reconsidered.
 This is deliberate and documented at `src/ingest.ts:763-766`: a file absent from the walk
@@ -202,7 +173,7 @@ run can tell the two apart — plus tombstones rather than hard deletes, so veri
 report `deleted` instead of silently succeeding. Nothing in `docs/NEXT_LEVEL_PLAN.md`
 covers this; it is unplanned work.
 
-## 7. A shrunk note reports its tail citations as `not_found`
+## 6. A shrunk note reports its tail citations as `not_found`
 
 When a note is edited down to fewer passages, ingest correctly deletes the orphaned tail
 rows. A belief that pinned one of those rows then fails verification with reason
@@ -223,7 +194,7 @@ which verdict this case produces.
 report a distinct reason — the content is unchanged, only its position moved. The index
 needed for this already exists. Unplanned.
 
-## 8. Per-tool MCP drift detection does not exist
+## 7. Per-tool MCP drift detection does not exist
 
 `mcp_tool_pin` stores a `schema_hash` and a `description_hash` for every tool an MCP
 server declares (`sql/schema_mcp_pin.sql:14-15`). They are written by `pinToolsList`
@@ -247,7 +218,7 @@ not declaring it.
 stored pin rows and emit the `tool_drift` its own type already declares. The data is
 being collected; only the comparison is missing. Unplanned.
 
-## 9. MCP-imported skills are content-hashed by length
+## 8. MCP-imported skills are content-hashed by length
 
 `src/mcp_client.ts:272` writes a skill's `content_hash` as `String(body.length)`. That
 is a character count, not a digest. Any two bodies of equal length hash identically.
@@ -271,7 +242,7 @@ the hash first.
 **What would fix it.** Replace `String(body.length)` with `sha256(body)`, matching
 `mcp_bridge.ts`. One line.
 
-## 10. Overlapping ingest roots still duplicate via explicit paths
+## 9. Overlapping ingest roots still duplicate via explicit paths
 
 Overlapping roots are rejected when they come from the config file: `assertNoOverlap`
 (`src/config.ts:256-289`) runs unconditionally on parse and refuses both identical and
@@ -294,7 +265,7 @@ that it happened.
 **What would fix it.** Record ingested roots in the database and run the same overlap
 check against that record on every explicit-path run, not only on config parse. Unplanned.
 
-## 11. Ingest has no default exclude list
+## 10. Ingest has no default exclude list
 
 The directory walk prunes one thing by default, and even that is switchable: dot-prefixed
 entries are skipped unless `--include-dotted` is passed (`src/ingest.ts:365-372`). Beyond
@@ -315,7 +286,7 @@ does carry a hardcoded skip list; ingest has no equivalent.
 `dist`, `vendor`, archive folders), overridable and printed by `chamber config show` so
 the operator can see what is being skipped rather than having to infer it. Unplanned.
 
-## 12. CJK lexical retrieval does not work
+## 11. CJK lexical retrieval does not work
 
 The full-text index is declared without a tokenizer (`sql/schema_vector.sql:39-44`), so
 FTS5 uses its default, `unicode61`. `unicode61` splits on Unicode category boundaries. A
@@ -334,7 +305,7 @@ default.
 with SQLite is the zero-dependency option and handles CJK acceptably; a proper segmenter
 would be better and would cost a dependency Chamber does not currently have. Unplanned.
 
-## 13. Retrieval quality has no corpus-level regression guard
+## 12. Retrieval quality has no corpus-level regression guard
 
 This entry was narrower than first recorded, and the correction is worth stating: the
 hybrid-retrieval tests *do* assert rank order, not merely presence. They pin a target
@@ -359,7 +330,7 @@ most load-bearing path.
 as a scored eval with a floor that fails the build. Fifty queries would catch most of
 what matters. Unplanned.
 
-## 14. The scheduled job's log names neither its database nor its exit status
+## 13. The scheduled job's log names neither its database nor its exit status
 
 This entry has now been corrected twice, and both corrections narrowed it. The launchd
 job (`deploy/launchd/com.chamber.verify.plist`) *does* log ingest's exit code — the `||`

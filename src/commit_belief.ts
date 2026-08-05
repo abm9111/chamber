@@ -15,6 +15,7 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
+import { appendAudit } from "./audit.ts";
 import { claimHash, newId } from "./hash.ts";
 import { verifyPin, type BeliefSourceFailure } from "./pins.ts";
 import type {
@@ -50,6 +51,35 @@ function emitGate(
     row.subjectId ?? null,
     row.detail ? JSON.stringify(row.detail) : null,
   );
+
+  // The same decision, into the hash-chained log.
+  //
+  // `gate_event` is an ordinary table: no prev_hash, no Merkle leaf, nothing
+  // that makes an edit detectable. Until this line, the belief gate — the
+  // decision this whole system exists to make — wrote only there, while
+  // sixteen other modules wrote to the chained `audit_event`. Measured by
+  // probes/gate_audit.ts on a live database: 4 gate_event rows, 0 audit_event
+  // rows. The strongest claim Chamber makes, tamper-evident audit, covered the
+  // bookkeeping around the verdicts and not the verdicts.
+  //
+  // `appendAudit` rather than `appendAuditInTx` because `emitGate` is called
+  // from three different transaction contexts in this file: inside the
+  // BEGIN IMMEDIATE, after a ROLLBACK, and before any transaction opens.
+  // appendAudit tries BEGIN IMMEDIATE and falls back to the caller's
+  // transaction when one is already open, so it is correct in all three.
+  //
+  // `gate_event` stays as the queryable projection; this is a mirror, not a
+  // move, so nothing that reads it changes. A call inside a transaction that
+  // later rolls back loses both rows together, which is the existing
+  // behaviour of gate_event and keeps the two tables telling one story.
+  appendAudit(db, {
+    category: "gate",
+    action: `${row.gate}:${row.action}`,
+    subjectKind: row.subjectKind,
+    subjectId: row.subjectId,
+    turnId: row.turnId,
+    detail: { gate: row.gate, decision: row.action, ...(row.detail ?? {}) },
+  });
 }
 
 function openBlockingDebts(

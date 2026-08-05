@@ -11,6 +11,7 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
+import { appendAudit } from "./audit.ts";
 import { newId } from "./hash.ts";
 import type { ActivateResult, ActivateSkillInput } from "./types.ts";
 import { openDeliberation } from "./faculty.ts";
@@ -39,6 +40,21 @@ function emitGate(
     row.subjectId ?? null,
     row.detail ? JSON.stringify(row.detail) : null,
   );
+
+  // Mirrored into the hash-chained log for the reason given at the identical
+  // point in src/commit_belief.ts: `gate_event` is unchained, and the decision
+  // about whether a skill may mutate anything belongs in the tamper-evident
+  // record rather than beside it. `appendAudit` self-selects between opening
+  // its own transaction and joining the caller's, which this file needs —
+  // emitGate runs here both before the BEGIN IMMEDIATE and inside it.
+  appendAudit(db, {
+    category: "gate",
+    action: `${row.gate}:${row.action}`,
+    subjectKind: row.subjectKind,
+    subjectId: row.subjectId,
+    turnId: row.turnId,
+    detail: { gate: row.gate, decision: row.action, ...(row.detail ?? {}) },
+  });
 }
 
 function suspensionMode(db: DatabaseSync): "shadow" | "teeth" {

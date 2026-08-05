@@ -132,9 +132,27 @@ function parseVector(jsonText: string): Float32Array {
   return Float32Array.from(arr);
 }
 
+/**
+ * The interpreter that runs `scripts/embed_minilm.py`.
+ *
+ * Overridable because "python3" resolves differently depending on who is
+ * asking, and the difference is not cosmetic. On this machine an interactive
+ * shell finds an interpreter with numpy and onnxruntime installed, while a
+ * *login* shell — which is what `launchd` and `systemd` units run — finds
+ * `/usr/bin/python3`, which has neither. The scheduled ingest therefore
+ * embedded the whole corpus with hash vectors every morning and exited 0.
+ *
+ * Naming the interpreter is the only reliable fix: PATH is the thing that
+ * differs, so a setting that depends on PATH cannot resolve it.
+ */
+function pythonBin(): string {
+  const raw = process.env.CHAMBER_PYTHON;
+  return raw && raw.trim() !== "" ? raw.trim() : "python3";
+}
+
 /** Embed one string with MiniLM (subprocess). */
 export function embedMinilm(text: string): Float32Array {
-  const r = spawnSync("python3", [SCRIPT, text], {
+  const r = spawnSync(pythonBin(), [SCRIPT, text], {
     encoding: "utf-8",
     maxBuffer: 16 * 1024 * 1024,
     timeout: 120_000,
@@ -186,6 +204,33 @@ export interface EmbedResult {
  * Embed text with the best available local model.
  * Prefer MiniLM; fall back to hash embedder.
  */
+/**
+ * Announce a silent downgrade once per process.
+ *
+ * Once, because embedding runs per passage: a per-call warning on a 28,508
+ * passage ingest is 28,508 lines, which is its own way of saying nothing.
+ */
+let minilmFallbackWarned = false;
+function warnMinilmFallback(err: unknown): void {
+  if (minilmFallbackWarned) return;
+  minilmFallbackWarned = true;
+  const why = err instanceof Error ? err.message : String(err);
+  console.warn(
+    `chamber: WARNING — the MiniLM model files are present but the embedder ` +
+      `could not run, so this run is writing non-semantic hash vectors ` +
+      `(${HASH_MODEL}, ${HASH_DIMS}d) instead of ${MINILM_MODEL}. Retrieval ` +
+      `will not find things by meaning. Cause: ${why}. ` +
+      `embedMinilm shells out to python3 — check that the python3 on PATH has ` +
+      `its dependencies, which a scheduled job often does not. ` +
+      `Re-ingest once fixed; existing rows keep the vectors they were written with.`,
+  );
+}
+
+/** True when a silent MiniLM downgrade happened in this process. */
+export function minilmFallbackOccurred(): boolean {
+  return minilmFallbackWarned;
+}
+
 export function embedLocal(
   text: string,
   prefer: EmbedderKind | "auto" = "auto",
@@ -219,8 +264,32 @@ export function embedLocal(
         dims: vector.length,
         kind: "minilm",
       };
-    } catch {
-      if (prefer === "minilm") throw new Error("minilm embed failed");
+    } catch (err) {
+      if (prefer === "minilm") {
+        throw new Error(
+          `minilm embed failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      // A silent fall-through here destroyed a 28,508-passage corpus.
+      //
+      // `minilmAvailable()` tests that two *files* exist; it does not test that
+      // the embedder runs. embedMinilm shells out to python3, so an
+      // interpreter without onnxruntime on PATH — which is exactly what a
+      // launchd or systemd job gets — makes availability report true and
+      // execution throw. This catch then wrote a 256-dim hash vector in place
+      // of a 384-dim semantic one and said nothing.
+      //
+      // Measured on this machine: the scheduled 08:30 ingest re-embedded every
+      // passage with local-hash-v1 and exited 0, and `chamber ask` answered
+      // "nothing in the corpus matches this question" for material that was
+      // sitting in the index. A hash vector is a valid vector, so nothing
+      // downstream could tell.
+      //
+      // The fallback is kept — a machine with no python is entitled to a
+      // degraded index — but it is now audible exactly once per process, on
+      // stderr, naming the cause. Callers that must not degrade pass
+      // `prefer: "minilm"` and get the throw above.
+      warnMinilmFallback(err);
     }
   }
   const vector = hashEmbed(text);

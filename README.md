@@ -98,7 +98,7 @@ source and misread it, and every layer here will pass it. That is a stated
 non-goal, it has been observed happening, and it is not solved.
 
 Read [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) before trusting
-any output. Fourteen limitations are documented there, including two that are
+any output. Fifteen limitations are documented there, including two that are
 unflattering: the sandbox does not isolate, and citation debt blocks a verbatim
 repeat but not a paraphrase.
 

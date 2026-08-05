@@ -392,3 +392,46 @@ or a model call inside the gate. A belief-kind citation that consulted
 `belief.status` and open debt — refusing support from a debt-laden or superseded
 belief — closes the second half with a SELECT the gate already nearly performs.
 Unplanned.
+
+## 15. The embedder can silently downgrade, and runs one subprocess per passage
+
+`embedMinilm` shells out to `python3` with `scripts/embed_minilm.py`. Two things
+follow from that, and the first one destroyed a real corpus.
+
+**It can fail without saying so.** `minilmAvailable()` (`src/embedder.ts:56`)
+tests that two *files* exist. It does not test that the embedder *runs*. So on a
+machine where the resolved `python3` lacks `numpy` or `onnxruntime`, availability
+reports true, `embedMinilm` throws, and `embedLocal(_, "auto")` falls back to a
+256-dimension hash vector. A hash vector is a valid vector, so nothing
+downstream can tell.
+
+Observed on the development machine on 2026-08-05, not reasoned about: an
+interactive shell resolved `python3` to an interpreter with the dependencies,
+while a **login** shell — which is what `launchd` and `systemd` units run —
+resolved it to `/usr/bin/python3`, which has neither. The scheduled 08:30 job
+therefore re-embedded all 28,508 passages with `local-hash-v1` every morning and
+exited 0. `chamber ask` answered *"nothing in the corpus matches this question"*
+for material sitting in the index, because the query was a 384-dimension MiniLM
+vector and every stored vector was a 256-dimension hash.
+
+**What it costs.** Every other signal reported health. `verify` exited 0, the
+passage count was correct, and content pins verified — pins hash the stored
+*body*, not the vector, so the citation gate cannot see this. The only visible
+symptom was ingest finishing in two minutes instead of seventy-five, and nothing
+watches for a check being suspiciously fast.
+
+**Mitigated, not fixed.** The fallback now prints one warning per process naming
+the underlying error, and `CHAMBER_PYTHON` names the interpreter explicitly —
+PATH is the thing that differs between shells, so a PATH-dependent setting
+cannot resolve it. What remains unfixed is the shape of the check:
+`minilmAvailable()` still answers a question about files rather than about
+execution, which is the same defect `engines/preflight.md` calls "a probe that
+cannot fail". Nothing records, per corpus, which embedder produced it, so a
+database cannot report that its vectors and its queries disagree.
+
+**And it is slow.** `upsertDocument` calls `embedLocal` once per passage — a
+fresh python startup and ONNX model load each time, measured at ~158 ms. A
+28,500-passage corpus takes about 75 minutes. `embedLocalBatch`
+(`src/embedder.ts:304`) exists to amortise exactly this and **has no callers**.
+Wiring it in is the single largest performance win available in the ingest path.
+Unplanned.

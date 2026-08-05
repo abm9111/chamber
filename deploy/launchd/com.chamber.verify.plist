@@ -60,6 +60,26 @@ fi
 exit $rc</string>
   </array>
 
+  <!--
+    The interpreter that runs the MiniLM embedder, named explicitly.
+
+    `sh -lc` is a *login* shell, and on macOS a login shell finds
+    /usr/bin/python3 — which has no numpy and no onnxruntime. embedMinilm
+    therefore threw, the embedder fell back to non-semantic hash vectors, and
+    this job re-embedded the entire corpus with them every morning while
+    exiting 0. `chamber ask` then answered "nothing in the corpus matches" for
+    material that was sitting in the index.
+
+    PATH is the thing that differs between an interactive shell and this one,
+    so a setting that depends on PATH cannot fix it. Point this at an
+    interpreter that has the dependencies.
+  -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CHAMBER_PYTHON</key>
+    <string>REPLACE_WITH_HOME/frida-env/bin/python3</string>
+  </dict>
+
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key><integer>8</integer>

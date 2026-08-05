@@ -10,6 +10,13 @@
     Runs after com.chamber.verify (08:30) so it can read that run's result
     rather than racing it.
 
+    10:07, not 08:52. A real MiniLM ingest of ~28,500 passages takes about 75
+    minutes because the embedder spawns one python subprocess per passage, so
+    the 08:30 job does not reach `verify` until roughly 09:55. The original
+    08:52 slot was chosen while the corpus was silently being hash-embedded,
+    which took two minutes -- so this schedule was calibrated against a bug,
+    and would have read a half-built index and reported it as fact.
+
     This job records; it does not judge. Its exit status is deliberately 0 even
     when a check inside it fails, because `chamber verify` is the gate and it
     already runs on its own schedule with its own non-zero contract. A recorder
@@ -29,8 +36,8 @@
 
   <key>StartCalendarInterval</key>
   <dict>
-    <key>Hour</key><integer>8</integer>
-    <key>Minute</key><integer>52</integer>
+    <key>Hour</key><integer>10</integer>
+    <key>Minute</key><integer>7</integer>
   </dict>
 
   <key>StandardOutPath</key>

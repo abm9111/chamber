@@ -1217,10 +1217,30 @@ async function main(): Promise<void> {
         since = parsed.toISOString();
       }
       const report = verifyBeliefSources(db, { since });
+      // Two counters, because "lost everything" and "lost something" are
+      // different findings and only one of them used to be reportable.
+      //
+      // The exit status was `broken > 0`, where `broken` counted only beliefs
+      // with `verified === 0`. A belief that lost two of its three pins printed
+      // two hash_mismatch lines and still exited 0. That is a hole in the one
+      // machine-readable signal this command produces: the scheduled launchd
+      // job raises its notification solely on a non-zero exit, so partial
+      // evidence loss was silent to the only consumer that exists.
+      //
+      // Found by an external review on 2026-08-05 and reproduced by
+      // probes/verify_partial_drift.ts before this change: a belief committed
+      // against three real passages, two edited underneath it, verified 1/3,
+      // exit 0.
+      //
+      // Any pin that no longer verifies now fails the run. "Some of the
+      // evidence survived" is not a passing state for a check whose entire job
+      // is to notice that evidence moved.
       let broken = 0;
+      let degraded = 0;
       for (const b of report) {
         if (b.failures.length === 0) continue;
-        broken += b.verified === 0 ? 1 : 0;
+        if (b.verified === 0) broken++;
+        else degraded++;
         console.log(`${b.beliefId}  ${b.verified}/${b.total} pins verified`);
         console.log(`  "${b.content.slice(0, 70)}"`);
         // What this message has to convey is whether the operator's evidence
@@ -1262,9 +1282,10 @@ async function main(): Promise<void> {
         }
       }
       console.log(
-        `\n${report.length} belief(s) checked, ${broken} with no verified support left`,
+        `\n${report.length} belief(s) checked, ${broken} with no verified support left` +
+          `, ${degraded} with some support lost`,
       );
-      if (broken > 0) process.exitCode = 1;
+      if (broken + degraded > 0) process.exitCode = 1;
       break;
     }
     case "expiry": {

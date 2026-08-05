@@ -13,6 +13,8 @@ That inversion is deliberate: when a probe starts passing, promote it into
 | `sandbox_escape.ts` | `CHAMBER_SANDBOX_REQUIRED=1` is a no-op; sandboxed code reads/writes `$HOME` and reaches the network | Phase 1.1 |
 | `gate_audit.ts` | `commit_belief` / `try_activate_skill` write only unchained `gate_event` | Phase 1.2 |
 | `pin_bypass.ts` | The citation gate is satisfied by a fabricated source pin | Phase 1.3 |
+| `debt_paraphrase.ts` | Citation debt blocks verbatim repetition only; a paraphrase of a blocked claim commits freely | — |
+| `verify_partial_drift.ts` | A belief losing only some pins still makes `chamber verify` exit 0 | — |
 | `seatbelt/` | What macOS `sandbox-exec` can and cannot enforce — read before writing the seatbelt backend | Phase 1.1 |
 
 ## Run
@@ -21,6 +23,8 @@ That inversion is deliberate: when a probe starts passing, promote it into
 CHAMBER_SANDBOX_REQUIRED=1 node --experimental-strip-types probes/sandbox_escape.ts
 node --experimental-strip-types probes/gate_audit.ts
 node --experimental-strip-types probes/pin_bypass.ts
+node --experimental-strip-types probes/debt_paraphrase.ts
+node --experimental-strip-types probes/verify_partial_drift.ts
 ```
 
 Or all three: `npm run probes` (reports which defects are still present).

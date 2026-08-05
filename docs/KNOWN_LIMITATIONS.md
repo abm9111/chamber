@@ -361,3 +361,34 @@ states the path nowhere.
 
 **What would fix it.** Have `verify` print the resolved database path, and have the job
 echo verify's exit status after it returns. Unplanned.
+
+## 14. Citation debt blocks verbatim repetition only — a paraphrase escapes
+
+The debt gate's blocking condition is keyed on `claim_hash`, and
+`claimHash(type, text)` is sha256 over the exact claim text after whitespace
+normalisation (`src/hash.ts:4-7`; consumed at `src/commit_belief.ts:85-97` and
+`:185`). Two sentences asserting the same fact in different words are two
+different hashes. An assertion blocked from being re-committed word-for-word
+commits freely the moment it is reworded — and language models reword by
+default.
+
+**What it costs.** Verified by `probes/debt_paraphrase.ts` (added 2026-08-05,
+exits 1 while this holds): an unsourced assertion commits and mints blocking
+debt; the verbatim repeat is correctly REJECTED by that debt; a paraphrase of
+the same claim commits `ok: true` while the original debt is still open. Debt
+prevents *repetition*, not *reliance* on the same unsupported claim. The review
+brief's sentence that debt "blocks anything built on top of" an unsupported
+assertion overstates the mechanism twice over — once here, and once because a
+belief-kind source is verified by existence only (`src/commit_belief.ts:239-250`),
+so a belief carrying open blocking debt still counts as verified support when
+cited. `--strict` (`requireVerifiedSupport`) refuses the paraphrase too, but it
+refuses every unsourced assertion, original included — it is not a paraphrase
+defence, and it is not the default path.
+
+**What would fix it.** Nothing simple, and it should be said plainly: exact-text
+keying is the only zero-dependency option, and any semantic-equivalence check
+(embedding similarity over claim text, an NLI model) costs either a dependency
+or a model call inside the gate. A belief-kind citation that consulted
+`belief.status` and open debt — refusing support from a debt-laden or superseded
+belief — closes the second half with a SELECT the gate already nearly performs.
+Unplanned.

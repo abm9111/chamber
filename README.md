@@ -107,6 +107,13 @@ fall back to non-semantic hash vectors and every question answer "nothing in
 the corpus matches." Naming the interpreters is the only reliable fix. See
 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) entry 15.
 
+The server resolves config once, on its first tool call, and pins it for the
+life of the process — so **reconnect the server after editing config**. Editing
+`model.base` while a host held the process open produced `ECONNREFUSED` against
+the *old* address while the CLI answered fine from the same file, which reads
+as a broken config rather than a stale daemon. The resolved database, mode and
+base are printed to stderr on first use so the host's MCP log can settle it.
+
 Nothing on that surface can activate a skill, approve a pending write, or
 ingest — the gates exist so a *human* passes through them, and handing a model
 the approval side would invert them rather than weaken them.

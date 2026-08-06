@@ -100,6 +100,21 @@ function getDb(): DatabaseSync {
     // stub text that a reader would have taken for a real refusal.
     applyModelEnv(config);
     db = openChamberDb(config.database);
+    // Announced because this process pins these values for its whole life.
+    //
+    // applyModelEnv seeds only what is unset, which is what makes env outrank
+    // config — and it also means a config edit can never reach a server that
+    // has already run one tool call. Editing the model base while a host held
+    // this process open produced ECONNREFUSED against the *old* address, which
+    // reads as a broken config rather than a stale daemon; the CLI answered
+    // fine from the same file at the same moment. One line on stderr, which
+    // the host keeps in its MCP log, is the difference between diagnosing that
+    // in a minute and doubting the config file.
+    console.error(
+      `chamber mcp: db=${config.database} model=${process.env.CHAMBER_MODEL} ` +
+        `base=${process.env.CHAMBER_API_BASE ?? "(unset)"} ` +
+        `— pinned for this process; reconnect the server after editing config`,
+    );
   }
   return db;
 }

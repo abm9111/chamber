@@ -18,8 +18,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { openChamberDb } from "./db.ts";
+import { corpusStats } from "./corpus.ts";
 import {
   loadConfig,
+  applyModelEnv,
   explainConfig,
   configPath,
   type ChamberConfig,
@@ -626,84 +628,58 @@ function cmdIndex(
  * list of things you could act on.
  */
 function cmdCorpus(db: DatabaseSync): void {
-  const rows = db
-    .prepare(`SELECT source_ref, source_kind, length(body) AS bytes FROM vector_document`)
-    .all() as { source_ref: string; source_kind: string; bytes: number }[];
+  const s = corpusStats(db);
 
-  if (rows.length === 0) {
+  if (s.passages === 0) {
     console.log("corpus is empty — run `chamber ingest`");
     return;
   }
 
-  const files = new Set<string>();
-  const byGroup = new Map<string, { passages: number; bytes: number; files: Set<string> }>();
-  const byKind = new Map<string, number>();
-
-  for (const r of rows) {
-    const ref = String(r.source_ref);
-    const file = ref.replace(/#p\d+$/, "");
-    files.add(file);
-    // First path segment, or "(root)" for a file sitting directly in a root.
-    const slash = file.indexOf("/");
-    const group = slash === -1 ? "(root)" : file.slice(0, slash);
-    const g = byGroup.get(group) ?? { passages: 0, bytes: 0, files: new Set<string>() };
-    g.passages += 1;
-    g.bytes += r.bytes ?? 0;
-    g.files.add(file);
-    byGroup.set(group, g);
-    byKind.set(r.source_kind, (byKind.get(r.source_kind) ?? 0) + 1);
-  }
-
-  const totalBytes = rows.reduce((a, r) => a + (r.bytes ?? 0), 0);
   const kb = (n: number): string => `${Math.round(n / 1024).toLocaleString()} KB`;
 
   console.log(
-    `${rows.length.toLocaleString()} passages · ${files.size.toLocaleString()} files · ` +
-      `${kb(totalBytes)} · ${(rows.length / files.size).toFixed(1)} passages/file`,
+    `${s.passages.toLocaleString()} passages · ${s.files.toLocaleString()} files · ` +
+      `${kb(s.bytes)} · ${(s.passages / s.files).toFixed(1)} passages/file`,
   );
 
   // Citability is not cosmetic: only kinds with a registered pin formula can be
   // retrieved by `ask` at all, so a corpus full of an uncitable kind is a
   // corpus that answers nothing.
-  const kinds = [...byKind.entries()].sort((a, b) => b[1] - a[1]);
   console.log(
-    `\nby kind: ${kinds.map(([k, n]) => `${k} ${n.toLocaleString()}`).join(" · ")}` +
-      (kinds.some(([k]) => k !== "vault_page")
+    `\nby kind: ${s.byKind.map((k) => `${k.kind} ${k.passages.toLocaleString()}`).join(" · ")}` +
+      (s.byKind.some((k) => k.kind !== "vault_page")
         ? "\n  only vault_page is citable — other kinds are searchable but `ask` will not retrieve them"
         : ""),
   );
 
-  const groups = [...byGroup.entries()].sort((a, b) => b[1].passages - a[1].passages);
   console.log(`\ntop contributors (first path segment, what --exclude matches):`);
-  for (const [name, g] of groups.slice(0, 12)) {
-    const share = ((g.passages / rows.length) * 100).toFixed(1);
-    const bar = "█".repeat(Math.max(1, Math.round((g.passages / groups[0]![1].passages) * 22)));
+  for (const g of s.groups.slice(0, 12)) {
+    const share = ((g.passages / s.passages) * 100).toFixed(1);
+    const bar = "█".repeat(
+      Math.max(1, Math.round((g.passages / s.groups[0]!.passages) * 22)),
+    );
     console.log(
       `  ${String(share).padStart(5)}%  ${bar.padEnd(22)}  ` +
         `${g.passages.toLocaleString().padStart(7)} passages  ` +
-        `${String(g.files.size).padStart(5)} files  ${name}`,
+        `${String(g.files).padStart(5)} files  ${g.name}`,
     );
   }
-  if (groups.length > 12) {
-    const rest = groups.slice(12).reduce((a, [, g]) => a + g.passages, 0);
-    console.log(`         …and ${groups.length - 12} more, ${rest.toLocaleString()} passages`);
+  if (s.groups.length > 12) {
+    const rest = s.groups.slice(12).reduce((a, g) => a + g.passages, 0);
+    console.log(
+      `         …and ${s.groups.length - 12} more, ${rest.toLocaleString()} passages`,
+    );
   }
 
   // A single file contributing hundreds of passages is the signature of the
   // failure above: a 1.5 MB chat export chunks into ~600 passages where an
   // ordinary note produces ~25.
-  const perFile = new Map<string, number>();
-  for (const r of rows) {
-    const f = String(r.source_ref).replace(/#p\d+$/, "");
-    perFile.set(f, (perFile.get(f) ?? 0) + 1);
-  }
-  const fattest = [...perFile.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
-  const median = [...perFile.values()].sort((a, b) => a - b)[Math.floor(perFile.size / 2)] ?? 1;
-  if (fattest[0] && fattest[0][1] > median * 8) {
-    console.log(`\nunusually large files (median is ${median} passages):`);
-    for (const [f, n] of fattest) {
-      if (n <= median * 8) break;
-      console.log(`  ${String(n).padStart(6)} passages  ${f}`);
+  if (s.fattest.length > 0) {
+    console.log(
+      `\nunusually large files (median is ${s.medianPassagesPerFile} passages):`,
+    );
+    for (const f of s.fattest) {
+      console.log(`  ${String(f.passages).padStart(6)} passages  ${f.file}`);
     }
     console.log("  a file far above the median is usually an export, not a note");
   }
@@ -976,20 +952,11 @@ async function main(): Promise<void> {
   // — falling back on a genuine disk I/O error opening the resolved path,
   // not laundering an unrelated config error into a silent :memory:.
   //
-  // The model layer reads CHAMBER_API_BASE / CHAMBER_API_MODEL from the
-  // environment directly. Seeding only where unset preserves precedence by
-  // construction, since env already outranks config. This is a seam, not an
-  // architecture: close it when complete() takes explicit options.
+  // The model layer reads its base, name and mode from the environment
+  // directly; applyModelEnv is what puts config there. See its doc comment —
+  // an entrypoint that skips it answers from the stub without saying so.
   loadedConfig ??= loadConfig();
-  if (!process.env.CHAMBER_API_BASE && loadedConfig.model.base) {
-    process.env.CHAMBER_API_BASE = loadedConfig.model.base;
-  }
-  if (!process.env.CHAMBER_API_MODEL && loadedConfig.model.name) {
-    process.env.CHAMBER_API_MODEL = loadedConfig.model.name;
-  }
-  if (!process.env.CHAMBER_MODEL && loadedConfig.model.mode) {
-    process.env.CHAMBER_MODEL = loadedConfig.model.mode;
-  }
+  applyModelEnv(loadedConfig);
 
   const db = open();
 

@@ -489,6 +489,39 @@ function parseFile(path: string): ParsedFile {
   };
 }
 
+/**
+ * Seed the model environment `src/model.ts` reads, from config.
+ *
+ * `complete()` resolves its mode from `process.env.CHAMBER_MODEL` alone, and
+ * that variable defaults to `"stub"`. Nothing reads `config.model.mode` on the
+ * way there. So an entrypoint that opens a database and calls `runAsk` without
+ * this step answers from the canned stub while the config file plainly says
+ * `"mode": "openai"` — and the stub returns well-formed prose, so the only
+ * symptom is answers that are subtly not about your corpus. That is the same
+ * shape as the embedder downgrade this project has already been bitten by
+ * once: a valid-looking result standing in for a real one, silently.
+ *
+ * Every entrypoint that may reach the model must call this. It lives here,
+ * exported, because it was previously two lines inlined in the CLI, which is
+ * precisely why `src/server.ts` and the gateway runners do not do it.
+ *
+ * Seeding only where unset preserves precedence by construction: env already
+ * outranks config, so a variable the operator set explicitly is never
+ * overwritten. This is a seam, not an architecture — close it when
+ * `complete()` takes explicit options.
+ */
+export function applyModelEnv(config: ChamberConfig): void {
+  if (!process.env.CHAMBER_API_BASE && config.model.base) {
+    process.env.CHAMBER_API_BASE = config.model.base;
+  }
+  if (!process.env.CHAMBER_API_MODEL && config.model.name) {
+    process.env.CHAMBER_API_MODEL = config.model.name;
+  }
+  if (!process.env.CHAMBER_MODEL && config.model.mode) {
+    process.env.CHAMBER_MODEL = config.model.mode;
+  }
+}
+
 export function loadConfig(opts: { path?: string } = {}): ChamberConfig {
   const path = opts.path ?? configPath();
   const file = parseFile(path);

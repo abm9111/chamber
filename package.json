@@ -19,6 +19,7 @@
     "turn": "node --experimental-strip-types src/cli.ts turn",
     "status": "node --experimental-strip-types src/cli.ts status",
     "server": "node --experimental-strip-types src/server.ts",
+    "mcp": "node --experimental-strip-types src/mcp_server.ts",
     "gateway": "node --experimental-strip-types src/gateway_runner.ts",
     "cron-run": "node --experimental-strip-types src/cli.ts cron run",
     "launch": "node --experimental-strip-types src/cli.ts status",

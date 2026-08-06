@@ -88,6 +88,32 @@ them and answer from them — see `chamber corpus` and
 something drifted. A check that correctly reports nothing on most days is a
 check you stop reading, so it stays quiet until it isn't.
 
+### Use it from an AI coding agent
+
+`src/mcp_server.ts` exposes three tools over MCP — `chamber_ask`,
+`chamber_verify`, `chamber_corpus` — so a host like Claude Code can query your
+corpus and see the per-claim citation verdicts rather than just the prose.
+
+```bash
+claude mcp add -s user chamber \
+  -e CHAMBER_PYTHON=/path/to/python-with-onnxruntime \
+  -- /absolute/path/to/node --experimental-strip-types /path/to/chamber/src/mcp_server.ts
+```
+
+Both absolute paths are deliberate. A spawned MCP server does not inherit your
+interactive shell's `PATH`: `node` may resolve to a version below the 23.6
+floor, and `python3` to one without `onnxruntime` — which makes the embedder
+fall back to non-semantic hash vectors and every question answer "nothing in
+the corpus matches." Naming the interpreters is the only reliable fix. See
+[`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) entry 15.
+
+Nothing on that surface can commit a belief, activate a skill, approve a
+pending write, or ingest. The gates exist so a *human* passes through them;
+letting a model write into the ledger it is held to would invert them rather
+than weaken them. `chamber_ask` is not purely read-only, though — exactly as on
+the command line, it mints citation debt for unsourced claims and records
+spend.
+
 ## What a verified citation does and does not prove
 
 Chamber proves a cited passage **is the passage it claims to be** — unmodified,
@@ -138,6 +164,7 @@ deliberately. A gate that cannot fail reports safety it never checked.
 
 ```text
 src/ask.ts              retrieval → prompt → per-claim citation gate
+src/mcp_server.ts       the read side over MCP: ask, verify, corpus
 src/commit_belief.ts    the belief gate; check and write in one transaction
 src/pins.ts             content pins and drift verification
 src/audit.ts            hash-chained log + incremental Merkle

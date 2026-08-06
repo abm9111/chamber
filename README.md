@@ -107,12 +107,16 @@ fall back to non-semantic hash vectors and every question answer "nothing in
 the corpus matches." Naming the interpreters is the only reliable fix. See
 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) entry 15.
 
-Nothing on that surface can commit a belief, activate a skill, approve a
-pending write, or ingest. The gates exist so a *human* passes through them;
-letting a model write into the ledger it is held to would invert them rather
-than weaken them. `chamber_ask` is not purely read-only, though — exactly as on
-the command line, it mints citation debt for unsourced claims and records
-spend.
+Nothing on that surface can activate a skill, approve a pending write, or
+ingest — the gates exist so a *human* passes through them, and handing a model
+the approval side would invert them rather than weaken them.
+
+`chamber_ask` is not read-only, and the write is not just bookkeeping: every
+claim goes through the commit gate, so a claim with verified citations is
+recorded as a **belief with its pins** — which is exactly what `chamber verify`
+later re-checks for drift. Unsourced assertions mint citation debt; spend is
+recorded. This is the same behaviour as `chamber ask` on the command line. The
+guarantee is that the gate is not bypassed, not that nothing is written.
 
 ## What a verified citation does and does not prove
 

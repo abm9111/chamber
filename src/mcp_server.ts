@@ -10,28 +10,34 @@
  *
  * ## What is exposed, and what is not
  *
- * Three tools, all of them queries: ask, verify, corpus. Nothing here can
- * commit a belief, activate a skill, approve a pending write, or run an
- * ingest.
- *
- * That is the whole design. Chamber's invariant is that no assertion becomes
- * load-bearing except through a gate, and the gates exist so a *human* passes
- * through them. Exposing `commitBelief` over MCP would let a model write into
- * the ledger it is supposed to be held to, which does not weaken the gate so
- * much as invert it — the audit chain would faithfully record a model
- * approving its own conclusions. `ingest` is excluded for a duller reason: it
- * is a long write that the scheduled 08:30 job already owns, and two of them
+ * Three tools: ask, verify, corpus. No tool here can activate a skill, approve
+ * a pending write, or run an ingest. `ingest` is excluded for a dull reason —
+ * it is a long write the scheduled 08:30 job already owns, and two of them
  * racing is how this database got locked before.
  *
- * ## "Read-only" is not quite true of ask
+ * ## `chamber_ask` writes, and one of the things it writes is beliefs
  *
  * `chamber_verify` and `chamber_corpus` are pure SELECTs. `chamber_ask` is
- * not: exactly as on the command line, it mints citation debt for assertions
- * it could not source and records the model spend. Those are the accounting
- * rows that make an unsourced claim visible later, so suppressing them would
- * make the MCP path quieter than the CLI path about the same failure — the
- * one asymmetry worth refusing. It is stated in the tool description rather
- * than hidden.
+ * not, and the distinction is bigger than accounting: `runAsk` puts every
+ * claim through `enforceClaimContract`, which calls `commitBelief`. A claim
+ * with verified citations lands in the ledger with its pins; an unsourced
+ * assertion mints citation debt; spend is recorded. Measured: five MCP asks
+ * during the first live test wrote five beliefs, one of them carrying five
+ * pinned sources.
+ *
+ * That is not a hole — it is how beliefs enter the ledger at all, on this
+ * surface exactly as on the command line, and it is what gives `verify`
+ * something to detect drift *in*. But it does mean the honest claim is "the
+ * gate is not bypassed", not "nothing is written". An earlier version of this
+ * file asserted the latter in its own tool description, which was false in a
+ * way a caller could act on.
+ *
+ * What stays off the surface is everything that would let a caller get *past*
+ * a gate rather than through it: no skill activation, no approving a pending
+ * write, no direct ledger access. The gates exist so a human passes through
+ * them, and handing a model the approval side would not weaken them so much
+ * as invert them — the audit chain would faithfully record a model clearing
+ * its own conclusions.
  *
  * ## stdout belongs to the protocol
  *
@@ -112,8 +118,11 @@ const TOOLS = [
       "UNSUPPORTED (no verified source — recorded, not load-bearing). Cited " +
       "sources are returned as file#passage references you can open. Answers " +
       "only from the indexed corpus; says so when nothing matches. NOTE: this " +
-      "writes — it mints citation-debt rows for unsourced claims and records " +
-      "model spend, exactly as `chamber ask` does. It cannot commit a belief.",
+      "WRITES, exactly as `chamber ask` does — each claim goes through the " +
+      "commit gate, so a claim with verified citations is recorded as a belief " +
+      "with its pins (which is what `chamber_verify` later checks for drift), " +
+      "an unsourced assertion mints citation debt, and spend is recorded. It " +
+      "cannot bypass that gate, activate a skill, or approve a pending write.",
     inputSchema: {
       type: "object",
       properties: {

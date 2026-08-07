@@ -37,6 +37,7 @@ import {
   verifyInclusionProof,
   buildMerkleLayers,
 } from "../src/merkle.ts";
+import { embedMinilmBatch } from "../src/embedder.ts";
 import {
   localHashEmbed,
   cosineSimilarity,
@@ -551,6 +552,62 @@ test("gates", "a debt on one claim does not block an unrelated claim", () => {
     path: "deep",
   });
   assert(r.ok, `unrelated claim was wrongly blocked: ${JSON.stringify(r)}`);
+});
+
+/**
+ * The batch embedder ignored CHAMBER_PYTHON and hardcoded "python3" — the very
+ * defect the comment above `pythonBin` says embedded a whole corpus with hash
+ * vectors every morning, still live in the path the paraphrase gate calls.
+ * Naming a missing interpreter must reach the subprocess and fail, not be
+ * quietly replaced by whatever PATH happens to offer.
+ */
+test("pins", "the batch embedder honours the named interpreter", () => {
+  const saved = process.env.CHAMBER_PYTHON;
+  process.env.CHAMBER_PYTHON = "/nonexistent/python-that-is-not-here";
+  try {
+    let threw = false;
+    try {
+      embedMinilmBatch(["alpha text one", "beta text two"]);
+    } catch {
+      threw = true;
+    }
+    assert(threw, "a missing named interpreter must fail, not fall back to PATH");
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+  }
+});
+
+/**
+ * `embedLocalBatch` throws where singular `embedLocal` degrades — the batch path
+ * has no mid-call hash fallback. So the documented `semantic: false` branch was
+ * unreachable, and a broken embedder did not soften the gate, it PARKED every
+ * assertion commit made while any blocking debt was open. A check that cannot
+ * run has to be recorded as not having run; it must not take the ledger down.
+ */
+test("gates", "a commit survives an embedder that cannot run", () => {
+  const db = freshDb();
+  const indebted = "The refund policy allows returns within 30 days.";
+  insertDebt(db, claimHash("belief", indebted), indebted);
+
+  const saved = process.env.CHAMBER_PYTHON;
+  process.env.CHAMBER_PYTHON = "/nonexistent/python-that-is-not-here";
+  try {
+    const r = commitBelief(db, {
+      type: "belief",
+      text: "The office in Dubai opens at nine on weekdays.",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    assert(
+      r.ok,
+      `a broken embedder must not park the commit: ${JSON.stringify(r)}`,
+    );
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+  }
 });
 
 test("gates", "2_retraction_is_free", () => {

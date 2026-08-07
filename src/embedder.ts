@@ -173,7 +173,10 @@ export function embedMinilmBatch(texts: string[]): Float32Array[] {
   if (texts.length === 0) return [];
   if (texts.length === 1) return [embedMinilm(texts[0]!)];
   const r = spawnSync(
-    "python3",
+    // Not the literal "python3": the whole point of pythonBin is that PATH
+    // resolves differently for a login shell, and this batch path is the one
+    // the scheduled ingest actually takes.
+    pythonBin(),
     [SCRIPT, "--json", JSON.stringify(texts)],
     {
       encoding: "utf-8",

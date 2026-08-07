@@ -141,7 +141,23 @@ function paraphraseBlockingDebts(
 
   // One batch, not one call per debt: embedMinilm shells out to python3, so
   // per-row embedding would put a process spawn per open debt on every commit.
-  const embeds = embedLocalBatch([text, ...rows.map((r) => r.claim_text)]);
+  // `embedLocalBatch` throws where singular `embedLocal` degrades: the batch
+  // path has no mid-call hash fallback, so a python3 that is missing, lacks
+  // onnxruntime, OOMs or times out raises instead of returning hash vectors.
+  // Unhandled, that escaped into the commit's outer catch and PARKED every
+  // assertion made while any blocking debt was open — a broken embedder taking
+  // down the ledger rather than softening one check. It is the same outcome the
+  // `semantic: false` branch below already describes, so it is reported the
+  // same way: the check did not run, and the caller is told.
+  let embeds;
+  try {
+    embeds = embedLocalBatch([text, ...rows.map((r) => r.claim_text)]);
+  } catch {
+    return { debts: [], semantic: false };
+  }
+  // A short or padded result would silently mis-pair claims with debts, since
+  // the comparison below indexes rows by position.
+  if (embeds.length !== rows.length + 1) return { debts: [], semantic: false };
   if (embeds.some((e) => e.kind === "hash")) return { debts: [], semantic: false };
 
   const target = embeds[0]!.vector;
@@ -373,13 +389,23 @@ export function commitBelief(
     // operator reading the ledger cannot tell a commit that cleared the
     // paraphrase check from one committed on a machine where it never ran.
     if (!paraphrase.semantic) {
-      emitGate(db, {
-        turnId,
-        gate: "debt",
-        action: "degraded",
+      // Straight to the chained audit log rather than through emitGate.
+      // `gate_event.action` is CHECK-constrained to a closed vocabulary that has
+      // no member meaning "this check could not run" — "degraded" was rejected
+      // outright, so the row intended to record the degradation instead threw
+      // and parked the commit. `audit_event.action` is free text, and the
+      // hash-chained log is the better home for it regardless.
+      appendAudit(db, {
+        category: "gate",
+        action: "debt:degraded",
         subjectKind: "claim_hash",
         subjectId: hash,
-        detail: { check: "paraphrase", reason: "embedder degraded to hash" },
+        turnId,
+        detail: {
+          gate: "debt",
+          check: "paraphrase",
+          reason: "embedder unavailable or non-semantic; paraphrase check did not run",
+        },
       });
     }
 

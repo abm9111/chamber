@@ -248,21 +248,29 @@ function runBwrap(
       ? [cmd, "--experimental-strip-types", script, ...(req.args ?? [])]
       : [cmd, script, ...(req.args ?? [])];
 
+  // Order is load-bearing: bwrap applies mount operations left to right, and
+  // the work directory lives under the system temp dir. With `--tmpfs /tmp`
+  // last, the empty tmpfs mounted straight over `/tmp` after the bind, hiding
+  // the script that was just written there — so on a host with real bubblewrap
+  // the payload failed ENOENT, the isolation probe read that as "does not
+  // confine", and CHAMBER_SANDBOX_REQUIRED=1 refused every call on exactly the
+  // machines that could isolate. The tmpfs therefore goes down first and the
+  // work directory is bound on top of it.
   const bwrapArgs = [
     "--ro-bind",
     "/",
     "/",
-    "--bind",
-    dir,
-    dir,
-    "--chdir",
-    dir,
     "--dev",
     "/dev",
     "--proc",
     "/proc",
     "--tmpfs",
     "/tmp",
+    "--bind",
+    dir,
+    dir,
+    "--chdir",
+    dir,
     "--unshare-net",
     "--die-with-parent",
     ...innerArgs,

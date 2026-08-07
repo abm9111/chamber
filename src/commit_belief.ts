@@ -18,6 +18,8 @@ import type { DatabaseSync } from "node:sqlite";
 import { appendAudit } from "./audit.ts";
 import { claimHash, newId } from "./hash.ts";
 import { verifyPin, type BeliefSourceFailure } from "./pins.ts";
+import { embedLocalBatch } from "./embedder.ts";
+import { cosineSimilarity } from "./vector.ts";
 import type {
   CommitBeliefInput,
   CommitResult,
@@ -94,6 +96,63 @@ function openBlockingDebts(
          AND status IN ('pending','proposed_paid')`,
     )
     .all(claimHashValue) as { id: string }[];
+}
+
+/**
+ * Cosine above which two claims are treated as the same assertion for the
+ * purpose of the debt gate. Measured on the probe pair: a genuine paraphrase
+ * of one sentence scores ~0.83, an unrelated sentence from the same corpus
+ * ~0.03, so the boundary is wide and this sits inside it. It is deliberately
+ * nearer the paraphrase than the midpoint: a false positive here refuses a
+ * commit and says which debt did it, which an author can see and answer by
+ * citing a source, while a false negative is the silent escape this exists to
+ * close.
+ */
+export const DEBT_PARAPHRASE_THRESHOLD = 0.8;
+
+/**
+ * Open blocking debts whose claim says the same thing as `text` in different
+ * words. `claim_hash` cannot find these — it is sha256 over normalised text,
+ * so "within 30 days" and "during the 30 days after purchase" are two unrelated
+ * keys, and debt that blocks only exact repetition blocks nothing a model
+ * writes twice.
+ *
+ * `semantic` is false when the embedder degraded to the hash fallback mid-call.
+ * Hash vectors encode character n-grams, not meaning, so comparing them here
+ * would produce a confident number with nothing behind it — the caller is told
+ * the check did not run rather than being handed that number.
+ */
+function paraphraseBlockingDebts(
+  db: DatabaseSync,
+  text: string,
+  excludeHash: string,
+): { debts: { id: string }[]; semantic: boolean } {
+  const rows = db
+    .prepare(
+      `SELECT id, claim_text FROM citation_debt
+       WHERE blocking = 1
+         AND status IN ('pending','proposed_paid')
+         AND claim_hash != ?
+         AND claim_text IS NOT NULL
+         AND claim_text != ''`,
+    )
+    .all(excludeHash) as unknown as { id: string; claim_text: string }[];
+  if (rows.length === 0) return { debts: [], semantic: true };
+
+  // One batch, not one call per debt: embedMinilm shells out to python3, so
+  // per-row embedding would put a process spawn per open debt on every commit.
+  const embeds = embedLocalBatch([text, ...rows.map((r) => r.claim_text)]);
+  if (embeds.some((e) => e.kind === "hash")) return { debts: [], semantic: false };
+
+  const target = embeds[0]!.vector;
+  const debts = rows
+    .filter(
+      (_, i) =>
+        cosineSimilarity(target, embeds[i + 1]!.vector) >=
+        DEBT_PARAPHRASE_THRESHOLD,
+    )
+    .map((r) => ({ id: r.id }));
+  return { debts, semantic: true };
 }
 
 function inheritDebtsAlongChain(
@@ -300,11 +359,29 @@ export function commitBelief(
       }
     }
 
-    // Open blocking debts on this claim_hash + inherited from revision chain
+    // Open blocking debts on this claim_hash + inherited from revision chain +
+    // debts on the same claim worn as different words.
     const directDebts = openBlockingDebts(db, hash);
     const inherited = inheritDebtsAlongChain(db, revisionOf);
-    const blocking = [...directDebts, ...inherited];
+    const paraphrase = ASSERTION.has(type)
+      ? paraphraseBlockingDebts(db, text, hash)
+      : { debts: [], semantic: true };
+    const blocking = [...directDebts, ...inherited, ...paraphrase.debts];
     const blockingIds = [...new Set(blocking.map((d) => d.id))];
+
+    // A gate that could not run is not a gate that passed. Without this row an
+    // operator reading the ledger cannot tell a commit that cleared the
+    // paraphrase check from one committed on a machine where it never ran.
+    if (!paraphrase.semantic) {
+      emitGate(db, {
+        turnId,
+        gate: "debt",
+        action: "degraded",
+        subjectKind: "claim_hash",
+        subjectId: hash,
+        detail: { check: "paraphrase", reason: "embedder degraded to hash" },
+      });
+    }
 
     if (ASSERTION.has(type) && blockingIds.length > 0) {
       emitGate(db, {

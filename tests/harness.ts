@@ -492,6 +492,55 @@ test("gates", "1_debt_blocks_commit", () => {
   assert(blocked >= 1, "expected gate_event blocked");
 });
 
+/**
+ * Debt must block the *claim*, not the *string*. `claim_hash` is sha256 over
+ * normalised text, so every rewording is a fresh hash and walks through a gate
+ * that is supposedly closed — and a language model rewords by default. These
+ * two tests fix the boundary from both sides: the gate has to follow a claim
+ * across paraphrase, and it has to let an unrelated claim through, because a
+ * blocking gate that over-triggers silently costs more than the escape it fixed.
+ */
+test("gates", "an open blocking debt follows the claim across a rewording", () => {
+  const db = freshDb();
+  const original =
+    "The refund policy allows customers to return any purchase within 30 days.";
+  const paraphrase =
+    "Customers may send back anything they bought for a full refund during the 30 days after purchase.";
+  insertDebt(db, claimHash("belief", original), original);
+
+  const before = count(db, `SELECT COUNT(*) AS c FROM belief`);
+  const r = commitBelief(db, {
+    type: "belief",
+    text: paraphrase,
+    sources: [],
+    authorFamily: "test",
+    path: "deep",
+  });
+  const after = count(db, `SELECT COUNT(*) AS c FROM belief`);
+
+  assert(
+    !r.ok && r.status === "REJECTED",
+    `paraphrase escaped the debt gate: ${JSON.stringify(r)}`,
+  );
+  assert(after === before, `belief rows leaked: before=${before} after=${after}`);
+});
+
+test("gates", "a debt on one claim does not block an unrelated claim", () => {
+  const db = freshDb();
+  const indebted =
+    "The refund policy allows customers to return any purchase within 30 days.";
+  insertDebt(db, claimHash("belief", indebted), indebted);
+
+  const r = commitBelief(db, {
+    type: "belief",
+    text: "The office in Dubai opens at nine in the morning on weekdays.",
+    sources: [],
+    authorFamily: "test",
+    path: "deep",
+  });
+  assert(r.ok, `unrelated claim was wrongly blocked: ${JSON.stringify(r)}`);
+});
+
 test("gates", "2_retraction_is_free", () => {
   const db = freshDb();
   const text = "some contested claim";

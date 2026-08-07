@@ -17,7 +17,7 @@ import {
   rmSync,
   existsSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 
@@ -83,18 +83,27 @@ function sandboxRequired(): boolean {
 
 /**
  * Source that reports whether the thing running it is actually confined.
- * Both checks must come back blocked: a real bwrap invocation gets `/` bound
- * read-only and its network unshared, so it can neither write to $HOME nor
- * resolve a name.
+ *
+ * All three checks must come back blocked. **Read is the one that was missing**,
+ * and its absence is why a sandbox that mounted the entire host read-only was
+ * certified as confining: the probe asked whether the payload could write to
+ * $HOME and reach the network, both of which a read-open `--ro-bind / /` sandbox
+ * correctly refuses, and answered "confined" while `~/.secrets` and the Chamber
+ * database sat readable in front of it. Exfiltration does not need the network —
+ * stdout is returned to the caller verbatim.
+ *
+ * A probe only ever proves the dimensions it tests. If a future backend can be
+ * escaped some other way, this list is where that has to be written down.
  */
 const ISOLATION_PROBE_SOURCE = `
-  import { writeFileSync, unlinkSync } from "node:fs";
+  import { writeFileSync, unlinkSync, readdirSync } from "node:fs";
   import { homedir } from "node:os";
   import dns from "node:dns/promises";
-  let wrote = false, net = false;
+  let wrote = false, net = false, read = false;
   try { const p = homedir() + "/.chamber_isolation_probe"; writeFileSync(p, "x"); wrote = true; unlinkSync(p); } catch {}
   try { await dns.lookup("example.com"); net = true; } catch {}
-  console.log(JSON.stringify({ confined: !wrote && !net }));
+  try { read = readdirSync(homedir()).length >= 0; } catch {}
+  console.log(JSON.stringify({ confined: !wrote && !net && !read }));
 `;
 
 let isolationProbeCache: { backend: SandboxBackend; ok: boolean } | null = null;
@@ -256,10 +265,42 @@ function runBwrap(
   // confine", and CHAMBER_SANDBOX_REQUIRED=1 refused every call on exactly the
   // machines that could isolate. The tmpfs therefore goes down first and the
   // work directory is bound on top of it.
+  // What the payload may see, as an allowlist.
+  //
+  // This began as `--ro-bind / /` — the entire host, readable. That was
+  // inert only because the ordering bug below meant the payload never ran;
+  // fixing the ordering made a read-open sandbox reachable for the first time,
+  // which is a worse defect than the one it fixed. `--unshare-net` stops
+  // exfiltration over the network but not over stdout, which is returned to
+  // the caller verbatim, so read access to `~/.secrets`, the Chamber database
+  // and any credential on disk was a real path out.
+  //
+  // An allowlist is the only shape that fails safe: a directory nobody thought
+  // about is absent rather than exposed. `--ro-bind-try` because these differ
+  // per distro and a missing one must not abort the run. The runtime's own
+  // prefix is included because node or python may live outside /usr — under
+  // nvm it sits in $HOME, and binding that one subtree is not the same as
+  // binding $HOME.
+  const runtimeRoot = resolve(dirname(cmd), "..");
   const bwrapArgs = [
-    "--ro-bind",
-    "/",
-    "/",
+    "--ro-bind-try",
+    "/usr",
+    "/usr",
+    "--ro-bind-try",
+    "/bin",
+    "/bin",
+    "--ro-bind-try",
+    "/sbin",
+    "/sbin",
+    "--ro-bind-try",
+    "/lib",
+    "/lib",
+    "--ro-bind-try",
+    "/lib64",
+    "/lib64",
+    "--ro-bind-try",
+    runtimeRoot,
+    runtimeRoot,
     "--dev",
     "/dev",
     "--proc",

@@ -639,15 +639,76 @@ test("pins", "a pin whose row was re-identified verifies by content", () => {
   });
   assert(reborn.id !== doc.id, "test setup: identity must actually differ");
 
-  const verdict = verifyPin(db, {
-    kind: "vault_page",
-    refId: doc.id,
-    snapshotHash,
-  });
+  const verdict = verifyPin(
+    db,
+    { kind: "vault_page", refId: doc.id, snapshotHash },
+    { allowRelocation: true },
+  );
   assert(
     verdict.ok,
     `unchanged evidence reported as lost: ${JSON.stringify(verdict)}`,
   );
+});
+
+/**
+ * Relocation is for *reporting on pins that were already granted*, never for
+ * granting one. A content hash proves the text exists somewhere in the corpus;
+ * it does not prove the citation named it. Without the id requirement, any
+ * refId — including one naming nothing — plus a hash that is handed back to
+ * callers in ask's own ContractSource buys a belief_source row pointing at
+ * nothing, which `verify` then re-resolves by content forever. That is
+ * probes/pin_bypass.ts's defect in a new place, so the fallback is off unless
+ * a caller opts in, and only drift reporting does.
+ */
+test("pins", "a citation naming no row cannot buy support from another row's hash", () => {
+  const db = freshDb();
+  const real = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "research/real.md#p0",
+    title: "Real › Top",
+    body: "genuine corpus text",
+    model: LOCAL_HASH_MODEL,
+  });
+  const realHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: real.id,
+    snapshotHash: "",
+  }).actualHash!;
+
+  const verdict = verifyPin(db, {
+    kind: "vault_page",
+    refId: "vdoc_this_row_never_existed",
+    snapshotHash: realHash,
+  });
+  assert(
+    !verdict.ok,
+    `a fabricated citation bought support from another row: ${JSON.stringify(verdict)}`,
+  );
+});
+
+test("pins", "a non-string snapshot hash is a verdict, not a throw", () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "research/bind.md#p0",
+    body: "some text",
+    model: LOCAL_HASH_MODEL,
+  });
+  let verdict: ReturnType<typeof verifyPin> | undefined;
+  try {
+    verdict = verifyPin(
+      db,
+      {
+        kind: "vault_page",
+        refId: "vdoc_missing_on_purpose",
+        snapshotHash: { a: 1 } as unknown as string,
+      },
+      { allowRelocation: true },
+    );
+  } catch (err) {
+    assert(false, `binder threw instead of denying: ${String(err)}`);
+  }
+  assert(verdict && !verdict.ok, "a malformed pin must be refused");
 });
 
 test("pins", "a pin whose content really is gone still reports not_found", () => {

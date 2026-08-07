@@ -110,6 +110,11 @@ import {
   compareCheckpoints,
   defaultCheckpointPath,
 } from "../src/checkpoint_export.ts";
+import {
+  appendAnchor,
+  verifyAnchorLog,
+  latestAnchor,
+} from "../src/anchor.ts";
 import { importSkillFile, parseSkillMarkdown } from "../src/skill_import.ts";
 import { loadAndRegisterMcpFile } from "../src/mcp_bridge.ts";
 import { startSession, appendMessage, searchSessions } from "../src/sessions.ts";
@@ -4395,6 +4400,89 @@ test("audit", "the default checkpoint path is durable, not world-writable /tmp",
   const p = defaultCheckpointPath();
   assert(!p.startsWith("/tmp/"), `default checkpoint path is in /tmp: ${p}`);
   assert(p.endsWith(".json"), p);
+});
+
+/**
+ * The anchor log exists because a single receipt is one file to rewrite. Each
+ * append links the previous entry's hash, so the *history* of roots is what an
+ * attacker has to forge, not one number — and it lives outside the database, so
+ * a rollback that resets every witness inside SQLite still contradicts it.
+ *
+ * What it does not do, and the tests say so by not asserting it: make tampering
+ * impossible. An attacker who rewrites the whole log consistently still wins.
+ * It raises the cost from one artefact to two and makes the mismatch loud.
+ */
+test("audit", "each anchor entry links the one before it", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-anchor-"));
+  const log = join(dir, "anchors.jsonl");
+  try {
+    const db = freshDb();
+    appendAudit(db, { category: "system", action: "one", actor: "test" });
+    const a1 = appendAnchor(log, buildCheckpointReceipt(db));
+    appendAudit(db, { category: "system", action: "two", actor: "test" });
+    const a2 = appendAnchor(log, buildCheckpointReceipt(db));
+
+    assert(a1.prevAnchorHash === null, "first anchor has no predecessor");
+    assert(
+      a2.prevAnchorHash === a1.anchorHash,
+      `second anchor must link the first: ${a2.prevAnchorHash} != ${a1.anchorHash}`,
+    );
+    assert(verifyAnchorLog(log).ok, "an untouched log must verify");
+    assert(verifyAnchorLog(log).entries === 2, "expected 2 entries");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("audit", "an edited anchor entry breaks the log", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-anchor-"));
+  const log = join(dir, "anchors.jsonl");
+  try {
+    const db = freshDb();
+    for (const action of ["one", "two", "three"]) {
+      appendAudit(db, { category: "system", action, actor: "test" });
+      appendAnchor(log, buildCheckpointReceipt(db));
+    }
+    const lines = readFileSync(log, "utf8").trim().split("\n");
+    const middle = JSON.parse(lines[1]!) as { receipt: { leafCount: number } };
+    middle.receipt.leafCount = 99;
+    lines[1] = JSON.stringify(middle);
+    writeFileSync(log, lines.join("\n") + "\n");
+
+    const v = verifyAnchorLog(log);
+    assert(!v.ok, "an edited entry must not verify");
+    assert((v.reason ?? "").length > 0, "must say which entry broke");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("audit", "the newest anchor catches a database rolled back beneath it", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-anchor-"));
+  const log = join(dir, "anchors.jsonl");
+  try {
+    const full = freshDb();
+    for (let i = 0; i < 5; i++) {
+      appendAudit(full, { category: "system", action: `e${i}`, actor: "test" });
+    }
+    appendAnchor(log, buildCheckpointReceipt(full));
+
+    // Every witness inside this database agrees with every other; it is only
+    // the anchor, which was never in the database, that remembers otherwise.
+    const rolledBack = freshDb();
+    for (let i = 0; i < 2; i++) {
+      appendAudit(rolledBack, { category: "system", action: `e${i}`, actor: "test" });
+    }
+    const now = buildCheckpointReceipt(rolledBack);
+    assert(now.audit.ok, "the rolled-back database verifies against itself");
+
+    const latest = latestAnchor(log);
+    assert(latest !== null, "expected an anchor to compare against");
+    const cmp = compareCheckpoints(latest!.receipt, now);
+    assert(!cmp.ok, `rollback beneath the anchor went unreported: ${JSON.stringify(cmp)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("faculty", "F7_model_mode_heuristic_veto", () => {

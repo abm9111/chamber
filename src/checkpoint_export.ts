@@ -15,6 +15,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { getIncrementalRoot } from "./merkle_inc.ts";
 import { verifyAuditChain } from "./audit.ts";
 import { configPath } from "./config.ts";
+import { stableStringify } from "./hash.ts";
 
 export interface CheckpointReceipt {
   format: "chamber_checkpoint_v1";
@@ -70,21 +71,12 @@ export interface SignedCheckpointReceipt extends CheckpointReceipt {
   signature?: CheckpointSignature;
 }
 
-/** Key-order-independent bytes, so a re-serialised receipt still verifies. */
+/**
+ * Key-order-independent bytes, so a receipt that has been through a file and
+ * back still verifies. The signature is excluded from what it signs.
+ */
 function canonicalBytes(receipt: CheckpointReceipt): Buffer {
-  const stable = (v: unknown): unknown => {
-    if (Array.isArray(v)) return v.map(stable);
-    if (v && typeof v === "object") {
-      return Object.fromEntries(
-        Object.entries(v as Record<string, unknown>)
-          .filter(([k]) => k !== "signature")
-          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-          .map(([k, val]) => [k, stable(val)]),
-      );
-    }
-    return v;
-  };
-  return Buffer.from(JSON.stringify(stable(receipt)), "utf8");
+  return Buffer.from(stableStringify(receipt, ["signature"]), "utf8");
 }
 
 export function generateCheckpointKey(): {

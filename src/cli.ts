@@ -145,6 +145,12 @@ import {
   defaultCheckpointPath,
   type SignedCheckpointReceipt,
 } from "./checkpoint_export.ts";
+import {
+  appendAnchor,
+  verifyAnchorLog,
+  latestAnchor,
+  defaultAnchorPath,
+} from "./anchor.ts";
 import { formatErrorChain } from "./error_chain.ts";
 import type { DatabaseSync } from "node:sqlite";
 import type { EpistemicType, CommittedPath } from "./types.ts";
@@ -1819,21 +1825,47 @@ async function main(): Promise<void> {
           `signature: ${sig.ok ? "ok" : `FAILED — ${sig.reason}`}` +
             (sig.ok ? " (identifies the signer; does not vouch for them)" : ""),
         );
-        const cmp = compareCheckpoints(prev, buildCheckpointReceipt(db));
+        const current = buildCheckpointReceipt(db);
+        const cmp = compareCheckpoints(prev, current);
         console.log(cmp.ok ? "chain: consistent with this receipt" : `chain: ${cmp.reason}`);
-        if (!cmp.ok || !sig.ok) process.exitCode = 1;
+
+        // The anchor log carries every checkpoint, not just the one receipt
+        // handed in, so it catches a rollback to a point *after* that receipt
+        // was taken. Its own chain is checked first: a log that has been edited
+        // cannot be used to judge anything.
+        const anchorPath = defaultAnchorPath();
+        const logCheck = verifyAnchorLog(anchorPath);
+        let anchorOk = true;
+        if (logCheck.entries === 0) {
+          console.log("anchors: none recorded");
+        } else if (!logCheck.ok) {
+          console.log(`anchors: LOG BROKEN — ${logCheck.reason}`);
+          anchorOk = false;
+        } else {
+          const latest = latestAnchor(anchorPath)!;
+          const against = compareCheckpoints(latest.receipt, current);
+          console.log(
+            against.ok
+              ? `anchors: consistent with ${logCheck.entries} anchor(s), newest seq ${latest.seq}`
+              : `anchors: ${against.reason}`,
+          );
+          anchorOk = against.ok;
+        }
+        if (!cmp.ok || !sig.ok || !anchorOk) process.exitCode = 1;
         break;
       }
       const out = rest[0] ?? defaultCheckpointPath();
       const r = exportCheckpoint(db, out);
+      const anchor = appendAnchor(defaultAnchorPath(), r);
       console.log(`wrote ${out}`);
       console.log(
         `mmrRoot=${r.mmrRoot?.slice(0, 16) ?? "null"}… leaves=${r.leafCount} audit.ok=${r.audit.ok}` +
           ` signed=${!!r.signature}`,
       );
+      console.log(`anchored seq ${anchor.seq} → ${defaultAnchorPath()}`);
       console.log(
-        "keep this file outside the database to make a rollback detectable:" +
-          " chamber checkpoint verify <path>",
+        "copy the anchor log somewhere this machine cannot rewrite —" +
+          " it is what makes a rollback detectable: chamber checkpoint verify",
       );
       break;
     }

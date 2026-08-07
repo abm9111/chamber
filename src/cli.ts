@@ -137,7 +137,14 @@ import {
   queryCallers,
   queryCallees,
 } from "./scip.ts";
-import { exportCheckpoint } from "./checkpoint_export.ts";
+import {
+  exportCheckpoint,
+  buildCheckpointReceipt,
+  compareCheckpoints,
+  verifyCheckpointSignature,
+  defaultCheckpointPath,
+  type SignedCheckpointReceipt,
+} from "./checkpoint_export.ts";
 import { formatErrorChain } from "./error_chain.ts";
 import type { DatabaseSync } from "node:sqlite";
 import type { EpistemicType, CommittedPath } from "./types.ts";
@@ -1792,11 +1799,41 @@ async function main(): Promise<void> {
       break;
     }
     case "checkpoint": {
-      const out = rest[0] ?? "/tmp/chamber-checkpoint.json";
+      // `checkpoint verify <receipt>` holds an older receipt against the chain
+      // as it stands. That comparison is the only thing here that detects a
+      // rollback which took its own witnesses with it — a signature cannot,
+      // because whoever rolled the chain back holds the key that signs the
+      // replacement.
+      if (rest[0] === "verify") {
+        const inPath = rest[1] ?? defaultCheckpointPath();
+        if (!existsSync(inPath)) {
+          console.error(`no checkpoint at ${inPath}`);
+          process.exitCode = 1;
+          break;
+        }
+        const prev = JSON.parse(
+          readFileSync(inPath, "utf8"),
+        ) as SignedCheckpointReceipt;
+        const sig = verifyCheckpointSignature(prev);
+        console.log(
+          `signature: ${sig.ok ? "ok" : `FAILED — ${sig.reason}`}` +
+            (sig.ok ? " (identifies the signer; does not vouch for them)" : ""),
+        );
+        const cmp = compareCheckpoints(prev, buildCheckpointReceipt(db));
+        console.log(cmp.ok ? "chain: consistent with this receipt" : `chain: ${cmp.reason}`);
+        if (!cmp.ok || !sig.ok) process.exitCode = 1;
+        break;
+      }
+      const out = rest[0] ?? defaultCheckpointPath();
       const r = exportCheckpoint(db, out);
       console.log(`wrote ${out}`);
       console.log(
-        `mmrRoot=${r.mmrRoot?.slice(0, 16) ?? "null"}… leaves=${r.leafCount} audit.ok=${r.audit.ok}`,
+        `mmrRoot=${r.mmrRoot?.slice(0, 16) ?? "null"}… leaves=${r.leafCount} audit.ok=${r.audit.ok}` +
+          ` signed=${!!r.signature}`,
+      );
+      console.log(
+        "keep this file outside the database to make a rollback detectable:" +
+          " chamber checkpoint verify <path>",
       );
       break;
     }

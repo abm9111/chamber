@@ -102,7 +102,14 @@ import {
   findSymbol,
   queryCallees,
 } from "../src/scip.ts";
-import { buildCheckpointReceipt } from "../src/checkpoint_export.ts";
+import {
+  buildCheckpointReceipt,
+  signCheckpointReceipt,
+  verifyCheckpointSignature,
+  generateCheckpointKey,
+  compareCheckpoints,
+  defaultCheckpointPath,
+} from "../src/checkpoint_export.ts";
 import { importSkillFile, parseSkillMarkdown } from "../src/skill_import.ts";
 import { loadAndRegisterMcpFile } from "../src/mcp_bridge.ts";
 import { startSession, appendMessage, searchSessions } from "../src/sessions.ts";
@@ -4289,6 +4296,105 @@ test("scip", "S2_checkpoint_receipt", () => {
   assert(receipt.format === "chamber_checkpoint_v1", receipt.format);
   assert(receipt.leafCount >= 1, "expected mmr leaves");
   assert(receipt.audit.ok, JSON.stringify(receipt.audit));
+});
+
+/**
+ * What a signature on a checkpoint can and cannot prove.
+ *
+ * It proves the receipt was not altered by anyone without the key. It does NOT
+ * prove the chain behind it is whole: the agent holds the key, so an agent that
+ * truncates the audit tail can re-checkpoint and re-sign, and the result
+ * verifies perfectly. Only a receipt kept from an earlier moment catches that,
+ * by being compared against the chain as it stands now — which is what
+ * `compareCheckpoints` is for and why the receipt has to outlive the process
+ * that wrote it.
+ */
+test("audit", "a signed checkpoint verifies, and any edit to it does not", () => {
+  const db = freshDb();
+  appendAudit(db, { category: "system", action: "boot", actor: "test" });
+  const key = generateCheckpointKey();
+  const signed = signCheckpointReceipt(buildCheckpointReceipt(db), key.privateKey);
+
+  assert(!!signed.signature, "receipt must carry a signature");
+  assert(verifyCheckpointSignature(signed).ok, "freshly signed receipt must verify");
+
+  const tampered = { ...signed, leafCount: signed.leafCount + 1 };
+  assert(
+    !verifyCheckpointSignature(tampered).ok,
+    "an edited receipt must not verify",
+  );
+});
+
+test("audit", "a checkpoint compared against a shortened chain reports truncation", () => {
+  const db = freshDb();
+  for (let i = 0; i < 5; i++) {
+    appendAudit(db, { category: "system", action: `event_${i}`, actor: "test" });
+  }
+  const before = buildCheckpointReceipt(db);
+
+  // The tail truncation the benchmark discloses: delete the last events and
+  // re-checkpoint. The chain still verifies internally — nothing inside the
+  // database remembers the rows that are gone.
+  db.exec(
+    `DELETE FROM audit_event WHERE seq IN (SELECT seq FROM audit_event ORDER BY seq DESC LIMIT 2)`,
+  );
+  const after = buildCheckpointReceipt(db);
+
+  const cmp = compareCheckpoints(before, after);
+  assert(!cmp.ok, `truncation went unreported: ${JSON.stringify(cmp)}`);
+  assert(
+    (cmp.reason ?? "").length > 0,
+    "a truncation verdict must say what moved",
+  );
+});
+
+/**
+ * The case the naive delete does not cover, and the reason an exported receipt
+ * has to survive the database. An attacker who also resets the MMR leaves and
+ * the chain tip leaves a database that verifies perfectly against itself —
+ * every internal check passes, because every internal witness was rolled back
+ * too. Only a receipt taken before the rollback still knows how long the chain
+ * used to be.
+ */
+test("audit", "a chain rolled back with its own witnesses is caught by an older receipt", () => {
+  const long = freshDb();
+  for (let i = 0; i < 5; i++) {
+    appendAudit(long, { category: "system", action: `event_${i}`, actor: "test" });
+  }
+  const kept = buildCheckpointReceipt(long);
+
+  // A clean database with fewer events stands in for a full rollback: every
+  // internal witness agrees with every other, which is exactly the problem.
+  const rolledBack = freshDb();
+  for (let i = 0; i < 3; i++) {
+    appendAudit(rolledBack, { category: "system", action: `event_${i}`, actor: "test" });
+  }
+  const now = buildCheckpointReceipt(rolledBack);
+  assert(now.audit.ok, "the rolled-back chain must verify against itself");
+
+  const cmp = compareCheckpoints(kept, now);
+  assert(!cmp.ok, `a self-consistent rollback went unreported: ${JSON.stringify(cmp)}`);
+  assert(
+    (cmp.reason ?? "").includes("backwards"),
+    `verdict should name the shortening: ${cmp.reason}`,
+  );
+});
+
+test("audit", "a checkpoint compared against an extended chain is fine", () => {
+  const db = freshDb();
+  appendAudit(db, { category: "system", action: "boot", actor: "test" });
+  const before = buildCheckpointReceipt(db);
+  appendAudit(db, { category: "system", action: "later", actor: "test" });
+  const after = buildCheckpointReceipt(db);
+
+  const cmp = compareCheckpoints(before, after);
+  assert(cmp.ok, `honest growth was flagged: ${JSON.stringify(cmp)}`);
+});
+
+test("audit", "the default checkpoint path is durable, not world-writable /tmp", () => {
+  const p = defaultCheckpointPath();
+  assert(!p.startsWith("/tmp/"), `default checkpoint path is in /tmp: ${p}`);
+  assert(p.endsWith(".json"), p);
 });
 
 test("faculty", "F7_model_mode_heuristic_veto", () => {

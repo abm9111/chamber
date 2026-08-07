@@ -17,9 +17,13 @@
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { sha256, stableStringify } from "./hash.ts";
 import {
   defaultCheckpointPath,
+  compareCheckpoints,
+  verifyCheckpointPrefix,
+  type CheckpointReceipt,
   type SignedCheckpointReceipt,
 } from "./checkpoint_export.ts";
 
@@ -40,12 +44,33 @@ function anchorHashOf(entry: Omit<AnchorEntry, "anchorHash">): string {
   return sha256(stableStringify(entry));
 }
 
-function readEntries(path: string): AnchorEntry[] {
-  if (!existsSync(path)) return [];
-  return readFileSync(path, "utf8")
-    .split("\n")
-    .filter((l) => l.trim().length > 0)
-    .map((l) => JSON.parse(l) as AnchorEntry);
+/**
+ * Read the log, keeping malformed lines as a reported fault rather than a throw.
+ *
+ * An unguarded `JSON.parse` per line made the tamper-evidence check disarmable
+ * by appending garbage: one junk line and `verify` died with a stack trace
+ * instead of reporting, after it had already printed that the chain looked
+ * consistent. A check that can be turned into a crash is a check an attacker
+ * controls. `appendFileSync` is not atomic either, so a crash or a full disk
+ * produces the same half-written line without anyone being hostile.
+ */
+function readEntries(path: string): {
+  entries: AnchorEntry[];
+  malformed: number[];
+} {
+  if (!existsSync(path)) return { entries: [], malformed: [] };
+  const entries: AnchorEntry[] = [];
+  const malformed: number[] = [];
+  const lines = readFileSync(path, "utf8").split("\n");
+  for (const [i, line] of lines.entries()) {
+    if (line.trim().length === 0) continue;
+    try {
+      entries.push(JSON.parse(line) as AnchorEntry);
+    } catch {
+      malformed.push(i + 1);
+    }
+  }
+  return { entries, malformed };
 }
 
 export function appendAnchor(
@@ -53,7 +78,7 @@ export function appendAnchor(
   receipt: SignedCheckpointReceipt,
   now: () => Date = () => new Date(),
 ): AnchorEntry {
-  const existing = readEntries(path);
+  const { entries: existing } = readEntries(path);
   const prev = existing.at(-1) ?? null;
   const body: Omit<AnchorEntry, "anchorHash"> = {
     seq: (prev?.seq ?? 0) + 1,
@@ -76,7 +101,14 @@ export function verifyAnchorLog(path: string): {
   entries: number;
   reason?: string;
 } {
-  const entries = readEntries(path);
+  const { entries, malformed } = readEntries(path);
+  if (malformed.length > 0) {
+    return {
+      ok: false,
+      entries: entries.length,
+      reason: `line(s) ${malformed.join(", ")} are not valid JSON — the log is damaged or was appended to by something else`,
+    };
+  }
   let prevHash: string | null = null;
   for (const [i, entry] of entries.entries()) {
     const { anchorHash, ...body } = entry;
@@ -101,5 +133,53 @@ export function verifyAnchorLog(path: string): {
 
 /** The most recent anchor, or null when nothing has been anchored yet. */
 export function latestAnchor(path: string): AnchorEntry | null {
-  return readEntries(path).at(-1) ?? null;
+  return readEntries(path).entries.at(-1) ?? null;
+}
+
+/**
+ * Judge the current chain against **every** anchor, not merely the newest.
+ *
+ * Reading only the tail hands the attacker the comparison: truncate the chain,
+ * run `chamber checkpoint` once, and the newest anchor is their own description
+ * of the shortened chain — correctly hash-linked, so the log still verifies. The
+ * whole point of keeping the history is that an *earlier* attestation, made
+ * before the rollback, can still contradict it. The oldest disagreement is the
+ * one worth reporting, so this walks forward and returns the first.
+ */
+export function verifyAgainstAnchors(
+  path: string,
+  current: CheckpointReceipt,
+  db?: DatabaseSync,
+): { ok: boolean; reason?: string; anchors: number; failedAt?: number } {
+  const log = verifyAnchorLog(path);
+  if (!log.ok) {
+    return { ok: false, reason: log.reason, anchors: log.entries };
+  }
+  const { entries } = readEntries(path);
+  for (const entry of entries) {
+    // Both checks, per anchor. `compareCheckpoints` reads two receipts and
+    // therefore cannot see a truncation that was followed by fresh writes — the
+    // chain is longer, so every length test passes. Only re-deriving the
+    // attested root from the tree catches that, and it has to run against the
+    // *older* anchors: an attacker who truncates and re-runs `checkpoint`
+    // overwrites the receipt file and appends a correctly-linked anchor of
+    // their own, so the newest attestation is theirs. The honest one is behind
+    // it in this log.
+    const verdict = db
+      ? (() => {
+          const c = compareCheckpoints(entry.receipt, current);
+          if (!c.ok) return c;
+          return verifyCheckpointPrefix(db, entry.receipt);
+        })()
+      : compareCheckpoints(entry.receipt, current);
+    if (!verdict.ok) {
+      return {
+        ok: false,
+        reason: `anchor seq ${entry.seq} (${entry.anchoredAt}): ${verdict.reason}`,
+        anchors: entries.length,
+        failedAt: entry.seq,
+      };
+    }
+  }
+  return { ok: true, anchors: entries.length };
 }

@@ -111,11 +111,13 @@ import {
   generateCheckpointKey,
   compareCheckpoints,
   defaultCheckpointPath,
+  verifyCheckpointPrefix,
 } from "../src/checkpoint_export.ts";
 import {
   appendAnchor,
   verifyAnchorLog,
   latestAnchor,
+  verifyAgainstAnchors,
 } from "../src/anchor.ts";
 import { importSkillFile, parseSkillMarkdown } from "../src/skill_import.ts";
 import { loadAndRegisterMcpFile } from "../src/mcp_bridge.ts";
@@ -208,6 +210,7 @@ import { fileURLToPath } from "node:url";
 import { spawnSync, spawn, execFileSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   mkdirSync,
@@ -660,6 +663,38 @@ test("pins", "a pin whose row was re-identified verifies by content", () => {
  * probes/pin_bypass.ts's defect in a new place, so the fallback is off unless
  * a caller opts in, and only drift reporting does.
  */
+/**
+ * Identity by (kind, root, ref) means one ref is one row — which is right for
+ * re-ingesting a passage and wrong for a caller who does not know they are
+ * reusing a ref. `chamber index` passes neither an id nor a root, so indexing
+ * twice under one `--ref` replaced the first excerpt and printed "indexed <id>"
+ * with an unchanged corpus size. The row is gone, and any belief pinned to it
+ * now reports drift against text nobody edited. Replacing is a legitimate
+ * operation; doing it silently is not.
+ */
+test("pins", "replacing an indexed passage reports that it replaced one", () => {
+  const db = freshDb();
+  const first = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/meeting",
+    body: "first excerpt",
+    model: LOCAL_HASH_MODEL,
+  });
+  assert(first.replaced === false, "a new ref is not a replacement");
+
+  const second = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/meeting",
+    body: "second excerpt",
+    model: LOCAL_HASH_MODEL,
+  });
+  assert(second.id === first.id, "same ref is the same row");
+  assert(
+    second.replaced === true,
+    "overwriting an existing passage must be reported to the caller",
+  );
+});
+
 test("pins", "a citation naming no row cannot buy support from another row's hash", () => {
   const db = freshDb();
   const real = upsertDocument(db, {
@@ -4625,6 +4660,61 @@ test("audit", "a chain rolled back with its own witnesses is caught by an older 
   );
 });
 
+/**
+ * Two receipts alone cannot prove one chain extends the other — that needs a
+ * consistency proof against the tree, not a pair of roots. `compareCheckpoints`
+ * only compared roots when the length was unchanged, so truncate-the-tail then
+ * keep-writing sailed through as consistent: the shrink checks were false, and
+ * the equal-length root check never fired. `peaks` was exported for exactly this
+ * and nothing read it.
+ *
+ * The check that does work replays the tree's own leaves up to the earlier
+ * receipt's `lastSeq` and re-derives the root it claimed.
+ */
+test("audit", "a chain that grew after rewriting its history fails the prefix check", () => {
+  const original = freshDb();
+  for (let i = 0; i < 6; i++) {
+    appendAudit(original, { category: "system", action: `real_${i}`, actor: "test" });
+  }
+  const kept = buildCheckpointReceipt(original);
+
+  // Rewritten history, then more events on top — longer than the receipt, and
+  // internally consistent, which is what defeated every length-based check.
+  const rewritten = freshDb();
+  for (let i = 0; i < 6; i++) {
+    appendAudit(rewritten, { category: "system", action: `forged_${i}`, actor: "test" });
+  }
+  for (let i = 0; i < 2; i++) {
+    appendAudit(rewritten, { category: "system", action: `later_${i}`, actor: "test" });
+  }
+  const now = buildCheckpointReceipt(rewritten);
+  assert(now.audit.ok, "the rewritten chain verifies against itself");
+  assert(
+    (now.lastSeq ?? 0) > (kept.lastSeq ?? 0),
+    "test setup: the forged chain must be longer",
+  );
+  assert(
+    compareCheckpoints(kept, now).ok,
+    "precondition: receipt-only comparison cannot see this",
+  );
+
+  const prefix = verifyCheckpointPrefix(rewritten, kept);
+  assert(!prefix.ok, `rewritten history passed the prefix check: ${JSON.stringify(prefix)}`);
+});
+
+test("audit", "a chain that only grew passes the prefix check", () => {
+  const db = freshDb();
+  for (let i = 0; i < 6; i++) {
+    appendAudit(db, { category: "system", action: `real_${i}`, actor: "test" });
+  }
+  const kept = buildCheckpointReceipt(db);
+  for (let i = 0; i < 3; i++) {
+    appendAudit(db, { category: "system", action: `later_${i}`, actor: "test" });
+  }
+  const prefix = verifyCheckpointPrefix(db, kept);
+  assert(prefix.ok, `honest growth was flagged: ${JSON.stringify(prefix)}`);
+});
+
 test("audit", "a checkpoint compared against an extended chain is fine", () => {
   const db = freshDb();
   appendAudit(db, { category: "system", action: "boot", actor: "test" });
@@ -4692,6 +4782,117 @@ test("audit", "an edited anchor entry breaks the log", () => {
     const v = verifyAnchorLog(log);
     assert(!v.ok, "an edited entry must not verify");
     assert((v.reason ?? "").length > 0, "must say which entry broke");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * A tamper-evidence check must not be disarmable by making it crash. One junk
+ * line appended to the log threw out of the unguarded `JSON.parse` in
+ * `readEntries`, so an attacker who rolled the chain back only had to append
+ * garbage to turn detection into a stack trace — after the CLI had already
+ * printed "chain: consistent".
+ */
+test("audit", "a malformed anchor line is reported, not thrown", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-anchor-"));
+  const log = join(dir, "anchors.jsonl");
+  try {
+    const db = freshDb();
+    appendAudit(db, { category: "system", action: "one", actor: "test" });
+    appendAnchor(log, buildCheckpointReceipt(db));
+    appendFileSync(log, "{not json at all\n");
+
+    let v: ReturnType<typeof verifyAnchorLog> | undefined;
+    try {
+      v = verifyAnchorLog(log);
+    } catch (err) {
+      assert(false, `verifyAnchorLog threw instead of reporting: ${String(err)}`);
+    }
+    assert(v && !v.ok, "a malformed log must not verify");
+    assert((v!.reason ?? "").length > 0, "must say which line broke");
+    // latestAnchor is on the same read path and is called right after.
+    try {
+      latestAnchor(log);
+    } catch (err) {
+      assert(false, `latestAnchor threw on a malformed log: ${String(err)}`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Comparing only the newest anchor lets the attacker supply it: truncate, then
+ * run `chamber checkpoint` once. That appends a correctly-linked anchor
+ * describing the shortened chain, and a check that reads only the tail is
+ * comparing the database against the forger's own claim. The log keeps the whole
+ * history precisely so the *earliest* attestation can still speak.
+ */
+test("audit", "an anchor older than the newest still catches a rollback", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-anchor-"));
+  const log = join(dir, "anchors.jsonl");
+  try {
+    const long = freshDb();
+    for (let i = 0; i < 5; i++) {
+      appendAudit(long, { category: "system", action: `e${i}`, actor: "test" });
+    }
+    appendAnchor(log, buildCheckpointReceipt(long)); // honest anchor, seq 1
+
+    const rolledBack = freshDb();
+    for (let i = 0; i < 2; i++) {
+      appendAudit(rolledBack, { category: "system", action: `e${i}`, actor: "test" });
+    }
+    // The attacker re-anchors the shortened chain. Correctly hash-linked.
+    appendAnchor(log, buildCheckpointReceipt(rolledBack)); // seq 2
+    assert(verifyAnchorLog(log).ok, "the log itself is still internally valid");
+
+    const verdict = verifyAgainstAnchors(log, buildCheckpointReceipt(rolledBack));
+    assert(
+      !verdict.ok,
+      `re-anchoring hid the rollback: ${JSON.stringify(verdict)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The end-to-end version of the two checks together, and the one a unit test of
+ * either half misses: truncate, write *more* than was attested, then re-anchor.
+ * Every length test sees growth, `compareCheckpoints` is structurally blind, and
+ * the newest anchor is the attacker's. Only re-deriving the attested root from
+ * the tree, run against the *older* anchor, contradicts it — so
+ * `verifyAgainstAnchors` has to be handed the database.
+ */
+test("audit", "truncate-then-grow is caught by an older anchor when the tree is available", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-anchor-"));
+  const log = join(dir, "anchors.jsonl");
+  try {
+    const honest = freshDb();
+    for (let i = 0; i < 6; i++) {
+      appendAudit(honest, { category: "system", action: `honest_${i}`, actor: "test" });
+    }
+    appendAnchor(log, buildCheckpointReceipt(honest));
+
+    const forged = freshDb();
+    for (let i = 0; i < 3; i++) {
+      appendAudit(forged, { category: "system", action: `forged_${i}`, actor: "test" });
+    }
+    for (let i = 0; i < 5; i++) {
+      appendAudit(forged, { category: "system", action: `cover_${i}`, actor: "test" });
+    }
+    const now = buildCheckpointReceipt(forged);
+    appendAnchor(log, now); // attacker re-anchors the forged chain
+    assert((now.lastSeq ?? 0) > 6, "test setup: forged chain must be longer");
+
+    assert(
+      verifyAgainstAnchors(log, now).ok,
+      "precondition: without the tree, receipts alone cannot see this",
+    );
+    const withTree = verifyAgainstAnchors(log, now, forged);
+    assert(!withTree.ok, `truncate-then-grow survived: ${JSON.stringify(withTree)}`);
+    assert(withTree.failedAt === 1, `the honest anchor should be the one that objects: ${withTree.failedAt}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

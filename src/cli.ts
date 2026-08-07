@@ -143,12 +143,12 @@ import {
   compareCheckpoints,
   verifyCheckpointSignature,
   defaultCheckpointPath,
+  verifyCheckpointPrefix,
   type SignedCheckpointReceipt,
 } from "./checkpoint_export.ts";
 import {
   appendAnchor,
-  verifyAnchorLog,
-  latestAnchor,
+  verifyAgainstAnchors,
   defaultAnchorPath,
 } from "./anchor.ts";
 import { formatErrorChain } from "./error_chain.ts";
@@ -616,7 +616,15 @@ function cmdIndex(
     title: title || undefined,
     body,
   });
-  console.log(`indexed ${r.id}  model=${r.model} dims=${r.dims}`);
+  console.log(
+    `${r.replaced ? "REPLACED" : "indexed"} ${r.id}  model=${r.model} dims=${r.dims}`,
+  );
+  if (r.replaced) {
+    console.log(
+      "  ↳ this ref already held a passage; its previous text is gone." +
+        " Any belief pinned to it will now report drift.",
+    );
+  }
   console.log(`corpus size: ${countDocuments(db)}`);
 }
 
@@ -1820,10 +1828,20 @@ async function main(): Promise<void> {
         const prev = JSON.parse(
           readFileSync(inPath, "utf8"),
         ) as SignedCheckpointReceipt;
-        const sig = verifyCheckpointSignature(prev);
+        // A trusted key from outside the document is what makes this an
+        // identity check. Without one it only proves the receipt is internally
+        // consistent — anyone can sign anything with a key they just made and
+        // embed it — so say that rather than implying authorship.
+        const trustedKey = rest[2] ?? process.env.CHAMBER_CHECKPOINT_PUBKEY;
+        const sig = verifyCheckpointSignature(prev, trustedKey);
         console.log(
           `signature: ${sig.ok ? "ok" : `FAILED — ${sig.reason}`}` +
-            (sig.ok ? " (identifies the signer; does not vouch for them)" : ""),
+            (sig.ok
+              ? trustedKey
+                ? " (matches the key you supplied)"
+                : " — self-signed: proves the receipt is intact, NOT who wrote it." +
+                  " Pass a trusted public key to check authorship."
+              : ""),
         );
         const current = buildCheckpointReceipt(db);
         const cmp = compareCheckpoints(prev, current);
@@ -1834,24 +1852,29 @@ async function main(): Promise<void> {
         // was taken. Its own chain is checked first: a log that has been edited
         // cannot be used to judge anything.
         const anchorPath = defaultAnchorPath();
-        const logCheck = verifyAnchorLog(anchorPath);
-        let anchorOk = true;
-        if (logCheck.entries === 0) {
+        const against = verifyAgainstAnchors(anchorPath, current, db);
+        if (against.anchors === 0) {
           console.log("anchors: none recorded");
-        } else if (!logCheck.ok) {
-          console.log(`anchors: LOG BROKEN — ${logCheck.reason}`);
-          anchorOk = false;
         } else {
-          const latest = latestAnchor(anchorPath)!;
-          const against = compareCheckpoints(latest.receipt, current);
           console.log(
             against.ok
-              ? `anchors: consistent with ${logCheck.entries} anchor(s), newest seq ${latest.seq}`
+              ? `anchors: consistent with all ${against.anchors} anchor(s)`
               : `anchors: ${against.reason}`,
           );
-          anchorOk = against.ok;
         }
-        if (!cmp.ok || !sig.ok || !anchorOk) process.exitCode = 1;
+
+        // The check the receipt comparison structurally cannot make: re-derive
+        // the attested root from the tree's own leaves. Catches a truncation
+        // that was followed by fresh writes, which looks like growth to every
+        // length-based test.
+        const prefix = verifyCheckpointPrefix(db, prev);
+        console.log(
+          prefix.ok
+            ? "history: the chain still contains what this receipt attested"
+            : `history: ${prefix.reason}`,
+        );
+
+        if (!cmp.ok || !sig.ok || !against.ok || !prefix.ok) process.exitCode = 1;
         break;
       }
       const out = rest[0] ?? defaultCheckpointPath();

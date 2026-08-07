@@ -12,7 +12,7 @@ import {
   createPublicKey,
 } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { getIncrementalRoot } from "./merkle_inc.ts";
+import { getIncrementalRoot, rootAtSeq } from "./merkle_inc.ts";
 import { verifyAuditChain } from "./audit.ts";
 import { configPath } from "./config.ts";
 import { stableStringify } from "./hash.ts";
@@ -177,14 +177,51 @@ export function verifyCheckpointSignature(
 }
 
 /**
+ * Prove the chain as it stands still contains the history a receipt attested.
+ *
+ * This is the check `compareCheckpoints` structurally cannot do. Given only two
+ * receipts, a truncation followed by fresh writes looks like growth: the chain
+ * is longer, so both shrink tests are false, and the root comparison is gated on
+ * the length being unchanged so it never runs. Re-deriving the earlier root from
+ * the tree's own leaves is what catches it, and it needs the database.
+ *
+ * `mmrRoot` null means the receipt attested an empty chain — nothing to prove.
+ */
+export function verifyCheckpointPrefix(
+  db: DatabaseSync,
+  previous: CheckpointReceipt,
+): { ok: boolean; reason?: string } {
+  if (previous.mmrRoot === null || previous.lastSeq === null) return { ok: true };
+
+  const { rootHash, leafCount } = rootAtSeq(db, previous.lastSeq);
+  if (rootHash === null) {
+    return {
+      ok: false,
+      reason: `no events remain at or before seq ${previous.lastSeq}; the receipt attested ${previous.leafCount}`,
+    };
+  }
+  if (leafCount < previous.leafCount) {
+    return {
+      ok: false,
+      reason: `only ${leafCount} of the ${previous.leafCount} attested events remain up to seq ${previous.lastSeq}`,
+    };
+  }
+  if (rootHash !== previous.mmrRoot) {
+    return {
+      ok: false,
+      reason: `history up to seq ${previous.lastSeq} no longer hashes to the attested root — it was rewritten, not merely extended`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
  * Compare a receipt kept from an earlier moment against the chain as it stands.
  *
- * This is the part that catches tail truncation, and it works precisely because
- * `previous` came from outside the database. Nothing inside remembers deleted
- * rows: drop the last N audit events, re-checkpoint, and the chain verifies
- * internally with no trace. Held against a receipt from before the deletion,
- * the tail going backwards — or the same length hashing differently — has
- * nowhere to hide.
+ * Catches a tail that went backwards, and a rewrite at unchanged length. It
+ * cannot catch a truncation followed by fresh writes — that needs the tree, and
+ * `verifyCheckpointPrefix` is the check for it. Callers holding a database
+ * should run both; this one alone is not a consistency proof.
  */
 export function compareCheckpoints(
   previous: CheckpointReceipt,

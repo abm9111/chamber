@@ -186,7 +186,7 @@ export function stableDocumentId(
 export function upsertDocument(
   db: DatabaseSync,
   input: UpsertDocumentInput,
-): { id: string; model: string; dims: number } {
+): { id: string; model: string; dims: number; replaced: boolean } {
   const id =
     input.id ??
     stableDocumentId(input.sourceKind, input.sourceRef, input.metadata?.ingestRoot);
@@ -227,6 +227,13 @@ export function upsertDocument(
   const existing = db
     .prepare(`SELECT id FROM vector_document WHERE id = ?`)
     .get(id) as { id: string } | undefined;
+
+  // Whether this call destroyed a passage. Since identity is (kind, root, ref),
+  // a caller reusing a ref silently replaced the row it did not know was there —
+  // `chamber index` printed "indexed <id>" and an unchanged corpus size while
+  // the earlier excerpt disappeared, taking any pin to it with it. Re-ingest
+  // relies on exactly this overwrite, so the fix is to report it, not block it.
+  const replaced = !!existing;
 
   if (existing) {
     db.prepare(
@@ -270,7 +277,7 @@ export function upsertDocument(
        embedded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
   ).run(id, model, dims, float32ToBlob(vec));
 
-  return { id, model, dims };
+  return { id, model, dims, replaced };
 }
 
 export function deleteDocument(db: DatabaseSync, id: string): boolean {

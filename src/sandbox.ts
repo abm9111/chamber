@@ -57,6 +57,96 @@ function which(bin: string): boolean {
   return r.status === 0 && !!r.stdout.trim();
 }
 
+/**
+ * Backends execution is genuinely confined by. Membership is a claim about
+ * Chamber's own wiring, not about the binary existing: `docker` is detected on
+ * PATH and named by `detectSandboxBackend`, but nothing here routes through it
+ * yet, so it does not belong. Adding a backend to this set is what makes
+ * `CHAMBER_SANDBOX_REQUIRED=1` willing to run on it — do it when the code path
+ * lands, not when the binary appears.
+ */
+const ISOLATING_BACKENDS = new Set<SandboxBackend>(["bwrap"]);
+
+/**
+ * Is isolation being demanded? Any value that is not an explicit "off" counts.
+ *
+ * Testing `=== "1"` made `CHAMBER_SANDBOX_REQUIRED=true` — and `yes`, and a
+ * trailing newline from a shell heredoc — run unisolated while the operator who
+ * set it believed the opposite. That is the worst direction for a typo to
+ * resolve: the flag exists to be a promise, so an unrecognised spelling must
+ * keep the promise, not silently drop it.
+ */
+function sandboxRequired(): boolean {
+  const v = (process.env.CHAMBER_SANDBOX_REQUIRED ?? "").trim().toLowerCase();
+  return !(v === "" || v === "0" || v === "false" || v === "no" || v === "off");
+}
+
+/**
+ * Source that reports whether the thing running it is actually confined.
+ * Both checks must come back blocked: a real bwrap invocation gets `/` bound
+ * read-only and its network unshared, so it can neither write to $HOME nor
+ * resolve a name.
+ */
+const ISOLATION_PROBE_SOURCE = `
+  import { writeFileSync, unlinkSync } from "node:fs";
+  import { homedir } from "node:os";
+  import dns from "node:dns/promises";
+  let wrote = false, net = false;
+  try { const p = homedir() + "/.chamber_isolation_probe"; writeFileSync(p, "x"); wrote = true; unlinkSync(p); } catch {}
+  try { await dns.lookup("example.com"); net = true; } catch {}
+  console.log(JSON.stringify({ confined: !wrote && !net }));
+`;
+
+let isolationProbeCache: { backend: SandboxBackend; ok: boolean } | null = null;
+
+/**
+ * Demonstrate that `backend` confines execution, instead of believing its name.
+ *
+ * The name has two sources and neither is evidence. `CHAMBER_SANDBOX_BACKEND`
+ * is an unsigned assertion any parent process can set, and `which("bwrap")`
+ * proves only that a file with that name is on PATH — a three-line stub that
+ * drops the isolation flags and execs its payload satisfies both, and did:
+ * untrusted source ran with $HOME readable while the result said
+ * `backend: "bwrap"`. So run a probe through the backend and require it to come
+ * back confined. A stub passes the payload through and the probe reports
+ * escape; a broken or missing binary fails to run at all. Both refuse.
+ *
+ * Cached per process and per backend: this costs one spawn, and the answer
+ * cannot change without the process's PATH or env changing under it.
+ */
+function isolationHolds(backend: SandboxBackend): boolean {
+  if (isolationProbeCache?.backend === backend) return isolationProbeCache.ok;
+  let ok = false;
+  const dir = mkdtempSync(join(tmpdir(), "chamber-sbxprobe-"));
+  try {
+    const script = writeSource(dir, "node", ISOLATION_PROBE_SOURCE);
+    const req: SandboxRequest = {
+      runtime: "node",
+      source: ISOLATION_PROBE_SOURCE,
+      timeoutMs: 10_000,
+    };
+    // Call the backend runner directly. Routing through runInSandbox would
+    // re-enter this check and recurse.
+    const r = backend === "bwrap" ? runBwrap(req, dir, script) : null;
+    ok = !!r?.ok && r.stdout.includes('"confined":true');
+  } catch {
+    ok = false;
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+  isolationProbeCache = { backend, ok };
+  return ok;
+}
+
+/** Test seam: drop the memoised probe result. */
+export function resetIsolationProbe(): void {
+  isolationProbeCache = null;
+}
+
 export function detectSandboxBackend(): SandboxBackend {
   if (process.env.CHAMBER_SANDBOX_BACKEND) {
     return process.env.CHAMBER_SANDBOX_BACKEND as SandboxBackend;
@@ -201,22 +291,35 @@ function runBwrap(
 
 export function runInSandbox(req: SandboxRequest): SandboxResult {
   const backend = detectSandboxBackend();
-  if (backend === "none" || process.env.CHAMBER_SANDBOX_REQUIRED === "1") {
-    if (backend === "none") {
-      return {
-        ok: false,
-        backend: "none",
-        exitCode: null,
-        signal: null,
-        stdout: "",
-        stderr: "",
-        timedOut: false,
-        durationMs: 0,
-        sourceHash: createHash("sha256").update(req.source).digest("hex"),
-        workDir: "",
-        error: "sandbox required but no backend available",
-      };
-    }
+  const refusal =
+    backend === "none"
+      ? "no sandbox backend available"
+      : !sandboxRequired()
+        ? null
+        : !ISOLATING_BACKENDS.has(backend)
+          ? `sandbox required but ${backend} does not isolate ` +
+            `(isolating backends: ${[...ISOLATING_BACKENDS].join(", ")})`
+          : !isolationHolds(backend)
+            ? `sandbox required and ${backend} was selected, but it did not ` +
+              `confine a probe — treating the name as unproven`
+            : null;
+  if (refusal) {
+    return {
+      ok: false,
+      // Nothing ran, so no backend ran it. Naming the *detected* backend here
+      // would tell an audit reader that docker confined this call when docker
+      // never saw it; the detected name belongs in `error`, which says why.
+      backend: "none",
+      exitCode: null,
+      signal: null,
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+      durationMs: 0,
+      sourceHash: createHash("sha256").update(req.source).digest("hex"),
+      workDir: "",
+      error: refusal,
+    };
   }
 
   const dir = mkdtempSync(join(tmpdir(), "chamber-sbx-"));

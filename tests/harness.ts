@@ -80,7 +80,7 @@ import {
   proposeDebtPayment,
   confirmDebtPaid,
 } from "../src/debt.ts";
-import { sandboxSelfTest, runInSandbox } from "../src/sandbox.ts";
+import { sandboxSelfTest, runInSandbox, resetIsolationProbe } from "../src/sandbox.ts";
 import { runTool, synthesizeTool, listTools } from "../src/tools.ts";
 import {
   remember,
@@ -3909,6 +3909,143 @@ test("tools", "T5_synth_fail_rejects", () => {
 
 test("tools", "T6_builtins_listed", () => {
   assert(listTools().some((t) => t.name === "sha256"), "sha256 builtin");
+});
+
+/**
+ * `CHAMBER_SANDBOX_REQUIRED=1` is a promise that nothing runs unisolated.
+ * The backend name alone cannot keep it: `detectSandboxBackend()` reports
+ * whatever binary it found on PATH, and finding the `docker` binary says
+ * nothing about whether Chamber actually routes execution through it. Only
+ * a backend that Chamber genuinely isolates through may run under the flag;
+ * every other value must refuse before a process is spawned.
+ */
+function withSandboxEnv<T>(
+  env: { required?: string; backend?: string },
+  fn: () => T,
+): T {
+  const keys = ["CHAMBER_SANDBOX_REQUIRED", "CHAMBER_SANDBOX_BACKEND"] as const;
+  const saved = new Map<string, string | undefined>();
+  for (const key of keys) {
+    saved.set(key, process.env[key]);
+    delete process.env[key];
+  }
+  if (env.required !== undefined) process.env.CHAMBER_SANDBOX_REQUIRED = env.required;
+  if (env.backend !== undefined) process.env.CHAMBER_SANDBOX_BACKEND = env.backend;
+  try {
+    return fn();
+  } finally {
+    for (const [key, prev] of saved) {
+      if (prev === undefined) delete process.env[key];
+      else process.env[key] = prev;
+    }
+  }
+}
+
+test("tools", "a required sandbox refuses a backend that does not isolate", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-sbx-probe-"));
+  const marker = join(dir, "escaped");
+  try {
+    for (const backend of ["docker", "subprocess", "none"]) {
+      const r = withSandboxEnv({ required: "1", backend }, () =>
+        runInSandbox({
+          runtime: "node",
+          source:
+            `import { writeFileSync } from "node:fs";\n` +
+            `writeFileSync(${JSON.stringify(marker)}, "x");\n` +
+            `console.log("ran");`,
+          timeoutMs: 5000,
+        }),
+      );
+      assert(!r.ok, `${backend}: must refuse, got ok=true`);
+      assert(
+        !existsSync(marker),
+        `${backend}: refused but the source still executed and wrote ${marker}`,
+      );
+      assert(
+        (r.error ?? "").length > 0,
+        `${backend}: a refusal must say why`,
+      );
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tools", "a required sandbox never reports a backend it did not run on", () => {
+  const r = withSandboxEnv({ required: "1", backend: "docker" }, () =>
+    runInSandbox({ runtime: "node", source: `console.log("ran")`, timeoutMs: 5000 }),
+  );
+  assert(r.backend !== "docker", "refused on docker, so must not claim docker ran");
+  assert(!r.stdout.includes("ran"), `source executed anyway: ${r.stdout}`);
+});
+
+/**
+ * An allowlist of backend *names* is a label check, not a capability check.
+ * Both inputs to that label are attacker-or-operator controlled: the env
+ * override is an unsigned assertion, and `which("bwrap")` only proves a file of
+ * that name is on PATH. A stub that execs its payload satisfies both and runs
+ * untrusted source while the result claims `backend: "bwrap"`. Isolation has to
+ * be demonstrated by probing it, not accepted because something said so.
+ */
+test("tools", "a required sandbox refuses a backend that only claims to isolate", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-fakebin-"));
+  const savedPath = process.env.PATH;
+  try {
+    writeFileSync(
+      join(dir, "bwrap"),
+      `#!/bin/sh\n` +
+        `while [ $# -gt 0 ]; do case "$1" in\n` +
+        `  --ro-bind|--bind) shift 3;;\n` +
+        `  --chdir|--dev|--proc|--tmpfs) shift 2;;\n` +
+        `  --unshare-net|--die-with-parent) shift;;\n` +
+        `  *) break;; esac; done\n` +
+        `exec "$@"\n`,
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${dir}:${savedPath ?? ""}`;
+    resetIsolationProbe(); // PATH changed under the memoised answer
+    const r = withSandboxEnv({ required: "1", backend: "bwrap" }, () =>
+      runInSandbox({
+        runtime: "node",
+        source: `console.log("ESCAPED")`,
+        timeoutMs: 8000,
+      }),
+    );
+    assert(!r.ok, `a stub named bwrap satisfied the gate: ${JSON.stringify(r)}`);
+    assert(
+      !r.stdout.includes("ESCAPED"),
+      "untrusted source ran under a forged isolation label",
+    );
+  } finally {
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+    resetIsolationProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tools", "a sandbox requirement spelled other than \"1\" still binds", () => {
+  for (const spelling of ["true", "yes", "1\n", " 1 "]) {
+    const r = withSandboxEnv({ required: spelling, backend: "subprocess" }, () =>
+      runInSandbox({
+        runtime: "node",
+        source: `console.log("EXECUTED")`,
+        timeoutMs: 5000,
+      }),
+    );
+    assert(
+      !r.ok && !r.stdout.includes("EXECUTED"),
+      `CHAMBER_SANDBOX_REQUIRED=${JSON.stringify(spelling)} ran unisolated`,
+    );
+  }
+});
+
+test("tools", "an unset sandbox requirement still runs the subprocess fallback", () => {
+  const r = withSandboxEnv({ backend: "subprocess" }, () =>
+    runInSandbox({ runtime: "node", source: `console.log("ran")`, timeoutMs: 5000 }),
+  );
+  assert(r.ok, `fallback must still work when isolation is not required: ${r.error}`);
+  assert(r.stdout.includes("ran"), r.stdout);
 });
 
 test("memory", "M1_remember_working", () => {

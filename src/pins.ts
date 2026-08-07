@@ -156,19 +156,40 @@ export function verifyPin(db: DatabaseSync, source: PinnedSource): PinVerdict {
   // defeating "unregistered kinds are unverifiable, not exempt". The kind a
   // citation claims must be the kind the stored row actually has; a mismatch
   // resolves to no row and therefore not_found.
-  const row = db
+  type DocRow = {
+    source_kind: string;
+    title: string | null;
+    body: string;
+    source_ref: string | null;
+  };
+
+  let row = db
     .prepare(
       `SELECT source_kind, title, body, source_ref FROM vector_document
        WHERE id = ? AND source_kind = ?`,
     )
-    .get(source.refId, source.kind) as
-    | {
-        source_kind: string;
-        title: string | null;
-        body: string;
-        source_ref: string | null;
-      }
-    | undefined;
+    .get(source.refId, source.kind) as DocRow | undefined;
+
+  if (!row) {
+    // The id is where we last saw the evidence; the content hash is the pin.
+    // A row can lose its id without losing its content — a from-scratch
+    // re-index did exactly that to this corpus, renaming all 28,627 rows and
+    // orphaning every belief older than the rebuild. Reporting `not_found`
+    // there says "your citation was never real" about text sitting unchanged
+    // in the index, so before concluding the evidence is gone, look for it by
+    // what it says. `idx_vector_doc_snap` makes this an indexed lookup.
+    //
+    // The kind is still bound, so this cannot promote an unverifiable kind.
+    // Ordered by id so a corpus holding the same passage twice resolves the
+    // same way on every run rather than picking arbitrarily.
+    row = db
+      .prepare(
+        `SELECT source_kind, title, body, source_ref FROM vector_document
+         WHERE snapshot_hash = ? AND source_kind = ?
+         ORDER BY id LIMIT 1`,
+      )
+      .get(source.snapshotHash, source.kind) as DocRow | undefined;
+  }
 
   if (!row) return { ok: false, reason: "not_found" };
 

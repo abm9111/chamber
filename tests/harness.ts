@@ -44,6 +44,7 @@ import {
   upsertDocument,
   searchVector,
   deleteDocument,
+  LOCAL_HASH_MODEL,
   countDocuments,
   toMatchExpression,
   parseSearchArgs,
@@ -561,6 +562,119 @@ test("gates", "a debt on one claim does not block an unrelated claim", () => {
  * Naming a missing interpreter must reach the subprocess and fail, not be
  * quietly replaced by whatever PATH happens to offer.
  */
+/**
+ * Rebuilding the index must not rename the corpus.
+ *
+ * `newId` is sha256 over Date.now()+Math.random(), so every rebuilt row used to
+ * get a fresh identity while beliefs kept pointing at the old one. Measured on
+ * the live database: a rebuild on 2026-08-05 re-created all 28,627 rows, and
+ * every belief committed the day before reported `not_found` on evidence that
+ * was still present, byte-identical, at the same passage index. A passage's
+ * identity is its (kind, ref), so the same passage must mint the same id.
+ */
+test("pins", "the same passage keeps its id across a rebuilt index", () => {
+  const first = freshDb();
+  const a = upsertDocument(first, {
+    sourceKind: "vault_page",
+    sourceRef: "research/note.md#p3",
+    title: "Note › Heading",
+    body: "the body of passage three",
+    model: LOCAL_HASH_MODEL,
+  });
+  // A wholly separate database stands in for "the index was rebuilt from
+  // scratch": nothing carries over except the note itself.
+  const rebuilt = freshDb();
+  const b = upsertDocument(rebuilt, {
+    sourceKind: "vault_page",
+    sourceRef: "research/note.md#p3",
+    title: "Note › Heading",
+    body: "the body of passage three",
+    model: LOCAL_HASH_MODEL,
+  });
+  assert(a.id === b.id, `rebuild renamed the passage: ${a.id} vs ${b.id}`);
+
+  const other = upsertDocument(rebuilt, {
+    sourceKind: "vault_page",
+    sourceRef: "research/note.md#p4",
+    title: "Note › Heading",
+    body: "a different passage",
+    model: LOCAL_HASH_MODEL,
+  });
+  assert(other.id !== a.id, "different passages must not collide");
+});
+
+/**
+ * And where identity did churn anyway — rows written before the scheme above,
+ * or a note whose passages renumbered — a pin whose content is still present
+ * verbatim is intact, not missing. Reporting `not_found` for it says "your
+ * citation was never real" about evidence sitting in the corpus unchanged,
+ * which is the loudest possible verdict for the one case where nothing is
+ * wrong. The content hash is the pin; the id is only where we last saw it.
+ */
+test("pins", "a pin whose row was re-identified verifies by content", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "research/relocated.md#p0",
+    title: "Relocated › Top",
+    body: "evidence that did not move",
+    model: LOCAL_HASH_MODEL,
+  });
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: "",
+  }).actualHash!;
+
+  // The row is re-created under a new identity with identical content, exactly
+  // as a from-scratch rebuild did on the live database.
+  deleteDocument(db, doc.id);
+  const reborn = upsertDocument(db, {
+    id: "vdoc_forced_new_identity",
+    sourceKind: "vault_page",
+    sourceRef: "research/relocated.md#p0",
+    title: "Relocated › Top",
+    body: "evidence that did not move",
+    model: LOCAL_HASH_MODEL,
+  });
+  assert(reborn.id !== doc.id, "test setup: identity must actually differ");
+
+  const verdict = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash,
+  });
+  assert(
+    verdict.ok,
+    `unchanged evidence reported as lost: ${JSON.stringify(verdict)}`,
+  );
+});
+
+test("pins", "a pin whose content really is gone still reports not_found", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "research/deleted.md#p0",
+    title: "Deleted › Top",
+    body: "evidence that is truly gone",
+    model: LOCAL_HASH_MODEL,
+  });
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: "",
+  }).actualHash!;
+  deleteDocument(db, doc.id);
+
+  const verdict = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash,
+  });
+  assert(!verdict.ok, "deleted evidence must not verify");
+  assert(verdict.reason === "not_found", `expected not_found, got ${verdict.reason}`);
+});
+
 test("pins", "the batch embedder honours the named interpreter", () => {
   const saved = process.env.CHAMBER_PYTHON;
   process.env.CHAMBER_PYTHON = "/nonexistent/python-that-is-not-here";
@@ -2082,12 +2196,20 @@ test(
     // between NULL and "" across re-ingests was therefore undetectable
     // drift — exactly the failure mode a content pin exists to catch.
     const db = freshDb();
+    // Explicit ids: document identity is now derived from (kind, root, ref),
+    // so one ref is one row and the second upsert would otherwise overwrite the
+    // first rather than sit beside it. The property under test is the *hash
+    // formula* — that NULL and "" are distinguishable — so the two rows are
+    // forced apart here and the ref stays shared, which is the case that
+    // produced the original collision.
     const withNullTitle = upsertDocument(db, {
+      id: "vdoc_title_null_case",
       sourceKind: "vault_page",
       sourceRef: "notes/same-ref.md",
       body: "same body",
     });
     const withEmptyTitle = upsertDocument(db, {
+      id: "vdoc_title_empty_case",
       sourceKind: "vault_page",
       sourceRef: "notes/same-ref.md",
       title: "",

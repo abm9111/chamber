@@ -33,11 +33,21 @@ const r = runInSandbox({
   runtime: "node",
   source: `
     import { readFileSync } from "node:fs";
-    import dns from "node:dns/promises";
-    let readOutside = false, net = false;
+    import net from "node:net";
+    let readOutside = false, reachedNet = false;
     try { readFileSync("/etc/passwd"); readOutside = true; } catch {}
-    try { await dns.lookup("example.com"); net = true; } catch {}
-    console.log(JSON.stringify({ ran: true, readOutside, net }));
+    // Raw IP, not a hostname: /etc is not bound, so DNS fails regardless of
+    // whether the sandbox has a network, and a name-resolution needle reports
+    // "no network" for a fully network-open sandbox.
+    reachedNet = await new Promise((resolve) => {
+      const socket = net.connect({ host: "1.1.1.1", port: 443 });
+      const done = (v) => { try { socket.destroy(); } catch {} resolve(v); };
+      socket.setTimeout(3000);
+      socket.on("connect", () => done(true));
+      socket.on("timeout", () => done(false));
+      socket.on("error", () => done(false));
+    });
+    console.log(JSON.stringify({ ran: true, readOutside, reachedNet }));
   `,
   timeoutMs: 15_000,
 });
@@ -45,9 +55,21 @@ const r = runInSandbox({
 console.log("backend reported:", r.backend, " ok:", r.ok);
 console.log(r.stdout.trim() || r.stderr.trim() || r.error);
 
+// A refusal is ambiguous, and the ambiguity matters. `isolationHolds` runs its
+// own read needle before any payload, so a sandbox that genuinely leaks makes
+// `runInSandbox` refuse — which lands here looking exactly like "no namespace
+// available". Reporting that as a configuration problem points an operator at a
+// sysctl when the real condition is a live escape, so the two are separated by
+// what the refusal actually says.
 if (!r.ok) {
+  const unproven = (r.error ?? "").includes("did not confine a probe");
   console.log(
-    "\n>>> NOT PROVEN — the sandbox refused, so confinement was never exercised.\n" +
+    unproven
+      ? "\n>>> NOT PROVEN — bwrap was selected but could not confine its own probe.\n" +
+          "    That is either a missing namespace capability OR a real escape;\n" +
+          "    this probe cannot tell them apart, and neither can CI.\n" +
+          "    Check `unshare --user --map-root-user true` before assuming config."
+      : "\n>>> NOT PROVEN — the sandbox refused, so confinement was never exercised.\n" +
       "    On Linux this usually means bubblewrap cannot create a user namespace.\n" +
       "    Ubuntu 24.04 restricts that by default:\n" +
       "      sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n" +
@@ -57,8 +79,25 @@ if (!r.ok) {
   process.exit(1);
 }
 
-const leaked =
-  r.stdout.includes('"readOutside":true') || r.stdout.includes('"net":true');
+// Parse rather than substring-match, and require positive evidence the payload
+// ran. `leaked` inferred from the absence of two substrings meant that empty or
+// truncated stdout — an output cap, a runtime that starts and writes nothing —
+// read as confinement, certifying a run whose assertions may never have
+// executed.
+let report: { ran?: boolean; readOutside?: boolean; reachedNet?: boolean } = {};
+try {
+  report = JSON.parse(r.stdout.trim().split("\n").filter(Boolean).pop() ?? "{}");
+} catch {
+  /* leave empty — handled below */
+}
+if (report.ran !== true) {
+  console.log(
+    "\n>>> NOT PROVEN — the payload did not report running. Absence of a leak in\n" +
+      "    empty output is not evidence of confinement.",
+  );
+  process.exit(1);
+}
+const leaked = report.readOutside === true || report.reachedNet === true;
 console.log(
   leaked
     ? "\n>>> NOT CONFINED — the payload ran and reached outside the sandbox"

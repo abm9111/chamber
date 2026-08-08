@@ -178,11 +178,24 @@ export function exportCheckpointGuarded(
   outPath: string,
   anchorPath: string = defaultAnchorPath(),
 ): { receipt: SignedCheckpointReceipt; anchor: AnchorEntry } {
-  const log = verifyAnchorLog(anchorPath);
-  if (!log.ok) {
+  // Gate on exactly what `appendAnchor` refuses — a malformed line — and
+  // nothing more.
+  //
+  // Gating on the full chain check was stricter than the thing it guards, and
+  // strictly worse: one edited byte inside a *valid* JSON entry made
+  // verifyAnchorLog fail, so every subsequent checkpoint threw before writing
+  // anything. That converts the attestation mechanism from "detects the tamper"
+  // into "stops attesting", with no repair command, which is a denial of
+  // service an attacker can trigger with a single write. A hash mismatch is
+  // exactly what `checkpoint verify` exists to report; it must not also stop
+  // the record advancing.
+  const { malformed } = readEntries(anchorPath);
+  if (malformed.length > 0) {
     throw new Error(
-      `anchor log ${anchorPath} is unusable (${log.reason}); refusing to write a ` +
-        `checkpoint that could not be anchored — repair the log first`,
+      `anchor log ${anchorPath} has malformed line(s) ${malformed.join(", ")}; ` +
+        `refusing to write a checkpoint that could not be anchored — repair the ` +
+        `log first. A tampered-but-parseable log does not stop this: that is ` +
+        `reported by \`chamber checkpoint verify\`.`,
     );
   }
   const receipt = exportCheckpoint(db, outPath);

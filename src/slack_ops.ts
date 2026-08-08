@@ -10,7 +10,7 @@ import { newId, sha256 } from "./hash.ts";
 import { appendAudit } from "./audit.ts";
 import { startSession, appendMessage } from "./sessions.ts";
 import { commitBelief } from "./commit_belief.ts";
-import { completeSync } from "./model.ts";
+import { completeSync, syncCompletionAvailable } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { formatSpendFooter, spendLastHours } from "./spend.ts";
 import { runExpiryJob } from "./expiry.ts";
@@ -65,6 +65,12 @@ export function gatedSlackTurn(
   message: string,
   meta: { channelId: string; userId: string; threadTs?: string },
 ): string {
+  // Before runExpiryJob, ensureDefaultScope, the session and the observation —
+  // all of which write. completeSync refuses the openai mode by design, and
+  // discovering that after the ledger has moved is the defect this guards.
+  const model = syncCompletionAvailable();
+  if (!model.ok) return `turn unavailable: ${model.reason}`;
+
   runExpiryJob(db);
   ensureDefaultScope(db);
   const rate = checkRateLimit(

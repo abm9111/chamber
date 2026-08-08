@@ -78,12 +78,15 @@ jobs:
       # Runs every probe and fails if any of them fails. This chained with `;`
       # until 2026-08-05, so the suite's exit status was only the last probe's
       # and a failing gate_audit was invisible.
-      - run: npm run probes
       # Ubuntu 24.04 blocks unprivileged user namespaces via AppArmor, which is
-      # what stops bubblewrap confining anything on a stock runner. Without this
-      # the sandbox correctly refuses — and CI then only ever observes the gate
-      # saying no, never doing its job.
+      # what stops bubblewrap confining anything on a stock runner. This ran
+      # AFTER `npm run probes` until 2026-08-08, so the whole suite still
+      # executed against a bwrap that could not start — sandbox_escape.ts saw a
+      # refusal and printed "no escape detected", a pass. Reintroducing
+      # `--ro-bind / /` would not have turned it red. It has to come first, or
+      # the probes it enables are the only ones it helps.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: npm run probes
       # Demands the other half: the payload must RUN and be contained. A refusal
       # fails this step. `npm run probes` deliberately excludes it, because on a
       # machine with no isolating backend it could only ever fail.

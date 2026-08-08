@@ -5035,6 +5035,40 @@ test("audit", "truncate-then-grow is caught by an older anchor when the tree is 
  * even after the damage was repaired. Refusing first leaves both artefacts
  * consistent.
  */
+/**
+ * A tampered-but-parseable log must not stop the record advancing.
+ *
+ * Gating the checkpoint on the *full* chain check was stricter than the thing it
+ * guards — `appendAnchor` only ever refused malformed JSON — and strictly worse:
+ * one edited byte inside a valid entry made every subsequent checkpoint throw
+ * before writing anything, with no repair command. That turns the attestation
+ * mechanism from "detects the tamper" into "stops attesting", which an attacker
+ * triggers with a single write. Detection is `checkpoint verify`'s job.
+ */
+test("audit", "a tampered anchor log still lets the checkpoint advance", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-cp-"));
+  const log = join(dir, "anchors.jsonl");
+  const out = join(dir, "checkpoint.json");
+  try {
+    const db = freshDb();
+    appendAudit(db, { category: "system", action: "one", actor: "test" });
+    appendAnchor(log, buildCheckpointReceipt(db));
+
+    // Valid JSON, wrong hash — the shape a rollback attempt leaves behind.
+    const entry = JSON.parse(readFileSync(log, "utf8").trim());
+    entry.receipt.leafCount = 99;
+    writeFileSync(log, JSON.stringify(entry) + "\n");
+    assert(!verifyAnchorLog(log).ok, "precondition: the log must read as tampered");
+
+    exportCheckpointGuarded(db, out, log);
+    assert(existsSync(out), "a tampered log must not stop the checkpoint advancing");
+    const after = verifyAgainstAnchors(log, buildCheckpointReceipt(db));
+    assert(!after.ok, "and verify must still report the tamper");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("audit", "a damaged anchor log stops the checkpoint before the receipt is written", () => {
   const dir = mkdtempSync(join(tmpdir(), "chamber-cp-"));
   const log = join(dir, "anchors.jsonl");

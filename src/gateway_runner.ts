@@ -19,7 +19,7 @@ import {
   TelegramGateway,
 } from "./gateway.ts";
 import { startSession, appendMessage } from "./sessions.ts";
-import { completeSync } from "./model.ts";
+import { completeSync, syncCompletionAvailable } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { commitBelief } from "./commit_belief.ts";
 import { spendLastHours, formatSpendFooter } from "./spend.ts";
@@ -127,6 +127,15 @@ export function openGatewayDb(): DatabaseSync {
 }
 
 function gatedTurn(message: string, channel: string, chatId: string): string {
+  // Asked before anything is written. Every one of these surfaces commits an
+  // observation, opens a session and writes audit rows before it reaches
+  // completeSync, which refuses the openai mode by design — so the ledger gained
+  // rows and the caller gained an exception, in that order. Guarding only the
+  // CLI left four other surfaces reproducing the exact defect the guard was
+  // written to remove.
+  const model = syncCompletionAvailable();
+  if (!model.ok) return `turn unavailable: ${model.reason}`;
+
   const db = openGatewayDb();
   runExpiryJob(db);
   const turnId = newId("trn");

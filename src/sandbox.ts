@@ -147,12 +147,30 @@ function sandboxRequired(): boolean {
  * write attempt only re-tests the same mount from a noisier angle.
  */
 const ISOLATION_PROBE_SOURCE = `
-  import { writeFileSync, unlinkSync, readFileSync } from "node:fs";
-  import dns from "node:dns/promises";
-  let wrote = false, net = false, read = false;
-  try { await dns.lookup("example.com"); net = true; } catch {}
+  import { readFileSync } from "node:fs";
+  import net from "node:net";
+  let reachedNet = false, read = false;
+  // A raw IP, never a hostname. \`/etc\` is not on the allowlist, so there is no
+  // resolv.conf inside the namespace and DNS fails with EAI_AGAIN whether or not
+  // the sandbox has a network. Probing egress by resolving a name therefore
+  // reports "no network" for a sandbox with completely open networking — the
+  // needle answered a question about \`/etc\` while appearing to answer one about
+  // the network.
+  reachedNet = await new Promise((resolve) => {
+    const socket = net.connect({ host: "1.1.1.1", port: 443 });
+    const done = (v) => { try { socket.destroy(); } catch {} resolve(v); };
+    socket.setTimeout(3000);
+    socket.on("connect", () => done(true));
+    socket.on("timeout", () => done(false));
+    socket.on("error", () => done(false));
+  });
   try { readFileSync("/etc/passwd"); read = true; } catch {}
-  console.log(JSON.stringify({ confined: !wrote && !net && !read }));
+  // Writes are not probed separately: every bind this sandbox issues is
+  // --ro-bind-try, so the only writable locations are the tmpfs /tmp and the
+  // bound work directory, both intended. The previous \`wrote\` term was left
+  // hardcoded false after its leg was deleted, so it read as a checked
+  // dimension while contributing nothing. Absent is honest; always-false is not.
+  console.log(JSON.stringify({ ran: true, reachedNet, read, confined: !reachedNet && !read }));
 `;
 
 let isolationProbeCache: { backend: SandboxBackend; ok: boolean } | null = null;

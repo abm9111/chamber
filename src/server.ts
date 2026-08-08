@@ -26,7 +26,7 @@ import { configPath, loadConfig } from "./config.ts";
 import { formatErrorChain } from "./error_chain.ts";
 import { sha256, newId } from "./hash.ts";
 import { commitBelief } from "./commit_belief.ts";
-import { completeSync } from "./model.ts";
+import { completeSync, syncCompletionAvailable } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { runExpiryJob } from "./expiry.ts";
 import { spendLastHours, formatSpendFooter, assertSpendBudget } from "./spend.ts";
@@ -295,6 +295,15 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 }
 
 function runTurn(message: string): Record<string, unknown> {
+  // Asked before anything is written. Every one of these surfaces commits an
+  // observation, opens a session and writes audit rows before it reaches
+  // completeSync, which refuses the openai mode by design — so the ledger gained
+  // rows and the caller gained an exception, in that order. Guarding only the
+  // CLI left four other surfaces reproducing the exact defect the guard was
+  // written to remove.
+  const model = syncCompletionAvailable();
+  if (!model.ok) throw new Error(`turn unavailable: ${model.reason}`);
+
   const budget = assertSpendBudget(db);
   if (!budget.ok) {
     return {

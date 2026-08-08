@@ -213,6 +213,18 @@ export interface EmbedResult {
  * Once, because embedding runs per passage: a per-call warning on a 28,508
  * passage ingest is 28,508 lines, which is its own way of saying nothing.
  */
+/** Same once-per-process discipline, for a named embedder other than MiniLM. */
+const fallbackWarned = new Set<string>();
+function warnEmbedderFallback(kind: string, err: unknown): void {
+  if (fallbackWarned.has(kind)) return;
+  fallbackWarned.add(kind);
+  console.warn(
+    `chamber: WARNING — the ${kind} embedder is configured but could not run, ` +
+      `so this run is writing non-semantic hash vectors. Cause: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+  );
+}
+
 let minilmFallbackWarned = false;
 function warnMinilmFallback(err: unknown): void {
   if (minilmFallbackWarned) return;
@@ -337,7 +349,10 @@ export function embedLocalBatch(
     } catch (err) {
       if (prefer === "ollama")
         throw new Error("ollama batch embed failed", { cause: err });
-      warnMinilmFallback(err);
+      // Not warnMinilmFallback: that names MiniLM model files, which are
+      // irrelevant when the configured embedder is ollama, and sends the
+      // operator to check an install that is not the one that failed.
+      warnEmbedderFallback("ollama", err);
     }
   }
 

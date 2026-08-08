@@ -56,6 +56,20 @@ function which(bin: string): boolean {
 }
 
 /**
+ * The absolute path a command name resolves to, or null.
+ *
+ * Never `resolve()` a bare command name: that silently interprets it relative to
+ * the working directory, which is how a "bind the runtime's own prefix" rule
+ * turned into "bind the parent of wherever this process happens to be running".
+ */
+function absolutePathOf(cmd: string): string | null {
+  if (cmd.startsWith("/")) return cmd;
+  const r = spawnSync("which", [cmd], { encoding: "utf8" });
+  const out = r.status === 0 ? r.stdout.trim().split("\n")[0] : "";
+  return out && out.startsWith("/") ? out : null;
+}
+
+/**
  * Backends execution is genuinely confined by. Membership is a claim about
  * Chamber's own wiring, not about the binary existing: `docker` is detected on
  * PATH and named by `detectSandboxBackend`, but nothing here routes through it
@@ -92,15 +106,22 @@ function sandboxRequired(): boolean {
  *
  * A probe only ever proves the dimensions it tests. If a future backend can be
  * escaped some other way, this list is where that has to be written down.
+ *
+ * The read leg names paths that are never on the allowlist. It used to list
+ * `homedir()` itself, which bwrap *creates* whenever the runtime prefix lives
+ * under $HOME — an nvm install, the case the allowlist explicitly supports — so
+ * a correctly-confining sandbox reported itself unconfined and refused every
+ * call. The needle has to be something the allowlist can never contain.
  */
 const ISOLATION_PROBE_SOURCE = `
-  import { writeFileSync, unlinkSync, readdirSync } from "node:fs";
+  import { writeFileSync, unlinkSync, readdirSync, readFileSync } from "node:fs";
   import { homedir } from "node:os";
   import dns from "node:dns/promises";
   let wrote = false, net = false, read = false;
   try { const p = homedir() + "/.chamber_isolation_probe"; writeFileSync(p, "x"); wrote = true; unlinkSync(p); } catch {}
   try { await dns.lookup("example.com"); net = true; } catch {}
-  try { read = readdirSync(homedir()).length >= 0; } catch {}
+  try { readdirSync(homedir() + "/.ssh"); read = true; } catch {}
+  try { readFileSync("/etc/shadow"); read = true; } catch {}
   console.log(JSON.stringify({ confined: !wrote && !net && !read }));
 `;
 
@@ -282,7 +303,17 @@ function runBwrap(
   // prefix is included because node or python may live outside /usr — under
   // nvm it sits in $HOME, and binding that one subtree is not the same as
   // binding $HOME.
-  const runtimeRoot = resolve(dirname(cmd), "..");
+  // `cmd` is an absolute path only for the node runtime; python and bash are
+  // bare names. `dirname("python3")` is ".", so deriving a prefix from it gave
+  // the parent of the *working directory* — which under a systemd unit with no
+  // WorkingDirectory is "/", re-binding the entire host read-only and undoing
+  // the allowlist this function exists to enforce. Resolve through PATH first,
+  // and if that fails, add no runtime bind at all: the payload then cannot start
+  // and refuses, which is the safe direction.
+  const resolved = absolutePathOf(cmd);
+  const runtimeBind = resolved
+    ? ["--ro-bind-try", resolve(dirname(resolved), ".."), resolve(dirname(resolved), "..")]
+    : [];
   const bwrapArgs = [
     "--ro-bind-try",
     "/usr",
@@ -299,9 +330,7 @@ function runBwrap(
     "--ro-bind-try",
     "/lib64",
     "/lib64",
-    "--ro-bind-try",
-    runtimeRoot,
-    runtimeRoot,
+    ...runtimeBind,
     "--dev",
     "/dev",
     "--proc",

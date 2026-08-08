@@ -126,7 +126,7 @@ function paraphraseBlockingDebts(
   db: DatabaseSync,
   text: string,
   excludeHash: string,
-): { debts: { id: string }[]; semantic: boolean } {
+): { debts: { id: string }[]; semantic: boolean; attempted: boolean } {
   const rows = db
     .prepare(
       `SELECT id, claim_text FROM citation_debt
@@ -137,7 +137,11 @@ function paraphraseBlockingDebts(
          AND claim_text != ''`,
     )
     .all(excludeHash) as unknown as { id: string; claim_text: string }[];
-  if (rows.length === 0) return { debts: [], semantic: true };
+  // Nothing open to compare against: the gate had no work, which is not the
+  // same as having run, and not the same as having been skipped. Reporting it
+  // as either would put a claim in the verdict that no evidence supports — and
+  // it also means the common case never spawns the embedder under the lock.
+  if (rows.length === 0) return { debts: [], semantic: true, attempted: false };
 
   // One batch, not one call per debt: embedMinilm shells out to python3, so
   // per-row embedding would put a process spawn per open debt on every commit.
@@ -153,12 +157,14 @@ function paraphraseBlockingDebts(
   try {
     embeds = embedLocalBatch([text, ...rows.map((r) => r.claim_text)]);
   } catch {
-    return { debts: [], semantic: false };
+    return { debts: [], semantic: false, attempted: true };
   }
   // A short or padded result would silently mis-pair claims with debts, since
   // the comparison below indexes rows by position.
-  if (embeds.length !== rows.length + 1) return { debts: [], semantic: false };
-  if (embeds.some((e) => e.kind === "hash")) return { debts: [], semantic: false };
+  if (embeds.length !== rows.length + 1)
+    return { debts: [], semantic: false, attempted: true };
+  if (embeds.some((e) => e.kind === "hash"))
+    return { debts: [], semantic: false, attempted: true };
 
   const target = embeds[0]!.vector;
   const debts = rows
@@ -168,7 +174,7 @@ function paraphraseBlockingDebts(
         DEBT_PARAPHRASE_THRESHOLD,
     )
     .map((r) => ({ id: r.id }));
-  return { debts, semantic: true };
+  return { debts, semantic: true, attempted: true };
 }
 
 function inheritDebtsAlongChain(
@@ -254,11 +260,17 @@ export function commitBelief(
    * commits — so silence would leave the caller unable to tell a confabulated
    * pin from one that was simply never offered.
    */
-  let paraphraseCheckState: "ran" | "skipped" = "ran";
+  /**
+   * Only assertions are subject to the paraphrase gate, so only they can report
+   * on it. Stamping `"ran"` on an observation — where the check is skipped by
+   * construction and no embedding is ever attempted — told a reader the exact
+   * opposite of the truth, in the one field added to remove that confusion.
+   */
+  let paraphraseCheckState: "ran" | "skipped" | undefined = undefined;
   const withRejected = <T extends CommitResult>(result: T): T => ({
     ...result,
     ...(rejectedSources.length > 0 ? { rejectedSources } : {}),
-    paraphraseCheck: paraphraseCheckState,
+    ...(paraphraseCheckState ? { paraphraseCheck: paraphraseCheckState } : {}),
   });
 
   const hash = claimHash(type, text);
@@ -269,48 +281,20 @@ export function commitBelief(
       : null;
 
   /**
-   * The paraphrase leg runs *before* the write transaction, deliberately.
+   * Recorded here, written in the `finally` below — after the transaction has
+   * committed or rolled back, so a refusal cannot erase it.
    *
-   * It embeds, and embedding shells out to python3 with a 180s timeout. Doing
-   * that while holding BEGIN IMMEDIATE parked every other writer behind a
-   * subprocess, against busy timeouts measured in seconds — this repo ships
-   * separate server, jobs and gateway units against one database.
-   *
-   * Hoisting it also makes the degradation record durable. Written inside the
-   * transaction it was discarded by every rollback path, so the one trace that
-   * the gate had not run disappeared in exactly the cases where a claim was
-   * contested. What the transaction still owns is the *decision*: the ids found
-   * here are re-checked for being open inside it, so a debt settled in between
-   * cannot block, and one opened in between is caught by the exact-hash leg or
-   * by the next commit.
+   * The check itself stays *inside* the lock. It was hoisted out once to keep a
+   * python3 spawn from holding BEGIN IMMEDIATE, and that traded a contention
+   * problem for a correctness one: a paraphrase debt minted between an outside
+   * read and the lock is invisible to an in-lock re-check, because re-checking
+   * can only prune ids the earlier read already found — it never re-runs the
+   * similarity search. Two units against the one database this repo ships, and
+   * an unsupported claim the gate exists to refuse commits as a citable belief
+   * while the verdict reports the gate as having run. FM-6 says check and write
+   * are one transaction; that is the law, and the spawn is the cost of it.
    */
-  const paraphrase = ASSERTION.has(type)
-    ? paraphraseBlockingDebts(db, text, hash)
-    : { debts: [], semantic: true };
-
-  if (!paraphrase.semantic) {
-    // Outside the transaction, so a later refusal cannot erase it. Straight to
-    // the chained audit log rather than through emitGate: `gate_event.action` is
-    // CHECK-constrained to a closed vocabulary with no member meaning "this
-    // check could not run", so "degraded" was rejected outright and the row
-    // intended to record the failure instead threw and parked the commit.
-    appendAudit(db, {
-      category: "gate",
-      action: "debt:degraded",
-      subjectKind: "claim_hash",
-      subjectId: hash,
-      turnId,
-      detail: {
-        gate: "debt",
-        check: "paraphrase",
-        reason: "embedder unavailable or non-semantic; paraphrase check did not run",
-      },
-    });
-  }
-
-  // Surfaced on every verdict via withRejected, so `strict` and the ask surface
-  // can tell a gate that passed from one that never executed.
-  paraphraseCheckState = paraphrase.semantic ? "ran" : "skipped";
+  let degradedReason: string | null = null;
 
   try {
     db.exec("BEGIN IMMEDIATE");
@@ -424,20 +408,21 @@ export function commitBelief(
     }
 
     // Open blocking debts on this claim_hash + inherited from revision chain +
-    // debts on the same claim worn as different words.
+    // debts on the same claim worn as different words. All three reads happen
+    // under the same lock as the write they authorise (FM-6).
     const directDebts = openBlockingDebts(db, hash);
     const inherited = inheritDebtsAlongChain(db, revisionOf);
-    // Re-read inside the lock: the ids came from before the transaction opened.
-    const stillOpen = paraphrase.debts.filter(
-      (d) =>
-        !!db
-          .prepare(
-            `SELECT id FROM citation_debt
-             WHERE id = ? AND blocking = 1 AND status IN ('pending','proposed_paid')`,
-          )
-          .get(d.id),
-    );
-    const blocking = [...directDebts, ...inherited, ...stillOpen];
+    const paraphrase = ASSERTION.has(type)
+      ? paraphraseBlockingDebts(db, text, hash)
+      : { debts: [], semantic: true, attempted: false };
+    if (paraphrase.attempted) {
+      paraphraseCheckState = paraphrase.semantic ? "ran" : "skipped";
+      if (!paraphrase.semantic) {
+        degradedReason =
+          "embedder unavailable or non-semantic; paraphrase check did not run";
+      }
+    }
+    const blocking = [...directDebts, ...inherited, ...paraphrase.debts];
     const blockingIds = [...new Set(blocking.map((d) => d.id))];
 
 
@@ -668,5 +653,26 @@ export function commitBelief(
       status: "PARKED",
       reason: `commit failed closed: ${String(err)}`,
     });
+  } finally {
+    // After COMMIT or ROLLBACK, so a refusal cannot erase it — and outside the
+    // transaction, so it is not the thing that fails when the lock is
+    // contended. Best-effort by design: a failure to record that the gate was
+    // degraded must not turn a decided commit into a thrown exception, which is
+    // what happened when this call sat inline and `appendAudit` rethrew
+    // SQLITE_BUSY straight past the fail-closed handler above.
+    if (degradedReason) {
+      try {
+        appendAudit(db, {
+          category: "gate",
+          action: "debt:degraded",
+          subjectKind: "claim_hash",
+          subjectId: hash,
+          turnId,
+          detail: { gate: "debt", check: "paraphrase", reason: degradedReason },
+        });
+      } catch {
+        /* the verdict stands; the note about it is best-effort */
+      }
+    }
   }
 }

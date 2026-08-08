@@ -42,6 +42,14 @@ export function loadMcpManifest(path: string): McpServerManifest {
  * stays legible to the human approving it; it just cannot pretend to be the
  * document around it.
  */
+/**
+ * A vendor string rendered on one line, unable to open a fence or break out of
+ * it. Newlines collapse so it cannot introduce a structural line of its own.
+ */
+function inlineSafe(text: string): string {
+  return text.replace(/`/g, "\\`").replace(/[\r\n]+/g, " ").trim();
+}
+
 function quarantineUntrusted(text: string | undefined): string {
   const body = (text ?? "").replace(/`/g, "\\`");
   return [
@@ -114,12 +122,16 @@ export function registerMcpManifest(
     // above the real one and chose the code that runs, while the operator read
     // the vendor's declared source below it. It could equally forge a
     // `risk:` or `CHAMBER_TOOL:` line at line-start.
-    const body = `# MCP tool: ${t.name}
+    // Every vendor-controlled field, not just the description. The name sits
+    // above both the description and the source fence, so a name carrying a
+    // fence supplies the first one — which is the code `tools.ts` executes.
+    // Fixing one field and leaving its neighbour is not fixing the class.
+    const body = `# MCP tool: ${inlineSafe(t.name)}
 
 ${quarantineUntrusted(t.description)}
 
 CHAMBER_TOOL:1
-mcp_server: ${manifest.name}
+mcp_server: ${inlineSafe(manifest.name)}
 risk: ${risk.join(",")}
 runtime: ${t.runtime ?? "node"}
 endpoint: ${t.endpoint ?? "local"}

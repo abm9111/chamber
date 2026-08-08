@@ -78,7 +78,19 @@ export function appendAnchor(
   receipt: SignedCheckpointReceipt,
   now: () => Date = () => new Date(),
 ): AnchorEntry {
-  const { entries: existing } = readEntries(path);
+  // Refuse to append over damage. Chaining from the last *valid* line left the
+  // malformed one in place forever, so `verifyAnchorLog` reported the log
+  // damaged on every later run and `verifyAgainstAnchors` returned early without
+  // comparing anything — one interrupted write permanently disarmed the
+  // tamper-evidence, with no path back. Failing here keeps the damage visible
+  // and repairable instead of burying it under new entries.
+  const { entries: existing, malformed } = readEntries(path);
+  if (malformed.length > 0) {
+    throw new Error(
+      `anchor log ${path} has malformed line(s) ${malformed.join(", ")}; ` +
+        `refusing to append over them — inspect and repair the log first`,
+    );
+  }
   const prev = existing.at(-1) ?? null;
   const body: Omit<AnchorEntry, "anchorHash"> = {
     seq: (prev?.seq ?? 0) + 1,

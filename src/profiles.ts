@@ -6,7 +6,7 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
-import { sha256, newId } from "./hash.ts";
+import { sha256 } from "./hash.ts";
 import { proposeWrite } from "./approvals.ts";
 import { appendAudit } from "./audit.ts";
 

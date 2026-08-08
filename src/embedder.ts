@@ -271,6 +271,7 @@ export function embedLocal(
       if (prefer === "minilm") {
         throw new Error(
           `minilm embed failed: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
         );
       }
       // A silent fall-through here destroyed a 28,508-passage corpus.
@@ -314,6 +315,31 @@ export function embedLocalBatch(
       : prefer === "minilm" && !minilmAvailable()
         ? "hash"
         : prefer;
+
+  // Ollama has no batch endpoint here, so it embeds per text — but it must be
+  // *attempted*. Without this branch an ollama-configured install fell straight
+  // through to hash vectors, and every caller that treats `kind: "hash"` as
+  // "semantic comparison is impossible" was permanently degraded: the paraphrase
+  // debt gate never ran a single time on those machines, and each commit wrote a
+  // degradation record nobody had a reason to investigate, because nothing was
+  // broken — the branch simply did not exist.
+  if (kind === "ollama") {
+    try {
+      return texts.map((t) => {
+        const vector = embedOllama(t);
+        return {
+          vector,
+          model: process.env.CHAMBER_OLLAMA_EMBED_MODEL ?? OLLAMA_MODEL_DEFAULT,
+          dims: vector.length,
+          kind: "ollama" as const,
+        };
+      });
+    } catch (err) {
+      if (prefer === "ollama")
+        throw new Error("ollama batch embed failed", { cause: err });
+      warnMinilmFallback(err);
+    }
+  }
 
   if (kind === "minilm") {
     const vecs = embedMinilmBatch(texts);

@@ -31,7 +31,6 @@ export function checkRateLimit(
   }
   const elapsed = now - b.updatedAt;
   if (elapsed > 0 && refillMs > 0) {
-    const refill = Math.floor(elapsed / refillMs) * 1;
     // continuous-ish: tokens += elapsed/refillMs
     const add = (elapsed / refillMs) * capacity;
     b.tokens = Math.min(capacity, b.tokens + add);

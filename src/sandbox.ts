@@ -9,13 +9,11 @@
  * Tools never write to Chamber DB directly — stdout/stderr captured as evidence.
  */
 
-import { spawnSync, spawn } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   writeFileSync,
-  readFileSync,
   rmSync,
-  existsSync,
 } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -125,6 +123,9 @@ let isolationProbeCache: { backend: SandboxBackend; ok: boolean } | null = null;
  */
 function isolationHolds(backend: SandboxBackend): boolean {
   if (isolationProbeCache?.backend === backend) return isolationProbeCache.ok;
+  // Fail-closed default: an unconfined verdict is the safe one if any path
+  // below fails to assign.
+  // eslint-disable-next-line no-useless-assignment
   let ok = false;
   const dir = mkdtempSync(join(tmpdir(), "chamber-sbxprobe-"));
   try {

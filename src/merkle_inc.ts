@@ -15,7 +15,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { newId, sha256 } from "./hash.ts";
 import {
-  buildMerkleLayers,
   proveInclusion,
   verifyInclusionProof,
 } from "./merkle.ts";

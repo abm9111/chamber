@@ -98,14 +98,26 @@ export interface RejectedSource {
   reason: string;
 }
 
+/**
+ * `paraphraseCheck` reports whether the semantic debt gate actually executed.
+ * A broken embedder softens that gate, and without this the softening was
+ * invisible: `strict` refuses claims with no verified support and had no way to
+ * tell a check that passed from one that never ran.
+ */
 export type CommitResult =
-  | { ok: true; beliefId: string; rejectedSources?: RejectedSource[] }
+  | {
+      ok: true;
+      beliefId: string;
+      rejectedSources?: RejectedSource[];
+      paraphraseCheck?: "ran" | "skipped";
+    }
   | {
       ok: false;
       status: "REJECTED" | "PARKED";
       reason: string;
       debtIds?: string[];
       rejectedSources?: RejectedSource[];
+      paraphraseCheck?: "ran" | "skipped";
     };
 
 export interface ActivateSkillInput {

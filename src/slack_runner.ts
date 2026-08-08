@@ -14,7 +14,6 @@ import {
   handleChamberSlash,
   slackApprove,
   slackReject,
-  pendingWriteBlocks,
   canSlackApprove,
   registerSlackPendingHook,
 } from "./slack_ops.ts";

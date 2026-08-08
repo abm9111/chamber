@@ -17,7 +17,6 @@ import {
   proposeWrite,
   decideWrite,
   expireStalePending,
-  listPendingQueue,
   getApprovalPolicy,
   markApplied,
   formatWriteConflict,
@@ -28,7 +27,6 @@ import { evaluateWorkflows } from "../src/approval_workflows.ts";
 import {
   appendAudit,
   verifyAuditChain,
-  queryAudit,
 } from "../src/audit.ts";
 import {
   createMerkleCheckpoint,
@@ -119,11 +117,11 @@ import {
   latestAnchor,
   verifyAgainstAnchors,
 } from "../src/anchor.ts";
-import { importSkillFile, parseSkillMarkdown } from "../src/skill_import.ts";
+import { importSkillFile } from "../src/skill_import.ts";
 import { loadAndRegisterMcpFile } from "../src/mcp_bridge.ts";
 import { startSession, appendMessage, searchSessions } from "../src/sessions.ts";
 import { ensureDefaultProfiles, getProfile } from "../src/profiles.ts";
-import { addCronJob, computeNextRun, runDueCronJobs } from "../src/cron.ts";
+import { computeNextRun } from "../src/cron.ts";
 import {
   generatePkce,
   buildAuthorizeUrl,
@@ -158,7 +156,6 @@ import { getHarness, listHarnesses } from "../src/harness_adapter.ts";
 import {
   canSlackApprove,
   parseChamberSlash,
-  handleChamberSlash,
   slackApprove,
   slackScopeId,
   openSlackDb,
@@ -171,7 +168,6 @@ import {
   sanitizeDiscordOutbound,
   formatAttachmentMeta,
   chunkDiscordMessage,
-  isDiscordFreeResponseChannel,
   openDiscordDb,
 } from "../src/discord_ops.ts";
 // Importing this module must not start a gateway; see `invokedDirectly` there.
@@ -813,6 +809,80 @@ test("gates", "a commit survives an embedder that cannot run", () => {
     assert(
       r.ok,
       `a broken embedder must not park the commit: ${JSON.stringify(r)}`,
+    );
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+  }
+});
+
+/**
+ * A gate that could not run must say so **to the caller**, not only to a log
+ * nothing reads. `strict` refuses claims with no verified support; it had no way
+ * to distinguish a paraphrase check that passed from one that never executed, so
+ * a broken embedder silently downgraded the gate and every surface reported a
+ * clean commit.
+ */
+test("gates", "a commit says when the paraphrase gate could not run", () => {
+  const db = freshDb();
+  const indebted = "The refund policy allows returns within 30 days.";
+  insertDebt(db, claimHash("belief", indebted), indebted);
+
+  const saved = process.env.CHAMBER_PYTHON;
+  process.env.CHAMBER_PYTHON = "/nonexistent/python-that-is-not-here";
+  try {
+    const r = commitBelief(db, {
+      type: "belief",
+      text: "The office in Dubai opens at nine on weekdays.",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    assert(r.ok, `must not park: ${JSON.stringify(r)}`);
+    assert(
+      r.ok && r.paraphraseCheck === "skipped",
+      `caller cannot see the gate was skipped: ${JSON.stringify(r)}`,
+    );
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+  }
+});
+
+/**
+ * And the durable record has to outlive the refusal. Written inside the open
+ * transaction, it was discarded by every rollback path — so the one trace that
+ * the gate did not run vanished in exactly the cases where a claim was
+ * contested, which are the cases worth auditing.
+ */
+test("gates", "the degraded record survives a commit that is then refused", () => {
+  const db = freshDb();
+  const text = "A claim whose own hash already carries an open blocking debt.";
+  insertDebt(db, claimHash("belief", text), text);
+  // A second, differently-worded open debt so the paraphrase leg has work to do.
+  insertDebt(db, claimHash("belief", "An unrelated open obligation."), "An unrelated open obligation.");
+
+  const saved = process.env.CHAMBER_PYTHON;
+  process.env.CHAMBER_PYTHON = "/nonexistent/python-that-is-not-here";
+  try {
+    const r = commitBelief(db, {
+      type: "belief",
+      text,
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    assert(!r.ok && r.status === "REJECTED", `expected refusal: ${JSON.stringify(r)}`);
+    // `debt:degraded`, not `gate:debt:degraded`: the record goes straight to
+    // appendAudit, so it carries no emitGate `${gate}:` prefix.
+    const degraded = count(
+      db,
+      `SELECT COUNT(*) AS c FROM audit_event WHERE action = 'debt:degraded'`,
+    );
+    assert(degraded >= 1, "the degraded record was rolled back with the refusal");
+    assert(
+      !r.ok && r.paraphraseCheck === "skipped",
+      "a refusal must also tell the caller the gate did not run",
     );
   } finally {
     if (saved === undefined) delete process.env.CHAMBER_PYTHON;
@@ -3787,7 +3857,7 @@ test(
     symlinkSync(join(dir2, "shared"), join(dir2, "alias"));
     symlinkSync(join(dir2, "Private"), join(dir2, "backdoor"));
 
-    const r2 = ingestDirectory(db2, dir2, { exclude: ["Private"] });
+    ingestDirectory(db2, dir2, { exclude: ["Private"] });
     const refs2 = ingestedPaths(db2);
     assert(
       refs2.includes("alias/note.md") || refs2.includes("shared/note.md"),
@@ -8037,6 +8107,8 @@ test("config", "two spellings of one directory are rejected on a case-folding vo
   // Only meaningful where the filesystem actually folds case; on a
   // case-sensitive volume "VAULT" is a different directory and does not exist,
   // so there is nothing to detect.
+  // Defaults false so a case-sensitive volume simply skips the assertion.
+  // eslint-disable-next-line no-useless-assignment
   let folds = false;
   try { folds = realpathSync(join(dir, "VAULT")).length > 0; } catch { folds = false; }
   if (folds) {

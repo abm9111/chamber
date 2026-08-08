@@ -22,7 +22,7 @@ import { startSession, appendMessage } from "./sessions.ts";
 import { completeSync } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { commitBelief } from "./commit_belief.ts";
-import { recordSpend, spendLastHours, formatSpendFooter } from "./spend.ts";
+import { spendLastHours, formatSpendFooter } from "./spend.ts";
 import { appendAudit } from "./audit.ts";
 import { runExpiryJob } from "./expiry.ts";
 import { profileContext } from "./profiles.ts";
@@ -39,7 +39,7 @@ class DiscordGateway implements GatewayAdapter {
   get available() {
     return !!this.token;
   }
-  async start(onMessage: (msg: InboundMessage) => Promise<string>): Promise<void> {
+  async start(_onMessage: (msg: InboundMessage) => Promise<string>): Promise<void> {
     if (!this.available) {
       console.log("Discord gateway: DISCORD_BOT_TOKEN not set — disabled");
       return;
@@ -84,7 +84,7 @@ class SlackGateway implements GatewayAdapter {
   get available() {
     return !!this.token;
   }
-  async start(onMessage: (msg: InboundMessage) => Promise<string>): Promise<void> {
+  async start(_onMessage: (msg: InboundMessage) => Promise<string>): Promise<void> {
     if (!this.available) {
       console.log("Slack gateway: SLACK_BOT_TOKEN not set — disabled");
       return;

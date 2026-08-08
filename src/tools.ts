@@ -9,9 +9,8 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
-import { newId, sha256 } from "./hash.ts";
 import { runInSandbox, type SandboxResult } from "./sandbox.ts";
-import { proposeWrite, decideWrite, markApplied } from "./approvals.ts";
+import { proposeWrite } from "./approvals.ts";
 import { appendAudit } from "./audit.ts";
 import { recordSpend } from "./spend.ts";
 

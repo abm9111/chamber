@@ -512,7 +512,9 @@ export function ingestDirectory(
   try {
     root = realpathSync(resolve(rootInput));
   } catch (err) {
-    throw new Error(`ingest root is unreadable: ${rootInput} — ${errText(err)}`);
+    throw new Error(`ingest root is unreadable: ${rootInput} — ${errText(err)}`, {
+      cause: err,
+    });
   }
   if (!statSync(root).isDirectory()) {
     throw new Error(`ingest root is not a directory: ${rootInput}`);

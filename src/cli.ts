@@ -91,7 +91,6 @@ import {
   listProfiles,
   getProfile,
   updateProfile,
-  profileContext,
 } from "./profiles.ts";
 import {
   startSession,
@@ -99,21 +98,19 @@ import {
   searchSessions,
   listSessions,
 } from "./sessions.ts";
-import { addCronJob, listCronJobs, runDueCronJobs, setCronEnabled } from "./cron.ts";
+import { addCronJob, listCronJobs, runDueCronJobs } from "./cron.ts";
 import {
   registerSkill,
   listSkills,
   proposeLearnedSkill,
   listLearningProposals,
-  activateSkillRegistry,
 } from "./skills_registry.ts";
 import { importSkillFile, importSkillDirectory } from "./skill_import.ts";
 import { loadAndRegisterMcpFile } from "./mcp_bridge.ts";
 import { ensureDefaultScope, createScope, listScopes, globalPosture, effectivePolicy } from "./scope.ts";
 import { enqueueJob, processJobQueue, listJobs } from "./job_queue.ts";
 import { getHarness, listHarnesses } from "./harness_adapter.ts";
-import { pilotSummary, logPilotEvent } from "./pilot.ts";
-import { pendingWhy } from "./approvals.ts";
+import { pilotSummary } from "./pilot.ts";
 import {
   mcpDiscover,
   mcpToolsList,
@@ -126,9 +123,6 @@ import {
   loginInteractive,
   getStoredToken,
   deleteStoredToken,
-  generatePkce,
-  buildAuthorizeUrl,
-  normalizeResourceUrl,
 } from "./mcp_oauth.ts";
 import { statSync } from "node:fs";
 import {
@@ -294,7 +288,6 @@ function runTurn(db: DatabaseSync, message: string): void {
   console.log(`\n▶ turn ${turnId.slice(0, 12)}…`);
   console.log(`  user: ${message}`);
 
-  const lower = message.toLowerCase();
   const wantsMemory =
     /\b(remember|prefer|i am|i'm|my name|always|never)\b/i.test(message);
   const wantsSkill =

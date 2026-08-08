@@ -254,8 +254,12 @@ export function commitBelief(
    * commits — so silence would leave the caller unable to tell a confabulated
    * pin from one that was simply never offered.
    */
-  const withRejected = <T extends CommitResult>(result: T): T =>
-    rejectedSources.length > 0 ? { ...result, rejectedSources } : result;
+  let paraphraseCheckState: "ran" | "skipped" = "ran";
+  const withRejected = <T extends CommitResult>(result: T): T => ({
+    ...result,
+    ...(rejectedSources.length > 0 ? { rejectedSources } : {}),
+    paraphraseCheck: paraphraseCheckState,
+  });
 
   const hash = claimHash(type, text);
   const beliefId = newId("blf");
@@ -263,6 +267,50 @@ export function commitBelief(
     halfLifeSeconds && halfLifeSeconds > 0
       ? new Date(Date.now() + halfLifeSeconds * 1000).toISOString()
       : null;
+
+  /**
+   * The paraphrase leg runs *before* the write transaction, deliberately.
+   *
+   * It embeds, and embedding shells out to python3 with a 180s timeout. Doing
+   * that while holding BEGIN IMMEDIATE parked every other writer behind a
+   * subprocess, against busy timeouts measured in seconds — this repo ships
+   * separate server, jobs and gateway units against one database.
+   *
+   * Hoisting it also makes the degradation record durable. Written inside the
+   * transaction it was discarded by every rollback path, so the one trace that
+   * the gate had not run disappeared in exactly the cases where a claim was
+   * contested. What the transaction still owns is the *decision*: the ids found
+   * here are re-checked for being open inside it, so a debt settled in between
+   * cannot block, and one opened in between is caught by the exact-hash leg or
+   * by the next commit.
+   */
+  const paraphrase = ASSERTION.has(type)
+    ? paraphraseBlockingDebts(db, text, hash)
+    : { debts: [], semantic: true };
+
+  if (!paraphrase.semantic) {
+    // Outside the transaction, so a later refusal cannot erase it. Straight to
+    // the chained audit log rather than through emitGate: `gate_event.action` is
+    // CHECK-constrained to a closed vocabulary with no member meaning "this
+    // check could not run", so "degraded" was rejected outright and the row
+    // intended to record the failure instead threw and parked the commit.
+    appendAudit(db, {
+      category: "gate",
+      action: "debt:degraded",
+      subjectKind: "claim_hash",
+      subjectId: hash,
+      turnId,
+      detail: {
+        gate: "debt",
+        check: "paraphrase",
+        reason: "embedder unavailable or non-semantic; paraphrase check did not run",
+      },
+    });
+  }
+
+  // Surfaced on every verdict via withRejected, so `strict` and the ask surface
+  // can tell a gate that passed from one that never executed.
+  paraphraseCheckState = paraphrase.semantic ? "ran" : "skipped";
 
   try {
     db.exec("BEGIN IMMEDIATE");
@@ -379,35 +427,19 @@ export function commitBelief(
     // debts on the same claim worn as different words.
     const directDebts = openBlockingDebts(db, hash);
     const inherited = inheritDebtsAlongChain(db, revisionOf);
-    const paraphrase = ASSERTION.has(type)
-      ? paraphraseBlockingDebts(db, text, hash)
-      : { debts: [], semantic: true };
-    const blocking = [...directDebts, ...inherited, ...paraphrase.debts];
+    // Re-read inside the lock: the ids came from before the transaction opened.
+    const stillOpen = paraphrase.debts.filter(
+      (d) =>
+        !!db
+          .prepare(
+            `SELECT id FROM citation_debt
+             WHERE id = ? AND blocking = 1 AND status IN ('pending','proposed_paid')`,
+          )
+          .get(d.id),
+    );
+    const blocking = [...directDebts, ...inherited, ...stillOpen];
     const blockingIds = [...new Set(blocking.map((d) => d.id))];
 
-    // A gate that could not run is not a gate that passed. Without this row an
-    // operator reading the ledger cannot tell a commit that cleared the
-    // paraphrase check from one committed on a machine where it never ran.
-    if (!paraphrase.semantic) {
-      // Straight to the chained audit log rather than through emitGate.
-      // `gate_event.action` is CHECK-constrained to a closed vocabulary that has
-      // no member meaning "this check could not run" — "degraded" was rejected
-      // outright, so the row intended to record the degradation instead threw
-      // and parked the commit. `audit_event.action` is free text, and the
-      // hash-chained log is the better home for it regardless.
-      appendAudit(db, {
-        category: "gate",
-        action: "debt:degraded",
-        subjectKind: "claim_hash",
-        subjectId: hash,
-        turnId,
-        detail: {
-          gate: "debt",
-          check: "paraphrase",
-          reason: "embedder unavailable or non-semantic; paraphrase check did not run",
-        },
-      });
-    }
 
     if (ASSERTION.has(type) && blockingIds.length > 0) {
       emitGate(db, {

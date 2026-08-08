@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Chamber week-1 kernel — governable cognition gates",
+  "description": "Chamber week-1 kernel \u2014 governable cognition gates",
   "bin": {
     "chamber": "src/cli.ts"
   },
@@ -27,7 +27,8 @@
     "serve": "node --experimental-strip-types src/server.ts",
     "gateway:slack": "node --experimental-strip-types src/slack_runner.ts",
     "gateway:discord": "node --experimental-strip-types src/discord_runner.ts",
-    "lint": "eslint src tests probes"
+    "lint": "eslint src tests probes",
+    "probes:isolation": "CHAMBER_SANDBOX_REQUIRED=1 node --experimental-strip-types probes/sandbox_confines.ts"
   },
   "engines": {
     "node": ">=23.6"

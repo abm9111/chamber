@@ -79,3 +79,12 @@ jobs:
       # until 2026-08-05, so the suite's exit status was only the last probe's
       # and a failing gate_audit was invisible.
       - run: npm run probes
+      # Ubuntu 24.04 blocks unprivileged user namespaces via AppArmor, which is
+      # what stops bubblewrap confining anything on a stock runner. Without this
+      # the sandbox correctly refuses — and CI then only ever observes the gate
+      # saying no, never doing its job.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # Demands the other half: the payload must RUN and be contained. A refusal
+      # fails this step. `npm run probes` deliberately excludes it, because on a
+      # machine with no isolating backend it could only ever fail.
+      - run: npm run probes:isolation

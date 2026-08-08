@@ -62,6 +62,31 @@ function which(bin: string): boolean {
  * the working directory, which is how a "bind the runtime's own prefix" rule
  * turned into "bind the parent of wherever this process happens to be running".
  */
+/**
+ * The read-only bind that lets the runtime start, or refusal.
+ *
+ * Computing this from the resolved binary keeps re-deriving `/`: `dirname` of
+ * `/bin/bash` is `/bin`, whose parent is the root, so on any host whose PATH
+ * reaches `/bin` first the allowlist re-mounts the entire filesystem — the very
+ * thing it replaced. Resolving through PATH fixed the *cwd* case and left this
+ * one, because the bug was never the resolution, it was deriving a bind from an
+ * arbitrary path at all.
+ *
+ * So this refuses instead of computing. A prefix of `/` or a single segment
+ * (`/usr`, `/opt`) is rejected outright — anything that broad is already covered
+ * by the static allowlist, and a runtime living outside it is one this sandbox
+ * cannot confine. An empty bind means the payload cannot start, which is the
+ * safe direction: nothing runs rather than something runs unconfined.
+ */
+function runtimeBindFor(cmd: string): string[] {
+  const resolved = absolutePathOf(cmd);
+  if (!resolved) return [];
+  const prefix = resolve(dirname(resolved), "..");
+  const segments = prefix.split("/").filter(Boolean);
+  if (segments.length < 2) return [];
+  return ["--ro-bind-try", prefix, prefix];
+}
+
 function absolutePathOf(cmd: string): string | null {
   if (cmd.startsWith("/")) return cmd;
   const r = spawnSync("which", [cmd], { encoding: "utf8" });
@@ -107,21 +132,26 @@ function sandboxRequired(): boolean {
  * A probe only ever proves the dimensions it tests. If a future backend can be
  * escaped some other way, this list is where that has to be written down.
  *
- * The read leg names paths that are never on the allowlist. It used to list
- * `homedir()` itself, which bwrap *creates* whenever the runtime prefix lives
- * under $HOME — an nvm install, the case the allowlist explicitly supports — so
- * a correctly-confining sandbox reported itself unconfined and refused every
- * call. The needle has to be something the allowlist can never contain.
+ * Choosing the read needle is harder than it looks, and both earlier attempts
+ * were wrong in opposite directions. `homedir()` is *created* by bwrap whenever
+ * the runtime prefix lives under $HOME (nvm), so a confining sandbox reported
+ * itself unconfined and refused everything. `~/.ssh` and `/etc/shadow` then
+ * failed with ENOENT and EACCES for an ordinary service user whether confined or
+ * not, so a read-open sandbox reported itself confined — the dangerous
+ * direction. The needle must be present, world-readable *unconfined*, and
+ * outside the allowlist *confined*: `/etc/passwd` is all three, with no
+ * permission confound to muddy the result.
+ *
+ * Writes are not probed separately: every bind this sandbox issues is
+ * `--ro-bind-try`, so a successful read of the needle is the discriminator and a
+ * write attempt only re-tests the same mount from a noisier angle.
  */
 const ISOLATION_PROBE_SOURCE = `
-  import { writeFileSync, unlinkSync, readdirSync, readFileSync } from "node:fs";
-  import { homedir } from "node:os";
+  import { writeFileSync, unlinkSync, readFileSync } from "node:fs";
   import dns from "node:dns/promises";
   let wrote = false, net = false, read = false;
-  try { const p = homedir() + "/.chamber_isolation_probe"; writeFileSync(p, "x"); wrote = true; unlinkSync(p); } catch {}
   try { await dns.lookup("example.com"); net = true; } catch {}
-  try { readdirSync(homedir() + "/.ssh"); read = true; } catch {}
-  try { readFileSync("/etc/shadow"); read = true; } catch {}
+  try { readFileSync("/etc/passwd"); read = true; } catch {}
   console.log(JSON.stringify({ confined: !wrote && !net && !read }));
 `;
 
@@ -310,10 +340,7 @@ function runBwrap(
   // the allowlist this function exists to enforce. Resolve through PATH first,
   // and if that fails, add no runtime bind at all: the payload then cannot start
   // and refuses, which is the safe direction.
-  const resolved = absolutePathOf(cmd);
-  const runtimeBind = resolved
-    ? ["--ro-bind-try", resolve(dirname(resolved), ".."), resolve(dirname(resolved), "..")]
-    : [];
+  const runtimeBind = runtimeBindFor(cmd);
   const bwrapArgs = [
     "--ro-bind-try",
     "/usr",

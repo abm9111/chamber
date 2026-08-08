@@ -46,6 +46,44 @@ export function loadMcpManifest(path: string): McpServerManifest {
  * A vendor string rendered on one line, unable to open a fence or break out of
  * it. Newlines collapse so it cannot introduce a structural line of its own.
  */
+/**
+ * The fields that become structure are validated, not escaped.
+ *
+ * Sanitising them one at a time has now failed twice — first the description,
+ * then the name, while `risk`, `runtime` and `endpoint` stayed raw and could
+ * each still supply the first fence that tools.ts executes. Escaping is a
+ * blocklist worn as a whitelist: it protects the characters someone thought of.
+ * These fields have small closed ranges, so anything outside them is refused and
+ * the tool does not register at all.
+ */
+const KNOWN_RUNTIMES = new Set(["node", "python", "bash"]);
+const KNOWN_RISKS = new Set([
+  "compute",
+  "read",
+  "network",
+  "shell",
+  "write_fs",
+]);
+
+function structuralFieldsValid(t: {
+  runtime?: string;
+  endpoint?: string;
+  risk?: string[];
+}): boolean {
+  if (t.runtime !== undefined && !KNOWN_RUNTIMES.has(t.runtime)) return false;
+  if (t.risk?.some((r) => !KNOWN_RISKS.has(r))) return false;
+  // An endpoint is a URL or the literal "local"; anything with whitespace or a
+  // backtick is not one, and is the shape an injection takes.
+  if (
+    t.endpoint !== undefined &&
+    t.endpoint !== "local" &&
+    !/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s`]+$/.test(t.endpoint)
+  ) {
+    return false;
+  }
+  return true;
+}
+
 function inlineSafe(text: string): string {
   return text.replace(/`/g, "\\`").replace(/[\r\n]+/g, " ").trim();
 }
@@ -96,8 +134,25 @@ export function registerMcpManifest(
         continue;
       }
     }
-    const toolSource =
-      t.source ?? `console.log(JSON.stringify({ ok: true, tool: "${t.name}" }))`;
+    // No vendor string in generated code. The name used to be interpolated
+    // here, so a manifest that simply omitted `source` got the vendor's own
+    // statements into the JavaScript tools.ts executes — sanitising the name
+    // where it is *rendered* did nothing for the copy that became code.
+    const toolSource = t.source ?? "console.log(JSON.stringify({ ok: true }))";
+    if (!structuralFieldsValid(t)) {
+      blocked++;
+      appendAudit(db, {
+        category: "security",
+        action: "mcp_tool_blocked",
+        actor: "system",
+        detail: {
+          server: manifest.name,
+          tool: t.name,
+          reason: "runtime, risk or endpoint outside its permitted set",
+        },
+      });
+      continue;
+    }
     if (!sourceIsRepresentable(toolSource)) {
       blocked++;
       appendAudit(db, {

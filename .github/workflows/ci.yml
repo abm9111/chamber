@@ -61,6 +61,14 @@ jobs:
       # gate, and this one guards executing untrusted code.
       - run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - run: bwrap --version
+      # The paraphrase debt gate needs a working embedder. Without one,
+      # embedLocalBatch degrades, the gate reports "could not run", the
+      # paraphrase commits, and probes/debt_paraphrase.ts correctly calls that
+      # an escape — so a runner missing these packages fails the build for a
+      # missing dependency while looking like a security regression. The model
+      # itself is committed under models/minilm/; only the runtime is absent.
+      - run: python3 -m pip install --quiet --break-system-packages numpy onnxruntime tokenizers
+      - run: python3 scripts/embed_minilm.py "smoke" > /dev/null && echo "embedder OK"
       # Runs every probe and fails if any of them fails. This chained with `;`
       # until 2026-08-05, so the suite's exit status was only the last probe's
       # and a failing gate_audit was invisible.

@@ -79,6 +79,8 @@ import { extractChunks, fileMerkleRoot } from "../src/code_index.ts";
 import {
   proposeDebtPayment,
   confirmDebtPaid,
+  waiveDebt,
+  listOpenDebts,
 } from "../src/debt.ts";
 import { sandboxSelfTest, runInSandbox, resetIsolationProbe } from "../src/sandbox.ts";
 import { runTool, synthesizeTool, listTools } from "../src/tools.ts";
@@ -942,6 +944,62 @@ test("gates", "every verdict says where the paraphrase gate got to", () => {
   assert(
     ran.paraphraseCheck === "no_candidates",
     `expected no_candidates with no open debts, got ${ran.paraphraseCheck}`,
+  );
+});
+
+/**
+ * The operator escape hatch. Debt is permanent and claim-hash-scoped, so a
+ * misclassified line blocks that exact sentence forever — and `pay-debt` only
+ * helps when the corpus actually contains support. Without a waive, the only
+ * remedy is editing the database by hand, which is the one thing a ledger with
+ * a hash-chained audit log should never require. The schema anticipated this
+ * (`status: 'waived'`, `waived_by`); nothing exposed it.
+ *
+ * A waive is an admission, not a payment: it records that a human decided to
+ * proceed without evidence, and says so in the chained log.
+ */
+test("gates", "an operator can waive a debt that cannot be paid", () => {
+  const db = freshDb();
+  const text = "A claim the corpus cannot support.";
+  insertDebt(db, claimHash("belief", text), text);
+
+  const blocked = commitBelief(db, {
+    type: "belief", text, sources: [], authorFamily: "test", path: "deep",
+  });
+  assert(!blocked.ok, "precondition: the debt must block");
+
+  assert(waiveDebt(db, "dbt_nonexistent", "typo") === false, "unknown id must not report success");
+  const debtId = listOpenDebts(db)[0]!.id;
+  const ok = waiveDebt(db, debtId, "misclassified — no source exists");
+  assert(ok, "waiving an open debt must succeed");
+  assert(
+    waiveDebt(db, debtId, "again") === false,
+    "a settled debt must not be waivable twice",
+  );
+
+  const after = commitBelief(db, {
+    type: "belief", text, sources: [], authorFamily: "test", path: "deep",
+  });
+  assert(after.ok, `the claim must commit once waived: ${JSON.stringify(after)}`);
+
+  const audited = count(
+    db,
+    `SELECT COUNT(*) AS c FROM audit_event WHERE action = 'debt:waived'`,
+  );
+  assert(audited >= 1, "a waive must land in the chained audit log");
+
+  // The waived debt is settled — but the newly-committed claim is still
+  // unsourced, so it mints its own fresh debt. A waive clears one decision; it
+  // is not permanent amnesty for the sentence, which is the safer reading and
+  // worth pinning down so nobody "fixes" it into one.
+  const settled = db
+    .prepare(`SELECT status, waived_by FROM citation_debt WHERE id = ?`)
+    .get(debtId) as { status: string; waived_by: string };
+  assert(settled.status === "waived", `expected waived, got ${settled.status}`);
+  assert(settled.waived_by === "human", `expected human, got ${settled.waived_by}`);
+  assert(
+    !listOpenDebts(db).some((d) => d.id === debtId),
+    "the waived debt must no longer be open",
   );
 });
 

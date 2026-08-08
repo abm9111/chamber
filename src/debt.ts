@@ -10,6 +10,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { newId } from "./hash.ts";
+import { appendAudit } from "./audit.ts";
 import { searchVector, type VectorHit } from "./vector.ts";
 import { searchCode } from "./code_index.ts";
 import { verifyPin, isCitableSourceKind } from "./pins.ts";
@@ -284,6 +285,51 @@ export function proposeDebtPayment(
 }
 
 /** Human/epistemology confirms payment. */
+/**
+ * Settle a debt the corpus cannot pay, on a human's judgement and record.
+ *
+ * Debt is permanent and claim-hash-scoped, so a misclassified line blocks that
+ * exact sentence forever, and `proposeDebtPayment` only helps where support
+ * actually exists. Without this the sole remedy was editing the database by
+ * hand — the one repair a ledger with a hash-chained audit log must never
+ * require, because it is indistinguishable from tampering.
+ *
+ * A waive is an admission, not a payment, and the two must stay distinguishable
+ * forever: `paid` means evidence was found, `waived` means a person decided to
+ * proceed without it. The reason is mandatory and goes into the chained log, so
+ * "why does this claim stand on nothing" has an answer later.
+ */
+export function waiveDebt(
+  db: DatabaseSync,
+  debtId: string,
+  reason: string,
+  by: "human" | "epistemology" = "human",
+): boolean {
+  if (!reason.trim()) {
+    throw new Error("waiving a debt requires a reason — it is the whole record");
+  }
+  const r = db
+    .prepare(
+      `UPDATE citation_debt
+       SET status = 'waived',
+           waived_by = ?,
+           paid_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+       WHERE id = ? AND status IN ('pending','proposed_paid')`,
+    )
+    .run(by, debtId);
+  if (Number(r.changes ?? 0) < 1) return false;
+
+  appendAudit(db, {
+    category: "gate",
+    action: "debt:waived",
+    actor: by,
+    subjectKind: "debt",
+    subjectId: debtId,
+    detail: { reason, waived_by: by },
+  });
+  return true;
+}
+
 export function confirmDebtPaid(
   db: DatabaseSync,
   debtId: string,

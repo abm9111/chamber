@@ -65,6 +65,7 @@ import {
   proposeDebtPayment,
   proposeAllDebtPayments,
   confirmDebtPaid,
+  waiveDebt,
 } from "./debt.ts";
 import { listTools, runTool, synthesizeTool, toolExecutionStatus } from "./tools.ts";
 import { sandboxSelfTest, detectSandboxBackend } from "./sandbox.ts";
@@ -1461,6 +1462,31 @@ async function main(): Promise<void> {
         console.log(
           `  ${d.id}  [${d.status}]  ${d.claimText.slice(0, 80)}`,
         );
+      }
+      break;
+    }
+    case "waive-debt": {
+      const id = rest[0];
+      const reason = rest.slice(1).join(" ").trim();
+      if (!id || !reason) {
+        console.error(
+          "usage: chamber waive-debt <debt-id> <reason>\n" +
+            "  A waive is an admission, not a payment: it records that you chose\n" +
+            "  to proceed without evidence. The reason is mandatory and is written\n" +
+            "  to the hash-chained audit log.",
+        );
+        process.exitCode = 1;
+        break;
+      }
+      if (waiveDebt(db, id, reason)) {
+        console.log(`waived ${id} — recorded as an admission, not a payment`);
+        console.log(
+          "  note: the claim itself is still unsourced, so committing it again " +
+            "mints a fresh debt. A waive clears one decision, not the sentence.",
+        );
+      } else {
+        console.error(`no open debt with id ${id}`);
+        process.exitCode = 1;
       }
       break;
     }

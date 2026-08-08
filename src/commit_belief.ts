@@ -112,6 +112,36 @@ function openBlockingDebts(
 export const DEBT_PARAPHRASE_THRESHOLD = 0.8;
 
 /**
+ * Cosine thresholds are a property of the embedding model, not of the idea.
+ *
+ * 0.8 was measured on MiniLM: a genuine paraphrase scored 0.834 and an unrelated
+ * sentence 0.030. Different models put unrelated text at different baselines —
+ * nomic-embed-text in particular reports high similarity between short
+ * unrelated strings — so carrying this number across would refuse commits that
+ * restate nothing. A model with no measured threshold gets no threshold: the
+ * gate reports that it could not run rather than applying a number borrowed
+ * from somewhere else.
+ *
+ * To add one, measure it the way the MiniLM entry was measured — a labelled set
+ * with near-paraphrases, contradictions, entity swaps and, for a bilingual
+ * corpus, cross-lingual restatements — and record the model id beside it.
+ */
+const CALIBRATED_THRESHOLDS: Readonly<Record<string, number>> = {
+  minilm: DEBT_PARAPHRASE_THRESHOLD,
+};
+
+/**
+ * How many open debts one commit will embed.
+ *
+ * The ollama path spawns a curl per text with a 30s ceiling, so an unbounded
+ * candidate set puts N round-trips on the request path. Capping bounds that —
+ * and the cap is announced rather than silent, because a gate that quietly
+ * examined 32 of 200 candidates and reported "no match" is making a claim it
+ * did not check.
+ */
+const MAX_PARAPHRASE_CANDIDATES = 32;
+
+/**
  * Open blocking debts whose claim says the same thing as `text` in different
  * words. `claim_hash` cannot find these — it is sha256 over normalised text,
  * so "within 30 days" and "during the 30 days after purchase" are two unrelated
@@ -154,25 +184,46 @@ function paraphraseBlockingDebts(
   // down the ledger rather than softening one check. It is the same outcome the
   // `semantic: false` branch below already describes, so it is reported the
   // same way: the check did not run, and the caller is told.
+  const candidates = rows.slice(0, MAX_PARAPHRASE_CANDIDATES);
+  if (rows.length > candidates.length) {
+    console.warn(
+      `chamber: NOTE — ${rows.length} open blocking debts, comparing the first ` +
+        `${candidates.length}. The remainder were not examined by this commit.`,
+    );
+  }
+
   let embeds;
   try {
-    embeds = embedLocalBatch([text, ...rows.map((r) => r.claim_text)]);
+    embeds = embedLocalBatch([text, ...candidates.map((r) => r.claim_text)]);
   } catch {
     return { debts: [], semantic: false, attempted: true };
   }
   // A short or padded result would silently mis-pair claims with debts, since
   // the comparison below indexes rows by position.
-  if (embeds.length !== rows.length + 1)
+  if (embeds.length !== candidates.length + 1)
     return { debts: [], semantic: false, attempted: true };
   if (embeds.some((e) => e.kind === "hash"))
     return { debts: [], semantic: false, attempted: true };
 
+  // No calibrated threshold for this model means no comparison. Borrowing
+  // MiniLM's 0.8 for a model whose unrelated-text baseline sits higher would
+  // refuse commits that restate nothing — a false positive in a gate whose
+  // whole value is that its refusals are trustworthy.
+  const kind = embeds[0]!.kind;
+  const threshold = CALIBRATED_THRESHOLDS[kind];
+  if (threshold === undefined) {
+    console.warn(
+      `chamber: NOTE — no calibrated paraphrase threshold for embedder "${kind}"; ` +
+        `the semantic debt check did not run. Measure one before relying on it.`,
+    );
+    return { debts: [], semantic: false, attempted: true };
+  }
+
   const target = embeds[0]!.vector;
-  const debts = rows
+  const debts = candidates
     .filter(
       (_, i) =>
-        cosineSimilarity(target, embeds[i + 1]!.vector) >=
-        DEBT_PARAPHRASE_THRESHOLD,
+        cosineSimilarity(target, embeds[i + 1]!.vector) >= threshold,
     )
     .map((r) => ({ id: r.id }));
   return { debts, semantic: true, attempted: true };

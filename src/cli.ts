@@ -54,7 +54,7 @@ import {
   parseIngestArgs,
   type IngestSkipKind,
 } from "./ingest.ts";
-import { completeSync } from "./model.ts";
+import { completeSync, syncCompletionAvailable } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { runAsk } from "./ask.ts";
 import { verifyBeliefSources } from "./pins.ts";
@@ -132,7 +132,6 @@ import {
   queryCallees,
 } from "./scip.ts";
 import {
-  exportCheckpoint,
   buildCheckpointReceipt,
   compareCheckpoints,
   verifyCheckpointSignature,
@@ -141,7 +140,7 @@ import {
   type SignedCheckpointReceipt,
 } from "./checkpoint_export.ts";
 import {
-  appendAnchor,
+  exportCheckpointGuarded,
   verifyAgainstAnchors,
   defaultAnchorPath,
 } from "./anchor.ts";
@@ -264,6 +263,18 @@ function printQueue(db: DatabaseSync): void {
 
 /** Heuristic turn — no LLM. Detects memory vs skill intent for gate demo. */
 function runTurn(db: DatabaseSync, message: string): void {
+  // Asked before anything is written. This routine commits an observation, opens
+  // a session and queues writes long before it reaches `completeSync`, which
+  // refuses the openai mode by design — so an openai-configured install used to
+  // gain a belief row and then a stack trace, in that order. A precondition
+  // checked after the write is not a precondition.
+  const model = syncCompletionAvailable();
+  if (!model.ok) {
+    console.error(`chamber turn: ${model.reason}`);
+    process.exitCode = 1;
+    return;
+  }
+
   const turnId = newId("trn");
   const sessionId =
     process.env.CHAMBER_SESSION ??
@@ -1871,8 +1882,9 @@ async function main(): Promise<void> {
         break;
       }
       const out = rest[0] ?? defaultCheckpointPath();
-      const r = exportCheckpoint(db, out);
-      const anchor = appendAnchor(defaultAnchorPath(), r);
+      // Guarded: a damaged anchor log stops this before the receipt is written,
+      // so the two halves of the record never drift apart.
+      const { receipt: r, anchor } = exportCheckpointGuarded(db, out);
       console.log(`wrote ${out}`);
       console.log(
         `mmrRoot=${r.mmrRoot?.slice(0, 16) ?? "null"}… leaves=${r.leafCount} audit.ok=${r.audit.ok}` +

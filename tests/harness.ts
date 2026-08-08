@@ -116,6 +116,7 @@ import {
   verifyAnchorLog,
   latestAnchor,
   verifyAgainstAnchors,
+  exportCheckpointGuarded,
 } from "../src/anchor.ts";
 import { importSkillFile } from "../src/skill_import.ts";
 import { loadAndRegisterMcpFile } from "../src/mcp_bridge.ts";
@@ -4974,6 +4975,40 @@ test("audit", "truncate-then-grow is caught by an older anchor when the tree is 
  * comparison returned early without checking anything — an interrupted write
  * permanently disarmed the tamper-evidence.
  */
+/**
+ * Order matters when one step can refuse. `exportCheckpoint` wrote the receipt
+ * and *then* `appendAnchor` threw on a damaged log — so the checkpoint advanced
+ * while the anchor log stayed frozen, the scheduled job failed on every later
+ * run, and `verifyAgainstAnchors` had no anchor matching the current receipt
+ * even after the damage was repaired. Refusing first leaves both artefacts
+ * consistent.
+ */
+test("audit", "a damaged anchor log stops the checkpoint before the receipt is written", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-cp-"));
+  const log = join(dir, "anchors.jsonl");
+  const out = join(dir, "checkpoint.json");
+  try {
+    const db = freshDb();
+    appendAudit(db, { category: "system", action: "one", actor: "test" });
+    appendAnchor(log, buildCheckpointReceipt(db));
+    appendFileSync(log, "{half written\n");
+
+    let threw = false;
+    try {
+      exportCheckpointGuarded(db, out, log);
+    } catch {
+      threw = true;
+    }
+    assert(threw, "a damaged anchor log must stop the checkpoint");
+    assert(
+      !existsSync(out),
+      "the receipt was written even though the anchor could not be appended",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("audit", "appending refuses to chain over a damaged anchor log", () => {
   const dir = mkdtempSync(join(tmpdir(), "chamber-anchor-"));
   const log = join(dir, "anchors.jsonl");
@@ -7632,6 +7667,51 @@ const CLI_PATH = join(
   dirname(fileURLToPath(import.meta.url)),
   "../src/cli.ts",
 );
+
+/**
+ * A turn that cannot complete must leave nothing behind.
+ *
+ * `completeSync` refuses the openai mode by design, but the observation was
+ * committed *before* it was consulted — so `chamber turn` under an
+ * openai-configured install wrote a belief row, then threw, and the operator got
+ * a stack trace over half-applied state. Fail-closed means refusing before
+ * touching the ledger, not after.
+ */
+test("cli", "a turn that cannot reach a model commits nothing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-turn-"));
+  const db = join(dir, "t.sqlite");
+  try {
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "turn", "hello there"],
+      {
+        encoding: "utf8",
+        timeout: 30_000,
+        env: { ...process.env, CHAMBER_DB: db, CHAMBER_MODEL: "openai" },
+      },
+    );
+    assert(r.error === undefined, `launch failed: ${r.error}`);
+    assert(r.status !== 0, `expected a non-zero exit, got ${r.status}`);
+
+    const count = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "status"],
+      {
+        encoding: "utf8",
+        timeout: 30_000,
+        env: { ...process.env, CHAMBER_DB: db, CHAMBER_MODEL: "stub" },
+      },
+    );
+    const m = (count.stdout || "").match(/beliefs:\s*(\d+)/);
+    assert(m !== null, `could not read belief count from status:\n${count.stdout}`);
+    assert(
+      m![1] === "0",
+      `a refused turn left ${m![1]} belief(s) behind — it committed before it failed`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("cli", "help_starts_the_real_binary_and_exits_clean", () => {
   const r = spawnSync(

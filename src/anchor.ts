@@ -21,6 +21,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { sha256, stableStringify } from "./hash.ts";
 import {
   defaultCheckpointPath,
+  exportCheckpoint,
   compareCheckpoints,
   verifyCheckpointPrefix,
   type CheckpointReceipt,
@@ -158,6 +159,37 @@ export function latestAnchor(path: string): AnchorEntry | null {
  * before the rollback, can still contradict it. The oldest disagreement is the
  * one worth reporting, so this walks forward and returns the first.
  */
+/**
+ * Write the checkpoint and its anchor, or neither.
+ *
+ * The two are halves of one record, and they were written in the order that
+ * makes a partial failure worst: `exportCheckpoint` put the receipt on disk, then
+ * `appendAnchor` refused a damaged log and threw. The checkpoint advanced while
+ * the anchor log stayed frozen, every later scheduled run failed the same way,
+ * and `verifyAgainstAnchors` had no anchor matching the current receipt even
+ * once the damage was repaired.
+ *
+ * Checking the log first costs one read and keeps the two artefacts in step: if
+ * the anchor cannot be appended, no receipt is written and the operator still has
+ * the pair they had before.
+ */
+export function exportCheckpointGuarded(
+  db: DatabaseSync,
+  outPath: string,
+  anchorPath: string = defaultAnchorPath(),
+): { receipt: SignedCheckpointReceipt; anchor: AnchorEntry } {
+  const log = verifyAnchorLog(anchorPath);
+  if (!log.ok) {
+    throw new Error(
+      `anchor log ${anchorPath} is unusable (${log.reason}); refusing to write a ` +
+        `checkpoint that could not be anchored — repair the log first`,
+    );
+  }
+  const receipt = exportCheckpoint(db, outPath);
+  const anchor = appendAnchor(anchorPath, receipt);
+  return { receipt, anchor };
+}
+
 export function verifyAgainstAnchors(
   path: string,
   current: CheckpointReceipt,

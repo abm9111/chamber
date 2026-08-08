@@ -15,7 +15,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { newId, sha256 } from "./hash.ts";
 import {
-  buildMerkleLayers,
   proveInclusion,
   verifyInclusionProof,
 } from "./merkle.ts";
@@ -161,6 +160,44 @@ export function appendMerkleLeaf(
   ).run(leafCount, rootHash, auditSeq, MMR_ALG);
 
   return { leafCount, rootHash, lastSeq: auditSeq, peaks: finalPeaks };
+}
+
+/**
+ * Re-derive the MMR root the tree had at `lastSeq`, from its own leaves.
+ *
+ * Two receipts cannot prove that one chain extends the other — that is a
+ * consistency proof, and it needs the tree. Comparing roots only works while the
+ * length is unchanged, which is why truncate-then-keep-writing passed every
+ * length-based check: both shrink tests are false once the chain is longer, and
+ * the equal-length root test never fires.
+ *
+ * Replaying the leaves up to the earlier receipt's `lastSeq` and re-bagging them
+ * gives the root that history *should* have produced. Same binary-counter fold
+ * and same left-to-right bag as `appendMerkleLeaf`, so the two must agree.
+ */
+export function rootAtSeq(
+  db: DatabaseSync,
+  lastSeq: number,
+): { rootHash: string | null; leafCount: number } {
+  const rows = db
+    .prepare(
+      `SELECT entry_hash FROM audit_event WHERE seq <= ? ORDER BY seq ASC`,
+    )
+    .all(lastSeq) as { entry_hash: string }[];
+  if (rows.length === 0) return { rootHash: null, leafCount: 0 };
+
+  const peaksByHeight = new Map<number, { height: number; hash: string }>();
+  for (const row of rows) {
+    let cur = { height: 0, hash: row.entry_hash };
+    while (peaksByHeight.has(cur.height)) {
+      const left = peaksByHeight.get(cur.height)!;
+      peaksByHeight.delete(cur.height);
+      cur = { height: cur.height + 1, hash: merkleParent(left.hash, cur.hash) };
+    }
+    peaksByHeight.set(cur.height, cur);
+  }
+  const ordered = [...peaksByHeight.values()].sort((a, b) => a.height - b.height);
+  return { rootHash: bagPeaks(ordered.map((p) => p.hash)), leafCount: rows.length };
 }
 
 export function getIncrementalRoot(db: DatabaseSync): {

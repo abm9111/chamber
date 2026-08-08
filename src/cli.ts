@@ -54,7 +54,7 @@ import {
   parseIngestArgs,
   type IngestSkipKind,
 } from "./ingest.ts";
-import { completeSync } from "./model.ts";
+import { completeSync, syncCompletionAvailable } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { runAsk } from "./ask.ts";
 import { verifyBeliefSources } from "./pins.ts";
@@ -91,7 +91,6 @@ import {
   listProfiles,
   getProfile,
   updateProfile,
-  profileContext,
 } from "./profiles.ts";
 import {
   startSession,
@@ -99,21 +98,19 @@ import {
   searchSessions,
   listSessions,
 } from "./sessions.ts";
-import { addCronJob, listCronJobs, runDueCronJobs, setCronEnabled } from "./cron.ts";
+import { addCronJob, listCronJobs, runDueCronJobs } from "./cron.ts";
 import {
   registerSkill,
   listSkills,
   proposeLearnedSkill,
   listLearningProposals,
-  activateSkillRegistry,
 } from "./skills_registry.ts";
 import { importSkillFile, importSkillDirectory } from "./skill_import.ts";
 import { loadAndRegisterMcpFile } from "./mcp_bridge.ts";
 import { ensureDefaultScope, createScope, listScopes, globalPosture, effectivePolicy } from "./scope.ts";
 import { enqueueJob, processJobQueue, listJobs } from "./job_queue.ts";
 import { getHarness, listHarnesses } from "./harness_adapter.ts";
-import { pilotSummary, logPilotEvent } from "./pilot.ts";
-import { pendingWhy } from "./approvals.ts";
+import { pilotSummary } from "./pilot.ts";
 import {
   mcpDiscover,
   mcpToolsList,
@@ -126,9 +123,6 @@ import {
   loginInteractive,
   getStoredToken,
   deleteStoredToken,
-  generatePkce,
-  buildAuthorizeUrl,
-  normalizeResourceUrl,
 } from "./mcp_oauth.ts";
 import { statSync } from "node:fs";
 import {
@@ -137,7 +131,19 @@ import {
   queryCallers,
   queryCallees,
 } from "./scip.ts";
-import { exportCheckpoint } from "./checkpoint_export.ts";
+import {
+  buildCheckpointReceipt,
+  compareCheckpoints,
+  verifyCheckpointSignature,
+  defaultCheckpointPath,
+  verifyCheckpointPrefix,
+  type SignedCheckpointReceipt,
+} from "./checkpoint_export.ts";
+import {
+  exportCheckpointGuarded,
+  verifyAgainstAnchors,
+  defaultAnchorPath,
+} from "./anchor.ts";
 import { formatErrorChain } from "./error_chain.ts";
 import type { DatabaseSync } from "node:sqlite";
 import type { EpistemicType, CommittedPath } from "./types.ts";
@@ -257,6 +263,18 @@ function printQueue(db: DatabaseSync): void {
 
 /** Heuristic turn — no LLM. Detects memory vs skill intent for gate demo. */
 function runTurn(db: DatabaseSync, message: string): void {
+  // Asked before anything is written. This routine commits an observation, opens
+  // a session and queues writes long before it reaches `completeSync`, which
+  // refuses the openai mode by design — so an openai-configured install used to
+  // gain a belief row and then a stack trace, in that order. A precondition
+  // checked after the write is not a precondition.
+  const model = syncCompletionAvailable();
+  if (!model.ok) {
+    console.error(`chamber turn: ${model.reason}`);
+    process.exitCode = 1;
+    return;
+  }
+
   const turnId = newId("trn");
   const sessionId =
     process.env.CHAMBER_SESSION ??
@@ -281,7 +299,6 @@ function runTurn(db: DatabaseSync, message: string): void {
   console.log(`\n▶ turn ${turnId.slice(0, 12)}…`);
   console.log(`  user: ${message}`);
 
-  const lower = message.toLowerCase();
   const wantsMemory =
     /\b(remember|prefer|i am|i'm|my name|always|never)\b/i.test(message);
   const wantsSkill =
@@ -603,7 +620,15 @@ function cmdIndex(
     title: title || undefined,
     body,
   });
-  console.log(`indexed ${r.id}  model=${r.model} dims=${r.dims}`);
+  console.log(
+    `${r.replaced ? "REPLACED" : "indexed"} ${r.id}  model=${r.model} dims=${r.dims}`,
+  );
+  if (r.replaced) {
+    console.log(
+      "  ↳ this ref already held a passage; its previous text is gone." +
+        " Any belief pinned to it will now report drift.",
+    );
+  }
   console.log(`corpus size: ${countDocuments(db)}`);
 }
 
@@ -1792,11 +1817,83 @@ async function main(): Promise<void> {
       break;
     }
     case "checkpoint": {
-      const out = rest[0] ?? "/tmp/chamber-checkpoint.json";
-      const r = exportCheckpoint(db, out);
+      // `checkpoint verify <receipt>` holds an older receipt against the chain
+      // as it stands. That comparison is the only thing here that detects a
+      // rollback which took its own witnesses with it — a signature cannot,
+      // because whoever rolled the chain back holds the key that signs the
+      // replacement.
+      if (rest[0] === "verify") {
+        const inPath = rest[1] ?? defaultCheckpointPath();
+        if (!existsSync(inPath)) {
+          console.error(`no checkpoint at ${inPath}`);
+          process.exitCode = 1;
+          break;
+        }
+        const prev = JSON.parse(
+          readFileSync(inPath, "utf8"),
+        ) as SignedCheckpointReceipt;
+        // A trusted key from outside the document is what makes this an
+        // identity check. Without one it only proves the receipt is internally
+        // consistent — anyone can sign anything with a key they just made and
+        // embed it — so say that rather than implying authorship.
+        const trustedKey = rest[2] ?? process.env.CHAMBER_CHECKPOINT_PUBKEY;
+        const sig = verifyCheckpointSignature(prev, trustedKey);
+        console.log(
+          `signature: ${sig.ok ? "ok" : `FAILED — ${sig.reason}`}` +
+            (sig.ok
+              ? trustedKey
+                ? " (matches the key you supplied)"
+                : " — self-signed: proves the receipt is intact, NOT who wrote it." +
+                  " Pass a trusted public key to check authorship."
+              : ""),
+        );
+        const current = buildCheckpointReceipt(db);
+        const cmp = compareCheckpoints(prev, current);
+        console.log(cmp.ok ? "chain: consistent with this receipt" : `chain: ${cmp.reason}`);
+
+        // The anchor log carries every checkpoint, not just the one receipt
+        // handed in, so it catches a rollback to a point *after* that receipt
+        // was taken. Its own chain is checked first: a log that has been edited
+        // cannot be used to judge anything.
+        const anchorPath = defaultAnchorPath();
+        const against = verifyAgainstAnchors(anchorPath, current, db);
+        if (against.anchors === 0) {
+          console.log("anchors: none recorded");
+        } else {
+          console.log(
+            against.ok
+              ? `anchors: consistent with all ${against.anchors} anchor(s)`
+              : `anchors: ${against.reason}`,
+          );
+        }
+
+        // The check the receipt comparison structurally cannot make: re-derive
+        // the attested root from the tree's own leaves. Catches a truncation
+        // that was followed by fresh writes, which looks like growth to every
+        // length-based test.
+        const prefix = verifyCheckpointPrefix(db, prev);
+        console.log(
+          prefix.ok
+            ? "history: the chain still contains what this receipt attested"
+            : `history: ${prefix.reason}`,
+        );
+
+        if (!cmp.ok || !sig.ok || !against.ok || !prefix.ok) process.exitCode = 1;
+        break;
+      }
+      const out = rest[0] ?? defaultCheckpointPath();
+      // Guarded: a damaged anchor log stops this before the receipt is written,
+      // so the two halves of the record never drift apart.
+      const { receipt: r, anchor } = exportCheckpointGuarded(db, out);
       console.log(`wrote ${out}`);
       console.log(
-        `mmrRoot=${r.mmrRoot?.slice(0, 16) ?? "null"}… leaves=${r.leafCount} audit.ok=${r.audit.ok}`,
+        `mmrRoot=${r.mmrRoot?.slice(0, 16) ?? "null"}… leaves=${r.leafCount} audit.ok=${r.audit.ok}` +
+          ` signed=${!!r.signature}`,
+      );
+      console.log(`anchored seq ${anchor.seq} → ${defaultAnchorPath()}`);
+      console.log(
+        "copy the anchor log somewhere this machine cannot rewrite —" +
+          " it is what makes a rollback detectable: chamber checkpoint verify",
       );
       break;
     }

@@ -18,10 +18,13 @@ import type { DatabaseSync } from "node:sqlite";
 import { appendAudit } from "./audit.ts";
 import { claimHash, newId } from "./hash.ts";
 import { verifyPin, type BeliefSourceFailure } from "./pins.ts";
+import { embedLocalBatch } from "./embedder.ts";
+import { cosineSimilarity } from "./vector.ts";
 import type {
   CommitBeliefInput,
   CommitResult,
   EpistemicType,
+  ParaphraseCheckState,
   SourceRef,
 } from "./types.ts";
 
@@ -96,6 +99,85 @@ function openBlockingDebts(
     .all(claimHashValue) as { id: string }[];
 }
 
+/**
+ * Cosine above which two claims are treated as the same assertion for the
+ * purpose of the debt gate. Measured on the probe pair: a genuine paraphrase
+ * of one sentence scores ~0.83, an unrelated sentence from the same corpus
+ * ~0.03, so the boundary is wide and this sits inside it. It is deliberately
+ * nearer the paraphrase than the midpoint: a false positive here refuses a
+ * commit and says which debt did it, which an author can see and answer by
+ * citing a source, while a false negative is the silent escape this exists to
+ * close.
+ */
+export const DEBT_PARAPHRASE_THRESHOLD = 0.8;
+
+/**
+ * Open blocking debts whose claim says the same thing as `text` in different
+ * words. `claim_hash` cannot find these — it is sha256 over normalised text,
+ * so "within 30 days" and "during the 30 days after purchase" are two unrelated
+ * keys, and debt that blocks only exact repetition blocks nothing a model
+ * writes twice.
+ *
+ * `semantic` is false when the embedder degraded to the hash fallback mid-call.
+ * Hash vectors encode character n-grams, not meaning, so comparing them here
+ * would produce a confident number with nothing behind it — the caller is told
+ * the check did not run rather than being handed that number.
+ */
+function paraphraseBlockingDebts(
+  db: DatabaseSync,
+  text: string,
+  excludeHash: string,
+): { debts: { id: string }[]; semantic: boolean; attempted: boolean } {
+  const rows = db
+    .prepare(
+      `SELECT id, claim_text FROM citation_debt
+       WHERE blocking = 1
+         AND status IN ('pending','proposed_paid')
+         AND claim_hash != ?
+         AND claim_text IS NOT NULL
+         AND claim_text != ''`,
+    )
+    .all(excludeHash) as unknown as { id: string; claim_text: string }[];
+  // Nothing open to compare against: the gate had no work, which is not the
+  // same as having run, and not the same as having been skipped. Reporting it
+  // as either would put a claim in the verdict that no evidence supports — and
+  // it also means the common case never spawns the embedder under the lock.
+  if (rows.length === 0) return { debts: [], semantic: true, attempted: false };
+
+  // One batch, not one call per debt: embedMinilm shells out to python3, so
+  // per-row embedding would put a process spawn per open debt on every commit.
+  // `embedLocalBatch` throws where singular `embedLocal` degrades: the batch
+  // path has no mid-call hash fallback, so a python3 that is missing, lacks
+  // onnxruntime, OOMs or times out raises instead of returning hash vectors.
+  // Unhandled, that escaped into the commit's outer catch and PARKED every
+  // assertion made while any blocking debt was open — a broken embedder taking
+  // down the ledger rather than softening one check. It is the same outcome the
+  // `semantic: false` branch below already describes, so it is reported the
+  // same way: the check did not run, and the caller is told.
+  let embeds;
+  try {
+    embeds = embedLocalBatch([text, ...rows.map((r) => r.claim_text)]);
+  } catch {
+    return { debts: [], semantic: false, attempted: true };
+  }
+  // A short or padded result would silently mis-pair claims with debts, since
+  // the comparison below indexes rows by position.
+  if (embeds.length !== rows.length + 1)
+    return { debts: [], semantic: false, attempted: true };
+  if (embeds.some((e) => e.kind === "hash"))
+    return { debts: [], semantic: false, attempted: true };
+
+  const target = embeds[0]!.vector;
+  const debts = rows
+    .filter(
+      (_, i) =>
+        cosineSimilarity(target, embeds[i + 1]!.vector) >=
+        DEBT_PARAPHRASE_THRESHOLD,
+    )
+    .map((r) => ({ id: r.id }));
+  return { debts, semantic: true, attempted: true };
+}
+
 function inheritDebtsAlongChain(
   db: DatabaseSync,
   startBeliefId: string | null,
@@ -137,10 +219,12 @@ export function commitBelief(
 
   // ── PRE (outside TX is fine for pure validation; TX still fail-closed) ──
   if (path === "fast" && ASSERTION.has(type)) {
+    // Decided before the gate exists, so it reports that rather than nothing.
     return {
       ok: false,
       status: "REJECTED",
       reason: "fast path may only commit observation|inference; belief-typed commit must escalate",
+      paraphraseCheck: "not_reached",
     };
   }
 
@@ -179,8 +263,23 @@ export function commitBelief(
    * commits — so silence would leave the caller unable to tell a confabulated
    * pin from one that was simply never offered.
    */
-  const withRejected = <T extends CommitResult>(result: T): T =>
-    rejectedSources.length > 0 ? { ...result, rejectedSources } : result;
+  /**
+   * Only assertions are subject to the paraphrase gate, so only they can report
+   * on it. Stamping `"ran"` on an observation — where the check is skipped by
+   * construction and no embedding is ever attempted — told a reader the exact
+   * opposite of the truth, in the one field added to remove that confusion.
+   */
+  // Defaults to the honest answer for a verdict returned before the gate. Set to
+  // `not_applicable` immediately for types the gate does not cover, and to the
+  // real result once the gate runs.
+  let paraphraseCheckState: ParaphraseCheckState = ASSERTION.has(type)
+    ? "not_reached"
+    : "not_applicable";
+  const withRejected = <T extends CommitResult>(result: T): T => ({
+    ...result,
+    ...(rejectedSources.length > 0 ? { rejectedSources } : {}),
+    paraphraseCheck: paraphraseCheckState,
+  });
 
   const hash = claimHash(type, text);
   const beliefId = newId("blf");
@@ -188,6 +287,22 @@ export function commitBelief(
     halfLifeSeconds && halfLifeSeconds > 0
       ? new Date(Date.now() + halfLifeSeconds * 1000).toISOString()
       : null;
+
+  /**
+   * Recorded here, written in the `finally` below — after the transaction has
+   * committed or rolled back, so a refusal cannot erase it.
+   *
+   * The check itself stays *inside* the lock. It was hoisted out once to keep a
+   * python3 spawn from holding BEGIN IMMEDIATE, and that traded a contention
+   * problem for a correctness one: a paraphrase debt minted between an outside
+   * read and the lock is invisible to an in-lock re-check, because re-checking
+   * can only prune ids the earlier read already found — it never re-runs the
+   * similarity search. Two units against the one database this repo ships, and
+   * an unsupported claim the gate exists to refuse commits as a citable belief
+   * while the verdict reports the gate as having run. FM-6 says check and write
+   * are one transaction; that is the law, and the spawn is the cost of it.
+   */
+  let degradedReason: string | null = null;
 
   try {
     db.exec("BEGIN IMMEDIATE");
@@ -300,11 +415,29 @@ export function commitBelief(
       }
     }
 
-    // Open blocking debts on this claim_hash + inherited from revision chain
+    // Open blocking debts on this claim_hash + inherited from revision chain +
+    // debts on the same claim worn as different words. All three reads happen
+    // under the same lock as the write they authorise (FM-6).
     const directDebts = openBlockingDebts(db, hash);
     const inherited = inheritDebtsAlongChain(db, revisionOf);
-    const blocking = [...directDebts, ...inherited];
+    const paraphrase = ASSERTION.has(type)
+      ? paraphraseBlockingDebts(db, text, hash)
+      : { debts: [], semantic: true, attempted: false };
+    if (!paraphrase.attempted && ASSERTION.has(type)) {
+      // Reached the gate with no open blocking debt to compare against: it ran,
+      // vacuously. That is not the same as never getting here.
+      paraphraseCheckState = "ran";
+    }
+    if (paraphrase.attempted) {
+      paraphraseCheckState = paraphrase.semantic ? "ran" : "skipped";
+      if (!paraphrase.semantic) {
+        degradedReason =
+          "embedder unavailable or non-semantic; paraphrase check did not run";
+      }
+    }
+    const blocking = [...directDebts, ...inherited, ...paraphrase.debts];
     const blockingIds = [...new Set(blocking.map((d) => d.id))];
+
 
     if (ASSERTION.has(type) && blockingIds.length > 0) {
       emitGate(db, {
@@ -533,5 +666,36 @@ export function commitBelief(
       status: "PARKED",
       reason: `commit failed closed: ${String(err)}`,
     });
+  } finally {
+    // After COMMIT or ROLLBACK, so a refusal cannot erase it — and outside the
+    // transaction, so it is not the thing that fails when the lock is
+    // contended. Best-effort by design: a failure to record that the gate was
+    // degraded must not turn a decided commit into a thrown exception, which is
+    // what happened when this call sat inline and `appendAudit` rethrew
+    // SQLITE_BUSY straight past the fail-closed handler above.
+    if (degradedReason) {
+      try {
+        appendAudit(db, {
+          category: "gate",
+          action: "debt:degraded",
+          subjectKind: "claim_hash",
+          subjectId: hash,
+          turnId,
+          detail: { gate: "debt", check: "paraphrase", reason: degradedReason },
+        });
+      } catch (err) {
+        // The verdict stands — a failure to *record* a degradation must not turn
+        // a decided commit into a thrown exception. But it must not be silent
+        // either: this row is the only durable trace that the gate did not run,
+        // so losing it quietly reproduces the exact defect the row was added to
+        // fix, one level up. Audible on stderr, once per failure.
+        console.warn(
+          `chamber: WARNING — the paraphrase gate was degraded for claim ${hash.slice(0, 12)}… ` +
+            `and the audit row recording that could not be written ` +
+            `(${err instanceof Error ? err.message : String(err)}). ` +
+            `This commit's verdict reports paraphraseCheck="skipped"; the ledger does not.`,
+        );
+      }
+    }
   }
 }

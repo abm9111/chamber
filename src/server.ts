@@ -29,7 +29,7 @@ import { commitBelief } from "./commit_belief.ts";
 import { completeSync } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { runExpiryJob } from "./expiry.ts";
-import { recordSpend, spendLastHours, formatSpendFooter, assertSpendBudget } from "./spend.ts";
+import { spendLastHours, formatSpendFooter, assertSpendBudget } from "./spend.ts";
 import {
   proposeWrite,
   decideWrite,
@@ -44,7 +44,6 @@ import { buildCheckpointReceipt } from "./checkpoint_export.ts";
 import { listOpenDebts } from "./debt.ts";
 import { listMemory } from "./memory.ts";
 import { startSession, appendMessage } from "./sessions.ts";
-import { profileContext } from "./profiles.ts";
 import { registerSlackPendingHook } from "./slack_ops.ts";
 import { quarantineUntrustedText, stripInvisibleNoise, checkRateLimit, surfaceRateKey } from "./surface_harden.ts";
 
@@ -229,13 +228,17 @@ function extractToken(req: IncomingMessage): string {
 function tokenOk(provided: string): boolean {
   if (!API_TOKEN) return true; // auth disabled
   if (!provided || provided.length !== API_TOKEN.length) {
-    // still walk both sides
+    // Still walk both sides. `acc` is deliberately discarded: the loop exists
+    // for its duration, not its result, so that a wrong-length token costs the
+    // same time as a wrong-value one. Deleting it would remove the defence this
+    // branch exists to provide.
     let acc = 0;
     const a = provided || " ";
     const b = API_TOKEN;
     for (let i = 0; i < b.length; i++) {
       acc |= (a.charCodeAt(i % a.length) || 0) ^ b.charCodeAt(i);
     }
+    void acc;
     return false;
   }
   let acc = 0;

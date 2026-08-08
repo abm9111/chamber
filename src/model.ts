@@ -194,6 +194,29 @@ export async function complete(
 }
 
 /** Sync wrapper for CLI paths that are not async-first. */
+/**
+ * Can the synchronous completion path serve this process at all?
+ *
+ * Callers that mutate state before completing must ask this first. `completeSync`
+ * refuses the openai mode by design, but `chamber turn` consulted it only after
+ * committing the observation — so the ledger gained a belief and the operator
+ * gained a stack trace. A precondition checked after the write is not a
+ * precondition.
+ */
+export function syncCompletionAvailable(): { ok: boolean; reason?: string } {
+  const mode = (process.env.CHAMBER_MODEL ?? "stub").toLowerCase();
+  if (mode === "openai") {
+    return {
+      ok: false,
+      reason:
+        "the configured model mode is 'openai', which the synchronous turn path " +
+        "cannot use. Run with CHAMBER_MODEL=stub for an offline turn, or use a " +
+        "surface that awaits complete().",
+    };
+  }
+  return { ok: true };
+}
+
 export function completeSync(
   db: DatabaseSync,
   input: CompleteInput,

@@ -8,8 +8,11 @@ data/*.sqlite*
 pilot.jsonl
 *.jsonl
 
-# Checkpoint receipts / exports (regenerable)
+# Checkpoint receipts / exports (regenerable). Both spellings: the default
+# basename is `checkpoint.json`, which `checkpoint-*.json` does not match.
+checkpoint.json
 checkpoint-*.json
+anchors.jsonl
 
 # Secrets & credentials
 .env

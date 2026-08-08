@@ -136,7 +136,29 @@ function vaultPageHash(row: {
   );
 }
 
-export function verifyPin(db: DatabaseSync, source: PinnedSource): PinVerdict {
+export interface VerifyPinOptions {
+  /**
+   * Resolve a pin whose row is gone by finding the same content elsewhere.
+   *
+   * Off by default, and only drift *reporting* turns it on. A content hash
+   * proves the text is somewhere in the corpus; it does not prove the citation
+   * named it. Granting support on that basis lets any refId — including one
+   * that names nothing — ride a hash into a belief_source row pointing at
+   * nothing, and snapshot hashes are handed back to callers in ask's own
+   * ContractSource. That is probes/pin_bypass.ts's defect wearing new clothes.
+   *
+   * Reporting is different in kind: those rows were already granted through the
+   * commit gate, so they named a real row once, and the question is only where
+   * that evidence went.
+   */
+  allowRelocation?: boolean;
+}
+
+export function verifyPin(
+  db: DatabaseSync,
+  source: PinnedSource,
+  opts: VerifyPinOptions = {},
+): PinVerdict {
   if (source.kind !== "vault_page") {
     return { ok: false, reason: "kind_unregistered" };
   }
@@ -156,19 +178,50 @@ export function verifyPin(db: DatabaseSync, source: PinnedSource): PinVerdict {
   // defeating "unregistered kinds are unverifiable, not exempt". The kind a
   // citation claims must be the kind the stored row actually has; a mismatch
   // resolves to no row and therefore not_found.
-  const row = db
+  type DocRow = {
+    source_kind: string;
+    title: string | null;
+    body: string;
+    source_ref: string | null;
+  };
+
+  let row = db
     .prepare(
       `SELECT source_kind, title, body, source_ref FROM vector_document
        WHERE id = ? AND source_kind = ?`,
     )
-    .get(source.refId, source.kind) as
-    | {
-        source_kind: string;
-        title: string | null;
-        body: string;
-        source_ref: string | null;
-      }
-    | undefined;
+    .get(source.refId, source.kind) as DocRow | undefined;
+
+  // `snapshotHash` reaches the binder below, so it needs the guard `refId` got
+  // twelve lines above and for the identical reason: a non-string value throws
+  // out of the binder ("Unknown named parameter 'a'"), and inside the commit
+  // transaction a throw is not a verdict — it unwinds the caller and parks the
+  // assertion instead of denying it. Until the relocation lookup existed this
+  // value was only ever compared with `!==`, so it never had to be guarded.
+  if (opts.allowRelocation && typeof source.snapshotHash !== "string") {
+    return { ok: false, reason: "not_found" };
+  }
+
+  if (!row && opts.allowRelocation) {
+    // The id is where we last saw the evidence; the content hash is the pin.
+    // A row can lose its id without losing its content — a from-scratch
+    // re-index did exactly that to this corpus, renaming all 28,627 rows and
+    // orphaning every belief older than the rebuild. Reporting `not_found`
+    // there says "your citation was never real" about text sitting unchanged
+    // in the index, so before concluding the evidence is gone, look for it by
+    // what it says. `idx_vector_doc_snap` makes this an indexed lookup.
+    //
+    // The kind is still bound, so this cannot promote an unverifiable kind.
+    // Ordered by id so a corpus holding the same passage twice resolves the
+    // same way on every run rather than picking arbitrarily.
+    row = db
+      .prepare(
+        `SELECT source_kind, title, body, source_ref FROM vector_document
+         WHERE snapshot_hash = ? AND source_kind = ?
+         ORDER BY id LIMIT 1`,
+      )
+      .get(source.snapshotHash, source.kind) as DocRow | undefined;
+  }
 
   if (!row) return { ok: false, reason: "not_found" };
 
@@ -294,11 +347,19 @@ export function verifyBeliefSources(
       continue;
     }
 
-    const verdict = verifyPin(db, {
-      kind: r.kind,
-      refId: r.ref_id,
-      snapshotHash: r.snapshot_hash,
-    });
+    // The one caller that may relocate: every row here was already granted
+    // through the commit gate, so it named a real document once and the only
+    // open question is where that evidence went. The gate itself
+    // (commit_belief, ask, debt) must keep requiring the cited row to exist.
+    const verdict = verifyPin(
+      db,
+      {
+        kind: r.kind,
+        refId: r.ref_id,
+        snapshotHash: r.snapshot_hash,
+      },
+      { allowRelocation: true },
+    );
     if (verdict.ok) entry.verified += 1;
     else {
       entry.failures.push({

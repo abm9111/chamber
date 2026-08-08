@@ -95,6 +95,9 @@ export function appendAudit(db: DatabaseSync, input: AuditAppendInput): string {
   const id = newId("aud");
   const createdAt = new Date().toISOString();
 
+  // Initialised so every path out has a defined value, including one where
+  // BEGIN throws before the assignment below.
+  // eslint-disable-next-line no-useless-assignment
   let ownTx = false;
   try {
     db.exec("BEGIN IMMEDIATE");

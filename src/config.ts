@@ -135,6 +135,7 @@ function readRaw(path: string): RawConfig | null {
   } catch (err) {
     throw new Error(
       `cannot read config ${path}: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err },
     );
   }
   let parsed: unknown;
@@ -143,6 +144,7 @@ function readRaw(path: string): RawConfig | null {
   } catch (err) {
     throw new Error(
       `config ${path} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+      { cause: err },
     );
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {

@@ -98,14 +98,43 @@ export interface RejectedSource {
   reason: string;
 }
 
+/**
+ * Where the semantic debt gate got to, on every verdict.
+ *
+ * A broken embedder softens that gate, and the softening used to be invisible.
+ * Reporting only "ran"/"skipped" replaced one ambiguity with another: the field
+ * was simply absent both when the gate did not apply and when the commit was
+ * refused before reaching it — two different claims about the same commit,
+ * rendered identically. Each state now means exactly one thing:
+ *
+ * - `ran`            — the gate executed and its result is in this verdict.
+ * - `skipped`        — the gate was reached but could not run (embedder
+ *                      unavailable or non-semantic); the block is softened and a
+ *                      `debt:degraded` audit row records it.
+ * - `not_applicable` — this epistemic type is not subject to the gate.
+ * - `not_reached`    — the commit was decided before the gate; says nothing
+ *                      about the gate either way.
+ */
+export type ParaphraseCheckState =
+  | "ran"
+  | "skipped"
+  | "not_applicable"
+  | "not_reached";
+
 export type CommitResult =
-  | { ok: true; beliefId: string; rejectedSources?: RejectedSource[] }
+  | {
+      ok: true;
+      beliefId: string;
+      rejectedSources?: RejectedSource[];
+      paraphraseCheck?: ParaphraseCheckState;
+    }
   | {
       ok: false;
       status: "REJECTED" | "PARKED";
       reason: string;
       debtIds?: string[];
       rejectedSources?: RejectedSource[];
+      paraphraseCheck?: ParaphraseCheckState;
     };
 
 export interface ActivateSkillInput {

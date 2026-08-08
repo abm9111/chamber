@@ -117,7 +117,7 @@ function httpPostForm(
 /** Normalize resource URL for token key (strip trailing slash except root). */
 export function normalizeResourceUrl(url: string): string {
   const u = new URL(url);
-  let path = u.pathname.replace(/\/+$/, "") || "";
+  const path = u.pathname.replace(/\/+$/, "") || "";
   return `${u.origin}${path}`;
 }
 

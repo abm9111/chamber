@@ -9,9 +9,8 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
-import { newId, sha256 } from "./hash.ts";
 import { runInSandbox, type SandboxResult } from "./sandbox.ts";
-import { proposeWrite, decideWrite, markApplied } from "./approvals.ts";
+import { proposeWrite } from "./approvals.ts";
 import { appendAudit } from "./audit.ts";
 import { recordSpend } from "./spend.ts";
 
@@ -73,38 +72,34 @@ try {
   },
 ];
 
-export function listTools(db?: DatabaseSync): ToolSpec[] {
-  const extra: ToolSpec[] = [];
-  if (db) {
-    try {
-      const rows = db
-        .prepare(
-          `SELECT id, name, body, status FROM skill WHERE status IN ('active','draft','quarantine')`,
-        )
-        .all() as { id: string; name: string; body: string; status: string }[];
-      for (const r of rows) {
-        if (!r.body.includes("CHAMBER_TOOL:")) continue;
-        extra.push({
-          id: r.id,
-          name: r.name,
-          description: `skill-tool ${r.status}`,
-          risk: ["compute"],
-          runtime: "node",
-          source: extractToolSource(r.body),
-          allowlisted: r.status === "active",
-          quarantined: r.status !== "active",
-        });
-      }
-    } catch {
-      /* schema may lack rows */
-    }
-  }
-  return [...BUILTINS, ...extra];
-}
-
-function extractToolSource(body: string): string {
-  const m = body.match(/```(?:js|javascript|ts|mjs)?\n([\s\S]*?)```/);
-  return m?.[1]?.trim() ?? body;
+/**
+ * The built-in tools, and deliberately nothing else.
+ *
+ * This used to append "skill-tools" read from a `skill` table, recovering their
+ * executable source by first-fence match over a markdown body. Two facts about
+ * that, both measured rather than argued:
+ *
+ * 1. **No schema in this repo creates a `skill` table.** The query threw
+ *    `no such table: skill` on every call, into a catch commented "schema may
+ *    lack rows" that swallowed it. The feature had never run. Several rounds of
+ *    review reasoned carefully about hardening a branch that could not execute.
+ * 2. **Recovering code by parsing a document is the wrong shape.** Any vendor
+ *    string rendered above the fence — description, name, runtime, endpoint,
+ *    risk — becomes a candidate first fence, which is why sanitising them one at
+ *    a time kept leaving a hole. The defect was the format, not the fields.
+ *
+ * So the path is gone rather than repaired: leaving a silently-dead execution
+ * branch invites someone to "fix" it by creating the table, which would enable
+ * vendor-supplied code execution in one commit that looks like plumbing.
+ *
+ * Re-enabling this is a deliberate design task, not a restoration. Store the
+ * source in its own column, never inside prose; require an explicit approval
+ * status; and keep `runTool`'s sandbox as the second line rather than the first.
+ * `tests/harness.ts` asserts an approved MCP tool does not become executable —
+ * that test is the thing to delete first, with a reason.
+ */
+export function listTools(_db?: DatabaseSync): ToolSpec[] {
+  return [...BUILTINS];
 }
 
 export function getTool(idOrName: string, db?: DatabaseSync): ToolSpec | null {

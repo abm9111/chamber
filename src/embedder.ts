@@ -173,7 +173,10 @@ export function embedMinilmBatch(texts: string[]): Float32Array[] {
   if (texts.length === 0) return [];
   if (texts.length === 1) return [embedMinilm(texts[0]!)];
   const r = spawnSync(
-    "python3",
+    // Not the literal "python3": the whole point of pythonBin is that PATH
+    // resolves differently for a login shell, and this batch path is the one
+    // the scheduled ingest actually takes.
+    pythonBin(),
     [SCRIPT, "--json", JSON.stringify(texts)],
     {
       encoding: "utf-8",
@@ -210,6 +213,18 @@ export interface EmbedResult {
  * Once, because embedding runs per passage: a per-call warning on a 28,508
  * passage ingest is 28,508 lines, which is its own way of saying nothing.
  */
+/** Same once-per-process discipline, for a named embedder other than MiniLM. */
+const fallbackWarned = new Set<string>();
+function warnEmbedderFallback(kind: string, err: unknown): void {
+  if (fallbackWarned.has(kind)) return;
+  fallbackWarned.add(kind);
+  console.warn(
+    `chamber: WARNING — the ${kind} embedder is configured but could not run, ` +
+      `so this run is writing non-semantic hash vectors. Cause: ` +
+      `${err instanceof Error ? err.message : String(err)}`,
+  );
+}
+
 let minilmFallbackWarned = false;
 function warnMinilmFallback(err: unknown): void {
   if (minilmFallbackWarned) return;
@@ -268,6 +283,7 @@ export function embedLocal(
       if (prefer === "minilm") {
         throw new Error(
           `minilm embed failed: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
         );
       }
       // A silent fall-through here destroyed a 28,508-passage corpus.
@@ -311,6 +327,34 @@ export function embedLocalBatch(
       : prefer === "minilm" && !minilmAvailable()
         ? "hash"
         : prefer;
+
+  // Ollama has no batch endpoint here, so it embeds per text — but it must be
+  // *attempted*. Without this branch an ollama-configured install fell straight
+  // through to hash vectors, and every caller that treats `kind: "hash"` as
+  // "semantic comparison is impossible" was permanently degraded: the paraphrase
+  // debt gate never ran a single time on those machines, and each commit wrote a
+  // degradation record nobody had a reason to investigate, because nothing was
+  // broken — the branch simply did not exist.
+  if (kind === "ollama") {
+    try {
+      return texts.map((t) => {
+        const vector = embedOllama(t);
+        return {
+          vector,
+          model: process.env.CHAMBER_OLLAMA_EMBED_MODEL ?? OLLAMA_MODEL_DEFAULT,
+          dims: vector.length,
+          kind: "ollama" as const,
+        };
+      });
+    } catch (err) {
+      if (prefer === "ollama")
+        throw new Error("ollama batch embed failed", { cause: err });
+      // Not warnMinilmFallback: that names MiniLM model files, which are
+      // irrelevant when the configured embedder is ollama, and sends the
+      // operator to check an install that is not the one that failed.
+      warnEmbedderFallback("ollama", err);
+    }
+  }
 
   if (kind === "minilm") {
     const vecs = embedMinilmBatch(texts);

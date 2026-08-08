@@ -25,6 +25,18 @@ jobs:
       - run: npm ci
       - run: npm run test
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      # Catches the class tsc does not: unused bindings, unreachable code,
+      # dropped promises. Gating, like every other job here.
+      - run: npm run lint
+
   typecheck:
     runs-on: ubuntu-latest
     steps:
@@ -43,6 +55,12 @@ jobs:
         with:
           node-version: '24'
       - run: npm ci
+      # Without bubblewrap the runner has no isolating backend, so the sandbox
+      # probe refuses and passes for the same reason it passes on a Mac -- the
+      # real bwrap path is never exercised. A probe that cannot fail is not a
+      # gate, and this one guards executing untrusted code.
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - run: bwrap --version
       # Runs every probe and fails if any of them fails. This chained with `;`
       # until 2026-08-05, so the suite's exit status was only the last probe's
       # and a failing gate_audit was invisible.

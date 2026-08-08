@@ -146,11 +146,50 @@ export interface VectorHit {
   retrievedBy?: "semantic" | "lexical" | "both";
 }
 
+/**
+ * A passage's identity is where it is, not when it was first seen.
+ *
+ * `newId` is sha256 over `Date.now()`-plus-`Math.random()`, so every row minted
+ * a fresh identity and rebuilding the index renamed the entire corpus. Measured
+ * on the live database: a from-scratch rebuild on 2026-08-05 re-created all
+ * 28,627 rows, and every belief committed the day before reported `not_found`
+ * against evidence that was still there, byte-identical, at the same passage
+ * index. Re-indexing is routine, so the effect was a total-loss drift alarm
+ * fired precisely when nothing had changed — the one failure a drift detector
+ * cannot afford, because it teaches the operator to ignore it.
+ *
+ * Deriving the id from (kind, ref) makes a rebuild re-mint the same id for the
+ * same passage, so pins survive by construction. Rows written before this keep
+ * their random ids: ingest passes the existing id through `idByRef`, so they are
+ * updated in place rather than duplicated.
+ *
+ * This does not cover a note whose passages renumber under an edit — that
+ * changes the ref, and a pin to it should report drift, because that passage
+ * really did move. `verifyPin`'s content fallback is what catches those.
+ *
+ * The ingest root is part of the identity, not decoration: `sourceRef` is
+ * relative to its root, so two roots can each hold `research/note.md#p0`, and
+ * keying on the ref alone merged them into one row — one vault silently
+ * answering with another's text. Roots are kept distinct here for the same
+ * reason ingest tracks them separately.
+ */
+export function stableDocumentId(
+  sourceKind: VectorSourceKind,
+  sourceRef?: string,
+  ingestRoot?: unknown,
+): string {
+  if (!sourceRef) return newId("vdoc");
+  const root = typeof ingestRoot === "string" ? ingestRoot : null;
+  return `vdoc_${sha256(JSON.stringify([sourceKind, root, sourceRef])).slice(0, 16)}`;
+}
+
 export function upsertDocument(
   db: DatabaseSync,
   input: UpsertDocumentInput,
-): { id: string; model: string; dims: number } {
-  const id = input.id ?? newId("vdoc");
+): { id: string; model: string; dims: number; replaced: boolean } {
+  const id =
+    input.id ??
+    stableDocumentId(input.sourceKind, input.sourceRef, input.metadata?.ingestRoot);
   const body = input.body;
   // JSON.stringify of a fixed 3-element array, NOT [...].join("\n"): joining is
   // not injective across its own separator, so {title:"X", body:"Y\nZ"} and
@@ -188,6 +227,13 @@ export function upsertDocument(
   const existing = db
     .prepare(`SELECT id FROM vector_document WHERE id = ?`)
     .get(id) as { id: string } | undefined;
+
+  // Whether this call destroyed a passage. Since identity is (kind, root, ref),
+  // a caller reusing a ref silently replaced the row it did not know was there —
+  // `chamber index` printed "indexed <id>" and an unchanged corpus size while
+  // the earlier excerpt disappeared, taking any pin to it with it. Re-ingest
+  // relies on exactly this overwrite, so the fix is to report it, not block it.
+  const replaced = !!existing;
 
   if (existing) {
     db.prepare(
@@ -231,7 +277,7 @@ export function upsertDocument(
        embedded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
   ).run(id, model, dims, float32ToBlob(vec));
 
-  return { id, model, dims };
+  return { id, model, dims, replaced };
 }
 
 export function deleteDocument(db: DatabaseSync, id: string): boolean {

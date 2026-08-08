@@ -23,6 +23,12 @@ jobs:
       # `npm ci` needs a lockfile; runtime dependencies are deliberately empty,
       # so this only installs the typecheck toolchain.
       - run: npm ci
+      # The suite is not pure: `gates/an open blocking debt follows the claim
+      # across a rewording` asserts semantic behaviour, so it needs a real
+      # embedder. Without numpy/onnxruntime the gate degrades, the rewording
+      # commits, and the test fails for a missing interpreter rather than a
+      # broken gate. The model is committed; only the runtime is not.
+      - run: python3 -m pip install --quiet --break-system-packages numpy onnxruntime tokenizers
       - run: npm run test
 
   lint:

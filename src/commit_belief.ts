@@ -24,6 +24,7 @@ import type {
   CommitBeliefInput,
   CommitResult,
   EpistemicType,
+  ParaphraseCheckState,
   SourceRef,
 } from "./types.ts";
 
@@ -218,10 +219,12 @@ export function commitBelief(
 
   // ── PRE (outside TX is fine for pure validation; TX still fail-closed) ──
   if (path === "fast" && ASSERTION.has(type)) {
+    // Decided before the gate exists, so it reports that rather than nothing.
     return {
       ok: false,
       status: "REJECTED",
       reason: "fast path may only commit observation|inference; belief-typed commit must escalate",
+      paraphraseCheck: "not_reached",
     };
   }
 
@@ -266,11 +269,16 @@ export function commitBelief(
    * construction and no embedding is ever attempted — told a reader the exact
    * opposite of the truth, in the one field added to remove that confusion.
    */
-  let paraphraseCheckState: "ran" | "skipped" | undefined = undefined;
+  // Defaults to the honest answer for a verdict returned before the gate. Set to
+  // `not_applicable` immediately for types the gate does not cover, and to the
+  // real result once the gate runs.
+  let paraphraseCheckState: ParaphraseCheckState = ASSERTION.has(type)
+    ? "not_reached"
+    : "not_applicable";
   const withRejected = <T extends CommitResult>(result: T): T => ({
     ...result,
     ...(rejectedSources.length > 0 ? { rejectedSources } : {}),
-    ...(paraphraseCheckState ? { paraphraseCheck: paraphraseCheckState } : {}),
+    paraphraseCheck: paraphraseCheckState,
   });
 
   const hash = claimHash(type, text);
@@ -415,6 +423,11 @@ export function commitBelief(
     const paraphrase = ASSERTION.has(type)
       ? paraphraseBlockingDebts(db, text, hash)
       : { debts: [], semantic: true, attempted: false };
+    if (!paraphrase.attempted && ASSERTION.has(type)) {
+      // Reached the gate with no open blocking debt to compare against: it ran,
+      // vacuously. That is not the same as never getting here.
+      paraphraseCheckState = "ran";
+    }
     if (paraphrase.attempted) {
       paraphraseCheckState = paraphrase.semantic ? "ran" : "skipped";
       if (!paraphrase.semantic) {
@@ -670,8 +683,18 @@ export function commitBelief(
           turnId,
           detail: { gate: "debt", check: "paraphrase", reason: degradedReason },
         });
-      } catch {
-        /* the verdict stands; the note about it is best-effort */
+      } catch (err) {
+        // The verdict stands — a failure to *record* a degradation must not turn
+        // a decided commit into a thrown exception. But it must not be silent
+        // either: this row is the only durable trace that the gate did not run,
+        // so losing it quietly reproduces the exact defect the row was added to
+        // fix, one level up. Audible on stderr, once per failure.
+        console.warn(
+          `chamber: WARNING — the paraphrase gate was degraded for claim ${hash.slice(0, 12)}… ` +
+            `and the audit row recording that could not be written ` +
+            `(${err instanceof Error ? err.message : String(err)}). ` +
+            `This commit's verdict reports paraphraseCheck="skipped"; the ledger does not.`,
+        );
       }
     }
   }

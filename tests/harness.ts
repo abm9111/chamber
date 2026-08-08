@@ -891,6 +891,58 @@ test("gates", "the degraded record survives a commit that is then refused", () =
   }
 });
 
+/**
+ * Absence is not a verdict. `paraphraseCheck` was stamped only when the gate was
+ * actually reached, so a caller could not tell "this type is not subject to the
+ * gate" from "we refused before getting there" — two different claims about the
+ * same commit, both rendered as a missing field. Every verdict now carries a
+ * state, and each state means one thing.
+ */
+test("gates", "every verdict says where the paraphrase gate got to", () => {
+  const db = freshDb();
+
+  // Not an assertion — the gate does not apply to it at all.
+  const obs = commitBelief(db, {
+    type: "observation",
+    text: "The office door was open at nine.",
+    sources: [],
+    authorFamily: "test",
+    path: "fast",
+  });
+  assert(
+    obs.paraphraseCheck === "not_applicable",
+    `observation should report not_applicable, got ${obs.paraphraseCheck}`,
+  );
+
+  // An assertion refused before the debt gate is reached: the fast path forbids
+  // belief-typed commits outright.
+  const early = commitBelief(db, {
+    type: "belief",
+    text: "A claim that never reaches the gate.",
+    sources: [],
+    authorFamily: "test",
+    path: "fast",
+  });
+  assert(!early.ok, "fast-path belief must be refused");
+  assert(
+    early.paraphraseCheck === "not_reached",
+    `an early refusal should report not_reached, got ${early.paraphraseCheck}`,
+  );
+
+  // An assertion that reaches the gate with nothing to compare against.
+  const ran = commitBelief(db, {
+    type: "belief",
+    text: "A claim that does reach the gate.",
+    sources: [],
+    authorFamily: "test",
+    path: "deep",
+  });
+  assert(
+    ran.paraphraseCheck === "ran" || ran.paraphraseCheck === "not_applicable",
+    `a deep assertion should report a reached state, got ${ran.paraphraseCheck}`,
+  );
+});
+
 test("gates", "2_retraction_is_free", () => {
   const db = freshDb();
   const text = "some contested claim";

@@ -5154,6 +5154,53 @@ test("parity", "a hostile tool description cannot forge the approval document", 
  * attack worked. This one omits `source` on purpose, and asserts on a row that
  * must exist rather than guarding with `if (row)`.
  */
+/**
+ * Vendor-supplied code is not executable, and this is what says so.
+ *
+ * `listTools` used to reach for a `skill` table that no schema in this repo
+ * creates, inside a catch that swallowed "no such table" — so the skill-tool
+ * path was dead, silently, and every hardening argument about it was reasoning
+ * about a branch that could not run. That the path is closed is now an asserted
+ * property rather than an accident of a missing table: whoever wires execution
+ * up has to delete this test and say why.
+ */
+test("parity", "an approved MCP tool does not become executable", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-mcp-"));
+  const path = join(dir, "m.json");
+  try {
+    writeFileSync(
+      path,
+      JSON.stringify({
+        name: "vendor",
+        tools: [
+          {
+            name: "innocent",
+            risk: ["compute"],
+            description: "d",
+            source: "console.log('vendor code')",
+          },
+        ],
+      }),
+    );
+    assert(loadAndRegisterMcpFile(db, path).registered === 1, "expected registration");
+    // Approve it as hard as the schema allows.
+    db.prepare(`UPDATE skill_registry SET status = 'active'`).run();
+
+    const names = listTools(db).map((t) => t.name);
+    assert(
+      !names.includes("mcp_vendor_innocent"),
+      `vendor tool became executable: ${JSON.stringify(names)}`,
+    );
+    assert(
+      listTools(db).every((t) => !String(t.description ?? "").includes("skill-tool")),
+      "no skill-tool may be surfaced for execution",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("parity", "a tool that omits source gets no vendor text in its code", () => {
   const db = freshDb();
   const dir = mkdtempSync(join(tmpdir(), "chamber-mcp-"));

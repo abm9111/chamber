@@ -66,7 +66,7 @@ import {
   proposeAllDebtPayments,
   confirmDebtPaid,
 } from "./debt.ts";
-import { listTools, runTool, synthesizeTool } from "./tools.ts";
+import { listTools, runTool, synthesizeTool, toolExecutionStatus } from "./tools.ts";
 import { sandboxSelfTest, detectSandboxBackend } from "./sandbox.ts";
 import {
   remember,
@@ -1490,6 +1490,10 @@ async function main(): Promise<void> {
       break;
     }
     case "tools": {
+      {
+        const exec = toolExecutionStatus();
+        if (!exec.enabled) console.log(`⚠ ${exec.reason}\n`);
+      }
       console.log(`sandbox backend: ${detectSandboxBackend()}`);
       for (const t of listTools(db)) {
         const flags = [

@@ -107,7 +107,12 @@ export interface RejectedSource {
  * refused before reaching it — two different claims about the same commit,
  * rendered identically. Each state now means exactly one thing:
  *
- * - `ran`            — the gate executed and its result is in this verdict.
+ * - `ran`            — the gate executed a comparison and its result is here.
+ * - `no_candidates`  — the gate was reached and found no open blocking debt to
+ *                      compare against, so nothing was embedded. Reporting this
+ *                      as `ran` claimed a comparison that never happened, which
+ *                      `paraphraseBlockingDebts` itself documents as "not the
+ *                      same as having run".
  * - `skipped`        — the gate was reached but could not run (embedder
  *                      unavailable or non-semantic); the block is softened and a
  *                      `debt:degraded` audit row records it.
@@ -117,6 +122,7 @@ export interface RejectedSource {
  */
 export type ParaphraseCheckState =
   | "ran"
+  | "no_candidates"
   | "skipped"
   | "not_applicable"
   | "not_reached";

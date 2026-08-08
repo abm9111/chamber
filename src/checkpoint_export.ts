@@ -267,20 +267,40 @@ export function compareCheckpoints(
   return { ok: true };
 }
 
+/**
+ * Build and sign, without writing anything.
+ *
+ * Split out so a caller can decide the *order* of the two durable effects. The
+ * anchor embeds the receipt, so it does not need the file to exist — appending
+ * first means a failed append leaves no published receipt behind.
+ */
+export function buildSignedCheckpointReceipt(
+  db: DatabaseSync,
+  opts: { sign?: boolean; keyPath?: string } = {},
+): SignedCheckpointReceipt {
+  const receipt = buildCheckpointReceipt(db);
+  return opts.sign === false
+    ? receipt
+    : signCheckpointReceipt(
+        receipt,
+        loadOrCreateCheckpointKey(opts.keyPath).privateKey,
+      );
+}
+
+export function writeCheckpointReceipt(
+  outPath: string,
+  signed: SignedCheckpointReceipt,
+): SignedCheckpointReceipt {
+  mkdirSync(dirname(outPath), { recursive: true });
+  writeFileSync(outPath, JSON.stringify(signed, null, 2), "utf8");
+  return signed;
+}
+
 export function exportCheckpoint(
   db: DatabaseSync,
   outPath: string,
   opts: { sign?: boolean; keyPath?: string } = {},
 ): SignedCheckpointReceipt {
-  const receipt = buildCheckpointReceipt(db);
-  const signed =
-    opts.sign === false
-      ? receipt
-      : signCheckpointReceipt(
-          receipt,
-          loadOrCreateCheckpointKey(opts.keyPath).privateKey,
-        );
-  mkdirSync(dirname(outPath), { recursive: true });
-  writeFileSync(outPath, JSON.stringify(signed, null, 2), "utf8");
-  return signed;
+  const signed = buildSignedCheckpointReceipt(db, opts);
+  return writeCheckpointReceipt(outPath, signed);
 }

@@ -424,9 +424,11 @@ export function commitBelief(
       ? paraphraseBlockingDebts(db, text, hash)
       : { debts: [], semantic: true, attempted: false };
     if (!paraphrase.attempted && ASSERTION.has(type)) {
-      // Reached the gate with no open blocking debt to compare against: it ran,
-      // vacuously. That is not the same as never getting here.
-      paraphraseCheckState = "ran";
+      // Reached the gate, but there was nothing open to compare against, so no
+      // embedding ran. Calling that "ran" asserted a comparison that never
+      // happened — and contradicted this callee's own contract, which says an
+      // empty candidate set is "not the same as having run".
+      paraphraseCheckState = "no_candidates";
     }
     if (paraphrase.attempted) {
       paraphraseCheckState = paraphrase.semantic ? "ran" : "skipped";

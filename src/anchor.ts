@@ -21,7 +21,8 @@ import type { DatabaseSync } from "node:sqlite";
 import { sha256, stableStringify } from "./hash.ts";
 import {
   defaultCheckpointPath,
-  exportCheckpoint,
+  buildSignedCheckpointReceipt,
+  writeCheckpointReceipt,
   compareCheckpoints,
   verifyCheckpointPrefix,
   type CheckpointReceipt,
@@ -198,8 +199,17 @@ export function exportCheckpointGuarded(
         `reported by \`chamber checkpoint verify\`.`,
     );
   }
-  const receipt = exportCheckpoint(db, outPath);
+  // Anchor first, receipt second. Checking that the log *parses* says nothing
+  // about whether the append will succeed — a full disk, a read-only mount or a
+  // permissions change all let the guard pass and then fail after the receipt
+  // was already on disk, which is exactly the split this function exists to
+  // prevent. The anchor embeds the receipt, so it does not need the file; if the
+  // append fails, nothing is published. The reverse residue — an anchor whose
+  // convenience export failed to write — is the safe direction, because the log
+  // is the durable record and the file is regenerable.
+  const receipt = buildSignedCheckpointReceipt(db);
   const anchor = appendAnchor(anchorPath, receipt);
+  writeCheckpointReceipt(outPath, receipt);
   return { receipt, anchor };
 }
 

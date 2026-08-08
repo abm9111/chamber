@@ -937,9 +937,11 @@ test("gates", "every verdict says where the paraphrase gate got to", () => {
     authorFamily: "test",
     path: "deep",
   });
+  // Reached the gate with nothing open to compare against: no embedding ran, so
+  // it must not claim one did.
   assert(
-    ran.paraphraseCheck === "ran" || ran.paraphraseCheck === "not_applicable",
-    `a deep assertion should report a reached state, got ${ran.paraphraseCheck}`,
+    ran.paraphraseCheck === "no_candidates",
+    `expected no_candidates with no open debts, got ${ran.paraphraseCheck}`,
   );
 });
 
@@ -5045,6 +5047,40 @@ test("audit", "truncate-then-grow is caught by an older anchor when the tree is 
  * mechanism from "detects the tamper" into "stops attesting", which an attacker
  * triggers with a single write. Detection is `checkpoint verify`'s job.
  */
+/**
+ * The guard checks that the log *parses*; that says nothing about whether the
+ * append will succeed. A full disk, a read-only mount or a permissions change
+ * all let it pass and then fail after the receipt is already on disk — the exact
+ * split the function exists to prevent. Anchoring first makes a failed append
+ * publish nothing.
+ */
+test("audit", "an anchor that cannot be appended leaves no receipt behind", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-cp-"));
+  const out = join(dir, "checkpoint.json");
+  // The anchor's parent is a FILE, so mkdirSync inside appendAnchor throws.
+  const blocker = join(dir, "blocker");
+  writeFileSync(blocker, "not a directory");
+  const log = join(blocker, "anchors.jsonl");
+  try {
+    const db = freshDb();
+    appendAudit(db, { category: "system", action: "one", actor: "test" });
+
+    let threw = false;
+    try {
+      exportCheckpointGuarded(db, out, log);
+    } catch {
+      threw = true;
+    }
+    assert(threw, "an unappendable anchor must fail the checkpoint");
+    assert(
+      !existsSync(out),
+      "the receipt was published even though its anchor could not be written",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("audit", "a tampered anchor log still lets the checkpoint advance", () => {
   const dir = mkdtempSync(join(tmpdir(), "chamber-cp-"));
   const log = join(dir, "anchors.jsonl");

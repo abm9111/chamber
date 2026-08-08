@@ -102,6 +102,27 @@ export function listTools(_db?: DatabaseSync): ToolSpec[] {
   return [...BUILTINS];
 }
 
+/**
+ * Whether anything a producer creates can actually be executed.
+ *
+ * `listTools` returns only the builtins, so a skill row — however synthesised,
+ * approved and activated — can never be resolved by `getTool` or run by
+ * `runTool`. The producers were left reporting success, which meant an operator
+ * could follow `tool-synth` through sandbox verification and human approval to
+ * completion and receive a tool that silently does not exist. Deleting a
+ * consumer obliges its producers to say so.
+ */
+export function toolExecutionStatus(): { enabled: boolean; reason: string } {
+  return {
+    enabled: false,
+    reason:
+      "skill-tool execution is disabled: source used to be recovered by " +
+      "first-fence match over a markdown body, which let any vendor field " +
+      "choose the code that ran. Re-enabling needs a dedicated source column " +
+      "and an explicit approval status — see the note on listTools.",
+  };
+}
+
 export function getTool(idOrName: string, db?: DatabaseSync): ToolSpec | null {
   const all = listTools(db);
   return (
@@ -314,7 +335,9 @@ ${sandbox.stderr.slice(0, 1000)}
       status: "queued",
       writeId: q.writeId,
       sandbox,
-      reason: "sandbox passed; skill create queued for human approval",
+      reason:
+        "sandbox passed; skill create queued for human approval — but note: " +
+        toolExecutionStatus().reason,
       skillBody,
     };
   }

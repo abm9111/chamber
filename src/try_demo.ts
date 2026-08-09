@@ -34,6 +34,19 @@ import { verifyBeliefSources } from "./pins.ts";
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "../fixtures/demo");
 
+/**
+ * Emphasis, but only into a terminal.
+ *
+ * `process.stdout.isTTY` is false when this is piped, redirected, or run by the
+ * CLI test that asserts the demo still ends on `hash_mismatch` — so the escape
+ * codes never reach a log file or a string comparison. A demo that only reads
+ * correctly on a screen is fine; one that corrupts its own test is not.
+ */
+const tty = (): boolean => process.stdout.isTTY === true;
+const bold = (t: string): string => (tty() ? `\u001b[1m${t}\u001b[0m` : t);
+const red = (t: string): string => (tty() ? `\u001b[31m${t}\u001b[0m` : t);
+const dim = (t: string): string => (tty() ? `\u001b[2m${t}\u001b[0m` : t);
+
 /** What a reader could type to reproduce the step they are watching. */
 function step(command: string, note?: string): void {
   console.log(`\n$ ${command}`);
@@ -54,13 +67,16 @@ export function runTry(opts: { keep?: boolean } = {}): number {
 
   try {
     seedNotes(notes);
-    console.log("Chamber — a two-minute demonstration on a throwaway workspace.");
-    line(`workspace: ${work}`);
+    console.log(bold("Chamber — a demonstration on a throwaway workspace."));
+    line(dim(`workspace: ${work}`));
     line("nothing here touches your real database, config, or notes.");
+    // Commands below are shown as they would be typed *from inside* that
+    // workspace. Printing the absolute path on every step cost a line of noise
+    // each time and pushed the part worth watching off the screen.
 
     db = openChamberDb(dbPath);
 
-    step(`chamber ingest ${notes}`, "index two sample notes");
+    step("chamber ingest ./notes", "index two sample notes");
     const ing = ingestDirectory(db, notes, {});
     line(`ingested ${ing.ingested} file(s) as ${ing.passages} passage(s)`);
 
@@ -109,7 +125,7 @@ export function runTry(opts: { keep?: boolean } = {}): number {
 
     copyFileSync(join(FIXTURES, "refunds.after.md"), join(notes, "refunds.md"));
 
-    step(`chamber ingest ${notes}`, "re-index after the edit");
+    step("chamber ingest ./notes", "re-index after the edit");
     const re = ingestDirectory(db, notes, {});
     line(`ingested ${re.ingested} file(s) as ${re.passages} passage(s)`);
 
@@ -120,7 +136,7 @@ export function runTry(opts: { keep?: boolean } = {}): number {
       line(`${b.beliefId}  ${b.verified}/${b.total} pins verified`);
       for (const f of b.failures) {
         drifted++;
-        line(`  ${f.reason}: ${f.sourceRef ?? f.refId}`);
+        line(`  ${red(bold(`${f.reason}: ${f.sourceRef ?? f.refId}`))}`);
       }
     }
 

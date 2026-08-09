@@ -13,8 +13,8 @@ Output assets/chamber-try.gif
 
 Set Shell zsh
 Set FontSize 16
-Set Width 1100
-Set Height 760
+Set Width 1180
+Set Height 800
 Set Padding 18
 Set Theme "Builtin Dark"
 Set TypingSpeed 40ms
@@ -25,12 +25,14 @@ Hide
 Type "export PS1='%F{green}$%f '; clear" Enter
 Show
 
-Sleep 1s
-Type "chamber try" Sleep 500ms Enter
+Sleep 800ms
+Type "chamber try" Sleep 400ms Enter
 
-# The run itself: ingest, search, believe, debt, pay-debt, verify clean.
-Sleep 12s
-
-# Then the announced edit and the drift. This is the beat worth landing, so it
-# holds long enough to read the hash_mismatch rather than scrolling past it.
-Sleep 8s
+# `chamber try` completes in under two seconds, so the sleeps here are for the
+# reader, not the program. The first version slept 20s against a 1.67s run and
+# spent 85% of a looping GIF on a frozen final frame — anyone landing on the
+# README mid-loop saw a still image.
+#
+# This holds only long enough to read the drift, then loops back while the
+# reader is still interested.
+Sleep 5s

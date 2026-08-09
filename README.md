@@ -182,10 +182,12 @@ any output. Seventeen limitations are documented there, including the two least
 flattering. The sandbox confines only where bubblewrap works — Linux with
 unprivileged user namespaces — and refuses to run anything anywhere else, which
 is safe but is not the same as working. And citation debt blocks a verbatim
-repeat reliably, while the paraphrase leg over it is a measured failure:
-calibration found no threshold that separates a restatement from a
-contradiction, so at the shipped setting it blocks every number swap and every
-negation, including an operator's correction of the very claim in debt.
+repeat reliably, while the paraphrase leg over it is a heuristic: calibration
+found no cosine threshold that separates a restatement from a contradiction. A
+numeric and negation check now removes the worst of that — an operator
+correcting an indebted claim is no longer refused for restating it — but two of
+five true paraphrases still slip through, and a contradiction that is neither
+numeric nor negated still reads as a repeat.
 
 ## The invariant
 

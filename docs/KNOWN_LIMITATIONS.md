@@ -504,12 +504,39 @@ still blocks 4 non-restatements.
 repeats reliably. The debt mechanism, `pay-debt`, and `waive-debt` are unrelated
 to this measurement.
 
-**What would fix it** is a different mechanism, not a better number — a
-natural-language-inference model that scores entailment and contradiction
-separately, or a cheap asymmetry check (numbers and negations differing between
-two otherwise-similar claims is a strong signal they are *not* the same claim).
-Until then the leg is a weak heuristic wearing a gate's clothing, and this note
-exists so nobody mistakes the constant for a calibrated one.
+**What was done about it, 2026-08-09.** The second of those two options is now
+implemented: `src/claim_asymmetry.ts` supplies the signal cosine cannot, from
+text already in hand and with no model. Before a block, it asks whether the two
+claims conflict on a *number* (each side carrying a value the other lacks) or
+disagree in *negation polarity*. Either is evidence they are not the same claim,
+and the block is dropped.
+
+Measured on the same 25 pairs, at the same 0.80: **false positives fall from 8
+to 3, and no true paraphrase is suppressed.** Every number swap and every
+negation stops being treated as a restatement, so the case that opened this
+section — an operator refused for correcting an indebted claim — no longer
+happens. `npm run calibrate:paraphrase` prints both columns, because only one of
+them is good news and a report showing the improvement without its cost would be
+advocacy.
+
+The suppressor may only ever *remove* a block, never cause one. That direction
+is not incidental: it is a blocklist, and this codebase has a written record of
+what happens when a blocklist is asked to decide what is permitted. Asked only
+to narrow, its failure mode is a paraphrase that gets through — the leg's
+pre-existing behaviour, not a new exposure.
+
+**What it does not fix.** The 2-of-5 true paraphrases the threshold misses are
+untouched; this only ever removes blocks. Three false positives remain, and they
+are the disagreements this mechanism cannot see: "opens at nine" against "closes
+at nine" is a real contradiction with the same number and no negation. One
+marker was measured out of the design — "no" fired on a genuine restatement
+("**No** production deployment may go out unless the freeze has been in effect"),
+because English writes positive rules negatively, so "no refunds are issued"
+against "refunds are issued" still reads as the same polarity here.
+
+The leg remains a heuristic. It is now a heuristic that fails in the cheaper
+direction, which is different from being calibrated, and this note exists so
+nobody mistakes the constant for one.
 
 **And the constant sits inside platform noise.** darwin/arm64 measures 8 false
 positives; the linux/x64 CI runner measures 9, from the same model file and the
@@ -517,7 +544,9 @@ same fixture. `audit_negation` scores 0.797 locally — three thousandths under
 the threshold — and lands on the other side under a different onnxruntime build.
 Which side a pair falls on is decided by the BLAS kernel rather than by meaning,
 which is about as clear a statement as one could want that 0.8 is not a
-calibrated boundary.
+calibrated boundary. The suppressor incidentally settles this one: that pair is
+a negation, so it is dropped on both architectures and its coin-flip no longer
+reaches a verdict.
 
 Two smaller findings from the same run, both now handled in code:
 

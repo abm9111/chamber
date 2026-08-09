@@ -20,6 +20,7 @@ import { claimHash, newId } from "./hash.ts";
 import { verifyPin, type BeliefSourceFailure } from "./pins.ts";
 import { embedLocalBatch } from "./embedder.ts";
 import { cosineSimilarity } from "./vector.ts";
+import { claimsDifferMaterially } from "./claim_asymmetry.ts";
 import type {
   CommitBeliefInput,
   CommitResult,
@@ -124,6 +125,13 @@ function openBlockingDebts(
  * blocks 4 non-restatements). Re-run `npm run calibrate:paraphrase` before
  * changing it, and read `docs/KNOWN_LIMITATIONS.md` — the honest conclusion is
  * that this leg needs a different mechanism, not a better constant.
+ *
+ * **That mechanism now exists beside it.** `claimsDifferMaterially`
+ * (`src/claim_asymmetry.ts`) runs after this threshold and drops the block where
+ * the two claims conflict on a number or in negation polarity, which takes the
+ * false positives from 8 to 3 on the same set without costing a true paraphrase.
+ * This constant is therefore no longer the whole gate, and the counts above
+ * describe the cosine leg alone.
  *
  * The exact-hash leg is unaffected and still blocks verbatim repeats.
  */
@@ -289,12 +297,32 @@ function paraphraseBlockingDebts(
   }
 
   const target = embeds[0]!.vector;
-  const debts = candidates
-    .filter(
-      (_, i) =>
-        cosineSimilarity(target, embeds[i + 1]!.vector) >= threshold,
-    )
-    .map((r) => ({ id: r.id }));
+  const debts: { id: string }[] = [];
+  const suppressed: string[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const row = candidates[i]!;
+    if (cosineSimilarity(target, embeds[i + 1]!.vector) < threshold) continue;
+    // Cosine says "close". Close is not the same as "the same claim", and the
+    // calibration measured exactly how often that gap refuses a correction: at
+    // 0.80 every number swap and every negation in the labelled set is blocked,
+    // so an operator fixing "30 days" to "14 days" is told they are repeating
+    // themselves. This narrows the block where the text carries evidence
+    // against it. It can only ever remove a block — see src/claim_asymmetry.ts
+    // for why that direction is not negotiable.
+    const asym = claimsDifferMaterially(text, row.claim_text);
+    if (asym.differs) {
+      suppressed.push(`${row.id} (${asym.reason}: ${asym.detail})`);
+      continue;
+    }
+    debts.push({ id: row.id });
+  }
+  if (suppressed.length > 0) {
+    console.warn(
+      `chamber: NOTE — ${suppressed.length} open debt(s) embedded close to this ` +
+        `claim but were not treated as restatements of it: ${suppressed.join("; ")}. ` +
+        `Their exact-hash block still applies.`,
+    );
+  }
   return { debts, semantic: true, attempted: true };
 }
 

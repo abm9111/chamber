@@ -65,6 +65,11 @@ import {
 } from "../src/embedder.ts";
 import { CALIBRATED_THRESHOLDS } from "../src/commit_belief.ts";
 import {
+  claimsDifferMaterially,
+  countNegators,
+  readNumbers,
+} from "../src/claim_asymmetry.ts";
+import {
   getIncrementalRoot,
   proveMmrInclusion,
   verifyMmrInclusion,
@@ -1009,6 +1014,78 @@ test("gates", "an operator can waive a debt that cannot be paid", () => {
  * The labelled set must stay well formed even where no embedder exists, or it
  * rots on every machine that cannot run the calibration.
  */
+/**
+ * The behaviour the suppressor exists for, through the real gate.
+ *
+ * Before it, this was the measured failure: a claim owes a citation, the
+ * operator commits the corrected figure, and the gate refuses it as a
+ * restatement of the very claim being corrected — 0.910 cosine between "30
+ * days" and "14 days". The correction is the one commit that must not be
+ * blocked by the debt it resolves.
+ *
+ * Soft-skips without a real embedder, because without one the semantic leg does
+ * not run at all and the test would pass for a reason that proves nothing.
+ */
+test("gates", "correcting an indebted claim's number is not refused as a repeat", () => {
+  if (!minilmAvailable()) {
+    assert(true, "minilm model not on disk — soft skip");
+    return;
+  }
+  const db = freshDb();
+  const indebted = "The refund policy allows customers to return any purchase within 30 days.";
+  insertDebt(db, claimHash("belief", indebted), indebted);
+
+  const correction = "The refund policy allows customers to return any purchase within 14 days.";
+  const r = commitBelief(db, {
+    type: "belief",
+    text: correction,
+    sources: [],
+    authorFamily: "test",
+    path: "deep",
+  });
+  if (r.ok === false && r.reason?.includes("did not run")) {
+    assert(true, "embedder unavailable at runtime — soft skip");
+    return;
+  }
+  assert(
+    r.ok,
+    `the correction was refused as a restatement of the claim it corrects: ${JSON.stringify(r)}`,
+  );
+  // And the leg must actually have run — a pass because the check was skipped
+  // would be this test's own version of the bug it guards.
+  assert(
+    r.ok && r.paraphraseCheck === "ran",
+    `passed without the paraphrase check running: ${JSON.stringify(r)}`,
+  );
+});
+
+/**
+ * The other direction, so the suppressor cannot pass by being inert: a genuine
+ * reworded repeat of an indebted claim is still refused.
+ */
+test("gates", "a reworded repeat of an indebted claim is still refused", () => {
+  if (!minilmAvailable()) {
+    assert(true, "minilm model not on disk — soft skip");
+    return;
+  }
+  const db = freshDb();
+  const indebted = "Tool execution is confined by bubblewrap on every call.";
+  insertDebt(db, claimHash("belief", indebted), indebted);
+
+  const r = commitBelief(db, {
+    type: "belief",
+    text: "Every tool call runs inside a bubblewrap sandbox.",
+    sources: [],
+    authorFamily: "test",
+    path: "deep",
+  });
+  if (r.ok === false && r.reason?.includes("did not run")) {
+    assert(true, "embedder unavailable at runtime — soft skip");
+    return;
+  }
+  assert(!r.ok, `a paraphrase of an indebted claim committed freely: ${JSON.stringify(r)}`);
+});
+
 test("gates", "the paraphrase calibration set is well formed", () => {
   const raw = JSON.parse(
     readFileSync(
@@ -1073,12 +1150,16 @@ test("gates", "the shipped threshold has not drifted from its measurement", () =
   assert(thr !== undefined, `no calibrated threshold for ${model}`);
   const vec = new Map(texts.map((t, i) => [t, embeds[i]!.vector]));
 
-  let fn = 0, fp = 0;
+  let fn = 0, fp = 0, fnNet = 0, fpNet = 0;
   for (const p of raw.pairs) {
     if ((p.unmetBy ?? []).includes(model)) continue;
-    const blocked = cosineSimilarity(vec.get(p.a)!, vec.get(p.b)!) >= thr!;
-    if (p.same && !blocked) fn++;
-    if (!p.same && blocked) fp++;
+    const close = cosineSimilarity(vec.get(p.a)!, vec.get(p.b)!) >= thr!;
+    if (p.same && !close) fn++;
+    if (!p.same && close) fp++;
+    // What the gate actually does: cosine, then the asymmetry suppressor.
+    const blocked = close && !claimsDifferMaterially(p.a, p.b).differs;
+    if (p.same && !blocked) fnNet++;
+    if (!p.same && blocked) fpNet++;
   }
   // Measured 2026-08-09 on minilm-l6-v2-q at 0.80 — and the bound is 9, not 8,
   // for a reason worth recording rather than papering over.
@@ -1095,6 +1176,86 @@ test("gates", "the shipped threshold has not drifted from its measurement", () =
   // platforms so the suite measures regressions rather than architecture.
   assert(fn <= 2, `false negatives rose to ${fn} (was 2 of 5)`);
   assert(fp <= 9, `false positives rose to ${fp} (was 8 on darwin, 9 on linux, of 17)`);
+
+  // What the gate actually does, and the number that matters. The asymmetry
+  // suppressor takes the cosine leg's 8 false positives down to 3 without
+  // costing a single true paraphrase — every number swap and every negation in
+  // the set stops being treated as a restatement.
+  //
+  // This bound is also platform-stable where the raw one is not: `audit_negation`
+  // straddles the threshold between architectures, but it is suppressed on both,
+  // so its coin-flip no longer reaches the verdict.
+  //
+  // The 3 that remain are the ones this mechanism cannot see: disagreement that
+  // is neither numeric nor negated ("opens at nine" vs "closes at nine"), and a
+  // long-form pair the embedder truncates. The real gate never scores that last
+  // one — CLAIM_TEXT_EMBED_LIMIT skips it — so the shipped false-positive count
+  // is lower still than this test can measure.
+  assert(fnNet <= 2, `false negatives rose to ${fnNet} with the suppressor (was 2 of 5)`);
+  assert(fpNet <= 3, `false positives rose to ${fpNet} with the suppressor (was 3 of 17)`);
+});
+
+/**
+ * The suppressor's one unacceptable failure, checked on every machine.
+ *
+ * It may miss — a missed suppression leaves the gate exactly where it was. It
+ * may not fire on a genuine restatement, because that turns a heuristic that
+ * merely refuses too much into one that lets an unsupported claim through by
+ * rewording. This needs no embedder, so unlike the calibration above it cannot
+ * quietly skip on a machine without python3.
+ */
+test("gates", "the asymmetry suppressor never fires on a true paraphrase", () => {
+  const raw = JSON.parse(
+    readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../fixtures/paraphrase_calibration.json"),
+      "utf8",
+    ),
+  ) as { pairs: { id: string; same: boolean; a: string; b: string }[] };
+
+  for (const p of raw.pairs.filter((x) => x.same)) {
+    const v = claimsDifferMaterially(p.a, p.b);
+    assert(
+      !v.differs,
+      `${p.id}: suppressed a true paraphrase (${v.reason}: ${v.detail})`,
+    );
+  }
+  // And it must still fire on the cases it was built for, or it is inert.
+  const fired = raw.pairs.filter((p) => claimsDifferMaterially(p.a, p.b).differs);
+  assert(fired.length >= 6, `suppressor fired on only ${fired.length} pairs (was 8)`);
+});
+
+test("gates", "numbers and negations are read the way the suppressor claims", () => {
+  // Digits and words normalise to the same value, so a paraphrase that spells a
+  // figure out does not read as a swap.
+  assert(readNumbers("within 30 days").has(30), "digit not read");
+  assert(readNumbers("within thirty days").has(30), "number word not read");
+  assert(readNumbers("seventy-two hours").has(72), "hyphenated compound not folded");
+  assert(readNumbers("seventy days").has(70), "bare tens mis-parsed");
+  assert(!readNumbers("no figures here").has(0), "invented a number");
+
+  assert(countNegators("does not enforce") === 1, "missed 'not'");
+  assert(countNegators("cannot be returned") === 1, "missed 'cannot'");
+  assert(countNegators("isn't enforced") === 1, "missed a contraction");
+  assert(countNegators("enforced on every call") === 0, "invented a negation");
+  // "no" is deliberately not a negator; see src/claim_asymmetry.ts for the pair
+  // that measured it out.
+  assert(countNegators("no deployment may go out") === 0, "'no' should not count");
+
+  // Direction: a swap needs conflict on both sides. A paraphrase that merely
+  // adds a figure the original left implicit must not be suppressed.
+  assert(
+    !claimsDifferMaterially("returns within 30 days", "returns within 30 days, or 5 working days by card").differs,
+    "suppressed on an added figure rather than a conflicting one",
+  );
+  assert(
+    claimsDifferMaterially("returns within 30 days", "returns within 14 days").differs,
+    "missed a genuine number swap",
+  );
+  // Two separately-negated claims are the same polarity, not opposite ones.
+  assert(
+    !claimsDifferMaterially("goods cannot be returned", "items cannot be sent back").differs,
+    "treated two negated claims as opposites",
+  );
 });
 
 test("gates", "2_retraction_is_free", () => {

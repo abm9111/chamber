@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 
 import { embedLocalBatch, minilmAvailable } from "../src/embedder.ts";
 import { cosineSimilarity } from "../src/vector.ts";
+import { claimsDifferMaterially } from "../src/claim_asymmetry.ts";
 
 interface Pair {
   id: string;
@@ -88,6 +89,10 @@ const scored = pairs
     ...p,
     score: cosineSimilarity(vec.get(p.a)!, vec.get(p.b)!),
     excluded: (p.unmetBy ?? []).includes(model),
+    // The asymmetry suppressor's verdict, measured alongside the cosine rather
+    // than after it: the gate applies both, so a sweep that reports only the
+    // cosine describes a gate that no longer exists.
+    asym: claimsDifferMaterially(p.a, p.b),
   }))
   .sort((x, y) => y.score - x.score);
 
@@ -103,6 +108,8 @@ for (let t = 0.5; t <= 0.99001; t += 0.01) {
     fn: sames.filter((p) => p.score < thr).length,
     fnTotal: sames.length,
     fp: diffs.filter((p) => p.score >= thr).length,
+    fpNet: diffs.filter((p) => p.score >= thr && !p.asym.differs).length,
+    fnNet: sames.filter((p) => p.score < thr || p.asym.differs).length,
     fpTotal: diffs.length,
   });
 }
@@ -157,14 +164,34 @@ console.log(
 );
 
 console.log("\nsweep (raw counts; N is small, percentages would flatter it)");
-console.log("   thr    FN        FP");
+console.log("   thr    FN        FP     |  with asymmetry suppressor: FN     FP");
 for (const row of sweep) {
   if (Math.round(row.threshold * 100) % 5 !== 0) continue;
   console.log(
     `   ${row.threshold.toFixed(2)}   ${String(row.fn).padStart(2)}/${row.fnTotal}` +
-      `     ${String(row.fp).padStart(2)}/${row.fpTotal}`,
+      `     ${String(row.fp).padStart(2)}/${row.fpTotal}` +
+      `   |                        ${String(row.fnNet).padStart(2)}/${row.fnTotal}` +
+      `     ${String(row.fpNet).padStart(2)}/${row.fpTotal}`,
   );
 }
+
+// The suppressor is a narrowing, so it can only move FP down and FN up. Both
+// directions are printed because only one of them is good news, and a report
+// that showed the improvement without its cost would be advocacy.
+const fired = counted.filter((p) => p.asym.differs);
+console.log("\nasymmetry suppressor — pairs it declines to treat as restatements");
+for (const p of fired) {
+  const wrong = p.same ? "  <-- WRONG: a true paraphrase" : "";
+  console.log(
+    `  ${p.score.toFixed(3)}  ${p.same ? "SAME" : "DIFF"}  ${p.category.padEnd(14)} ` +
+      `${p.id}  [${p.asym.reason}: ${p.asym.detail}]${wrong}`,
+  );
+}
+if (fired.length === 0) console.log("  (none)");
+console.log(
+  `  ${fired.filter((p) => !p.same).length} correct, ` +
+    `${fired.filter((p) => p.same).length} wrong`,
+);
 
 const firstClean = sweep.find((r) => r.fp === 0);
 console.log(

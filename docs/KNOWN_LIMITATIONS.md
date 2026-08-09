@@ -504,6 +504,14 @@ two otherwise-similar claims is a strong signal they are *not* the same claim).
 Until then the leg is a weak heuristic wearing a gate's clothing, and this note
 exists so nobody mistakes the constant for a calibrated one.
 
+**And the constant sits inside platform noise.** darwin/arm64 measures 8 false
+positives; the linux/x64 CI runner measures 9, from the same model file and the
+same fixture. `audit_negation` scores 0.797 locally — three thousandths under
+the threshold — and lands on the other side under a different onnxruntime build.
+Which side a pair falls on is decided by the BLAS kernel rather than by meaning,
+which is about as clear a statement as one could want that 0.8 is not a
+calibrated boundary.
+
 Two smaller findings from the same run, both now handled in code:
 
 - Claims longer than the embedder's 256-token window are no longer compared at

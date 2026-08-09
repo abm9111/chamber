@@ -1080,10 +1080,21 @@ test("gates", "the shipped threshold has not drifted from its measurement", () =
     if (p.same && !blocked) fn++;
     if (!p.same && blocked) fp++;
   }
-  // Measured 2026-08-09 on minilm-l6-v2-q at 0.80. Getting better is fine and
-  // should tighten these; getting worse is a regression worth a failing build.
+  // Measured 2026-08-09 on minilm-l6-v2-q at 0.80 — and the bound is 9, not 8,
+  // for a reason worth recording rather than papering over.
+  //
+  // darwin/arm64 measures 8 false positives; the linux/x64 CI runner measures 9.
+  // Same model file, same fixture, same threshold. `audit_negation` scores 0.797
+  // locally, three thousandths under the line, and lands on the other side of it
+  // under a different onnxruntime build. So the shipped constant sits *inside*
+  // the platform-noise band: which side a pair falls on is decided by the BLAS
+  // kernel, not by meaning.
+  //
+  // That is further evidence for what docs/KNOWN_LIMITATIONS.md already says —
+  // this leg is a weak heuristic, not a calibrated gate. The bound covers both
+  // platforms so the suite measures regressions rather than architecture.
   assert(fn <= 2, `false negatives rose to ${fn} (was 2 of 5)`);
-  assert(fp <= 8, `false positives rose to ${fp} (was 8 of 17)`);
+  assert(fp <= 9, `false positives rose to ${fp} (was 8 on darwin, 9 on linux, of 17)`);
 });
 
 test("gates", "2_retraction_is_free", () => {

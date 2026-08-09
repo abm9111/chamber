@@ -7893,6 +7893,44 @@ test("cli", "a turn that cannot reach a model commits nothing", () => {
   }
 });
 
+/**
+ * `chamber try` is the first thing an evaluator runs, so it has to work on a
+ * machine with no config, no database and no model — and it has to end on the
+ * drift, because that is the point of the demo. A demo nobody runs in CI rots
+ * into a transcript that no longer matches the tool.
+ */
+test("cli", "chamber try runs on a bare machine and ends on the drift", () => {
+  const cfgDir = mkdtempSync(join(tmpdir(), "chamber-try-cfg-"));
+  try {
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "try"],
+      {
+        encoding: "utf8",
+        timeout: 120_000,
+        // No CHAMBER_DB and no config: the command must need neither.
+        env: { ...process.env, XDG_CONFIG_HOME: cfgDir, CHAMBER_DB: "" },
+      },
+    );
+    assert(r.error === undefined, `launch failed: ${r.error}`);
+    assert(r.status === 0, `expected exit 0, got ${r.status}\n${r.stderr}`);
+    assert(
+      /hash_mismatch/.test(r.stdout),
+      `the demo must end on a caught drift:\n${r.stdout.slice(-500)}`,
+    );
+    // Green before red — an unannounced failure reads as a crash.
+    const cleanAt = r.stdout.indexOf("pins verified");
+    const driftAt = r.stdout.indexOf("hash_mismatch");
+    assert(cleanAt !== -1 && cleanAt < driftAt, "must show a clean verify first");
+    assert(
+      !existsSync(join(cfgDir, "chamber")),
+      "try must not write a config",
+    );
+  } finally {
+    rmSync(cfgDir, { recursive: true, force: true });
+  }
+});
+
 test("cli", "help_starts_the_real_binary_and_exits_clean", () => {
   const r = spawnSync(
     process.execPath,

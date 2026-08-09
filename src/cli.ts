@@ -112,6 +112,7 @@ import { ensureDefaultScope, createScope, listScopes, globalPosture, effectivePo
 import { enqueueJob, processJobQueue, listJobs } from "./job_queue.ts";
 import { getHarness, listHarnesses } from "./harness_adapter.ts";
 import { pilotSummary } from "./pilot.ts";
+import { runTry } from "./try_demo.ts";
 import {
   mcpDiscover,
   mcpToolsList,
@@ -949,6 +950,13 @@ async function main(): Promise<void> {
   // (see cmdConfig) would never fire — the generic top-level handler at the
   // bottom of this file would print instead. Both return here, and neither
   // opens the database (see cmdInit's and cmdConfig's doc comments).
+  if (cmd === "try") {
+    // Before loadConfig()/open(), exactly like `init` and `config`: the whole
+    // point is that it runs on a machine with no config and no database.
+    process.exitCode = runTry({ keep: rest.includes("--keep") });
+    return;
+  }
+
   if (cmd === "init") {
     cmdInit(rest);
     return;

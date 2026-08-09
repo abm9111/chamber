@@ -209,9 +209,11 @@ export function syncCompletionAvailable(): { ok: boolean; reason?: string } {
     return {
       ok: false,
       reason:
-        "the configured model mode is 'openai', which the synchronous turn path " +
-        "cannot use. Run with CHAMBER_MODEL=stub for an offline turn, or use a " +
-        "surface that awaits complete().",
+        "`chamber turn` is a heuristic, stub-only surface — it never talks to a " +
+        "model server, so a config with model.mode \"openai\" cannot drive it. " +
+        "This is not a misconfiguration: use `chamber ask` for a live model " +
+        "(it awaits the async path), or CHAMBER_MODEL=stub to see the gates " +
+        "run offline.",
     };
   }
   return { ok: true };

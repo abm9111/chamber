@@ -116,6 +116,15 @@ export interface RejectedSource {
  * - `skipped`        — the gate was reached but could not run (embedder
  *                      unavailable or non-semantic); the block is softened and a
  *                      `debt:degraded` audit row records it.
+ *
+ *                      **This is a decision, not an accident** (2026-08-09): a
+ *                      broken embedder softens one check rather than taking the
+ *                      ledger down. Refusing instead would make a missing
+ *                      python3 stop every assertion commit — and the softening
+ *                      is not silent, which is what makes allowing defensible:
+ *                      it is on every verdict and in the chained log. If
+ *                      paraphrase-blocking is ever made a hard invariant, this
+ *                      is the line to revisit.
  * - `not_applicable` — this epistemic type is not subject to the gate.
  * - `not_reached`    — the commit was decided before the gate; says nothing
  *                      about the gate either way.

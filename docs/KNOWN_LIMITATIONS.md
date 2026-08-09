@@ -435,3 +435,30 @@ fresh python startup and ONNX model load each time, measured at ~158 ms. A
 (`src/embedder.ts:304`) exists to amortise exactly this and **has no callers**.
 Wiring it in is the single largest performance win available in the ingest path.
 Unplanned.
+
+## The paraphrase gate softens when its embedder is unavailable — deliberately
+
+The semantic half of the citation-debt gate needs a real embedder. When one is
+not available — no python3, no onnxruntime, or a model with no calibrated
+threshold — the check cannot run, and Chamber **commits anyway**.
+
+That is a decision made on 2026-08-09, not an oversight. The alternative is a
+hard invariant: refuse every assertion the semantic check could not examine. It
+was rejected because a missing interpreter would then stop all assertion commits
+— a broken dependency taking the ledger down rather than softening one check.
+
+What makes allowing defensible is that the softening is never silent:
+
+- the verdict carries `paraphraseCheck: "skipped"`, so a caller can see it;
+- a `debt:degraded` row lands in the hash-chained audit log, written from a
+  `finally` so a later refusal cannot erase it;
+- a failure to write even that row warns on stderr rather than vanishing.
+
+The exact-hash leg of the gate is unaffected and still blocks. Only the
+*paraphrase* leg softens, so a verbatim repeat of an indebted claim is still
+refused; a reworded one may pass.
+
+**If you need the hard invariant**, `src/commit_belief.ts` is the place: the
+`paraphrase.attempted && !paraphrase.semantic` branch currently records and
+proceeds. Making it refuse is a small change; living with a ledger that stops
+accepting assertions when python3 breaks is the part to weigh.

@@ -61,6 +61,28 @@ Four more scenarios — a rolled-back ledger caught by an outside anchor, a
 sandbox that refuses rather than degrade, a hostile tool catalogue rejected —
 are in [`demos/`](demos/), and run in CI so they cannot drift from the code.
 
+## A dictionary for the words above
+
+Everything Chamber does is rows in one SQLite file. Each term in the
+transcripts names a table or a hash:
+
+| Word | What it actually is |
+|------|---------------------|
+| **passage** | one chunk of one markdown file. `refunds.md#p0` is file path + chunk index. |
+| **belief** | a row in `belief`: one asserted sentence, linked to the passages it stands on. |
+| **pin** | a sha-256 of a cited passage's stored title, body and ref, taken at the moment of citation and kept in `belief_source`. |
+| **verify** | re-read every pinned passage, recompute the hash, compare. Any mismatch exits non-zero. No model involved. |
+| **citation debt** | a row in `citation_debt`, created when an assertion commits with no source. The same claim cannot commit again until the debt is paid. |
+| **pay-debt** | retrieval proposes passages for the indebted claim; accepting them pins them. |
+| **APORIA** | the verdict when no retrieved passage supports an answer. The reply is "I don't know", recorded as that. |
+| **gate** | a check and a write inside one SQLite transaction — both commit or neither does. |
+| **audit log** | append-only `audit_event`; each row's hash covers the previous row's hash, so editing history breaks every hash after it. |
+| **anchor** | the log's root hash stored outside the database, so truncating the log is detectable rather than silent. |
+| **the scheduler** | a launchd/systemd job running `ingest` + `verify`, notifying only on drift. |
+
+None of it is hidden machinery: `sqlite3 ~/.local/share/chamber/chamber.sqlite
+'.tables'` shows the whole thing.
+
 ## Answers that cite their sources
 
 With a model configured, `chamber ask` judges every sentence on its own

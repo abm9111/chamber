@@ -462,3 +462,53 @@ refused; a reworded one may pass.
 `paraphrase.attempted && !paraphrase.semantic` branch currently records and
 proceeds. Making it refuse is a small change; living with a ledger that stops
 accepting assertions when python3 breaks is the part to weigh.
+
+## The paraphrase leg does not work well, and the measurement says so
+
+Calibrated 2026-08-09 against `fixtures/paraphrase_calibration.json` (25 labelled
+pairs) with `minilm-l6-v2-q`. Re-run it yourself: `npm run calibrate:paraphrase`.
+
+At the shipped threshold of 0.80: **2 of 5 true paraphrases missed, 8 of 17
+non-restatements blocked.** True paraphrases score 0.715–0.917; non-restatements
+score 0.082–0.991. The ranges overlap almost entirely, and the sweep finds **no
+false-positive-free threshold anywhere between 0.50 and 0.99**.
+
+The composition of the errors matters more than the counts:
+
+| blocked at 0.80, but not a restatement | score |
+|---|---|
+| "within 30 days" vs "within 14 days" | 0.910 |
+| "opens at nine" vs "opens at ten" | 0.956 |
+| "kept for ninety days" vs "thirty days" | 0.863 |
+| "enforces the sandbox" vs "does not enforce the sandbox" | 0.904 |
+| "opens at nine" vs "closes at nine" | 0.880 |
+
+Every number swap and every negation is blocked. Concretely: **an operator
+correcting an indebted claim is refused on the grounds that the correction
+restates it.** That is close to the opposite of the intended behaviour.
+
+The cause is not the constant. Cosine over a bag-of-meaning embedding cannot
+separate "says the same thing" from "says the opposite thing about the same
+subject", and that separation is the entire job of this leg. Moving the
+threshold trades one failure for the other — 0.90 catches 1 of 5 paraphrases and
+still blocks 4 non-restatements.
+
+**What still works:** the exact-hash leg is unaffected and blocks verbatim
+repeats reliably. The debt mechanism, `pay-debt`, and `waive-debt` are unrelated
+to this measurement.
+
+**What would fix it** is a different mechanism, not a better number — a
+natural-language-inference model that scores entailment and contradiction
+separately, or a cheap asymmetry check (numbers and negations differing between
+two otherwise-similar claims is a strong signal they are *not* the same claim).
+Until then the leg is a weak heuristic wearing a gate's clothing, and this note
+exists so nobody mistakes the constant for a calibrated one.
+
+Two smaller findings from the same run, both now handled in code:
+
+- Claims longer than the embedder's 256-token window are no longer compared at
+  all. Two long claims agreeing for their first 256 tokens and contradicting
+  afterwards embedded to the *same point* (0.991 measured), so the gate was
+  blocking on text the model never read.
+- The 32-candidate cap now has a deterministic `ORDER BY`, so the truncation
+  warning describes a reproducible sample.

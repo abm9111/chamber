@@ -60,8 +60,10 @@ import { runAsk, citedIndices } from "../src/ask.ts";
 import {
   minilmAvailable,
   embedLocal,
+  embedLocalBatch,
   MINILM_MODEL,
 } from "../src/embedder.ts";
+import { CALIBRATED_THRESHOLDS } from "../src/commit_belief.ts";
 import {
   getIncrementalRoot,
   proveMmrInclusion,
@@ -1001,6 +1003,87 @@ test("gates", "an operator can waive a debt that cannot be paid", () => {
     !listOpenDebts(db).some((d) => d.id === debtId),
     "the waived debt must no longer be open",
   );
+});
+
+/**
+ * The labelled set must stay well formed even where no embedder exists, or it
+ * rots on every machine that cannot run the calibration.
+ */
+test("gates", "the paraphrase calibration set is well formed", () => {
+  const raw = JSON.parse(
+    readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../fixtures/paraphrase_calibration.json"),
+      "utf8",
+    ),
+  ) as { pairs: { id: string; category: string; same: boolean; a: string; b: string; unmetBy?: string[]; unmetWhy?: string }[] };
+
+  const REQUIRED = [
+    "paraphrase", "near_miss", "contradiction", "entity_swap",
+    "number_swap", "unrelated", "cross_lingual", "long_form",
+  ];
+  const ids = new Set<string>();
+  for (const p of raw.pairs) {
+    assert(!ids.has(p.id), `duplicate id ${p.id}`);
+    ids.add(p.id);
+    assert(REQUIRED.includes(p.category), `unknown category ${p.category} on ${p.id}`);
+    assert(typeof p.same === "boolean", `${p.id}: same must be boolean`);
+    assert(p.a.trim() !== "" && p.b.trim() !== "", `${p.id}: empty side`);
+    assert(p.a !== p.b, `${p.id}: identical sides prove nothing`);
+    if (p.unmetBy) {
+      assert(
+        (p.unmetWhy ?? "").trim() !== "",
+        `${p.id}: unmetBy without unmetWhy hides a gap instead of recording it`,
+      );
+    }
+  }
+  for (const c of REQUIRED) {
+    assert(
+      raw.pairs.filter((p) => p.category === c).length >= 2,
+      `category ${c} needs at least 2 rows`,
+    );
+  }
+});
+
+/**
+ * Pins the *measured* behaviour, not an aspiration. The set does not separate
+ * cleanly — no threshold classifies it — so asserting "zero errors" would be a
+ * test that can never pass. This asserts the counts do not get worse, which is
+ * the only honest regression signal available while the mechanism stands.
+ */
+test("gates", "the shipped threshold has not drifted from its measurement", () => {
+  if (!minilmAvailable()) return; // no embedder: nothing to measure
+  const raw = JSON.parse(
+    readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../fixtures/paraphrase_calibration.json"),
+      "utf8",
+    ),
+  ) as { pairs: { id: string; same: boolean; a: string; b: string; unmetBy?: string[] }[] };
+
+  const texts = [...new Set(raw.pairs.flatMap((p) => [p.a, p.b]))];
+  let embeds;
+  try {
+    embeds = embedLocalBatch(texts, "minilm");
+  } catch {
+    return; // embedder present but not runnable here
+  }
+  if (embeds.some((e) => e.kind !== "minilm")) return; // hash fallback: meaningless
+
+  const model = embeds[0]!.model;
+  const thr = CALIBRATED_THRESHOLDS[model];
+  assert(thr !== undefined, `no calibrated threshold for ${model}`);
+  const vec = new Map(texts.map((t, i) => [t, embeds[i]!.vector]));
+
+  let fn = 0, fp = 0;
+  for (const p of raw.pairs) {
+    if ((p.unmetBy ?? []).includes(model)) continue;
+    const blocked = cosineSimilarity(vec.get(p.a)!, vec.get(p.b)!) >= thr!;
+    if (p.same && !blocked) fn++;
+    if (!p.same && blocked) fp++;
+  }
+  // Measured 2026-08-09 on minilm-l6-v2-q at 0.80. Getting better is fine and
+  // should tighten these; getting worse is a regression worth a failing build.
+  assert(fn <= 2, `false negatives rose to ${fn} (was 2 of 5)`);
+  assert(fp <= 8, `false positives rose to ${fp} (was 8 of 17)`);
 });
 
 test("gates", "2_retraction_is_free", () => {

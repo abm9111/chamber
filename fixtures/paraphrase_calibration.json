@@ -1,0 +1,203 @@
+{
+  "version": 1,
+  "purpose": "Ground truth for the paraphrase debt gate. `same: true` means the gate SHOULD block b while a blocking debt on a is open. `same: false` means it MUST NOT.",
+  "howToUse": "npm run calibrate:paraphrase — sweeps thresholds against a real embedder and prints the tradeoff. It recommends no number; a human picks one from the separation band.",
+  "unmetByNote": "A pair may carry `unmetBy: [modelId]` when that specific model demonstrably cannot reach the correct answer. This keeps a known hole in the repo attached to the model that has it, instead of deleting the row (hiding it) or lowering the threshold to catch it (which drops below the number_swap band and starts refusing correct commits).",
+  "pairs": [
+    {
+      "id": "refund_30d_paraphrase",
+      "category": "paraphrase",
+      "same": true,
+      "a": "The refund policy allows customers to return any purchase within 30 days.",
+      "b": "Customers may send back anything they bought for a full refund during the 30 days after purchase.",
+      "why": "the probe pair (probes/debt_paraphrase.ts) that produced the original 0.8"
+    },
+    {
+      "id": "office_hours_paraphrase",
+      "category": "paraphrase",
+      "same": true,
+      "a": "The Dubai office opens at nine on weekdays and closes at six.",
+      "b": "On weekdays the Dubai office is open from nine in the morning until six in the evening."
+    },
+    {
+      "id": "sandbox_paraphrase",
+      "category": "paraphrase",
+      "same": true,
+      "a": "Tool execution is confined by bubblewrap on every call.",
+      "b": "Every tool call runs inside a bubblewrap sandbox."
+    },
+    {
+      "id": "backup_paraphrase",
+      "category": "paraphrase",
+      "same": true,
+      "a": "Backups run nightly and are kept for ninety days.",
+      "b": "We take a backup every night and retain each one for ninety days."
+    },
+
+    {
+      "id": "ship_vs_refund_30d",
+      "category": "near_miss",
+      "same": false,
+      "a": "Orders ship within 30 days of being placed.",
+      "b": "Purchases can be refunded within 30 days of delivery.",
+      "why": "same topic, same number, different claim — shipping is not refunding"
+    },
+    {
+      "id": "opens_vs_closes",
+      "category": "near_miss",
+      "same": false,
+      "a": "The Dubai office opens at nine on weekdays.",
+      "b": "The Dubai office closes at nine on weekdays."
+    },
+    {
+      "id": "backup_taken_vs_tested",
+      "category": "near_miss",
+      "same": false,
+      "a": "Backups run nightly.",
+      "b": "Backups are restore-tested nightly.",
+      "why": "taking a backup and proving it restores are different claims, and conflating them is how people lose data"
+    },
+
+    {
+      "id": "sandbox_negation",
+      "category": "contradiction",
+      "same": false,
+      "a": "The gateway runner enforces the sandbox on every tool call.",
+      "b": "The gateway runner does not enforce the sandbox on every tool call.",
+      "why": "negation; bag-of-meaning embedders score these near 1.0 — expected to be an irreducible false positive"
+    },
+    {
+      "id": "refund_negation",
+      "category": "contradiction",
+      "same": false,
+      "a": "Perishable goods can be returned once dispatched.",
+      "b": "Perishable goods cannot be returned once dispatched."
+    },
+    {
+      "id": "audit_negation",
+      "category": "contradiction",
+      "same": false,
+      "a": "The audit chain detects tail truncation.",
+      "b": "The audit chain does not detect tail truncation."
+    },
+
+    {
+      "id": "office_dubai_vs_riyadh",
+      "category": "entity_swap",
+      "same": false,
+      "a": "The Dubai office opens at nine on weekdays.",
+      "b": "The Riyadh office opens at nine on weekdays."
+    },
+    {
+      "id": "engineer_swap",
+      "category": "entity_swap",
+      "same": false,
+      "a": "Priya owns the release checklist.",
+      "b": "Marcus owns the release checklist."
+    },
+    {
+      "id": "db_swap",
+      "category": "entity_swap",
+      "same": false,
+      "a": "Chamber stores beliefs in SQLite.",
+      "b": "Chamber stores beliefs in Postgres."
+    },
+
+    {
+      "id": "refund_30d_vs_14d",
+      "category": "number_swap",
+      "same": false,
+      "a": "The refund policy allows customers to return any purchase within 30 days.",
+      "b": "The refund policy allows customers to return any purchase within 14 days.",
+      "why": "one token apart, opposite claims — the hardest true negative in the set, and the one that bounds how high the threshold must be"
+    },
+    {
+      "id": "retention_90_vs_30",
+      "category": "number_swap",
+      "same": false,
+      "a": "Backups are kept for ninety days.",
+      "b": "Backups are kept for thirty days."
+    },
+    {
+      "id": "opens_nine_vs_ten",
+      "category": "number_swap",
+      "same": false,
+      "a": "The Dubai office opens at nine on weekdays.",
+      "b": "The Dubai office opens at ten on weekdays."
+    },
+
+    {
+      "id": "refund_vs_office",
+      "category": "unrelated",
+      "same": false,
+      "a": "The refund policy allows customers to return any purchase within 30 days.",
+      "b": "The Dubai office opens at nine on weekdays and closes at six.",
+      "why": "the unrelated baseline the original 0.030 came from"
+    },
+    {
+      "id": "sandbox_vs_backup",
+      "category": "unrelated",
+      "same": false,
+      "a": "Tool execution is confined by bubblewrap on every call.",
+      "b": "Backups run nightly and are kept for ninety days."
+    },
+    {
+      "id": "audit_vs_refund",
+      "category": "unrelated",
+      "same": false,
+      "a": "The audit chain is hash-linked from a genesis row.",
+      "b": "Refunds are issued to the original payment method."
+    },
+
+    {
+      "id": "refund_ar_en",
+      "category": "cross_lingual",
+      "same": true,
+      "unmetBy": ["minilm-l6-v2-q"],
+      "unmetWhy": "MiniLM-L6-v2 is English-only; an Arabic restatement lands in the unrelated band. Recorded, not asserted. The fix is a multilingual model calibrated under its own id, not a lower threshold.",
+      "a": "The refund policy allows customers to return any purchase within 30 days.",
+      "b": "تسمح سياسة الاسترجاع للعملاء بإعادة أي مشتريات خلال ثلاثين يوماً."
+    },
+    {
+      "id": "office_ar_en",
+      "category": "cross_lingual",
+      "same": true,
+      "unmetBy": ["minilm-l6-v2-q"],
+      "unmetWhy": "English-only model; see refund_ar_en.",
+      "a": "The Dubai office opens at nine on weekdays.",
+      "b": "يفتح مكتب دبي في التاسعة صباحاً في أيام العمل."
+    },
+    {
+      "id": "refund_ar_ar",
+      "category": "cross_lingual",
+      "same": true,
+      "unmetBy": ["minilm-l6-v2-q"],
+      "unmetWhy": "Both sides Arabic. An English-only tokenizer reduces both to near-unknown tokens, so they may score high for the wrong reason — a coincidence, not comprehension. Recorded so a multilingual model has to earn this properly.",
+      "a": "تسمح سياسة الاسترجاع بإعادة المشتريات خلال ثلاثين يوماً.",
+      "b": "يمكن للعملاء إرجاع ما اشتروه خلال ثلاثين يوماً من الاستلام."
+    },
+
+    {
+      "id": "long_shared_prefix_divergent_tail",
+      "category": "long_form",
+      "same": false,
+      "why": "Both sides share a >256-token prefix and contradict only in the tail. scripts/embed_minilm.py truncates at 256 tokens, so these embed IDENTICALLY and score ~1.0 — the gate blocking on text it never read. No threshold fixes this; the fix is bounding or chunking claim_text at mint time. Present so calibration surfaces it instead of papering over it.",
+      "a": "The operations manual defines the release process in full. Section one covers the change freeze, which begins seventy-two hours before any production deployment and applies to every service in the platform group without exception. Section two covers the approval chain: an engineer opens a change record, a second engineer reviews the diff, the on-call lead signs off, and the release manager schedules the window. Section three covers rollback, which must be demonstrated in staging before the change record can be approved, and which must complete within fifteen minutes of the decision to abort. Section four covers communication, including the customer notice template, the status page update, and the internal announcement that goes to the operations channel one hour before the window opens. Section five covers verification after the window closes, including the smoke suite, the error budget check, and the sign-off that closes the change record. Section six covers exceptions to all of the above, which require written approval from the director of engineering and are reviewed monthly. Section seven records that the retention period for release artefacts is ninety days.",
+      "b": "The operations manual defines the release process in full. Section one covers the change freeze, which begins seventy-two hours before any production deployment and applies to every service in the platform group without exception. Section two covers the approval chain: an engineer opens a change record, a second engineer reviews the diff, the on-call lead signs off, and the release manager schedules the window. Section three covers rollback, which must be demonstrated in staging before the change record can be approved, and which must complete within fifteen minutes of the decision to abort. Section four covers communication, including the customer notice template, the status page update, and the internal announcement that goes to the operations channel one hour before the window opens. Section five covers verification after the window closes, including the smoke suite, the error budget check, and the sign-off that closes the change record. Section six covers exceptions to all of the above, which require written approval from the director of engineering and are reviewed monthly. Section seven records that the retention period for release artefacts is seven days."
+    },
+    {
+      "id": "long_form_true_paraphrase",
+      "category": "long_form",
+      "same": true,
+      "a": "The change freeze begins seventy-two hours before any production deployment and applies to every service in the platform group.",
+      "b": "No production deployment may go out unless the freeze has been in effect for the previous seventy-two hours, and it covers all platform group services."
+    },
+    {
+      "id": "long_form_unrelated",
+      "category": "long_form",
+      "same": false,
+      "a": "The change freeze begins seventy-two hours before any production deployment.",
+      "b": "Release artefacts are retained for ninety days and then deleted."
+    }
+  ]
+}

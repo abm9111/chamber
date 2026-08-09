@@ -100,14 +100,32 @@ function openBlockingDebts(
 }
 
 /**
- * Cosine above which two claims are treated as the same assertion for the
- * purpose of the debt gate. Measured on the probe pair: a genuine paraphrase
- * of one sentence scores ~0.83, an unrelated sentence from the same corpus
- * ~0.03, so the boundary is wide and this sits inside it. It is deliberately
- * nearer the paraphrase than the midpoint: a false positive here refuses a
- * commit and says which debt did it, which an author can see and answer by
- * citing a source, while a false negative is the silent escape this exists to
- * close.
+ * Cosine above which two claims are treated as the same assertion.
+ *
+ * **Measured 2026-08-09 against `fixtures/paraphrase_calibration.json`
+ * (25 pairs) with minilm-l6-v2-q, and the measurement is not flattering.**
+ *
+ * At this threshold: 2 of 5 true paraphrases missed, and 8 of 17
+ * non-restatements blocked. True paraphrases score 0.715–0.917;
+ * non-restatements score 0.082–0.991. Those ranges overlap almost completely,
+ * so **no threshold classifies the set** — the sweep finds no false-positive-free
+ * value anywhere between 0.50 and 0.99.
+ *
+ * What gets wrongly blocked matters more than the count. All three
+ * `number_swap` pairs are blocked, including "within 30 days" against "within
+ * 14 days" at 0.910 — so an operator *correcting* an indebted claim is refused
+ * on the grounds that the correction restates it. Both negations are blocked
+ * too ("enforces" vs "does not enforce", 0.904). Cosine over a bag-of-meaning
+ * embedding cannot distinguish "says the same thing" from "says the opposite
+ * about the same thing", and that distinction is the entire job.
+ *
+ * The number is left at 0.8 deliberately: moving it trades one failure for the
+ * other rather than fixing anything (0.90 catches 1 of 5 paraphrases and still
+ * blocks 4 non-restatements). Re-run `npm run calibrate:paraphrase` before
+ * changing it, and read `docs/KNOWN_LIMITATIONS.md` — the honest conclusion is
+ * that this leg needs a different mechanism, not a better constant.
+ *
+ * The exact-hash leg is unaffected and still blocks verbatim repeats.
  */
 export const DEBT_PARAPHRASE_THRESHOLD = 0.8;
 
@@ -126,8 +144,12 @@ export const DEBT_PARAPHRASE_THRESHOLD = 0.8;
  * with near-paraphrases, contradictions, entity swaps and, for a bilingual
  * corpus, cross-lingual restatements — and record the model id beside it.
  */
-const CALIBRATED_THRESHOLDS: Readonly<Record<string, number>> = {
-  minilm: DEBT_PARAPHRASE_THRESHOLD,
+export const CALIBRATED_THRESHOLDS: Readonly<Record<string, number>> = {
+  // Keyed on the MODEL id, not the EmbedderKind. `kind` is transport: ollama
+  // resolves its model from CHAMBER_OLLAMA_EMBED_MODEL, so a single "ollama"
+  // entry would apply a nomic-calibrated number to mxbai or bge-m3 — the
+  // borrowed-number failure this table exists to prevent, one env var away.
+  "minilm-l6-v2-q": DEBT_PARAPHRASE_THRESHOLD, // measured 2026-08-09, 25 pairs
 };
 
 /**
@@ -140,6 +162,20 @@ const CALIBRATED_THRESHOLDS: Readonly<Record<string, number>> = {
  * did not check.
  */
 const MAX_PARAPHRASE_CANDIDATES = 32;
+
+/**
+ * Longest claim text worth embedding, in characters.
+ *
+ * `scripts/embed_minilm.py` sets `enable_truncation(max_length=256)`, so
+ * anything past roughly a thousand characters of prose is silently dropped
+ * before the vector is produced. Two long claims that agree for their first 256
+ * tokens and contradict afterwards therefore embed to the same point — measured
+ * at 0.991 in `fixtures/paraphrase_calibration.json`. A comparison over text the
+ * model never saw is not a weak signal, it is a fabricated one.
+ *
+ * ~1000 characters is deliberately conservative against a 256-token window.
+ */
+const CLAIM_TEXT_EMBED_LIMIT = 1000;
 
 /**
  * Open blocking debts whose claim says the same thing as `text` in different
@@ -165,7 +201,11 @@ function paraphraseBlockingDebts(
          AND status IN ('pending','proposed_paid')
          AND claim_hash != ?
          AND claim_text IS NOT NULL
-         AND claim_text != ''`,
+         AND claim_text != ''
+       -- Deterministic order, because MAX_PARAPHRASE_CANDIDATES truncates this
+       -- list. Without it the cap took an arbitrary 32 of N and the truncation
+       -- warning described a sample nobody could reproduce.
+       ORDER BY created_at DESC, id DESC`,
     )
     .all(excludeHash) as unknown as { id: string; claim_text: string }[];
   // Nothing open to compare against: the gate had no work, which is not the
@@ -184,11 +224,32 @@ function paraphraseBlockingDebts(
   // down the ledger rather than softening one check. It is the same outcome the
   // `semantic: false` branch below already describes, so it is reported the
   // same way: the check did not run, and the caller is told.
-  const candidates = rows.slice(0, MAX_PARAPHRASE_CANDIDATES);
-  if (rows.length > candidates.length) {
+  // The embedder truncates at 256 tokens (scripts/embed_minilm.py), and
+  // `claim_text` has no length bound in the schema. Two claims sharing a long
+  // prefix and diverging only past the cut embed IDENTICALLY — measured at 0.991
+  // on `long_shared_prefix_divergent_tail` in the calibration set, for two
+  // claims that contradict each other. Comparing text the embedder never read
+  // is worse than not comparing: it produces a confident number about nothing.
+  // Skip those rather than score them.
+  const withinWindow = rows.filter(
+    (r) => r.claim_text.length <= CLAIM_TEXT_EMBED_LIMIT,
+  );
+  if (withinWindow.length < rows.length) {
     console.warn(
-      `chamber: NOTE — ${rows.length} open blocking debts, comparing the first ` +
-        `${candidates.length}. The remainder were not examined by this commit.`,
+      `chamber: NOTE — ${rows.length - withinWindow.length} open debt(s) have ` +
+        `claim text longer than the embedder's window and were not compared. ` +
+        `Their exact-hash block still applies.`,
+    );
+  }
+  const candidates = withinWindow.slice(0, MAX_PARAPHRASE_CANDIDATES);
+  // Measured against the post-window list, not the raw rows: otherwise skipping
+  // an over-long debt made the cap warning claim a truncation that never
+  // happened ("comparing the first 0"), which is its own small lie.
+  if (withinWindow.length > candidates.length) {
+    console.warn(
+      `chamber: NOTE — ${withinWindow.length} comparable open blocking debts, ` +
+        `comparing the first ${candidates.length}. The remainder were not ` +
+        `examined by this commit.`,
     );
   }
 
@@ -209,12 +270,20 @@ function paraphraseBlockingDebts(
   // MiniLM's 0.8 for a model whose unrelated-text baseline sits higher would
   // refuse commits that restate nothing — a false positive in a gate whose
   // whole value is that its refusals are trustworthy.
-  const kind = embeds[0]!.kind;
-  const threshold = CALIBRATED_THRESHOLDS[kind];
+  const model = embeds[0]!.model;
+  if (embeds.some((e) => e.model !== model)) {
+    console.warn(
+      "chamber: NOTE — the embedding batch mixed models; the semantic debt " +
+        "check did not run rather than compare vectors from different spaces.",
+    );
+    return { debts: [], semantic: false, attempted: true };
+  }
+  const threshold = CALIBRATED_THRESHOLDS[model];
   if (threshold === undefined) {
     console.warn(
-      `chamber: NOTE — no calibrated paraphrase threshold for embedder "${kind}"; ` +
-        `the semantic debt check did not run. Measure one before relying on it.`,
+      `chamber: NOTE — no calibrated paraphrase threshold for model "${model}"; ` +
+        `the semantic debt check did not run. Run \`npm run calibrate:paraphrase\` ` +
+        `and record one before relying on it.`,
     );
     return { debts: [], semantic: false, attempted: true };
   }

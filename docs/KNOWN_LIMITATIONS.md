@@ -512,9 +512,9 @@ disagree in *negation polarity*. Either is evidence they are not the same claim,
 and the block is dropped.
 
 Measured on the same 25 pairs, at the same 0.80: **false positives fall from 8
-to 3, and no true paraphrase is suppressed.** Every number swap and every
-negation stops being treated as a restatement, so the case that opened this
-section — an operator refused for correcting an indebted claim — no longer
+to 3 (4 on linux/x64), and no true paraphrase is suppressed.** Every number swap
+and every negation stops being treated as a restatement, so the case that opened
+this section — an operator refused for correcting an indebted claim — no longer
 happens. `npm run calibrate:paraphrase` prints both columns, because only one of
 them is good news and a report showing the improvement without its cost would be
 advocacy.
@@ -544,9 +544,25 @@ same fixture. `audit_negation` scores 0.797 locally — three thousandths under
 the threshold — and lands on the other side under a different onnxruntime build.
 Which side a pair falls on is decided by the BLAS kernel rather than by meaning,
 which is about as clear a statement as one could want that 0.8 is not a
-calibrated boundary. The suppressor incidentally settles this one: that pair is
-a negation, so it is dropped on both architectures and its coin-flip no longer
+calibrated boundary. The suppressor settles that particular pair — it is a
+negation, so it is dropped on both architectures and its coin-flip no longer
 reaches a verdict.
+
+It does not settle the underlying problem, and running the suppressed set on
+both platforms made that clearer. Reproduced in Docker rather than inferred:
+three separate pairs sit within a hundredth of 0.80, and at least two cross it
+between architectures — `office_dubai_vs_riyadh` at 0.794 on darwin and 0.804 on
+linux, `backup_taken_vs_tested` at 0.814 and 0.807. So it was never one unlucky
+pair. The threshold runs through a crowded part of the distribution, which is
+what an uncalibrated boundary looks like from the inside, and both test bounds
+are written to cover both architectures so the suite measures regressions rather
+than hardware.
+
+The entity swap in that list suggests the obvious next extension — a
+proper-noun conflict check, by analogy with the numeric one. It is not
+implemented, and it is not a small decision: paraphrases legitimately drop and
+add names ("the Dubai office" / "our office"), so the false-suppression risk is
+far higher than for digits. It would need its own measurement before shipping.
 
 Two smaller findings from the same run, both now handled in code:
 

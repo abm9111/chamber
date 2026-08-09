@@ -1186,13 +1186,23 @@ test("gates", "the shipped threshold has not drifted from its measurement", () =
   // straddles the threshold between architectures, but it is suppressed on both,
   // so its coin-flip no longer reaches the verdict.
   //
-  // The 3 that remain are the ones this mechanism cannot see: disagreement that
-  // is neither numeric nor negated ("opens at nine" vs "closes at nine"), and a
-  // long-form pair the embedder truncates. The real gate never scores that last
-  // one — CLAIM_TEXT_EMBED_LIMIT skips it — so the shipped false-positive count
-  // is lower still than this test can measure.
+  // The ones that remain are the disagreements this mechanism cannot see:
+  // "opens at nine" vs "closes at nine" (0.880, same number, no negation),
+  // "backups run nightly" vs "backups are restore-tested nightly", an entity
+  // swap, and a long-form pair the embedder truncates. The real gate never
+  // scores that last one — CLAIM_TEXT_EMBED_LIMIT skips it — so the shipped
+  // false-positive count is lower still than this test can measure.
+  //
+  // The bound is 4, not 3, for the same reason the raw bound is 9 and not 8, and
+  // the reason is now better evidenced than it was. Measured: darwin/arm64 3,
+  // linux/x64 4 — reproduced in Docker, not inferred. Three separate pairs sit
+  // within a hundredth of the threshold and at least two cross it between
+  // architectures (`office_dubai_vs_riyadh` 0.794 vs 0.804,
+  // `backup_taken_vs_tested` 0.814 vs 0.807). It is not one unlucky pair; 0.80
+  // runs through a crowded part of the distribution, which is what a threshold
+  // that was never calibrated looks like from the inside.
   assert(fnNet <= 2, `false negatives rose to ${fnNet} with the suppressor (was 2 of 5)`);
-  assert(fpNet <= 3, `false positives rose to ${fpNet} with the suppressor (was 3 of 17)`);
+  assert(fpNet <= 4, `false positives rose to ${fpNet} with the suppressor (3 on darwin, 4 on linux, of 17)`);
 });
 
 /**

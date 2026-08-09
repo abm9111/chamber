@@ -18,7 +18,13 @@ npm ci && node --experimental-strip-types src/cli.ts try
 
 No config, no database, no model, no network. It builds a throwaway workspace,
 runs the real code paths against it, and deletes it (`--keep` to look around).
-Everything below is that command's actual output, trimmed:
+
+![chamber try](assets/chamber-try.gif)
+
+That recording is scripted from [`assets/demo.tape`](assets/demo.tape) rather
+than hand-captured, so it is regenerated when the output changes instead of
+quietly showing a version of Chamber that no longer exists. Everything below is
+the same command's actual output, trimmed:
 
 ```
 $ chamber believe belief "Customers may return any purchase within 30 days of delivery."

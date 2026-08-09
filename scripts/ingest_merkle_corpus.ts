@@ -7,7 +7,7 @@
 
 import { openChamberDb } from "../src/db.ts";
 import { upsertDocument, searchVector, countDocuments } from "../src/vector.ts";
-import { embedLocal, minilmAvailable, MINILM_MODEL } from "../src/embedder.ts";
+import { minilmAvailable, MINILM_MODEL } from "../src/embedder.ts";
 
 interface Doc {
   id: string;

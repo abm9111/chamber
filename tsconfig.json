@@ -20,6 +20,6 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "probes/**/*.ts"],
+  "include": ["src/**/*.ts", "tests/**/*.ts", "probes/**/*.ts", "demos/**/*.ts", "scripts/**/*.ts"],
   "exclude": ["node_modules", "vendor", "models"]
 }

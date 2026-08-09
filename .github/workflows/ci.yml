@@ -91,3 +91,9 @@ jobs:
       # fails this step. `npm run probes` deliberately excludes it, because on a
       # machine with no isolating backend it could only ever fail.
       - run: npm run probes:isolation
+      # The demos are the narrative the README quotes, so they run here rather
+      # than in `test`: this is the only job with a bubblewrap that confines, so
+      # demos/04 exercises the branch where the payload RUNS and is contained.
+      # Everywhere else it can only show the refusal. A demo that drifts from
+      # what the tool does is worse than no demo, so a failure is a red build.
+      - run: npm run demos

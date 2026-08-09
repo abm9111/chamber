@@ -7,50 +7,93 @@ already trusted.
 Zero runtime dependencies. Everything is `node:sqlite` and files on your disk.
 No account, no cloud call unless you point it at one.
 
-## What it actually does
-
-```
-$ chamber ask "should we lead with cite-or-refuse or drift detection?"
-
-According to the research note, lead with **cite-or-refuse**, treating
-drift detection as a secondary feature.
-
-  * The decision section states "Lead with cite-or-refuse" [3]
-  * Drift is "the quiet differentiator that earns attention" once trusted [3]
-
-  [UNSUPPORTED] According to the research note, lead with cite-or-refuse…
-  [ALLOWED]     The decision section states "Lead with cite-or-refuse…
-     sources: research/2026-08-04__x-demand.md#p5
-  [ALLOWED]     Drift is "the quiet differentiator that earns attention…
-     sources: research/2026-08-04__x-demand.md#p5
-```
-
-Every line is judged on its own citations. The opening summary carries none, so
-it is marked `UNSUPPORTED` — recorded, but not treated as load-bearing. The
-model is shown `[1]`…`[k]` and never a document id or a hash, so it cannot
-fabricate a citation even in principle.
-
-Months later:
-
-```
-$ chamber verify
-
-blf_50c26c3b  1/3 pins verified
-  "All three product lines hit their Q3 numbers."
-  hash_mismatch: committed against ops.md#p0, which now holds something else
-
-1 belief(s) checked, 0 with no verified support left, 1 with some support lost
-```
-
-Exit code is non-zero, so a scheduled job can act on it. The conclusion did not
-change; the ground under it did.
-
-## Quickstart
+## See it in two minutes
 
 Requires Node **23.6+** — Chamber runs TypeScript directly, with no build step.
 
 ```bash
 git clone <this repo> chamber && cd chamber
+npm ci && node --experimental-strip-types src/cli.ts try
+```
+
+No config, no database, no model, no network. It builds a throwaway workspace,
+runs the real code paths against it, and deletes it (`--keep` to look around).
+Everything below is that command's actual output, trimmed:
+
+```
+$ chamber believe belief "Customers may return any purchase within 30 days of delivery."
+  committed blf_ddcf4f3c9b2e81b8
+  an unsourced assertion is not refused — it mints citation debt.
+
+$ chamber debts
+  dbt_18bd1c1171cdbfcb  [pending]
+
+$ chamber pay-debt
+  proposed 2 source(s), 2 pinned; best=0.694
+
+$ chamber verify
+  blf_ddcf4f3c9b2e81b8  2/2 pins verified
+```
+
+That is the ordinary state: a belief standing on evidence that still holds. Then
+someone edits the note it was built on — `30 days` becomes `14 days`:
+
+```
+$ chamber ingest ./notes
+  ingested 2 file(s) as 4 passage(s)
+
+$ chamber verify
+  blf_ddcf4f3c9b2e81b8  1/2 pins verified
+    hash_mismatch: refunds.md#p0
+```
+
+Nobody asked it to re-examine that belief. The conclusion did not change; the
+ground under it did, and the exit code is non-zero, so a scheduled job can act
+on it. That is the whole product.
+
+Four more scenarios — a rolled-back ledger caught by an outside anchor, a
+sandbox that refuses rather than degrade, a hostile tool catalogue rejected —
+are in [`demos/`](demos/), and run in CI so they cannot drift from the code.
+
+## Answers that cite their sources
+
+With a model configured, `chamber ask` judges every sentence on its own
+citations. Against the same two sample notes, on a local 30B:
+
+```
+$ chamber ask "summarise our refund policy"
+
+Customers may return any purchase within 30 days of delivery [2]. Refunds
+are issued to the original payment method, usually within five working days
+of the returned item arriving at the warehouse [2]. However, perishable goods
+and personalised items cannot be returned once dispatched [1].
+
+  [ALLOWED] Customers may return any purchase within 30 days of delivery [2]. Refu
+     sources: refunds.md#p0 — refunds › Refund policy, refunds.md#p1 — refunds › Refund policy › Exceptions
+```
+
+The model is shown `[1]`…`[k]` and never a document id or a hash, so it cannot
+fabricate a citation even in principle — the numbers are resolved back to files
+after the answer is written. A sentence that cites nothing is marked
+`UNSUPPORTED`: recorded, but not treated as load-bearing.
+
+Asking something the corpus cannot answer is the more important case:
+
+```
+$ chamber ask "what should a customer do if they want to return a perishable
+               item after the office has closed?"
+
+I don't know
+
+  [APORIA] I don't know
+```
+
+Both notes are in the index and both are relevant. Neither answers the
+question, so nothing is composed from the pieces.
+
+## Pointing it at your own notes
+
+```bash
 npm link                 # puts `chamber` on your PATH
 chamber init             # writes ~/.config/chamber/config.json
 ```
@@ -135,9 +178,14 @@ source and misread it, and every layer here will pass it. That is a stated
 non-goal, it has been observed happening, and it is not solved.
 
 Read [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) before trusting
-any output. Fifteen limitations are documented there, including two that are
-unflattering: the sandbox does not isolate, and citation debt blocks a verbatim
-repeat but not a paraphrase.
+any output. Seventeen limitations are documented there, including the two least
+flattering. The sandbox confines only where bubblewrap works — Linux with
+unprivileged user namespaces — and refuses to run anything anywhere else, which
+is safe but is not the same as working. And citation debt blocks a verbatim
+repeat reliably, while the paraphrase leg over it is a measured failure:
+calibration found no threshold that separates a restatement from a
+contradiction, so at the shipped setting it blocks every number swap and every
+negation, including an operator's correction of the very claim in debt.
 
 ## The invariant
 
@@ -182,6 +230,7 @@ src/audit.ts            hash-chained log + incremental Merkle
 src/config.ts           settings: flag → env → config file → default
 src/db.ts               opens the database, loads every schema
 probes/                 adversarial probes, run by npm run probes
+demos/                  the four scenarios above, run in CI so they cannot rot
 docs/KNOWN_LIMITATIONS.md   what does not work, and what it costs
 ```
 

@@ -362,7 +362,14 @@ states the path nowhere.
 **What would fix it.** Have `verify` print the resolved database path, and have the job
 echo verify's exit status after it returns. Unplanned.
 
-## 14. Citation debt blocks verbatim repetition only — a paraphrase escapes
+## 14. Citation debt is keyed on exact text; the paraphrase leg over it is weak
+
+**Status, 2026-08-09.** A semantic leg was added after this entry was written, so
+a paraphrase no longer escapes unconditionally. It is not a fix: the two sections
+at the end of this document measure it and record where it fails. Read them
+together with this one — this entry explains the mechanism, they explain what the
+addition is actually worth. The description below is of the exact-hash leg, which
+is unchanged and remains the reliable half.
 
 The debt gate's blocking condition is keyed on `claim_hash`, and
 `claimHash(type, text)` is sha256 over the exact claim text after whitespace

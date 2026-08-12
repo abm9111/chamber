@@ -54,6 +54,7 @@ import {
 import {
   verifyPin,
   verifyBeliefSources,
+  countUnsourcedBeliefs,
   CITABLE_SOURCE_KINDS,
 } from "../src/pins.ts";
 import { runAsk, citedIndices } from "../src/ask.ts";
@@ -7073,6 +7074,57 @@ test("pins", "citedIndices dedupes, preserves order, and ignores non-citations",
 // The tests below are the ones that actually exercise the point of Task 7 —
 // time passing, the corpus moving, and a stored pin no longer matching. No
 // test in this section may call a live model; every completion is injected.
+
+test(
+  "pins",
+  "verify's checked-set complement is countable: unsourced beliefs are outside scope, and say so",
+  async () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-unsourced-"));
+    writeFileSync(join(dir, "policy.md"), "Retention policy is 90 days.\n");
+    ingestDirectory(db, dir);
+
+    // One belief WITH a source, via the same injected-completion path the
+    // drift test above uses — so the checked set is non-empty and the count
+    // below cannot pass vacuously.
+    const fake = async () => "Retention policy is 90 days. [1]";
+    await runAsk(db, "what is the retention policy", { complete: fake });
+
+    // One retraction-type belief, which commits freely and mints no sources:
+    // exactly the row an operator saw missing from "N checked" and had to
+    // reverse-engineer with SQL. Its absence from verify is by design; its
+    // absence from the *summary* was the defect in the operator's model.
+    const r = commitBelief(db, {
+      type: "unknown",
+      text: "we lack warrant on retention exceptions",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    assert(r.ok, `unknown-type belief should commit freely: ${JSON.stringify(r)}`);
+
+    const checked = verifyBeliefSources(db);
+    assert(
+      checked.some((b) => b.total > 0),
+      "setup failed: no sourced belief in the checked set",
+    );
+    assert(
+      !checked.some((b) => b.content.includes("lack warrant")),
+      "unsourced belief must not appear in verify's checked set",
+    );
+
+    const unsourced = countUnsourcedBeliefs(db);
+    assert(
+      unsourced === 1,
+      `expected exactly the one unsourced belief, got ${unsourced}`,
+    );
+
+    // The count must honor the same --since filter as the checked set, or the
+    // two numbers printed on one summary line describe different populations.
+    const none = countUnsourcedBeliefs(db, { since: "2999-01-01" });
+    assert(none === 0, `--since in the future should exclude it, got ${none}`);
+  },
+);
 
 test(
   "pins",

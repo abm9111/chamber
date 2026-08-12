@@ -372,3 +372,35 @@ export function verifyBeliefSources(
   }
   return [...byBelief.values()];
 }
+
+/**
+ * The complement of verifyBeliefSources's checked set: beliefs with no
+ * belief_source rows at all. Retraction types (`unknown`, `defeater`) commit
+ * freely without sources, and an assertion that minted citation debt has
+ * nothing pinned yet — none of them can drift, so verify correctly never
+ * visits them.
+ *
+ * Correctly excluded is not the same as visibly excluded. "17 belief(s)
+ * checked" over a database holding 29 read as full coverage to the operator,
+ * who then spent a morning proving the missing twelve were a design decision
+ * and not a silent skip — with SQL, because the summary would not say it.
+ * This count exists so the summary can.
+ *
+ * Takes the same `since` filter as verifyBeliefSources: the two numbers share
+ * a summary line, so they must describe the same population or the line is
+ * quietly comparing different corpora.
+ */
+export function countUnsourcedBeliefs(
+  db: DatabaseSync,
+  opts: { since?: string } = {},
+): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS c
+         FROM belief b
+        WHERE NOT EXISTS (SELECT 1 FROM belief_source s WHERE s.belief_id = b.id)
+          AND (? IS NULL OR b.created_at >= ?)`,
+    )
+    .get(opts.since ?? null, opts.since ?? null) as { c: number };
+  return row.c;
+}

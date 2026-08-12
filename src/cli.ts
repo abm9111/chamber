@@ -57,7 +57,7 @@ import {
 import { completeSync, syncCompletionAvailable } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { runAsk } from "./ask.ts";
-import { verifyBeliefSources } from "./pins.ts";
+import { verifyBeliefSources, countUnsourcedBeliefs } from "./pins.ts";
 import { runExpiryJob } from "./expiry.ts";
 import { indexCodeTree, searchCode } from "./code_index.ts";
 import {
@@ -1411,6 +1411,19 @@ async function main(): Promise<void> {
         `\n${report.length} belief(s) checked, ${broken} with no verified support left` +
           `, ${degraded} with some support lost`,
       );
+      // "N checked" against a larger belief table reads as a silent skip
+      // until the complement is named — an operator reverse-engineered the
+      // gap with SQL before this line existed. Zero stays silent: on a fully
+      // sourced database there is no gap to explain. The excluded rows are
+      // retraction types and debt-carrying assertions — nothing pinned, so
+      // nothing that can drift.
+      const unsourced = countUnsourcedBeliefs(db, { since });
+      if (unsourced > 0) {
+        console.log(
+          `${unsourced} belief(s) without sources — outside verify's scope ` +
+            `(retraction types and unsourced assertions have no pins to check)`,
+        );
+      }
       if (broken + degraded > 0) process.exitCode = 1;
       break;
     }

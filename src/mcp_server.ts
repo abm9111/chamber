@@ -71,7 +71,7 @@ console.info = console.error;
 console.debug = console.error;
 
 const SERVER_NAME = "chamber";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.1.1";
 const DEFAULT_PROTOCOL = "2025-06-18";
 
 interface JsonRpcRequest {

@@ -165,6 +165,18 @@ check you stop reading, so it stays quiet until it isn't.
 `chamber_verify`, `chamber_corpus` — so a host like Claude Code can query your
 corpus and see the per-claim citation verdicts rather than just the prose.
 
+From the npm package, the server is one subcommand:
+
+```bash
+claude mcp add -s user chamber \
+  -e CHAMBER_PYTHON=/path/to/python-with-onnxruntime \
+  -- npx -y @bu7umaid/chamber mcp
+```
+
+That form works when the host's spawn environment can resolve a Node 23.6+
+`npx`. When it cannot — and MCP hosts often spawn with a minimal `PATH` — name
+the interpreters absolutely:
+
 ```bash
 claude mcp add -s user chamber \
   -e CHAMBER_PYTHON=/path/to/python-with-onnxruntime \
@@ -245,9 +257,11 @@ npm run typecheck
 npm run probes  # adversarial probes; each one asserts a defect is absent
 ```
 
-`npm run probes` **is expected to fail today.** Two probes report real, open
-defects — `sandbox_escape` and `debt_paraphrase` — and they are wired in
-deliberately. A gate that cannot fail reports safety it never checked.
+`npm run probes` passes today, and that statement is dated the moment it is
+written — run it rather than trust it. Two of these probes (`sandbox_escape`,
+`debt_paraphrase`) spent weeks red against real, open defects before their
+fixes landed, and they are wired in as gates precisely because they can go red
+again. A gate that cannot fail reports safety it never checked.
 
 ## Layout
 

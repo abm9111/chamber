@@ -866,6 +866,7 @@ Usage:
   chamber turn "<message>"     Run one gated turn (stub model)
   chamber status               Spend + queue + counts
   chamber queue                List pending writes
+  chamber mcp                  Serve chamber_ask/verify/corpus over stdio (MCP)
   chamber approve <writeId>    Human-approve + apply
   chamber reject  <writeId>    Human-reject
   chamber believe <type> <text>
@@ -954,6 +955,17 @@ async function main(): Promise<void> {
     // Before loadConfig()/open(), exactly like `init` and `config`: the whole
     // point is that it runs on a machine with no config and no database.
     process.exitCode = runTry({ keep: rest.includes("--keep") });
+    return;
+  }
+
+  if (cmd === "mcp") {
+    // Also before loadConfig()/open(): the MCP server resolves config itself
+    // on its first tool call, and directory checkers introspect it on
+    // machines with no config or database at all. Anything printed to stdout
+    // here would corrupt the JSON-RPC stream, which is why this hands over
+    // stdio bare. The import attaches the server's stdin listeners, and they
+    // keep the process alive after main() returns.
+    await import("./mcp_server.ts");
     return;
   }
 

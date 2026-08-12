@@ -1,5 +1,5 @@
 {
-  "name": "@abm9111/chamber",
+  "name": "@bu7umaid/chamber",
   "version": "0.1.0",
   "type": "module",
   "description": "Ask questions about your own notes and get answers that cite their sources — then get told when a source changed underneath a conclusion. Local-first CLI + MCP server, zero runtime dependencies.",

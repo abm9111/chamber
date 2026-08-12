@@ -1,12 +1,42 @@
 {
-  "name": "chamber",
+  "name": "@abm9111/chamber",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
-  "description": "Chamber week-1 kernel \u2014 governable cognition gates",
-  "bin": {
-    "chamber": "src/cli.ts"
+  "description": "Ask questions about your own notes and get answers that cite their sources — then get told when a source changed underneath a conclusion. Local-first CLI + MCP server, zero runtime dependencies.",
+  "license": "MIT",
+  "mcpName": "io.github.abm9111/chamber",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abm9111/chamber.git"
   },
+  "homepage": "https://github.com/abm9111/chamber#readme",
+  "bugs": {
+    "url": "https://github.com/abm9111/chamber/issues"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "notes",
+    "obsidian",
+    "citations",
+    "provenance",
+    "local-first",
+    "rag",
+    "sqlite",
+    "knowledge-management",
+    "drift-detection"
+  ],
+  "bin": {
+    "chamber": "bin/chamber.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "sql/",
+    "scripts/",
+    "deploy/",
+    "docs/KNOWN_LIMITATIONS.md"
+  ],
   "scripts": {
     "test": "node --experimental-strip-types tests/harness.ts",
     "typecheck": "tsc --noEmit",

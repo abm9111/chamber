@@ -19,7 +19,7 @@ npm ci && node --experimental-strip-types src/cli.ts try
 No config, no database, no model, no network. It builds a throwaway workspace,
 runs the real code paths against it, and deletes it (`--keep` to look around).
 
-![chamber try](assets/chamber-try.gif)
+![chamber try](https://raw.githubusercontent.com/abm9111/chamber/main/assets/chamber-try.gif)
 
 That recording is scripted from [`assets/demo.tape`](assets/demo.tape) rather
 than hand-captured, so it is regenerated when the output changes instead of

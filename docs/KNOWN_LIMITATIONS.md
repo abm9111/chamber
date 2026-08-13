@@ -100,6 +100,17 @@ citation says it says," never as "this claim is true."
 
 ## 3. Checkpoints are manual, unsigned, and land in `/tmp`
 
+> **Correction, 2026-08-13.** Two of this entry's three claims have since been closed
+> in code and one was closed in deploy: `src/checkpoint_export.ts` now generates an
+> ed25519 keypair and signs receipts, the default output path is config-resolved
+> rather than `/tmp`, and `deploy/launchd/com.chamber.daily-snapshot.plist` runs the
+> export on a schedule. What still stands is the ceiling the last paragraph names:
+> the anchor log lives on the same disk as the operator, so this is
+> tamper-evidence against corruption and casual edits, not against an attacker
+> with full write access to the machine. A limitations doc that overstates a
+> weakness costs credibility in the same coin as one that hides it, so the
+> original text stays below, dated, rather than silently rewritten.
+
 `chamber checkpoint` writes a Merkle receipt over the audit chain. Three things limit
 what that receipt is worth. It is never invoked automatically — no cron entry, no
 launchd job, no queue kind calls it, and `maybeAutoCheckpoint` (`src/merkle.ts:388`) has
@@ -175,6 +186,13 @@ covers this; it is unplanned work.
 
 ## 6. A shrunk note reports its tail citations as `not_found`
 
+> **Correction, 2026-08-13.** The content-addressed fallback this entry says is
+> missing now exists: `verifyPin` takes `allowRelocation` and does an indexed
+> `snapshot_hash` lookup when the id misses, and `verifyBeliefSources` passes it
+> for drift reporting (never for granting support at commit — that distinction is
+> what `probes/pin_bypass.ts` guards). A moved-not-gone passage is reported as
+> relocated rather than `not_found`. The original text stays below, dated.
+
 When a note is edited down to fewer passages, ingest correctly deletes the orphaned tail
 rows. A belief that pinned one of those rows then fails verification with reason
 `not_found` (`src/pins.ts:173`), because lookup is by document id and that id no longer
@@ -195,6 +213,20 @@ report a distinct reason — the content is unchanged, only its position moved. 
 needed for this already exists. Unplanned.
 
 ## 7. Per-tool MCP drift detection does not exist
+
+> **Correction, 2026-08-13.** This entry's central claim was wrong, and wrong in
+> the direction this document keeps being wrong: overstating the weakness. A
+> same-roster rewrite of one tool's description or schema was ALWAYS caught,
+> because `hashToolsList` hashes every tool's name, description and inputSchema
+> into the whole-list hash — the harness test that mutates one description and
+> asserts drift has passed since the pin landed. What was true: the failure was
+> anonymous (`list_drift`, no tool named), the per-tool columns were written and
+> never read, and the declared `tool_drift` reason never fired. As of today
+> `verifyToolsAgainstPin` reads the per-tool pins and splits the diagnosis:
+> roster changes report `list_drift` naming what was added/removed; a
+> byte-identical roster whose tool content moved reports `tool_drift` naming
+> each drifted tool and whether its description or schema changed. The original
+> text stays below, dated.
 
 `mcp_tool_pin` stores a `schema_hash` and a `description_hash` for every tool an MCP
 server declares (`sql/schema_mcp_pin.sql:14-15`). They are written by `pinToolsList`

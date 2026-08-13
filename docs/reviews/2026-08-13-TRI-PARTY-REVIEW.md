@@ -60,6 +60,17 @@ facts.
   stored, and a description rewrite is the attack that historically worked.
   One-day close of KL entry 7, and a possible standalone story (pin your MCP
   supply chain).
+  > **Correction, 2026-08-13 (post-implementation).** The "invisible" half of
+  > this finding — and the ✔ this orchestrator put on it — was wrong:
+  > `hashToolsList` hashes every tool's description and schema into the
+  > whole-list hash, so the same-roster rewrite was always *detected*, only
+  > diagnosed anonymously as `list_drift`. The error originated in
+  > KNOWN_LIMITATIONS entry 7 itself, which the cold reviewer reasonably
+  > trusted and this orchestrator's single-occurrence grep did not test
+  > deeply enough to catch. The declared-never-constructed half stands, and
+  > the fix shipped as precision, not detection: roster vs content split,
+  > drifted tools named with facet. Third documented case of the honesty doc
+  > overstating a weakness.
 - **Claude:** KNOWN_LIMITATIONS entries 3 and 6 are stale against the code
   (ed25519 signing exists ✔; snapshot-hash relocation exists ✔) — the honesty
   doc now *overstates* weaknesses, which costs credibility in the other

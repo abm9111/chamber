@@ -7077,6 +7077,87 @@ test("pins", "citedIndices dedupes, preserves order, and ignores non-citations",
 
 test(
   "pins",
+  "ingest embeds each file's passages through one batch call, not one spawn per passage",
+  () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-batch-embed-"));
+    writeFileSync(
+      join(dir, "a.md"),
+      "# A\n\nfirst passage body\n\n## A2\n\nsecond passage body\n",
+    );
+    writeFileSync(join(dir, "b.md"), "# B\n\nonly passage\n");
+
+    const calls: string[][] = [];
+    const report = ingestDirectory(db, dir, {
+      embedBatch: (texts) => {
+        calls.push(texts);
+        return texts.map(() => ({
+          vector: new Float32Array(8).fill(0.5),
+          model: "test-batch-v1",
+          dims: 8,
+          kind: "hash" as const,
+        }));
+      },
+    });
+
+    assert(report.ingested === 2, `expected 2 files, got ${report.ingested}`);
+    assert(
+      calls.length === 2,
+      `expected one batch call per file, got ${calls.length}`,
+    );
+    assert(
+      calls.reduce((n, c) => n + c.length, 0) === report.passages,
+      "every passage body must go through the batch",
+    );
+    const models = db
+      .prepare(`SELECT DISTINCT model FROM vector_embedding`)
+      .all() as { model: string }[];
+    assert(
+      models.length === 1 && models[0]!.model === "test-batch-v1",
+      `all embeddings must carry the batch model, got ${JSON.stringify(models)}`,
+    );
+    assert(
+      report.embedFallback === undefined,
+      "a healthy batch run must not report a fallback",
+    );
+  },
+);
+
+test(
+  "pins",
+  "a throwing batch embedder falls back to the per-passage path, loudly and completely",
+  () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-batch-throw-"));
+    writeFileSync(join(dir, "a.md"), "# A\n\nfirst\n\n## A2\n\nsecond\n");
+
+    const report = ingestDirectory(db, dir, {
+      embedBatch: () => {
+        // The batch path THROWS where the singular path degrades — the
+        // documented divergence (CLAUDE.md). Ingest must translate the throw
+        // into the singular path's semantics, not die and not go half-batched.
+        throw new Error("spawn failed: python is a shell script today");
+      },
+    });
+
+    assert(report.ingested === 1, `file must still ingest, got ${report.ingested}`);
+    const embedded = db
+      .prepare(`SELECT COUNT(*) AS c FROM vector_embedding`)
+      .get() as { c: number };
+    assert(
+      embedded.c === report.passages && report.passages > 0,
+      `every passage must still get an embedding via fallback: ${embedded.c}/${report.passages}`,
+    );
+    assert(
+      typeof report.embedFallback === "string" &&
+        report.embedFallback.includes("python is a shell script"),
+      `the fallback must be reported with the original error, got ${report.embedFallback}`,
+    );
+  },
+);
+
+test(
+  "pins",
   "verify's checked-set complement is countable: unsourced beliefs are outside scope, and say so",
   async () => {
     const db = freshDb();

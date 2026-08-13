@@ -23,6 +23,7 @@ import {
 } from "node:fs";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { deleteDocument, upsertDocument } from "./vector.ts";
+import { embedLocalBatch, type EmbedResult } from "./embedder.ts";
 import { passagePathOf, passageSourceRef, splitPassages } from "./chunk.ts";
 
 /**
@@ -106,6 +107,15 @@ export interface IngestReport {
    */
   abortKind?: "invalid_exclude" | "unmatched_exclude";
   abortReason?: string;
+  /**
+   * Set when the batch embedder threw and the run fell back to the
+   * per-passage path. The corpus is still fully embedded — the singular path
+   * degrades per passage instead of throwing (the documented batch/singular
+   * divergence) — it was just embedded the slow way. One message for the
+   * whole run, the first failure's: per-file repeats are seven hundred
+   * copies of the same broken python.
+   */
+  embedFallback?: string;
 }
 
 export interface IngestOptions {
@@ -117,6 +127,12 @@ export interface IngestOptions {
    * Default true — see the abort in `ingestDirectory`.
    */
   requireExcludeMatch?: boolean;
+  /**
+   * Batch embedder for a file's passages; defaults to `embedLocalBatch`.
+   * Exists as an option so tests can observe the batching contract without an
+   * onnxruntime install — production callers should not pass it.
+   */
+  embedBatch?: (texts: string[]) => EmbedResult[];
 }
 
 /**
@@ -737,8 +753,34 @@ export function ingestDirectory(
     }
 
     const docTitle = title ?? stripMarkdownExt(path);
+
+    // One batch call per file instead of one embedder spawn per passage —
+    // the "single largest performance win available in the ingest path" per
+    // KNOWN_LIMITATIONS entry 15 (~158 ms/spawn × 28k passages ≈ 75 minutes).
+    // The batch path THROWS where the per-passage path degrades to hash
+    // vectors; on throw this run falls back to the per-passage path for this
+    // file — whole-file, never half-batched, so a corpus can not end up with
+    // half its passages in one embedding space and half in another — and the
+    // report says so once (`embedFallback`). Positional correspondence is by
+    // array order: bodies are mapped from `passages` and consumed by the same
+    // array's loop below, so `p.index` semantics never enter into it.
+    let embeds: EmbedResult[] | undefined;
+    try {
+      const batch = (opts.embedBatch ?? embedLocalBatch)(
+        passages.map((p) => p.body),
+      );
+      // A short batch would silently shift every later passage into the
+      // wrong vector; treat it as the failure it is.
+      embeds = batch.length === passages.length ? batch : undefined;
+      if (!embeds) throw new Error(`batch returned ${batch.length} vectors for ${passages.length} passages`);
+    } catch (err) {
+      embeds = undefined;
+      report.embedFallback ??= errText(err);
+    }
+
     const writtenIds = new Set<string>();
-    for (const p of passages) {
+    for (let i = 0; i < passages.length; i++) {
+      const p = passages[i]!;
       const sourceRef = passageSourceRef(path, p.index);
       const doc = upsertDocument(db, {
         id: idByRef.get(sourceRef),
@@ -751,6 +793,9 @@ export function ingestDirectory(
         title: passageTitle(docTitle, p.headings),
         body: p.body,
         metadata: { ingestRoot: root },
+        ...(embeds
+          ? { embedding: embeds[i]!.vector, model: embeds[i]!.model }
+          : {}),
       });
       report.passages += 1;
       report.documentIds.push(doc.id);

@@ -1095,6 +1095,15 @@ async function main(): Promise<void> {
         console.log(
           `ingested ${r.ingested} file(s) as ${r.passages} passage(s) from ${path}`,
         );
+        // stderr, not stdout: a scheduled run greps its log for surprises, and
+        // "the fast path silently became the slow path" is one. The corpus is
+        // still fully embedded — the per-passage path degrades instead of
+        // throwing — so this is a warning, not a failure.
+        if (r.embedFallback) {
+          console.error(
+            `  [embed_fallback] batch embedder failed; fell back to per-passage embedding: ${r.embedFallback}`,
+          );
+        }
         // A shrunken note's stale passages are deleted rather than left to keep
         // answering from content the note no longer holds. That is a corpus
         // deletion, so it is reported rather than done quietly.

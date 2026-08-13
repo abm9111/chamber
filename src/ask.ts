@@ -17,6 +17,7 @@ import {
   searchVector,
   countDocuments,
   lexicalQueryNotices,
+  rareQueryTokens,
   type LexicalOptions,
   type LexicalSearchError,
 } from "./vector.ts";
@@ -232,6 +233,79 @@ function joinNotes(...parts: (string | undefined)[]): string | undefined {
 }
 
 /**
+ * The retrieval-miss disclosure: an answer formed over the wrong passages is
+ * indistinguishable from a right one — every claim can verify individually
+ * while the passage that actually answers the question was never shown. That
+ * is the lived failure this probe exists for, and it is the "green suite over
+ * a broken gate" pattern reproduced at the retrieval layer.
+ *
+ * One extra `searchVector` call, only when the question contains rare terms
+ * (df ≤ the ask's own k — see `rareQueryTokens` for why that ceiling is not a
+ * magic number), in require mode so only passages actually containing a rare
+ * term return. Any hit the model was not shown is named next to the answer.
+ * Worded as "not among the passages shown", never "your answer is wrong" —
+ * the probe proves presence elsewhere, not error here.
+ */
+function findMissedExactMatches(
+  db: DatabaseSync,
+  question: string,
+  shown: { documentId: string }[],
+  k: number,
+  model: string | undefined,
+  onLexicalError: (e: LexicalSearchError) => void,
+): { term: string; label: string }[] {
+  // The df lookup reads the FTS table directly, so a corpus whose FTS index
+  // is broken throws here — before the probe's own searchVector could route
+  // the failure into `onLexicalError`. The probe must not turn a degraded
+  // leg into a crashed ask: the main path's lexical leg hits the same broken
+  // table and reports it through `lexicalDegradedNote`, whose wording ("a
+  // passage containing an exact rare term may have been missed") already
+  // covers exactly what this probe can no longer check.
+  let terms: string[];
+  try {
+    terms = rareQueryTokens(db, question, k);
+  } catch {
+    return [];
+  }
+  if (terms.length === 0) return [];
+  const query = terms.join(" ");
+  const probe = searchVector(db, query, {
+    k: 3,
+    model,
+    sourceKinds: CITABLE_SOURCE_KINDS,
+    lexical: { query, mode: "terms", require: true },
+    onLexicalError,
+  });
+  const shownIds = new Set(shown.map((s) => s.documentId));
+  const misses: { term: string; label: string }[] = [];
+  for (const h of probe) {
+    if (shownIds.has(h.documentId)) continue;
+    const body = h.body.toLowerCase();
+    const term = terms.find((t) => body.includes(t.toLowerCase()));
+    if (!term) continue;
+    misses.push({
+      term,
+      label: passageLabel(h.sourceRef, h.title, h.documentId),
+    });
+    if (misses.length === 2) break;
+  }
+  return misses;
+}
+
+function missedExactNote(
+  misses: { term: string; label: string }[],
+): string | undefined {
+  if (misses.length === 0) return undefined;
+  return misses
+    .map(
+      (m) =>
+        `an exact match for "${m.term}" was not among the passages shown to ` +
+        `the model: ${m.label}`,
+    )
+    .join("; also: ");
+}
+
+/**
  * Render one retrieved passage as a location a human can actually go to.
  *
  * `path#p7 — Ops Manual › Courier Reconciliation` rather than a bare document
@@ -330,6 +404,16 @@ export async function runAsk(
     sourceKind: h.sourceKind,
   }));
 
+  // Skipped under `exact`: the user already aimed the lexical leg, and a
+  // probe that re-finds what exact mode just retrieved would either be
+  // redundant or — firing on some other rare term — teach operators the note
+  // is noise. Runs on the zero-passages path too: "nothing was shown, and an
+  // exact match exists" is the strongest version of the disclosure.
+  const missedExact =
+    opts.exact === true
+      ? []
+      : findMissedExactMatches(db, question, hits, k, opts.model, onLexicalError);
+
   // Zero passages means the model would be answering from nothing but its own
   // weights, at cost, with no citation it could possibly make good on. Skip it
   // entirely rather than pay for confident fabrication and then reject it.
@@ -341,6 +425,7 @@ export async function runAsk(
       modelCalled: false,
       note: joinNotes(
         emptyRetrievalNote(db, uncitable),
+        missedExactNote(missedExact),
         lexicalError && lexicalDegradedNote(lexicalError),
         lexicalNotice,
       ),
@@ -465,6 +550,7 @@ export async function runAsk(
     // over a restricted view of the corpus.
     note: joinNotes(
       uncitable.length > 0 ? withheldNote(uncitable) : undefined,
+      missedExactNote(missedExact),
       lexicalError && lexicalDegradedNote(lexicalError),
       lexicalNotice,
     ),

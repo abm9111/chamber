@@ -535,6 +535,36 @@ function documentFrequency(db: DatabaseSync, token: string): number {
 }
 
 /**
+ * The question's tokens rare enough that every document containing one could
+ * have fit in a `k`-sized retrieval — so if none of them made it, the ranking
+ * actively excluded every occurrence of a term that rare. That is the
+ * retrieval-miss class `runAsk`'s disclosure probe exists to catch, and tying
+ * the ceiling to the caller's own `k` is what keeps this from being one more
+ * magic constant: "rare" means "small relative to what was shown", not an
+ * absolute.
+ *
+ * df = 0 tokens are excluded — a term the corpus does not contain cannot have
+ * been missed, only absent. Rarest first, so a caller that truncates keeps
+ * the most tellable misses.
+ */
+export function rareQueryTokens(
+  db: DatabaseSync,
+  text: string,
+  dfCeiling: number,
+): string[] {
+  const seen = new Set<string>();
+  const out: { token: string; df: number }[] = [];
+  for (const token of lexicalTokens(text)) {
+    const key = token.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const df = documentFrequency(db, token);
+    if (df > 0 && df <= dfCeiling) out.push({ token, df });
+  }
+  return out.sort((a, b) => a.df - b.df).map((t) => t.token);
+}
+
+/**
  * Normalise SQLite's bm25 onto [0,1] *without* looking at the other candidates.
  *
  * The denominator is the query's own idf mass — the total information content

@@ -7077,6 +7077,70 @@ test("pins", "citedIndices dedupes, preserves order, and ignores non-citations",
 
 test(
   "pins",
+  "ask discloses a rare-term passage that retrieval buried, next to the answer",
+  async () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-miss-"));
+    // The lived failure: the corpus holds exactly one passage carrying the
+    // question's distinctive term, and the ranking fills top-k with passages
+    // that resemble the question's phrasing instead. Vector-only mode forces
+    // the burial deterministically (hash embeddings score on shared n-grams);
+    // the probe must still fire precisely because the answer path had no
+    // lexical leg.
+    // The realistic burial: the rare term sits one line deep in a LONG note,
+    // so its n-gram share of the passage vector is tiny — the same mechanism
+    // that buried the launch-objections log in the lived failure. Short
+    // question-echo fillers outrank it on cosine.
+    const padding = Array.from(
+      { length: 60 },
+      (_, i) =>
+        `Betriebsanleitung Absatz ${i}: Wartung, Schmierung und Prüfung der Anlage erfolgen quartalsweise durch geschultes Personal.`,
+    ).join(" ");
+    writeFileSync(
+      join(dir, "rare.md"),
+      `# Rare\n\n${padding} Zebrastrasse: Stempelpflicht gilt zweimal. ${padding}\n`,
+    );
+    for (let i = 0; i < 8; i++) {
+      writeFileSync(
+        join(dir, `filler${i}.md`),
+        `# F${i}\n\nWhere does the retention rule apply for documents and notes, really apply?\n`,
+      );
+    }
+    ingestDirectory(db, dir);
+
+    const fake = async () => "The rule applies to documents. [1]";
+    const missed = await runAsk(db, "Where does the Zebrastrasse rule apply?", {
+      hybrid: false,
+      k: 3,
+      complete: fake,
+    });
+    assert(
+      !missed.passages.some((p) => p.label.includes("rare.md")),
+      "setup failed: rare.md was retrieved anyway, the burial did not reproduce",
+    );
+    assert(
+      typeof missed.note === "string" &&
+        missed.note.includes("Zebrastrasse") &&
+        missed.note.includes("rare.md"),
+      `the note must name the missed term and file, got: ${missed.note}`,
+    );
+
+    // Negative: when the rare-term passage WAS shown, no miss note. Exact
+    // mode retrieves it by construction, and doubling the disclosure there
+    // would train operators to ignore it.
+    const shown = await runAsk(db, "Zebrastrasse", {
+      exact: true,
+      complete: fake,
+    });
+    assert(
+      shown.note === undefined || !shown.note.includes("not among"),
+      `no miss note when the passage was shown/exact: ${shown.note}`,
+    );
+  },
+);
+
+test(
+  "pins",
   "ingest embeds each file's passages through one batch call, not one spawn per passage",
   () => {
     const db = freshDb();

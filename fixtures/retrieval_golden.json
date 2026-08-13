@@ -1,0 +1,23 @@
+{
+  "comment": "Seed golden set — 12 judged queries over fixtures/retrieval_corpus. SEED means exactly that: enough to catch a regression in the two failure classes witnessed in the field (rare-term burial in a long note; question-echo decoys outranking the answer) plus direct and paraphrase baselines. It is not a quality benchmark of the vault, and scores are only comparable within one embedder model — the runner prints which one produced them. Expand toward ~50 with real misses as the field log collects them; KNOWN_LIMITATIONS entry 12 is the context.",
+  "tiers": {
+    "direct": "query shares distinctive words with the relevant passage",
+    "paraphrase": "no distinctive word overlap; semantic leg must carry it",
+    "burial": "the answer's rare term sits inside a long note; short decoys echo the question",
+    "decoy": "a page exists that echoes the question's phrasing and answers nothing"
+  },
+  "queries": [
+    { "q": "how many days do customers have to return a purchase", "relevant": ["refunds.md#p0"], "tier": "direct" },
+    { "q": "refund policy exceptions perishable", "relevant": ["refunds.md#p1"], "tier": "direct" },
+    { "q": "when does the Dubai office open", "relevant": ["office.md#p0"], "tier": "direct" },
+    { "q": "what do new hires receive on day one", "relevant": ["onboarding.md#p0"], "tier": "direct" },
+    { "q": "can I send back something I bought two weeks ago", "relevant": ["refunds.md#p0"], "tier": "paraphrase" },
+    { "q": "getting into prod as a fresh employee", "relevant": ["onboarding.md#p0"], "tier": "paraphrase" },
+    { "q": "booking economy versus business for short trips", "relevant": ["travel.md#p0"], "tier": "paraphrase" },
+    { "q": "how often is the ZR-7734-Delta serviced", "relevant": ["maintenance-manual.md#p0"], "tier": "burial" },
+    { "q": "Kompressor maintenance interval", "relevant": ["maintenance-manual.md#p0"], "tier": "burial" },
+    { "q": "who must be informed when the Anlage has a Störung", "relevant": ["maintenance-manual.md#p0"], "tier": "burial" },
+    { "q": "when does the refund window close", "relevant": ["refunds.md#p0"], "tier": "decoy" },
+    { "q": "what time does the office open in the morning", "relevant": ["office.md#p0"], "tier": "decoy" }
+  ]
+}

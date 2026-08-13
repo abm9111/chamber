@@ -57,7 +57,11 @@ import {
 import { completeSync, syncCompletionAvailable } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { runAsk } from "./ask.ts";
-import { verifyBeliefSources, countUnsourcedBeliefs } from "./pins.ts";
+import {
+  verifyBeliefSources,
+  countUnsourcedBeliefs,
+  findGonePinnedFiles,
+} from "./pins.ts";
 import { runExpiryJob } from "./expiry.ts";
 import { indexCodeTree, searchCode } from "./code_index.ts";
 import {
@@ -1432,6 +1436,24 @@ async function main(): Promise<void> {
           `${unsourced} belief(s) without sources — outside verify's scope ` +
             `(retraction types and unsourced assertions have no pins to check)`,
         );
+      }
+      // Report-only, and deliberately outside the exit code: these pins DO
+      // verify — against stored content their file no longer backs. See
+      // findGonePinnedFiles for why saying it is the honest minimum and why
+      // exiting on it waits for tombstones.
+      const gone = findGonePinnedFiles(db);
+      if (gone.length > 0) {
+        const total = gone.reduce((n, g) => n + g.passages, 0);
+        console.log(
+          `${total} pinned passage(s) in ${gone.length} file(s) no longer on disk — ` +
+            `their pins verify against stored content only:`,
+        );
+        for (const g of gone.slice(0, 3)) {
+          console.log(`  gone: ${g.file}  (${g.passages} passage(s))`);
+        }
+        if (gone.length > 3) {
+          console.log(`  … and ${gone.length - 3} more file(s)`);
+        }
       }
       if (broken + degraded > 0) process.exitCode = 1;
       break;

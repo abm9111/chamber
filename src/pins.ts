@@ -10,7 +10,10 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { sha256 } from "./hash.ts";
+import { passagePathOf } from "./chunk.ts";
 
 export type PinFailure = "not_found" | "hash_mismatch" | "kind_unregistered";
 
@@ -390,6 +393,63 @@ export function verifyBeliefSources(
  * a summary line, so they must describe the same population or the line is
  * quietly comparing different corpora.
  */
+/**
+ * Pinned files that no longer exist on disk — the report-only first slice of
+ * closing KNOWN_LIMITATIONS entry 5.
+ *
+ * A deleted file is never revisited by ingest (the walk only sees files that
+ * exist), so its rows keep their stored content, its pins re-hash that stored
+ * content and verify forever, and retrieval keeps serving it. "The source was
+ * removed from underneath a conclusion" is the strongest version of the event
+ * this product exists to catch, and today it is the one case verify actively
+ * vouches for. Until tombstones land, verify can at least *say* it.
+ *
+ * The check is the filesystem, not an ingest manifest, which dissolves the
+ * excluded-vs-gone ambiguity that makes the deletion version of this feature
+ * dangerous: an excluded file still exists on disk and is correctly not
+ * reported; a gone file is gone regardless of why the walk skipped it. Only
+ * rows written by `chamber ingest` participate — they carry `ingestRoot` in
+ * metadata and a `path#pN` ref; rows from `chamber index` have no on-disk
+ * location to check and are skipped, which under-reports rather than
+ * false-alarms.
+ *
+ * Read-only, and deliberately not part of verify's exit code: pins on stored
+ * content DO verify, and flipping the exit here would change the scheduled
+ * job's contract before tombstones give the operator a way to act.
+ */
+export function findGonePinnedFiles(
+  db: DatabaseSync,
+): { file: string; passages: number }[] {
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT d.source_ref AS ref, d.metadata_json AS meta
+         FROM belief_source s
+         JOIN vector_document d ON d.id = s.ref_id
+        WHERE s.kind != 'belief'`,
+    )
+    .all() as { ref: string | null; meta: string | null }[];
+
+  const byFile = new Map<string, number>();
+  for (const r of rows) {
+    if (!r.ref || !r.meta) continue;
+    let root: unknown;
+    try {
+      root = (JSON.parse(r.meta) as { ingestRoot?: unknown }).ingestRoot;
+    } catch {
+      continue;
+    }
+    if (typeof root !== "string" || root === "") continue;
+    const file = join(root, passagePathOf(r.ref));
+    byFile.set(file, (byFile.get(file) ?? 0) + 1);
+  }
+
+  const gone: { file: string; passages: number }[] = [];
+  for (const [file, passages] of byFile) {
+    if (!existsSync(file)) gone.push({ file, passages });
+  }
+  return gone.sort((a, b) => b.passages - a.passages);
+}
+
 export function countUnsourcedBeliefs(
   db: DatabaseSync,
   opts: { since?: string } = {},

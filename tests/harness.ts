@@ -55,6 +55,7 @@ import {
   verifyPin,
   verifyBeliefSources,
   countUnsourcedBeliefs,
+  findGonePinnedFiles,
   CITABLE_SOURCE_KINDS,
 } from "../src/pins.ts";
 import { runAsk, citedIndices } from "../src/ask.ts";
@@ -7074,6 +7075,45 @@ test("pins", "citedIndices dedupes, preserves order, and ignores non-citations",
 // The tests below are the ones that actually exercise the point of Task 7 —
 // time passing, the corpus moving, and a stored pin no longer matching. No
 // test in this section may call a live model; every completion is injected.
+
+test(
+  "pins",
+  "pinned files gone from disk are countable — verify's blind spot gets named",
+  async () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-gone-"));
+    writeFileSync(join(dir, "keep.md"), "# Keep\n\nRetention policy is 90 days.\n");
+    ingestDirectory(db, dir);
+
+    const fake = async () => "Retention policy is 90 days. [1]";
+    const asked = await runAsk(db, "what is the retention policy", {
+      complete: fake,
+    });
+    const citedRef = asked.passages[0]?.sourceRef;
+    assert(
+      typeof citedRef === "string" && asked.claims.some((c) => c.citedRefs.length > 0),
+      "setup failed: no cited passage",
+    );
+
+    // Before deletion: nothing to report.
+    assert(
+      findGonePinnedFiles(db).length === 0,
+      "no file is gone yet — the report must be empty",
+    );
+
+    // Delete the cited note. KNOWN_LIMITATIONS entry 5: its rows are never
+    // revisited by ingest, its pins verify against stored content forever,
+    // and retrieval still serves it. This function is the report-only first
+    // slice: verify can at least SAY it.
+    rmSync(join(dir, "keep.md"));
+    const gone = findGonePinnedFiles(db);
+    assert(gone.length === 1, `expected 1 gone file, got ${gone.length}`);
+    assert(
+      gone[0]!.file.endsWith("keep.md") && gone[0]!.passages > 0,
+      `report must name the file and count passages: ${JSON.stringify(gone[0])}`,
+    );
+  },
+);
 
 test(
   "pins",

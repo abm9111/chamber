@@ -6026,13 +6026,40 @@ test("oauth", "O11_seal_roundtrip", () => {
 
 test("oauth", "O12_schema_pin_drift", () => {
   const db = freshDb();
-  const tools = [{ name: "a", description: "one" }];
+  const tools = [
+    { name: "a", description: "one" },
+    { name: "b", description: "two" },
+  ];
   const ep = "https://mcp.example.com/mcp";
   pinToolsList(db, ep, tools);
   const ok = verifyToolsAgainstPin(db, ep, tools);
   assert(ok.ok, JSON.stringify(ok));
-  const drift = verifyToolsAgainstPin(db, ep, [{ name: "a", description: "POISONED" }]);
-  assert(!drift.ok && drift.reason === "list_drift", JSON.stringify(drift));
+
+  // Same roster, one description rewritten: the rug-pull proper. The
+  // whole-list hash has always caught this (this very test used to pin that
+  // as `list_drift`); what it could not do was say WHICH tool moved. The
+  // per-tool pins exist to answer that, and `tool_drift` is the reason the
+  // type has promised since the columns were added.
+  const content = verifyToolsAgainstPin(db, ep, [
+    { name: "a", description: "POISONED" },
+    { name: "b", description: "two" },
+  ]);
+  assert(!content.ok && content.reason === "tool_drift", JSON.stringify(content));
+  assert(
+    content.ok === false &&
+      content.message.includes('"a"') &&
+      content.message.includes("description") &&
+      !content.message.includes('"b"'),
+    `tool_drift must name the drifted tool and facet, not the innocent one: ${JSON.stringify(content)}`,
+  );
+
+  // Roster change (a tool vanished): list_drift, naming what left.
+  const roster = verifyToolsAgainstPin(db, ep, [{ name: "a", description: "one" }]);
+  assert(!roster.ok && roster.reason === "list_drift", JSON.stringify(roster));
+  assert(
+    roster.ok === false && roster.message.includes('"b"'),
+    `list_drift must name the removed tool: ${JSON.stringify(roster)}`,
+  );
 });
 
 test("oauth", "O13_quarantine_wrapper", () => {

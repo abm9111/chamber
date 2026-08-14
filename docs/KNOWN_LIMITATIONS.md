@@ -604,3 +604,24 @@ Two smaller findings from the same run, both now handled in code:
   blocking on text the model never read.
 - The 32-candidate cap now has a deterministic `ORDER BY`, so the truncation
   warning describes a reproducible sample.
+
+## 18. `npx` on Node 24 LTS cannot run this package at all
+
+Node refuses to strip TypeScript types for files under `node_modules`
+(`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`) on Node 24, and `node_modules`
+is exactly where `npx` installs `@bu7umaid/chamber`. So `npx -y
+@bu7umaid/chamber try` — the README's own npm one-liner — dies on the current
+LTS. Node 26 lifts the restriction; the git-clone path runs TypeScript from a
+regular directory and needs only the documented 23.6 floor. Found by the
+GitHub Action's self-test on a stock `ubuntu-latest` runner (Node 24.19) after
+every local verification had quietly run on Node 26.
+
+**What it costs.** The lowest-friction install path silently excludes the
+default Node of most CI images and many machines, with a raw stack trace as
+the only explanation. The bin shim's version guard checks the 23.6 floor and
+passes 24 — correct by its own rule, wrong about this case.
+
+**What would fix it.** Ship compiled JavaScript in the npm tarball (a
+`prepack` build; the repository itself stays TypeScript-direct), or teach the
+bin shim to catch this specific error and say "Node 26+, or clone" instead of
+stack-tracing. Until one of those lands, the action and docs pin Node 26.

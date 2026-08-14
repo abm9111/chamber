@@ -33,9 +33,14 @@ inputs:
     required: false
     default: "0.1.2"
   node-version:
-    description: "Node.js version (Chamber needs 23.6+)."
+    description: >-
+      Node.js version. 26+ here, deliberately above the package's own 23.6
+      floor: Node 24 LTS refuses to strip TypeScript types for files under
+      node_modules (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING), which is
+      exactly where npx puts the package. The git-clone path needs only
+      23.6+; the npx path this action uses needs 26+.
     required: false
-    default: "24"
+    default: "26"
 
 outputs:
   report:

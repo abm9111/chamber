@@ -232,7 +232,7 @@ source and misread it, and every layer here will pass it. That is a stated
 non-goal, it has been observed happening, and it is not solved.
 
 Read [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) before trusting
-any output. Seventeen limitations are documented there, including the two least
+any output. Eighteen limitations are documented there, including the two least
 flattering. The sandbox confines only where bubblewrap works — Linux with
 unprivileged user namespaces — and refuses to run anything anywhere else, which
 is safe but is not the same as working. And citation debt blocks a verbatim

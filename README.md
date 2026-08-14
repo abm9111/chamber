@@ -156,9 +156,15 @@ them and answer from them — see `chamber corpus` and
 
 The same verify loop works on a repo: claims in docs pinned to passages of
 code or policy, `chamber verify --json` failing the build when the ground
-moves. [`docs/CI_DRIFT_GATE.md`](docs/CI_DRIFT_GATE.md) is the one-page
-recipe; [`demos/06_ci_drift_gate.ts`](demos/06_ci_drift_gate.ts) is the
-runnable transcript.
+moves. One line in a workflow — this repo ships the action:
+
+```yaml
+- uses: abm9111/chamber@v0.1.3
+```
+
+[`docs/CI_DRIFT_GATE.md`](docs/CI_DRIFT_GATE.md) is the one-page recipe;
+[`demos/06_ci_drift_gate.ts`](demos/06_ci_drift_gate.ts) is the runnable
+transcript.
 
 ### Run it daily
 

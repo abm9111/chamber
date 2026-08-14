@@ -53,7 +53,9 @@ runs, or every run starts with zero beliefs and verify has nothing to check:
 A text export/import for beliefs would be the clean third option; it does not
 exist yet.
 
-## GitHub Actions sketch
+## GitHub Actions — one line
+
+The repo ships an action (`action.yml` at the root), so the gate is:
 
 ```yaml
 jobs:
@@ -61,11 +63,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: abm9111/chamber@v0.1.3
+        with:
+          docs-path: docs
+          code-path: src          # optional; omit to skip code indexing
+          database: .chamber/chamber.sqlite   # must persist across runs
+```
+
+The action pins the npm version it runs (`version` input) so your CI never
+floats on this project's latest release. Its `report` output carries the
+full `verify --json` object. This repo's own CI runs the action against its
+own docs (`.github/workflows/action-selftest.yml`).
+
+Without the action, the same gate by hand:
+
+```yaml
       - uses: actions/setup-node@v4
         with: { node-version: 24 }
-      - run: npx -y @bu7umaid/chamber ingest ./docs
-      - run: npx -y @bu7umaid/chamber index-code ./src
-      - run: npx -y @bu7umaid/chamber verify --json
+      - run: npx -y @bu7umaid/chamber@0.1.2 ingest ./docs
+      - run: npx -y @bu7umaid/chamber@0.1.2 index-code ./src
+      - run: npx -y @bu7umaid/chamber@0.1.2 verify --json
 ```
 
 (Point `CHAMBER_DB`/config at the persisted database per the section above;

@@ -1,0 +1,83 @@
+name: "Chamber Verify — docs drift gate"
+description: >-
+  Fail the build when the ground moves under a written claim. Ingests your
+  docs (and optionally indexes your code), then re-checks every pinned
+  citation: hash comparison only, no model, no network beyond npm install.
+author: "abm9111"
+branding:
+  icon: "anchor"
+  color: "gray-dark"
+
+inputs:
+  docs-path:
+    description: "Directory of markdown to ingest as citable passages."
+    required: false
+    default: "docs"
+  code-path:
+    description: >-
+      Directory of code to index as citable passages (TypeScript/JavaScript/
+      Python). Empty skips code indexing.
+    required: false
+    default: ""
+  database:
+    description: >-
+      Path to the Chamber SQLite database holding the pinned beliefs. This
+      must persist across runs (commit it, or restore it from a cache) — a
+      fresh database has zero beliefs and verify has nothing to check.
+    required: false
+    default: ".chamber/chamber.sqlite"
+  version:
+    description: >-
+      @bu7umaid/chamber version to run. Pinned on purpose: an unpinned latest
+      would tie your CI to this project's release cadence.
+    required: false
+    default: "0.1.2"
+  node-version:
+    description: "Node.js version (Chamber needs 23.6+)."
+    required: false
+    default: "24"
+
+outputs:
+  report:
+    description: "The full verify --json object (beliefs, pins, failure reasons)."
+    value: ${{ steps.verify.outputs.report }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Ingest docs
+      shell: bash
+      env:
+        CHAMBER_DB: ${{ inputs.database }}
+      run: npx -y "@bu7umaid/chamber@${{ inputs.version }}" ingest "${{ inputs.docs-path }}"
+
+    - name: Index code
+      if: ${{ inputs.code-path != '' }}
+      shell: bash
+      env:
+        CHAMBER_DB: ${{ inputs.database }}
+      run: npx -y "@bu7umaid/chamber@${{ inputs.version }}" index-code "${{ inputs.code-path }}"
+
+    - name: Verify pinned claims
+      id: verify
+      shell: bash
+      env:
+        CHAMBER_DB: ${{ inputs.database }}
+      # verify exits non-zero when any belief lost verified support (broken
+      # OR degraded) — that exit code IS the gate; nothing here softens it.
+      # The JSON is captured first so the report reaches $GITHUB_OUTPUT even
+      # on a red run (delimiter form because the JSON is multi-line).
+      run: |
+        set -o pipefail
+        rc=0
+        report="$(npx -y "@bu7umaid/chamber@${{ inputs.version }}" verify --json)" || rc=$?
+        echo "report<<CHAMBER_EOF" >> "$GITHUB_OUTPUT"
+        echo "$report" >> "$GITHUB_OUTPUT"
+        echo "CHAMBER_EOF" >> "$GITHUB_OUTPUT"
+        echo "$report"
+        exit "$rc"

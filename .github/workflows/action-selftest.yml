@@ -1,0 +1,27 @@
+# The action is a demo that runs in CI — same policy as demos/: a transcript
+# that cannot drift from the code. This uses the local action against this
+# repo's own docs with a throwaway database: zero beliefs, so verify reports
+# "0 checked" and exits 0 — proving the mechanics (install, ingest, verify,
+# JSON output) without pretending a fresh database can detect drift.
+name: action-selftest
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the drift gate against our own docs
+        id: gate
+        uses: ./
+        with:
+          docs-path: docs
+          database: ${{ runner.temp }}/chamber-selftest.sqlite
+
+      - name: The report must be parseable JSON with the contract fields
+        run: |
+          echo '${{ steps.gate.outputs.report }}' | jq -e '.checked >= 0 and (.broken | type == "number") and (.database | type == "string")'

@@ -688,6 +688,14 @@ export interface SearchOptions {
    * the default `throw`. Whatever is passed here is obliged to tell the user.
    */
   onLexicalError?: (err: LexicalSearchError) => void;
+  /**
+   * Told which embedding model the query actually embedded with. The semantic
+   * leg filters corpus rows on exactly that model, so a query that silently
+   * degraded (MiniLM corpus, hash-embedded query) sees zero semantic rows —
+   * "nothing matches" with no cause named. A caller that compares this
+   * against the corpus's dominant model can name the cause; see runAsk.
+   */
+  onQueryEmbedded?: (model: string) => void;
 }
 
 export function searchVector(
@@ -714,6 +722,7 @@ export function searchVector(
     qVec = emb.vector;
     model = opts.model ?? emb.model;
   }
+  opts.onQueryEmbedded?.(model);
 
   // The eligibility filters are built once and applied to *both* legs. The
   // lexical leg reusing them is what keeps the citable-kind gate fail-closed:

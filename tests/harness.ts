@@ -7106,6 +7106,100 @@ test("pins", "citedIndices dedupes, preserves order, and ignores non-citations",
 
 test(
   "pins",
+  "ask says when the query embedded in a different space than the corpus",
+  async () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-embspace-"));
+    writeFileSync(join(dir, "policy.md"), "# Policy\n\nRetention policy is 90 days.\n");
+    // A corpus embedded as MiniLM on a machine whose ask-path python then
+    // degrades to hash vectors: the semantic leg filters on the query's own
+    // model, so it sees ZERO corpus rows — "nothing matches" with no cause
+    // named. KNOWN_LIMITATIONS entry 15's operator-facing symptom.
+    ingestDirectory(db, dir, {
+      embedBatch: (texts) =>
+        texts.map(() => ({
+          vector: new Float32Array(384).fill(0.3),
+          model: "minilm-l6-v2-q",
+          dims: 384,
+          kind: "minilm" as const,
+        })),
+    });
+
+    const fake = async () => "Retention policy is 90 days. [1]";
+    // Query space forced to hash: on a dev machine with onnxruntime the
+    // "auto" query would embed minilm and match the fake corpus, hiding the
+    // mismatch this test exists to pin. Forcing one side reproduces the
+    // broken-python machine deterministically on every machine.
+    const res = await runAsk(db, "what is the retention policy", {
+      complete: fake,
+      model: "local-hash-v1",
+    });
+    assert(
+      typeof res.note === "string" &&
+        res.note.includes("minilm-l6-v2-q") &&
+        res.note.includes("local-hash-v1"),
+      `the mismatch must name both embedding spaces: ${res.note}`,
+    );
+
+    // Negative: corpus and query in the same space — no mismatch note.
+    const db2 = freshDb();
+    ingestDirectory(db2, dir);
+    const same = await runAsk(db2, "what is the retention policy", {
+      complete: fake,
+    });
+    assert(
+      same.note === undefined || !same.note.includes("embedded"),
+      `no mismatch note when spaces agree: ${same.note}`,
+    );
+  },
+);
+
+test("oauth", "MCP tools carry honest annotations: two read-only, ask marked as writing", () => {
+  const MCP_PATH = join(dirname(fileURLToPath(import.meta.url)), "../src/mcp_server.ts");
+  const lines =
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "t", version: "0" } } }) +
+    "\n" +
+    JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) +
+    "\n" +
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) +
+    "\n";
+  const r = spawnSync(process.execPath, ["--experimental-strip-types", MCP_PATH], {
+    encoding: "utf8",
+    input: lines,
+    timeout: 30_000,
+  });
+  assert(r.error === undefined, `launch failed: ${r.error}`);
+  const reply = (r.stdout || "")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l) as { id?: number; result?: { tools?: { name: string; annotations?: Record<string, unknown> }[] } })
+    .find((d) => d.id === 2);
+  assert(reply?.result?.tools !== undefined, `no tools/list reply in: ${r.stdout}`);
+  const byName = new Map(reply.result.tools!.map((t) => [t.name, t.annotations]));
+
+  for (const name of ["chamber_verify", "chamber_corpus"]) {
+    const a = byName.get(name);
+    assert(
+      a?.readOnlyHint === true && a?.idempotentHint === true,
+      `${name} must declare readOnlyHint+idempotentHint: ${JSON.stringify(a)}`,
+    );
+  }
+  const ask = byName.get("chamber_ask");
+  assert(
+    ask?.readOnlyHint === false && ask?.destructiveHint === false,
+    `chamber_ask must declare it writes without destroying: ${JSON.stringify(ask)}`,
+  );
+  // openWorldHint is deliberately absent on ask: whether a model call leaves
+  // the machine depends on config (loopback vs remote), and an annotation
+  // that guesses is worse than one that abstains.
+  assert(
+    ask !== undefined && !("openWorldHint" in ask),
+    `chamber_ask must not guess openWorldHint: ${JSON.stringify(ask)}`,
+  );
+});
+
+test(
+  "pins",
   "re-indexing edited code replaces its rows — stale generations do not verify forever",
   () => {
     const db = freshDb();

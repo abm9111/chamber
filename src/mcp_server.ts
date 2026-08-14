@@ -163,6 +163,18 @@ const TOOLS = [
       },
       required: ["question"],
     },
+    // readOnlyHint false is the load-bearing one: hosts that gate writes must
+    // treat this tool as writing, because it is (beliefs, pins, debt, spend —
+    // see the description). destructiveHint false because nothing existing is
+    // altered or deleted; rows are only added through the gate. openWorldHint
+    // is deliberately ABSENT: whether a model call leaves this machine
+    // depends on config (loopback vs remote endpoint), and an annotation that
+    // guesses is worse than one that abstains.
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+    },
   },
   {
     name: "chamber_verify",
@@ -183,6 +195,7 @@ const TOOLS = [
         },
       },
     },
+    annotations: { readOnlyHint: true, idempotentHint: true },
   },
   {
     name: "chamber_corpus",
@@ -193,6 +206,7 @@ const TOOLS = [
       "export rather than a note). Use this before trusting a 'nothing " +
       "matches' answer. Read-only.",
     inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: true, idempotentHint: true },
   },
 ];
 

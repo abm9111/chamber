@@ -306,6 +306,36 @@ function missedExactNote(
 }
 
 /**
+ * The corpus's dominant embedding model versus the model the query actually
+ * embedded with. The semantic leg filters on the query's own model, so when a
+ * MiniLM corpus meets a hash-embedded query (python without onnxruntime on
+ * the spawned server's PATH — KNOWN_LIMITATIONS entry 15's operator-facing
+ * symptom), semantic retrieval sees zero rows and "nothing matches" names no
+ * cause. This names it, alongside the answer, in the same note channel every
+ * other retrieval caveat uses.
+ */
+function embedderMismatchNote(
+  db: DatabaseSync,
+  queryModel: string | undefined,
+): string | undefined {
+  if (queryModel === undefined) return undefined;
+  const dominant = db
+    .prepare(
+      `SELECT model FROM vector_embedding GROUP BY model
+        ORDER BY COUNT(*) DESC LIMIT 1`,
+    )
+    .get() as { model: string } | undefined;
+  if (!dominant || dominant.model === queryModel) return undefined;
+  return (
+    `the question embedded as ${queryModel} but most of the corpus is ` +
+    `embedded as ${dominant.model} — semantic retrieval cannot see across ` +
+    `that split, so this answer leaned on exact-word matching only. If the ` +
+    `corpus side is minilm, check CHAMBER_PYTHON points at a python with ` +
+    `onnxruntime`
+  );
+}
+
+/**
  * Render one retrieved passage as a location a human can actually go to.
  *
  * `path#p7 — Ops Manual › Courier Reconciliation` rather than a bare document
@@ -368,6 +398,10 @@ export async function runAsk(
           .map((n) => n.message)
           .join("; ") || undefined;
   let lexicalError: LexicalSearchError | undefined;
+  let queryEmbedModel: string | undefined;
+  const onQueryEmbedded = (m: string): void => {
+    queryEmbedModel = m;
+  };
   // Answering semantically is better than not answering, but only if the user
   // is told the answer was formed without the lexical leg — otherwise a broken
   // index is indistinguishable from a corpus that does not contain the answer,
@@ -381,6 +415,7 @@ export async function runAsk(
     model: opts.model,
     lexical,
     onLexicalError,
+    onQueryEmbedded,
   });
   const uncitable = unfiltered.filter((h) => !isCitableSourceKind(h.sourceKind));
   const hits =
@@ -425,6 +460,7 @@ export async function runAsk(
       modelCalled: false,
       note: joinNotes(
         emptyRetrievalNote(db, uncitable),
+        embedderMismatchNote(db, queryEmbedModel),
         missedExactNote(missedExact),
         lexicalError && lexicalDegradedNote(lexicalError),
         lexicalNotice,
@@ -550,6 +586,7 @@ export async function runAsk(
     // over a restricted view of the corpus.
     note: joinNotes(
       uncitable.length > 0 ? withheldNote(uncitable) : undefined,
+      embedderMismatchNote(db, queryEmbedModel),
       missedExactNote(missedExact),
       lexicalError && lexicalDegradedNote(lexicalError),
       lexicalNotice,

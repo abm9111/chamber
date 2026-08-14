@@ -56,6 +56,7 @@ import {
   verifyBeliefSources,
   countUnsourcedBeliefs,
   findGonePinnedFiles,
+  buildVerifyReport,
   CITABLE_SOURCE_KINDS,
 } from "../src/pins.ts";
 import { runAsk, citedIndices } from "../src/ask.ts";
@@ -7102,6 +7103,63 @@ test("pins", "citedIndices dedupes, preserves order, and ignores non-citations",
 // The tests below are the ones that actually exercise the point of Task 7 —
 // time passing, the corpus moving, and a stored pin no longer matching. No
 // test in this section may call a live model; every completion is injected.
+
+test(
+  "pins",
+  "buildVerifyReport assembles the machine-readable verify contract in one struct",
+  async () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-vjson-"));
+    const file = join(dir, "policy.md");
+    writeFileSync(file, "Retention policy is 90 days.\n");
+    ingestDirectory(db, dir);
+
+    const fake = async () => "Retention policy is 90 days. [1]";
+    await runAsk(db, "what is the retention policy", { complete: fake });
+    // One sourceless retraction, so the complement field is non-trivial.
+    const r = commitBelief(db, {
+      type: "unknown",
+      text: "we lack warrant on retention exceptions",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    assert(r.ok, "unknown-type belief should commit");
+
+    const clean = buildVerifyReport(db);
+    assert(clean.checked > 0, "checked set must be non-empty");
+    assert(clean.broken === 0 && clean.degraded === 0, JSON.stringify(clean));
+    assert(clean.unsourcedBeliefs === 1, `unsourced: ${clean.unsourcedBeliefs}`);
+    assert(clean.goneFiles.length === 0, "nothing is gone yet");
+
+    // Drift, then the same struct must carry it: the JSON consumer (a CI
+    // step) reads exactly what the prose reader is told, or the two split.
+    writeFileSync(file, "Retention policy is 30 days.\n");
+    ingestDirectory(db, dir);
+    const drifted = buildVerifyReport(db);
+    assert(
+      drifted.broken + drifted.degraded > 0,
+      `drift must be counted: ${JSON.stringify({ b: drifted.broken, d: drifted.degraded })}`,
+    );
+    assert(
+      drifted.beliefs.some((b) =>
+        b.failures.some((f) => f.reason === "hash_mismatch"),
+      ),
+      "failures must carry the reason",
+    );
+    // The whole struct must survive JSON — this is the --json contract.
+    const round = JSON.parse(JSON.stringify(drifted)) as typeof drifted;
+    assert(round.checked === drifted.checked, "JSON round-trip");
+
+    // since filters both the checked set and its complement — one line, one
+    // population.
+    const none = buildVerifyReport(db, { since: "2999-01-01" });
+    assert(
+      none.checked === 0 && none.unsourcedBeliefs === 0,
+      JSON.stringify(none),
+    );
+  },
+);
 
 test(
   "pins",

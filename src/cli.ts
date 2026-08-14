@@ -57,11 +57,7 @@ import {
 import { completeSync, syncCompletionAvailable } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { runAsk } from "./ask.ts";
-import {
-  verifyBeliefSources,
-  countUnsourcedBeliefs,
-  findGonePinnedFiles,
-} from "./pins.ts";
+import { buildVerifyReport } from "./pins.ts";
 import { runExpiryJob } from "./expiry.ts";
 import { indexCodeTree, searchCode } from "./code_index.ts";
 import {
@@ -910,7 +906,7 @@ Usage:
       gated on its own citations. --strict refuses an unsourced assertion
       instead of committing it with citation debt. Retrieval is hybrid by
       default; --exact / --semantic mean what they mean for 'search'.
-  chamber verify [--since <ISO date>]        re-check stored pins against the corpus
+  chamber verify [--since <ISO date>] [--json]   re-check stored pins against the corpus
       A pin is written when a belief commits; the corpus can move after that
       (an edited, re-ingested note). verify re-derives every stored pin from
       the corpus as it is now and reports what no longer matches — it never
@@ -1315,13 +1311,16 @@ async function main(): Promise<void> {
       // unrecognized flag and must be refused before it ever reaches
       // verifyBeliefSources, which cannot tell "no --since given" from "you
       // meant --since but misspelled it" — both look like an absent filter.
-      const unknown = rest.filter((a) => a.startsWith("--") && a !== "--since");
+      const unknown = rest.filter(
+        (a) => a.startsWith("--") && a !== "--since" && a !== "--json",
+      );
       if (unknown.length > 0) {
         console.error(`verify: unknown flag(s): ${unknown.join(", ")}`);
-        console.error("usage: chamber verify [--since <date>]");
+        console.error("usage: chamber verify [--since <date>] [--json]");
         process.exitCode = 1;
         break;
       }
+      const jsonMode = rest.includes("--json");
       const i = rest.indexOf("--since");
       let since: string | undefined;
       if (i >= 0) {
@@ -1329,7 +1328,7 @@ async function main(): Promise<void> {
         // Same guard `ingest --exclude` applies: a missing or flag-shaped
         // value is a usage error, not silent "no filter".
         if (raw === undefined || raw.startsWith("-")) {
-          console.error("usage: chamber verify [--since <date>]");
+          console.error("usage: chamber verify [--since <date>] [--json]");
           console.error("  --since requires a date value");
           process.exitCode = 1;
           break;
@@ -1355,7 +1354,21 @@ async function main(): Promise<void> {
         }
         since = parsed.toISOString();
       }
-      const report = verifyBeliefSources(db, { since });
+      const vr = buildVerifyReport(db, { since });
+
+      // The JSON branch prints the report struct and nothing else: a CI step
+      // parses stdout, and one stray prose line breaks the parse. It closes
+      // the remaining half of KNOWN_LIMITATIONS entry 13 — the run names its
+      // own database — and it is the same struct the prose below renders, so
+      // the two consumers cannot be told different stories.
+      if (jsonMode) {
+        console.log(
+          JSON.stringify({ database: resolvedDbPath, ...vr }, null, 2),
+        );
+        if (vr.broken + vr.degraded > 0) process.exitCode = 1;
+        break;
+      }
+
       // Two counters, because "lost everything" and "lost something" are
       // different findings and only one of them used to be reportable.
       //
@@ -1373,13 +1386,10 @@ async function main(): Promise<void> {
       //
       // Any pin that no longer verifies now fails the run. "Some of the
       // evidence survived" is not a passing state for a check whose entire job
-      // is to notice that evidence moved.
-      let broken = 0;
-      let degraded = 0;
-      for (const b of report) {
+      // is to notice that evidence moved. Counting lives in buildVerifyReport
+      // so the --json branch above and this prose describe one computation.
+      for (const b of vr.beliefs) {
         if (b.failures.length === 0) continue;
-        if (b.verified === 0) broken++;
-        else degraded++;
         console.log(`${b.beliefId}  ${b.verified}/${b.total} pins verified`);
         console.log(`  "${b.content.slice(0, 70)}"`);
         // What this message has to convey is whether the operator's evidence
@@ -1421,8 +1431,8 @@ async function main(): Promise<void> {
         }
       }
       console.log(
-        `\n${report.length} belief(s) checked, ${broken} with no verified support left` +
-          `, ${degraded} with some support lost`,
+        `\n${vr.checked} belief(s) checked, ${vr.broken} with no verified support left` +
+          `, ${vr.degraded} with some support lost`,
       );
       // "N checked" against a larger belief table reads as a silent skip
       // until the complement is named — an operator reverse-engineered the
@@ -1430,10 +1440,9 @@ async function main(): Promise<void> {
       // sourced database there is no gap to explain. The excluded rows are
       // retraction types and debt-carrying assertions — nothing pinned, so
       // nothing that can drift.
-      const unsourced = countUnsourcedBeliefs(db, { since });
-      if (unsourced > 0) {
+      if (vr.unsourcedBeliefs > 0) {
         console.log(
-          `${unsourced} belief(s) without sources — outside verify's scope ` +
+          `${vr.unsourcedBeliefs} belief(s) without sources — outside verify's scope ` +
             `(retraction types and unsourced assertions have no pins to check)`,
         );
       }
@@ -1441,21 +1450,20 @@ async function main(): Promise<void> {
       // verify — against stored content their file no longer backs. See
       // findGonePinnedFiles for why saying it is the honest minimum and why
       // exiting on it waits for tombstones.
-      const gone = findGonePinnedFiles(db);
-      if (gone.length > 0) {
-        const total = gone.reduce((n, g) => n + g.passages, 0);
+      if (vr.goneFiles.length > 0) {
+        const total = vr.goneFiles.reduce((n, g) => n + g.passages, 0);
         console.log(
-          `${total} pinned passage(s) in ${gone.length} file(s) no longer on disk — ` +
+          `${total} pinned passage(s) in ${vr.goneFiles.length} file(s) no longer on disk — ` +
             `their pins verify against stored content only:`,
         );
-        for (const g of gone.slice(0, 3)) {
+        for (const g of vr.goneFiles.slice(0, 3)) {
           console.log(`  gone: ${g.file}  (${g.passages} passage(s))`);
         }
-        if (gone.length > 3) {
-          console.log(`  … and ${gone.length - 3} more file(s)`);
+        if (vr.goneFiles.length > 3) {
+          console.log(`  … and ${vr.goneFiles.length - 3} more file(s)`);
         }
       }
-      if (broken + degraded > 0) process.exitCode = 1;
+      if (vr.broken + vr.degraded > 0) process.exitCode = 1;
       break;
     }
     case "expiry": {

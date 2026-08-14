@@ -394,6 +394,53 @@ export function verifyBeliefSources(
  * quietly comparing different corpora.
  */
 /**
+ * Everything one verify run knows, in one struct — the machine-readable
+ * contract behind `chamber verify --json`, and the single source the prose
+ * path renders from, so a CI consumer and a human reader can never be told
+ * different stories by the same run.
+ *
+ * `broken` counts beliefs with no verified support left; `degraded` counts
+ * partial loss. Both fail the run (see the exit-code history in cli.ts —
+ * partial evidence loss was once silent to the only machine consumer that
+ * existed, and probes/verify_partial_drift.ts guards the fix). The
+ * complement fields carry what the checked set excludes: sourceless beliefs
+ * (nothing pinned, nothing to drift) and pinned files gone from disk (pins
+ * that verify against stored content only — KNOWN_LIMITATIONS entry 5).
+ */
+export interface VerifyRunReport {
+  since: string | null;
+  checked: number;
+  broken: number;
+  degraded: number;
+  unsourcedBeliefs: number;
+  goneFiles: { file: string; passages: number }[];
+  beliefs: BeliefDrift[];
+}
+
+export function buildVerifyReport(
+  db: DatabaseSync,
+  opts: { since?: string } = {},
+): VerifyRunReport {
+  const beliefs = verifyBeliefSources(db, opts);
+  let broken = 0;
+  let degraded = 0;
+  for (const b of beliefs) {
+    if (b.failures.length === 0) continue;
+    if (b.verified === 0) broken++;
+    else degraded++;
+  }
+  return {
+    since: opts.since ?? null,
+    checked: beliefs.length,
+    broken,
+    degraded,
+    unsourcedBeliefs: countUnsourcedBeliefs(db, opts),
+    goneFiles: findGonePinnedFiles(db),
+    beliefs,
+  };
+}
+
+/**
  * Pinned files that no longer exist on disk — the report-only first slice of
  * closing KNOWN_LIMITATIONS entry 5.
  *

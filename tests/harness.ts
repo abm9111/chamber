@@ -85,7 +85,7 @@ import {
   enforceReplyContract,
 } from "../src/contract.ts";
 import { runExpiryJob } from "../src/expiry.ts";
-import { extractChunks, fileMerkleRoot } from "../src/code_index.ts";
+import { extractChunks, fileMerkleRoot, indexCodeTree } from "../src/code_index.ts";
 import {
   proposeDebtPayment,
   confirmDebtPaid,
@@ -7103,6 +7103,61 @@ test("pins", "citedIndices dedupes, preserves order, and ignores non-citations",
 // The tests below are the ones that actually exercise the point of Task 7 —
 // time passing, the corpus moving, and a stored pin no longer matching. No
 // test in this section may call a live model; every completion is injected.
+
+test(
+  "pins",
+  "re-indexing edited code replaces its rows — stale generations do not verify forever",
+  () => {
+    const db = freshDb();
+    const dir = mkdtempSync(join(tmpdir(), "chamber-codeidx-"));
+    mkdirSync(join(dir, "src"), { recursive: true });
+    const p = join(dir, "src", "fees.ts");
+    writeFileSync(p, "export function lateFeePercent(): number {\n  return 5;\n}\n");
+    indexCodeTree(db, dir);
+
+    const before = db
+      .prepare(`SELECT id, snapshot_hash AS h FROM vector_document WHERE source_ref LIKE 'src/fees.ts%'`)
+      .all() as { id: string; h: string }[];
+    assert(before.length > 0, "setup failed: nothing indexed");
+
+    // Pin a doc claim to the code passage — the CI drift gate's whole story.
+    const r = commitBelief(db, {
+      type: "belief",
+      text: "The late fee is five percent, per src/fees.ts.",
+      sources: [
+        { kind: "vault_page", refId: before[0]!.id, snapshotHash: before[0]!.h },
+      ],
+      authorFamily: "test",
+      path: "deep",
+    });
+    assert(r.ok, `doc claim must commit: ${JSON.stringify(r)}`);
+
+    writeFileSync(p, "export function lateFeePercent(): number {\n  return 15;\n}\n");
+    indexCodeTree(db, dir);
+
+    // Content-derived ids mint fresh rows for the edit; without a sweep the
+    // stale generation stayed too — the pin verified forever and retrieval
+    // served both fees as verified truth. One generation per chunk, only.
+    const after = db
+      .prepare(
+        `SELECT source_ref, COUNT(*) AS n FROM vector_document
+          WHERE source_ref LIKE 'src/fees.ts%' GROUP BY source_ref HAVING n > 1`,
+      )
+      .all() as { source_ref: string; n: number }[];
+    assert(
+      after.length === 0,
+      `duplicate generations survive re-index: ${JSON.stringify(after)}`,
+    );
+
+    // And the gate must now see the move: the pinned row is gone or changed,
+    // never silently green.
+    const vr = buildVerifyReport(db);
+    assert(
+      vr.broken + vr.degraded > 0,
+      `the code moved under the claim and verify stayed green: ${JSON.stringify(vr)}`,
+    );
+  },
+);
 
 test(
   "pins",

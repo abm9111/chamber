@@ -152,6 +152,14 @@ Pointed at a folder of exported chat logs, Chamber will happily index all of
 them and answer from them — see `chamber corpus` and
 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) entry 11.
 
+### Use it as a CI drift gate
+
+The same verify loop works on a repo: claims in docs pinned to passages of
+code or policy, `chamber verify --json` failing the build when the ground
+moves. [`docs/CI_DRIFT_GATE.md`](docs/CI_DRIFT_GATE.md) is the one-page
+recipe; [`demos/06_ci_drift_gate.ts`](demos/06_ci_drift_gate.ts) is the
+runnable transcript.
+
 ### Run it daily
 
 `deploy/launchd/com.chamber.verify.plist` (macOS) and `deploy/systemd/`

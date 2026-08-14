@@ -18,6 +18,7 @@ import { sha256 } from "./hash.ts";
 import { merkleParent, buildMerkleLayers } from "./merkle.ts";
 import {
   upsertDocument,
+  deleteDocument,
   searchVector,
   type VectorHit,
   type LexicalSearchError,
@@ -219,12 +220,34 @@ export function indexCodeTree(
     const merkle = fileMerkleRoot(extracted);
     roots.push({ ...merkle, path: rel });
 
+    // Ids are content-derived (`code_<hash>`), so an edited chunk mints a
+    // fresh row and the previous generation would otherwise remain — same
+    // sourceRef, both retrievable, and a pin to the stale row verifying
+    // forever while the code it described was gone. That is the ingest
+    // shrink-sweep defect class with a worse twist: not just stale content
+    // answering, but two generations of the same passage both standing as
+    // verified evidence. Same cure as ingest: sweep rows this file owned
+    // that this pass did not rewrite. Ownership is by ref prefix `rel:`,
+    // which cannot collide across files — `a.ts:1-3` and `a.ts.bak:1-3`
+    // differ in the prefix up to the colon — and the sweep runs only for a
+    // file that was walked and read, so a file deleted from disk keeps its
+    // rows (KNOWN_LIMITATIONS entry 5's scope, deliberately unchanged here).
+    const owned = db
+      .prepare(
+        `SELECT id FROM vector_document
+          WHERE source_ref LIKE ? ESCAPE '\\' AND id LIKE 'code\\_%' ESCAPE '\\'`,
+      )
+      .all(`${rel.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}:%`) as {
+      id: string;
+    }[];
+
+    const writtenIds = new Set<string>();
     for (const ch of extracted) {
       if (ch.kind === "file" && extracted.length > 1) {
         // prefer structural chunks; keep short files as whole
         if (source.length > 2000) continue;
       }
-      upsertDocument(db, {
+      const doc = upsertDocument(db, {
         id: `code_${ch.snapshotHash.slice(0, 24)}`,
         sourceKind: "vault_page",
         sourceRef: `${ch.path}:${ch.startLine}-${ch.endLine}`,
@@ -240,7 +263,11 @@ export function indexCodeTree(
         },
         model: opts.model ?? "local-hash-v1",
       });
+      writtenIds.add(doc.id);
       chunks++;
+    }
+    for (const o of owned) {
+      if (!writtenIds.has(o.id)) deleteDocument(db, o.id);
     }
   }
 

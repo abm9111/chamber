@@ -605,7 +605,24 @@ Two smaller findings from the same run, both now handled in code:
 - The 32-candidate cap now has a deterministic `ORDER BY`, so the truncation
   warning describes a reproducible sample.
 
-## 18. `npx` on Node 24 LTS cannot run this package at all
+## 18. `npx` could not run this package at all before 0.1.3
+
+> **Correction, 2026-08-14 (same day, hours later).** The entry below was
+> wrong twice within hours of being written, in ways worth recording. First:
+> it claimed Node 26 lifts the node_modules type-stripping restriction — a
+> clean-cache test on 26.5 refuted that; the restriction is effectively
+> universal on current Node. Second and worse: the "every local verification
+> had quietly run on Node 26" line understated the failure. The local npx
+> verifications were green because npm resolved the LOCAL repository package
+> (matching name@version at the working directory) and never executed the
+> registry tarball at all — the verified-cold claims made after 0.1.1 and
+> 0.1.2 were false, and the tarball additionally never shipped
+> `fixtures/demo`, so `try` would have failed even without the stripping
+> error. Green checks that never tested the real path, on the project that
+> exists to catch exactly that. Fixed in 0.1.3: the tarball ships compiled
+> JavaScript (`prepack` → `dist/`; the bin shim prefers it) plus the demo
+> fixtures, and the release checklist now requires the clean-cache,
+> neutral-cwd tarball test before any publish.
 
 Node refuses to strip TypeScript types for files under `node_modules`
 (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`) on Node 24, and `node_modules`

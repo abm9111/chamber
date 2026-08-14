@@ -47,3 +47,4 @@ probes/seatbelt/work/*.txt
 
 # vigil run records (local, content-free; see engines/telemetry.md)
 .vigil/
+dist

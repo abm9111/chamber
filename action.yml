@@ -2,11 +2,19 @@ name: "Chamber Verify — docs drift gate"
 description: >-
   Fail the build when the ground moves under a written claim. Ingests your
   docs (and optionally indexes your code), then re-checks every pinned
-  citation: hash comparison only, no model, no network beyond npm install.
+  citation: hash comparison only, no model, no network.
 author: "abm9111"
 branding:
   icon: "anchor"
   color: "gray-dark"
+
+# No npx, no npm install: the checked-out action directory IS this repository
+# at the ref you pinned in `uses:`, and the package has zero runtime
+# dependencies — so the action runs its own source directly. That sidesteps
+# ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING entirely (current Node refuses
+# to strip types under node_modules, which is where npx installs packages —
+# KNOWN_LIMITATIONS entry 18) and makes the version semantics exact: the tag
+# in `uses:` is the code that runs.
 
 inputs:
   docs-path:
@@ -26,21 +34,10 @@ inputs:
       fresh database has zero beliefs and verify has nothing to check.
     required: false
     default: ".chamber/chamber.sqlite"
-  version:
-    description: >-
-      @bu7umaid/chamber version to run. Pinned on purpose: an unpinned latest
-      would tie your CI to this project's release cadence.
-    required: false
-    default: "0.1.2"
   node-version:
-    description: >-
-      Node.js version. 26+ here, deliberately above the package's own 23.6
-      floor: Node 24 LTS refuses to strip TypeScript types for files under
-      node_modules (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING), which is
-      exactly where npx puts the package. The git-clone path needs only
-      23.6+; the npx path this action uses needs 26+.
+    description: "Node.js version (23.6+ — type stripping outside node_modules)."
     required: false
-    default: "26"
+    default: "24"
 
 outputs:
   report:
@@ -59,14 +56,14 @@ runs:
       shell: bash
       env:
         CHAMBER_DB: ${{ inputs.database }}
-      run: npx -y "@bu7umaid/chamber@${{ inputs.version }}" ingest "${{ inputs.docs-path }}"
+      run: node --experimental-strip-types "${{ github.action_path }}/src/cli.ts" ingest "${{ inputs.docs-path }}"
 
     - name: Index code
       if: ${{ inputs.code-path != '' }}
       shell: bash
       env:
         CHAMBER_DB: ${{ inputs.database }}
-      run: npx -y "@bu7umaid/chamber@${{ inputs.version }}" index-code "${{ inputs.code-path }}"
+      run: node --experimental-strip-types "${{ github.action_path }}/src/cli.ts" index-code "${{ inputs.code-path }}"
 
     - name: Verify pinned claims
       id: verify
@@ -80,7 +77,7 @@ runs:
       run: |
         set -o pipefail
         rc=0
-        report="$(npx -y "@bu7umaid/chamber@${{ inputs.version }}" verify --json)" || rc=$?
+        report="$(node --experimental-strip-types "${{ github.action_path }}/src/cli.ts" verify --json)" || rc=$?
         echo "report<<CHAMBER_EOF" >> "$GITHUB_OUTPUT"
         echo "$report" >> "$GITHUB_OUTPUT"
         echo "CHAMBER_EOF" >> "$GITHUB_OUTPUT"

@@ -31,11 +31,13 @@
   },
   "files": [
     "bin/",
+    "dist/",
     "src/",
     "sql/",
     "scripts/",
     "deploy/",
-    "docs/KNOWN_LIMITATIONS.md"
+    "docs/KNOWN_LIMITATIONS.md",
+    "fixtures/demo/"
   ],
   "scripts": {
     "test": "node --experimental-strip-types tests/harness.ts",
@@ -61,7 +63,9 @@
     "lint": "eslint src tests probes demos scripts",
     "probes:isolation": "CHAMBER_SANDBOX_REQUIRED=1 node --experimental-strip-types probes/sandbox_confines.ts",
     "calibrate:paraphrase": "node --experimental-strip-types scripts/calibrate_paraphrase_threshold.ts",
-    "eval:retrieval": "node --experimental-strip-types scripts/eval_retrieval.ts"
+    "eval:retrieval": "node --experimental-strip-types scripts/eval_retrieval.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build"
   },
   "engines": {
     "node": ">=23.6"

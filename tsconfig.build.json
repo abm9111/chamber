@@ -1,0 +1,23 @@
+{
+  // Emit config for the npm tarball ONLY (`npm run build`, wired to prepack).
+  // The repository itself stays TypeScript-direct with no build step; this
+  // exists because current Node refuses to strip types for files under
+  // node_modules (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING), which is
+  // where npx installs the package — KNOWN_LIMITATIONS entry 18. The bin
+  // shim prefers dist/ when present (the tarball) and falls back to src/
+  // (a clone).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    // Source imports say `./x.ts` (type-stripping style); the emitted JS
+    // must say `./x.js`. TS 5.7+ rewrites relative .ts specifiers in both
+    // static and string-literal dynamic imports.
+    "rewriteRelativeImportExtensions": true,
+    "allowImportingTsExtensions": false,
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src/**/*.ts"]
+}

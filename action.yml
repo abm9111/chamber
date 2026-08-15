@@ -1,8 +1,8 @@
 name: "Chamber Verify — docs drift gate"
+# Marketplace caps this description at 125 characters.
 description: >-
-  Fail the build when the ground moves under a written claim. Ingests your
-  docs (and optionally indexes your code), then re-checks every pinned
-  citation: hash comparison only, no model, no network.
+  Fail the build when the ground moves under a written claim — hash-checks
+  every pinned citation. No model, no network.
 author: "abm9111"
 branding:
   icon: "anchor"

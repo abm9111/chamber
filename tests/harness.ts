@@ -7380,12 +7380,19 @@ test(
         `# F${i}\n\nWhere does the retention rule apply for documents and notes, really apply?\n`,
       );
     }
-    ingestDirectory(db, dir);
+    // Hash-forced on BOTH legs. Unforced, this test ran under whichever
+    // embedder the machine happened to have: MiniLM locally (whose silent
+    // 256-token truncation guaranteed the burial), hash on a bare CI runner
+    // (where it did not reproduce). Two days of red CI over green local runs.
+    ingestDirectory(db, dir, {
+      embedBatch: (texts) => embedLocalBatch(texts, "hash"),
+    });
 
     const fake = async () => "The rule applies to documents. [1]";
     const missed = await runAsk(db, "Where does the Zebrastrasse rule apply?", {
       hybrid: false,
       k: 3,
+      model: LOCAL_HASH_MODEL,
       complete: fake,
     });
     assert(
@@ -7404,6 +7411,7 @@ test(
     // would train operators to ignore it.
     const shown = await runAsk(db, "Zebrastrasse", {
       exact: true,
+      model: LOCAL_HASH_MODEL,
       complete: fake,
     });
     assert(

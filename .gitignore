@@ -48,3 +48,7 @@ probes/seatbelt/work/*.txt
 # vigil run records (local, content-free; see engines/telemetry.md)
 .vigil/
 dist
+
+# Scratch copies of the harness written by probes/harness_declaration_guards.ts.
+# Removed in its finally block; ignored here in case it is killed mid-run.
+tests/.harness-guard-probe-*.ts

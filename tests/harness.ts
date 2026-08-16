@@ -11007,6 +11007,135 @@ test("pins", "an answer nothing produced says so, on the unset-model default", a
   }
 });
 
+/**
+ * Build a corpus and a config that omits `model.mode`, and hand back the env a
+ * child process needs to reproduce the reported defect.
+ *
+ * The config file is the load-bearing part. An earlier manual check of this
+ * path read the *developer's* real `~/.config/chamber/config.json`, which sets
+ * `mode: "openai"`, and so exercised a completely different branch — the test
+ * has to own the config or it is testing the machine it runs on. Every
+ * CHAMBER_* model variable is deleted rather than overridden, because "unset"
+ * is precisely the state under test.
+ */
+function stubAskFixture(): { env: NodeJS.ProcessEnv; dir: string } {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-stub-ask-"));
+  const docs = join(dir, "docs");
+  mkdirSync(docs, { recursive: true });
+  writeFileSync(
+    join(docs, "ops.md"),
+    "# Ops\n\n## Audit store\nWe decided the audit store is SQLite.\n",
+  );
+  const db = join(dir, "chamber.sqlite");
+  const cfg = join(dir, "config.json");
+  writeFileSync(cfg, `${JSON.stringify({ database: db, ingest: [] })}\n`);
+
+  const env: NodeJS.ProcessEnv = { ...process.env, CHAMBER_CONFIG: cfg, CHAMBER_DB: db };
+  delete env.CHAMBER_MODEL;
+  delete env.CHAMBER_API_BASE;
+  delete env.CHAMBER_API_MODEL;
+
+  const ingest = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", CLI_PATH, "ingest", docs],
+    { encoding: "utf8", timeout: 60_000, env },
+  );
+  assert(
+    ingest.status === 0,
+    `setup: ingest failed (${ingest.status}): ${ingest.stderr}`,
+  );
+  return { env, dir };
+}
+
+/**
+ * The wiring, not the function.
+ *
+ * `stubDisclosure` being correct proves nothing about whether a reader ever
+ * sees it — KNOWN_LIMITATIONS 19 was a wiring defect, not a logic one: the
+ * signal existed and went to a channel nobody reads. The unit tests above call
+ * `stubDisclosure`/`runAsk` directly, so a regression that moved this back to
+ * `console.error`, printed it below the answer, or dropped the call while
+ * refactoring the `ask` case would leave both of them green.
+ *
+ * So this asserts the three things that actually failed once: it is on
+ * **stdout** (a redirect keeps it), it is **before** the answer, and it is
+ * present at all.
+ */
+test("cli", "chamber ask prints the stub disclosure on stdout, above the answer", () => {
+  const { env, dir } = stubAskFixture();
+  try {
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", CLI_PATH, "ask", "what is the audit store"],
+      { encoding: "utf8", timeout: 60_000, env },
+    );
+    assert(r.error === undefined, `launch failed: ${r.error}`);
+    assert(r.status === 0, `ask exited ${r.status}: ${r.stderr}`);
+
+    const out = r.stdout ?? "";
+    const banner = out.indexOf("STUB MODEL");
+    assert(
+      banner >= 0,
+      `the disclosure must reach stdout, so a redirect keeps it. stdout was:\n${out}\nstderr:\n${r.stderr}`,
+    );
+    const answer = out.indexOf("committed observations and retrieved corpus pins");
+    assert(answer >= 0, `setup: expected the canned stub answer. stdout:\n${out}`);
+    assert(
+      banner < answer,
+      "the disclosure must come before the answer — a reader who stops at the " +
+        "first paragraph has to have been told already",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * The same wiring on the other surface, and the one the reported defect was
+ * actually about: the MCP tool result is what a host shows its user, while the
+ * `console.error` line in `getDb()` goes to the host's log. This asserts the
+ * banner is inside `result.content[0].text` — not merely somewhere in stderr,
+ * which is where the old signal already was.
+ */
+test("cli", "chamber_ask returns the stub disclosure inside the tool result", () => {
+  const { env, dir } = stubAskFixture();
+  try {
+    const MCP_PATH = join(dirname(fileURLToPath(import.meta.url)), "../src/mcp_server.ts");
+    const input =
+      `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "t", version: "0" } } })}\n` +
+      `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n` +
+      `${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "chamber_ask", arguments: { question: "what is the audit store" } } })}\n`;
+    const r = spawnSync(process.execPath, ["--experimental-strip-types", MCP_PATH], {
+      encoding: "utf8",
+      input,
+      timeout: 60_000,
+      env,
+    });
+    assert(r.error === undefined, `launch failed: ${r.error}`);
+    const reply = (r.stdout || "")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as { id?: number; result?: { content?: { text?: string }[] } })
+      .find((d) => d.id === 2);
+    const text = reply?.result?.content?.[0]?.text;
+    assert(
+      typeof text === "string",
+      `no chamber_ask result in stdout:\n${r.stdout}\nstderr:\n${r.stderr}`,
+    );
+    const banner = text.indexOf("STUB MODEL");
+    assert(
+      banner >= 0,
+      `the disclosure must be in the tool result the host renders, not only in ` +
+        `the stderr log. result text was:\n${text}`,
+    );
+    const answer = text.indexOf("committed observations and retrieved corpus pins");
+    assert(answer >= 0, `setup: expected the canned stub answer. result:\n${text}`);
+    assert(banner < answer, "the disclosure must precede the answer in the tool result");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("pins", "a real model's answer carries no stub disclosure", () => {
   // The other half, and the one that keeps the disclosure from becoming
   // decoration: it must be absent when a model actually spoke. Without this,
@@ -11600,6 +11729,30 @@ reportingStarted = true;
 const passed = results.filter((r) => r.ok).length;
 const failed = results.filter((r) => !r.ok);
 
+/**
+ * The tally is printed before the process can finish dying.
+ *
+ * A `test()` declared past this point throws — correctly, and with a non-zero
+ * exit — but the throw happens *after* these lines have already put
+ * `N/N passed · 0 failed` on stdout. The exit code is the real gate and it is
+ * right; anything scraping stdout for "passed" without reading the status is
+ * fooled. That is the same shape as the defect the guards close, so it does
+ * not get to survive one layer up.
+ *
+ * Registered before the tally prints, so it covers any abnormal exit after it.
+ * Only fires when the tally claimed success: a run that already reported
+ * failures is not lying about anything.
+ */
+let tallyPrinted = false;
+process.on("exit", (code) => {
+  if (code !== 0 && tallyPrinted && failed.length === 0) {
+    console.log(
+      `\n!! THE TALLY ABOVE IS VOID — the run aborted after printing it ` +
+        `(exit ${code}). Nothing above this line is a result.\n`,
+    );
+  }
+});
+
 console.log("\n══ Chamber acceptance harness ══\n");
 for (const r of results) {
   const mark = r.ok ? "PASS" : "FAIL";
@@ -11609,6 +11762,7 @@ for (const r of results) {
 console.log(
   `\n── ${passed}/${registered} passed · ${failed.length} failed ──\n`,
 );
+tallyPrinted = true;
 
 if (failed.length > 0) {
   process.exitCode = 1;

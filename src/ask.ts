@@ -44,7 +44,18 @@ export interface AskClaimResult {
   debtIds: string[];
 }
 
-export interface AskResult {
+/**
+ * Which code path produced an answer.
+ *
+ * `"injected"` is here rather than outside the domain because `AskOptions
+ * .complete` is a real, ungated parameter of the production `runAsk` — only
+ * tests pass it today, but nothing in the signature makes that true, so the
+ * type may not pretend otherwise. Folding it into `"stub"` would be the exact
+ * mislabelling `stubDisclosure` exists to prevent.
+ */
+export type ModelMode = "stub" | "openai" | "injected";
+
+interface AskResultShape {
   answer: string;
   claims: AskClaimResult[];
   passages: {
@@ -63,24 +74,6 @@ export interface AskResult {
      */
     label: string;
   }[];
-  modelCalled: boolean;
-  /**
-   * Which model actually produced `answer` — `undefined` when none was called.
-   *
-   * Not diagnostics. `CHAMBER_MODEL` defaults to `stub` (src/model.ts), and
-   * `model.mode` is optional in the config file with no default applied
-   * (src/config.ts), so a config that omits it reaches `stubComplete` and
-   * returns one of five canned sentences. One of them — "I can answer from
-   * committed observations and retrieved corpus pins only" — reads exactly
-   * like a real model refusing for lack of sources, and it arrives with a
-   * per-claim citation verdict block computed over that canned text.
-   *
-   * The only prior signal was a stderr line in the MCP host's log, which the
-   * reader of the answer never sees, and which prints `model=undefined` on
-   * precisely this path. So the mode travels *in the result*, and every
-   * surface that renders an answer renders `stubDisclosure` above it.
-   */
-  modelMode?: "stub" | "openai" | "injected";
   /**
    * Why retrieval returned what it did, when that is not self-evident from the
    * answer. Set both when nothing could be retrieved (and so no answer exists)
@@ -90,6 +83,42 @@ export interface AskResult {
    */
   note?: string;
 }
+
+/**
+ * The result of `runAsk`, discriminated on whether a model was called.
+ *
+ * **Why a union rather than two optional fields.** The invariant is "if a
+ * model produced this answer, its identity is known", and it was previously
+ * expressed as `modelCalled: boolean` beside `modelMode?: …` — two independent
+ * fields a caller had to correlate by hand, and which a future producer could
+ * set inconsistently without the compiler objecting. `stubDisclosure` then had
+ * to fail closed on an unrecognised mode to compensate for a shape that could
+ * be built wrong.
+ *
+ * That backstop stays, because defence in depth is the point, but the shape no
+ * longer needs it: an answer without a recorded author is now unrepresentable
+ * rather than merely discouraged. `runAsk`'s two returns already produced
+ * exactly these two shapes, and both callers already gate on `modelCalled`
+ * before reading anything else, so this cost nothing at any call site.
+ *
+ * `modelMode?: undefined` on the false arm is deliberate: it keeps the field
+ * readable without narrowing, so a caller that only wants the mode does not
+ * have to restructure around the discriminant to ask for it.
+ *
+ * Not diagnostics, and this is why it earns a place in the domain type.
+ * `CHAMBER_MODEL` defaults to `stub` (src/model.ts) and `model.mode` is
+ * optional in the config with no default applied (src/config.ts), so a config
+ * that omits it reaches `stubComplete` and returns one of five canned
+ * sentences. One — "I can answer from committed observations and retrieved
+ * corpus pins only" — reads exactly like a real model refusing for lack of
+ * sources, and it arrived with a per-claim citation verdict block computed
+ * over that canned text. The only prior signal was a stderr line in the MCP
+ * host's log, which the reader of the answer never sees, and which prints
+ * `model=undefined` on precisely this path.
+ */
+export type AskResult =
+  | (AskResultShape & { modelCalled: false; modelMode?: undefined })
+  | (AskResultShape & { modelCalled: true; modelMode: ModelMode });
 
 /**
  * The line an answer surface must print above an answer, or `undefined` when a
@@ -110,7 +139,7 @@ export interface AskResult {
  * is strictly worse than a known stub and must say so. Validating against a
  * closed set is the rule the vendor-metadata fences already learned twice.
  */
-export function stubDisclosure(mode: AskResult["modelMode"]): string | undefined {
+export function stubDisclosure(mode: ModelMode | undefined): string | undefined {
   if (mode === "openai" || mode === "injected") return undefined;
   if (mode === "stub") {
     return [
@@ -529,7 +558,7 @@ export async function runAsk(
   // Destructured rather than `.text`-ed inline because the mode is now part of
   // the result: which model spoke is not separable from what it said.
   let answer: string;
-  let modelMode: AskResult["modelMode"];
+  let modelMode: ModelMode;
   if (opts.complete) {
     answer = await opts.complete(prompt);
     // A test seam, and named as one. It is deliberately not "stub": an injected

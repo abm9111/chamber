@@ -25,6 +25,40 @@ jobs:
           docs-path: docs
           database: ${{ runner.temp }}/chamber-selftest.sqlite
 
+      # The injection fix was proved by reasoning in a comment, which is the
+      # shape CLAUDE.md warns about — the hostile-name test that passed while
+      # the attack worked. The step above exercises only the trusted `docs`
+      # path, so it would pass identically if someone "simplified"
+      # "$CHAMBER_DOCS_PATH" back to "${{ inputs.docs-path }}" for readability.
+      #
+      # So: hand the action a payload and demand nothing runs. The action
+      # itself is expected to fail (there is no such directory) — that failure
+      # is not the assertion and is why continue-on-error is set. The assertion
+      # is the canary in the step after it.
+      - name: Hand the action a shell payload as an input
+        id: injection
+        continue-on-error: true
+        uses: ./
+        with:
+          docs-path: 'docs$(touch /tmp/chamber-canary-subshell)`touch /tmp/chamber-canary-backtick`'
+          database: ${{ runner.temp }}/chamber-injection.sqlite
+
+      - name: No payload may have executed
+        run: |
+          set -euo pipefail
+          rc=0
+          for f in /tmp/chamber-canary-subshell /tmp/chamber-canary-backtick; do
+            if [ -e "$f" ]; then
+              echo "INJECTION SUCCEEDED — $f was created by an action input" >&2
+              rc=1
+            fi
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo "The env-var indirection in action.yml has regressed." >&2
+            exit 1
+          fi
+          echo "no injection — the payload stayed inside a filename argument"
+
       # Through the environment for the same reason action.yml is: the report is
       # built from ingested corpus text, so `${{ }}` here would paste document
       # content into the shell. A single apostrophe in any ingested doc ends the

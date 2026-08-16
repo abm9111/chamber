@@ -47,7 +47,7 @@
     "test:approvals": "node --experimental-strip-types tests/harness.ts --suite=approvals",
     "test:audit": "node --experimental-strip-types tests/harness.ts --suite=audit",
     "demos": "rc=0; for f in demos/*.ts; do node --experimental-strip-types \"$f\" || rc=1; done; exit $rc",
-    "probes": "rc=0; node --experimental-strip-types probes/gate_audit.ts || rc=1; node --experimental-strip-types probes/pin_bypass.ts || rc=1; node --experimental-strip-types probes/verify_partial_drift.ts || rc=1; node --experimental-strip-types probes/debt_paraphrase.ts || rc=1; CHAMBER_SANDBOX_REQUIRED=1 node --experimental-strip-types probes/sandbox_escape.ts || rc=1; exit $rc",
+    "probes": "rc=0; node --experimental-strip-types probes/gate_audit.ts || rc=1; node --experimental-strip-types probes/pin_bypass.ts || rc=1; node --experimental-strip-types probes/verify_partial_drift.ts || rc=1; node --experimental-strip-types probes/debt_paraphrase.ts || rc=1; node --experimental-strip-types probes/harness_declaration_guards.ts || rc=1; CHAMBER_SANDBOX_REQUIRED=1 node --experimental-strip-types probes/sandbox_escape.ts || rc=1; exit $rc",
     "cli": "node --experimental-strip-types src/cli.ts",
     "turn": "node --experimental-strip-types src/cli.ts turn",
     "status": "node --experimental-strip-types src/cli.ts status",

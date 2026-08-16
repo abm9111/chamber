@@ -642,3 +642,39 @@ passes 24 — correct by its own rule, wrong about this case.
 `prepack` build; the repository itself stays TypeScript-direct), or teach the
 bin shim to catch this specific error and say "Node 26+, or clone" instead of
 stack-tracing. Until one of those lands, the action and docs pin Node 26.
+
+## 19. `ask` on the stub answered in a real model's voice, unlabelled
+
+*Added and fixed 2026-08-16, found by an audit of this repository rather than
+by using it — which is the uncomfortable part: `CLAUDE.md` has warned "never
+demo `ask` on the stub" for weeks, and this file, the one that is supposed to
+be the honest surface, did not carry it.*
+
+`CHAMBER_MODEL` defaults to `stub` (`src/model.ts`), and `model.mode` is
+optional in the config file with no default applied (`src/config.ts`) — so
+`applyModelEnv` seeds nothing, `complete()` falls through to `stubComplete`,
+and a config that simply omits `model.mode` gets canned text. For a question
+beginning what/who/how/why that text is:
+
+> I can answer from committed observations and retrieved corpus pins only. Ask
+> me to search or state a fact: claim.
+
+which reads exactly like a real model declining for lack of sources. It was
+returned by `chamber ask` and by the `chamber_ask` MCP tool with no marker,
+followed by a per-claim citation verdict block computed over that canned
+sentence — so a `[verified]` under it meant the canned sentence had cited a
+real passage, not that anything had been answered.
+
+**The one existing signal did not reach the reader**, twice over. It was a
+`console.error` line in `src/mcp_server.ts`, which lands in the MCP host's log
+rather than in the tool result anyone reads; and on this exact path it printed
+`model=undefined`, because the env var it echoes is the one that was never set.
+
+**Fixed.** `AskResult` now carries `modelMode`, and both surfaces render
+`stubDisclosure()` above the answer — one shared function, because a
+disclosure each surface phrases for itself is one a surface eventually drops.
+
+**What remains.** The disclosure is a label, not a refusal: `ask` still answers
+on the stub, deliberately, because `chamber try` and the demos depend on an
+offline deterministic path. A reader who ignores five lines of capitals gets
+the old behaviour back.

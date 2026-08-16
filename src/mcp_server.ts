@@ -51,7 +51,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { openChamberDb } from "./db.ts";
 import { loadConfig, applyModelEnv } from "./config.ts";
-import { runAsk } from "./ask.ts";
+import { runAsk, stubDisclosure } from "./ask.ts";
 import { verifyBeliefSources } from "./pins.ts";
 import { corpusStats } from "./corpus.ts";
 import { formatErrorChain } from "./error_chain.ts";
@@ -236,7 +236,14 @@ async function callTool(
       if (!r.modelCalled) return r.note ?? "no passages retrieved";
 
       const label = new Map(r.passages.map((p) => [p.documentId, p.label]));
-      const out = [r.answer, ""];
+      const out: string[] = [];
+      // First, above the answer, and inside the tool result rather than on
+      // stderr. The stderr announcement in getDb() reaches the host's MCP log;
+      // it does not reach whoever reads this string, and on the config path
+      // that lands here it prints `model=undefined` rather than the word stub.
+      const disclosure = stubDisclosure(r.modelMode);
+      if (disclosure) out.push(disclosure, "");
+      out.push(r.answer, "");
       // Printed next to the answer, never in place of it: an answer produced
       // over a filtered view of the corpus is still an answer, but the caller
       // has to know the view was filtered.

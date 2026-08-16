@@ -65,6 +65,23 @@ export interface AskResult {
   }[];
   modelCalled: boolean;
   /**
+   * Which model actually produced `answer` — `undefined` when none was called.
+   *
+   * Not diagnostics. `CHAMBER_MODEL` defaults to `stub` (src/model.ts), and
+   * `model.mode` is optional in the config file with no default applied
+   * (src/config.ts), so a config that omits it reaches `stubComplete` and
+   * returns one of five canned sentences. One of them — "I can answer from
+   * committed observations and retrieved corpus pins only" — reads exactly
+   * like a real model refusing for lack of sources, and it arrives with a
+   * per-claim citation verdict block computed over that canned text.
+   *
+   * The only prior signal was a stderr line in the MCP host's log, which the
+   * reader of the answer never sees, and which prints `model=undefined` on
+   * precisely this path. So the mode travels *in the result*, and every
+   * surface that renders an answer renders `stubDisclosure` above it.
+   */
+  modelMode?: "stub" | "openai" | "injected";
+  /**
    * Why retrieval returned what it did, when that is not self-evident from the
    * answer. Set both when nothing could be retrieved (and so no answer exists)
    * and when an answer *was* produced over a corpus some of whose matching
@@ -72,6 +89,46 @@ export interface AskResult {
    * must be rendered next to the answer, not in place of it.
    */
   note?: string;
+}
+
+/**
+ * The line an answer surface must print above an answer, or `undefined` when a
+ * named real model produced it.
+ *
+ * Lives here rather than in each caller because `chamber ask` and the
+ * `chamber_ask` MCP tool are two renderings of one result, and a disclosure
+ * that each surface phrases for itself is a disclosure one of them will
+ * eventually drop — the same divergence `embedLocal` and `embedLocalBatch`
+ * already demonstrate.
+ *
+ * **Allow-listed, not blocked.** Written first as `if (mode !== "stub") return
+ * undefined`, which reintroduces the defect it exists to close one code path
+ * later: a future branch that produces an answer without setting `modelMode`
+ * gets silence, and silence is the thing that was wrong. Both callers gate on
+ * `modelCalled` before reaching here, so an absent mode at this point is not
+ * "no model was called" — it is an answer whose author nobody recorded, which
+ * is strictly worse than a known stub and must say so. Validating against a
+ * closed set is the rule the vendor-metadata fences already learned twice.
+ */
+export function stubDisclosure(mode: AskResult["modelMode"]): string | undefined {
+  if (mode === "openai" || mode === "injected") return undefined;
+  if (mode === "stub") {
+    return [
+      "!! STUB MODEL — no model was consulted.",
+      "   The answer below is one of five canned sentences. It is not about your",
+      "   corpus, and the per-claim verdicts under it were computed over that",
+      "   canned text, so a [verified] there means the canned sentence cited a",
+      "   real passage — not that anything was answered.",
+      '   Set model.mode to "openai" (chamber config init) or CHAMBER_MODEL=openai.',
+    ].join("\n");
+  }
+  return [
+    "!! UNKNOWN MODEL — this answer's author was not recorded.",
+    "   Something produced the text below and did not say what. Treat it as",
+    "   unattributed: the per-claim verdicts under it are still real checks",
+    "   against real passages, but nothing here establishes what wrote the",
+    "   claims they checked. This is a bug in the surface that built it.",
+  ].join("\n");
 }
 
 export interface AskOptions {
@@ -469,16 +526,27 @@ export async function runAsk(
   }
 
   const prompt = buildPrompt(question, passages);
-  const answer = opts.complete
-    ? await opts.complete(prompt)
-    : (
-        await complete(db, {
-          messages: [{ role: "user", content: prompt }],
-          channel: "chat",
-          turnId: opts.turnId,
-          sessionId: opts.sessionId,
-        })
-      ).text;
+  // Destructured rather than `.text`-ed inline because the mode is now part of
+  // the result: which model spoke is not separable from what it said.
+  let answer: string;
+  let modelMode: AskResult["modelMode"];
+  if (opts.complete) {
+    answer = await opts.complete(prompt);
+    // A test seam, and named as one. It is deliberately not "stub": an injected
+    // function is not the canned stub, and collapsing the two would either
+    // print the stub disclosure over test output or — far worse the other way —
+    // teach a future reader that an unknown provenance may be labelled `stub`.
+    modelMode = "injected";
+  } else {
+    const completion = await complete(db, {
+      messages: [{ role: "user", content: prompt }],
+      channel: "chat",
+      turnId: opts.turnId,
+      sessionId: opts.sessionId,
+    });
+    answer = completion.text;
+    modelMode = completion.mode;
+  }
 
   const byIndex = new Map(passages.map((p) => [p.index, p]));
   const claims = classifyClaims(answer);
@@ -581,6 +649,7 @@ export async function runAsk(
       label: passageLabel(p.sourceRef, p.title, p.documentId),
     })),
     modelCalled: true,
+    modelMode,
     // Alongside the answer, never instead of it: the answer is real and its
     // citations verified, and the operator still needs to know it was formed
     // over a restricted view of the corpus.

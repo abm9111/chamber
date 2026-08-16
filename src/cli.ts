@@ -56,7 +56,7 @@ import {
 } from "./ingest.ts";
 import { completeSync, syncCompletionAvailable } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
-import { runAsk } from "./ask.ts";
+import { runAsk, stubDisclosure } from "./ask.ts";
 import { buildVerifyReport } from "./pins.ts";
 import { runExpiryJob } from "./expiry.ts";
 import { indexCodeTree, searchCode } from "./code_index.ts";
@@ -1278,6 +1278,15 @@ async function main(): Promise<void> {
         console.log(r.note ?? "no passages retrieved");
         break;
       }
+      // Above the answer, not below it: a reader who stops at the first
+      // paragraph must have already been told nothing produced it.
+      //
+      // stdout, not stderr, and that is the whole point of the fix. The defect
+      // this closes was a disclosure sitting on a channel the reader of the
+      // answer does not read; `chamber ask "..." > out.txt` on stderr would
+      // reproduce it exactly, one redirect later.
+      const disclosure = stubDisclosure(r.modelMode);
+      if (disclosure) console.log(`\n${disclosure}`);
       console.log(`\n${r.answer}\n`);
       // An answer can be produced over a filtered view of the corpus. Printing
       // the note only on the no-answer path above is what made that silent.

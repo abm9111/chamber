@@ -59,7 +59,7 @@ import {
   buildVerifyReport,
   CITABLE_SOURCE_KINDS,
 } from "../src/pins.ts";
-import { runAsk, citedIndices } from "../src/ask.ts";
+import { runAsk, citedIndices, stubDisclosure } from "../src/ask.ts";
 import {
   minilmAvailable,
   embedLocal,
@@ -10915,6 +10915,75 @@ test("daemon", "gateway_runner runs main() when it is the program invoked", () =
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// The mechanism this guards is the *default* branch, so the test may not inject
+// `complete` — an injected function reports mode "injected" and never reaches
+// stubComplete at all. A test that supplied one would pass against the very bug
+// it claims to cover, which is the failure mode this repository keeps hitting:
+// the hostile-name test that passed while the attack worked, because it set an
+// explicit `source` and skipped the vulnerable default. So: no injection, and
+// CHAMBER_MODEL deleted rather than set to "stub", because "unset" is the state
+// a config file omitting `model.mode` actually leaves behind.
+test("pins", "an answer nothing produced says so, on the unset-model default", async () => {
+  const prior = process.env.CHAMBER_MODEL;
+  delete process.env.CHAMBER_MODEL;
+  try {
+    const db = freshDb();
+    upsertDocument(db, {
+      sourceKind: "vault_page",
+      sourceRef: "notes/decision.md",
+      title: "Decision",
+      body: "We decided to use SQLite for the audit store.",
+    });
+    const r = await runAsk(db, "what did we decide about the audit store", {});
+    assert(
+      r.modelCalled,
+      "setup: a passage was retrieved, so the model path must have run",
+    );
+    assert(
+      r.modelMode === "stub",
+      `unset CHAMBER_MODEL must resolve to the stub, got ${String(r.modelMode)}`,
+    );
+    const disclosure = stubDisclosure(r.modelMode);
+    assert(!!disclosure, "a stub answer must carry a disclosure");
+    assert(
+      disclosure!.includes("STUB MODEL"),
+      "the disclosure must name the stub in words a reader skimming will catch",
+    );
+    // The canned sentence that reads as a real refusal. If stubComplete ever
+    // stops returning it this assertion is the thing that notices.
+    assert(
+      r.answer.includes("committed observations and retrieved corpus pins"),
+      `expected the canned what/who/how/why reply, got: ${r.answer}`,
+    );
+  } finally {
+    if (prior === undefined) delete process.env.CHAMBER_MODEL;
+    else process.env.CHAMBER_MODEL = prior;
+  }
+});
+
+test("pins", "a real model's answer carries no stub disclosure", () => {
+  // The other half, and the one that keeps the disclosure from becoming
+  // decoration: it must be absent when a model actually spoke. Without this,
+  // returning the banner unconditionally would pass the test above.
+  assert(
+    stubDisclosure("openai") === undefined,
+    "an openai answer must not be labelled a stub",
+  );
+  assert(
+    stubDisclosure("injected") === undefined,
+    "an injected test completion is not the stub and must not be labelled one",
+  );
+  // Fail closed. Both callers reach this only after `modelCalled` is true, so
+  // an absent mode here is an answer with no recorded author — not "no model
+  // ran". Returning undefined for it is the original defect wearing a new
+  // shape, so the allow-list must reject anything it does not recognise.
+  const unknown = stubDisclosure(undefined);
+  assert(
+    !!unknown && unknown.includes("UNKNOWN MODEL"),
+    "an unrecorded provenance must disclose, not fall through to silence",
+  );
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────

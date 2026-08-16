@@ -6,21 +6,19 @@ Chamber itself is MIT-licensed (see LICENSE); the components below are not.
 
 ---
 
-## vendor/xenova-transformers/
+## vendor/xenova-transformers/ — removed 2026-08-16
 
-Portions of Transformers.js (https://github.com/huggingface/transformers.js),
-Copyright (c) Xenova and the Transformers.js contributors.
+Portions of Transformers.js were vendored here from the week-one baseline
+(`a49f4c5`) and never imported by anything: the embedder runs
+`scripts/embed_minilm.py` against `models/minilm/` via onnxruntime, and a
+search of the tree outside `vendor/` found references only in this file, in
+`benchmarks/BENCHMARK.md` and in an eslint ignore rule.
 
-Licensed under the Apache License, Version 2.0. The full licence text is at
-vendor/xenova-transformers/LICENSE and at
-http://www.apache.org/licenses/LICENSE-2.0
-
-These files are vendored (copied into this repository) rather than installed
-as an npm dependency, so that Chamber's runtime has no package dependencies.
-That choice makes them invisible to `npm audit`, Dependabot, and SBOM tooling
-— see vendor/xenova-transformers/VERSION for the pinned upstream revision and
-integrity hashes. Redistribution of this repository redistributes these files
-under Apache-2.0.
+So the directory carried live obligations for no function — Apache-2.0
+redistribution, a dependency surface `npm audit` and Dependabot cannot see, and
+a recorded upstream revision of `UNIDENTIFIED`, which meant no advisory could
+ever be evaluated against it. Deleted rather than documented. It remains in git
+history at any commit before this one, still under Apache-2.0.
 
 ## models/minilm/
 

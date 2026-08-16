@@ -11,7 +11,6 @@ export default tseslint.config(
   {
     ignores: [
       "node_modules/**",
-      "vendor/**",
       "models/**",
       "data/**",
       "docs/**",

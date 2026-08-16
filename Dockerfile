@@ -16,4 +16,11 @@ COPY scripts/ scripts/
 COPY package.json ./
 # initialize and tools/list respond before any config exists; tool calls
 # resolve config on first use (CHAMBER_* env vars or a mounted config file).
+
+# node:24-slim ships an unprivileged `node` user (uid 1000) with its own
+# $HOME, which is where the database lands on first tool call — the copied
+# sources are only ever read, so no ownership change is needed. Root bought
+# nothing here and cost a container-escape precondition (trivy DS-0002).
+USER node
+
 CMD ["node", "--experimental-strip-types", "src/mcp_server.ts"]

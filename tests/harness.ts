@@ -307,6 +307,32 @@ const pending: AsyncTestThunk[] = [];
  */
 let registered = 0;
 
+/**
+ * Two positions in this file are one-way doors, and `registered` cannot see
+ * either of them. It closes the gap for a test dropped *between* registration
+ * and reporting; a test declared *after* the thing that would have counted it
+ * increments a number nobody reads again, so both sides of the comparison move
+ * together and the summary still reads `N/N passed · 0 failed`, exit 0 — the
+ * exact tally the comment above promises cannot happen.
+ *
+ * The doors are separate because the failures are:
+ *
+ * - `drainStarted` — past the drain loop, `pending` is never read again, so an
+ *   **async** test declared below is queued and abandoned, body never invoked.
+ *   Sync tests below this line are legitimate and there are sixteen of them:
+ *   they run inline at registration, before the summary.
+ * - `reportingStarted` — past this, the tally is computed, so **any** test
+ *   declared below is invisible: a sync one runs and records into a `results`
+ *   already printed, and its failure never reaches the exit code.
+ *
+ * Found by hitting it. Two tests appended to the end of this file for
+ * KNOWN_LIMITATIONS 19 reported 370/370 with neither ever invoked, and only
+ * broke cover because the fix they guarded was deliberately reverted to watch
+ * them go red — and they did not.
+ */
+let drainStarted = false;
+let reportingStarted = false;
+
 /** True for real promises and for any thenable a test body might return. */
 function isThenable(value: unknown): value is PromiseLike<unknown> {
   if (value === null) return false;
@@ -349,6 +375,24 @@ function test(
   name: string,
   fn: () => void | Promise<void>,
 ): void {
+  // Both checks sit before the suite filter: a test declared too late is a
+  // broken test file whichever suite it names, and returning early for a
+  // filtered-out suite would hide it on every run not selecting that suite.
+  if (reportingStarted) {
+    throw new Error(
+      `test "${suite}/${name}" was declared after the summary was computed, ` +
+        `so nothing can count it — a failure here would not even change the ` +
+        `exit code. Move it above the "─── report ───" divider.`,
+    );
+  }
+  if (drainStarted && isAsyncFunction(fn)) {
+    throw new Error(
+      `async test "${suite}/${name}" was declared after the async queue was ` +
+        `drained. It would be queued and never invoked, and the summary ` +
+        `would still read all-green. Move it above the "─── report ───" ` +
+        `divider. (A sync test here is fine.)`,
+    );
+  }
   const selected = suiteFromArg();
   if (selected !== "all" && selected !== suite) return;
   registered++;
@@ -10988,6 +11032,11 @@ test("pins", "a real model's answer carries no stub disclosure", () => {
 
 // ─── report ──────────────────────────────────────────────────────────────────
 
+// Past this point `pending` is never read again, so an async test declared
+// below would be queued and abandoned. Sync tests below are fine and there are
+// sixteen of them: they execute inline at registration, ahead of the summary.
+drainStarted = true;
+
 // Drain the async queue sequentially: invoke a thunk, await it fully,
 // record pass/fail, only then move to the next. Running them one at a
 // time — instead of firing them all and awaiting the batch — is what
@@ -11543,6 +11592,10 @@ test("audit", "a skill refusal survives the rollback that refuses it", () => {
   );
   assert(verifyAuditChain(db).ok, "the chain must still verify");
 });
+
+// From here the tally is fixed: `registered` and `results` are read below, so
+// a test declared past this line cannot appear on either side of the summary.
+reportingStarted = true;
 
 const passed = results.filter((r) => r.ok).length;
 const failed = results.filter((r) => !r.ok);

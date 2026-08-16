@@ -25,6 +25,14 @@ jobs:
           docs-path: docs
           database: ${{ runner.temp }}/chamber-selftest.sqlite
 
+      # Through the environment for the same reason action.yml is: the report is
+      # built from ingested corpus text, so `${{ }}` here would paste document
+      # content into the shell. A single apostrophe in any ingested doc ends the
+      # quoting and the rest of that line runs -- and `pull_request` means the
+      # doc can arrive with the pull request. `printenv` rather than `echo "$V"`
+      # so no expansion touches it at all.
       - name: The report must be parseable JSON with the contract fields
+        env:
+          REPORT: ${{ steps.gate.outputs.report }}
         run: |
-          echo '${{ steps.gate.outputs.report }}' | jq -e '.checked >= 0 and (.broken | type == "number") and (.database | type == "string")'
+          printenv REPORT | jq -e '.checked >= 0 and (.broken | type == "number") and (.database | type == "string")'

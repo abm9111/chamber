@@ -52,24 +52,38 @@ runs:
       with:
         node-version: ${{ inputs.node-version }}
 
+    # Every caller-supplied value reaches bash as an environment variable and is
+    # referenced as "$VAR", never interpolated into the command text with
+    # ${{ }}. `database` was already written this way; `docs-path`, `code-path`
+    # and `github.action_path` were not, so a caller who wired an input to
+    # anything attacker-influenced — `docs-path: ${{ github.event.issue.title }}`
+    # is the usual shape — got the rest of that title executed as shell on their
+    # own runner, holding their own token. Interpolation happens before bash
+    # sees the line, so quoting the ${{ }} never helped; only the env indirection
+    # does. (semgrep yaml.github-actions.security.run-shell-injection)
     - name: Ingest docs
       shell: bash
       env:
         CHAMBER_DB: ${{ inputs.database }}
-      run: node --experimental-strip-types "${{ github.action_path }}/src/cli.ts" ingest "${{ inputs.docs-path }}"
+        CHAMBER_ACTION_PATH: ${{ github.action_path }}
+        CHAMBER_DOCS_PATH: ${{ inputs.docs-path }}
+      run: node --experimental-strip-types "$CHAMBER_ACTION_PATH/src/cli.ts" ingest "$CHAMBER_DOCS_PATH"
 
     - name: Index code
       if: ${{ inputs.code-path != '' }}
       shell: bash
       env:
         CHAMBER_DB: ${{ inputs.database }}
-      run: node --experimental-strip-types "${{ github.action_path }}/src/cli.ts" index-code "${{ inputs.code-path }}"
+        CHAMBER_ACTION_PATH: ${{ github.action_path }}
+        CHAMBER_CODE_PATH: ${{ inputs.code-path }}
+      run: node --experimental-strip-types "$CHAMBER_ACTION_PATH/src/cli.ts" index-code "$CHAMBER_CODE_PATH"
 
     - name: Verify pinned claims
       id: verify
       shell: bash
       env:
         CHAMBER_DB: ${{ inputs.database }}
+        CHAMBER_ACTION_PATH: ${{ github.action_path }}
       # verify exits non-zero when any belief lost verified support (broken
       # OR degraded) — that exit code IS the gate; nothing here softens it.
       # The JSON is captured first so the report reaches $GITHUB_OUTPUT even
@@ -77,7 +91,7 @@ runs:
       run: |
         set -o pipefail
         rc=0
-        report="$(node --experimental-strip-types "${{ github.action_path }}/src/cli.ts" verify --json)" || rc=$?
+        report="$(node --experimental-strip-types "$CHAMBER_ACTION_PATH/src/cli.ts" verify --json)" || rc=$?
         echo "report<<CHAMBER_EOF" >> "$GITHUB_OUTPUT"
         echo "$report" >> "$GITHUB_OUTPUT"
         echo "CHAMBER_EOF" >> "$GITHUB_OUTPUT"

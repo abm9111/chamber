@@ -7,12 +7,18 @@
 # editing HEAD.
 #
 # a49f4c51 tests/harness.ts — generic-api-key
-#   The match is a TEST NAME, not a credential:
-#       test("oauth", "O11_seal_roundtrip", () => {
-#   The rule keys on a string literal following an "oauth"-ish token. The values
-#   the test actually handles are `Buffer.alloc(32, 7)` (a deterministic all-
-#   sevens key) and the literal "super-secret-token" — a fixture asserting that
-#   sealSecret/openSecret round-trips.
+#   The match is a TEST NAME, not a credential. The rule keys on a quoted
+#   string literal that follows an oauth-ish token, and what follows it there is
+#   the test's own name (a seal-roundtrip case in the oauth suite). The values
+#   that test actually handles are a deterministic all-sevens Buffer.alloc key
+#   and an obvious placeholder literal, asserting sealSecret/openSecret
+#   round-trips.
+#
+#   NOTE — do not quote the flagged source line here. An earlier version of this
+#   comment reproduced it verbatim to be helpful, and gitleaks matched THIS FILE
+#   on the same rule: documenting a false positive recreated it. That commit is
+#   already pushed and history is immutable, so the reproduction needs its own
+#   entry below rather than a fix. Describe flagged patterns; never paste them.
 #
 # Verified independently: trufflehog --results=verified reports 0 over the same
 # history (3,720 chunks, 33MB), and detect-secrets' 15 tracked hits were each
@@ -26,3 +32,8 @@
 # alarm. Every entry here must name what was inspected and why it was cleared —
 # an unexplained line is a suppression, not an acceptance.
 a49f4c511e7964228da053e4fb04e54ac15725ae:tests/harness.ts:generic-api-key:1486
+# 85814c09 .gitleaksignore — generic-api-key
+#   The entry above, quoting its own flagged line. Cleared in the working tree
+#   by the rewrite in this commit; unfixable in history without a force-push of
+#   a pushed commit, which is a worse trade than one more documented line.
+85814c09a523a191cc5100e9a9da977ca09d97cc:.gitleaksignore:generic-api-key:11

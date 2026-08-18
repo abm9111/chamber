@@ -306,6 +306,20 @@ if (!existsSync(join(repo, ".git"))) {
   process.exit(1);
 }
 
+/**
+ * An abort that must still run cleanup.
+ *
+ * `process.exit()` does NOT unwind — a `finally` below it never runs, verified
+ * directly rather than assumed. Every early exit in this file used to be a
+ * bare `process.exit(1)` inside the try, and each one is reached *after* the
+ * corpus has been extracted; the self-test abort is reached after ingest too,
+ * when the database holds a copy of every passage body. So an aborted run left
+ * the whole corpus on disk while printing that nothing was left on disk.
+ *
+ * Aborts throw this instead, and exiting is deferred until after cleanup.
+ */
+class BacktestAbort extends Error {}
+
 const work = mkdtempSync(join(tmpdir(), "chamber-backtest-"));
 const corpus = join(work, "corpus");
 const dbPath = join(work, "backtest.sqlite");
@@ -315,6 +329,33 @@ const ingestOpts = { exclude: [], includeDotted: false, requireExcludeMatch: fal
 
 const log = (m: string): void => { if (!args.json) console.log(m); };
 
+/**
+ * Cleanup is idempotent and reachable from three routes: normal completion,
+ * an abort, and a signal. Ctrl-C during a long ingest is not an exotic case —
+ * this harness runs for minutes over a large vault, and an interrupted run
+ * that leaves an extracted private corpus behind fails in exactly the way the
+ * pathspec exclusion exists to prevent.
+ */
+let cleaned = false;
+const cleanup = (): void => {
+  if (cleaned) return;
+  cleaned = true;
+  // The WHOLE working directory, not just the extracted files: the SQLite
+  // database holds a full copy of every ingested passage body, so removing the
+  // corpus and leaving the database behind leaves the corpus behind, in a less
+  // obvious container.
+  rmSync(work, { recursive: true, force: true });
+};
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  process.on(sig, () => {
+    cleanup();
+    // Conventional 128+n, and re-raising is not worth the complexity here: the
+    // point is that the corpus is gone before the process is.
+    process.exit(sig === "SIGINT" ? 130 : 143);
+  });
+}
+
+let exitCode = 0;
 try {
   log(`repo      ${repo}`);
   log(`from      ${args.from} → to ${args.to}`);
@@ -325,10 +366,7 @@ try {
   materialise(repo, args.from, corpus, args.exclude);
   const db = openChamberDb(dbPath);
   const before = ingestDirectory(db, corpus, ingestOpts);
-  if (before.aborted) {
-    console.error(`ingest refused: ${before.abortReason}`);
-    process.exit(1);
-  }
+  if (before.aborted) throw new BacktestAbort(`ingest refused: ${before.abortReason}`);
   log(`ingested  ${before.ingested} file(s) → ${before.passages} passage(s) at ${args.from}`);
 
   // ── 2. mint pins through the real gate ─────────────────────────────────────
@@ -340,8 +378,7 @@ try {
     )
     .all() as unknown as Row[];
   if (rows.length === 0) {
-    console.error("corpus is empty at --from; nothing to pin");
-    process.exit(1);
+    throw new BacktestAbort("corpus is empty at --from; nothing to pin");
   }
   const touched = changedFiles(repo, args.from, args.to, args.exclude);
   const inChanged = (r: Row): boolean => touched.has(passagePathOf(r.source_ref!));
@@ -416,21 +453,17 @@ try {
   const selfTest = known === 0 ? 0 : survived / known;
   log(`self-test ${survived}/${known} pins classify as survived against their own source (${(selfTest * 100).toFixed(1)}%)`);
   if (selfTest < SELF_TEST_FLOOR) {
-    console.error(
-      `\nABORT: the ground-truth classifier fails on input where the answer is known.\n` +
-        `Every number below it would be wrong, and wrong in a way that reads as a finding.\n` +
-        `Fix contentUnits()/classify() against src/chunk.ts before trusting this harness.`,
+    throw new BacktestAbort(
+      `the ground-truth classifier fails on input where the answer is known.\n` +
+        `  Every number below it would be wrong, and wrong in a way that reads as a finding.\n` +
+        `  Fix contentUnits()/classify() against src/chunk.ts before trusting this harness.`,
     );
-    process.exit(1);
   }
 
   // ── 4. NEW state ───────────────────────────────────────────────────────────
   materialise(repo, args.to, corpus, args.exclude);
   const after = ingestDirectory(db, corpus, ingestOpts);
-  if (after.aborted) {
-    console.error(`ingest refused: ${after.abortReason}`);
-    process.exit(1);
-  }
+  if (after.aborted) throw new BacktestAbort(`ingest refused: ${after.abortReason}`);
   log(`re-ingest ${after.ingested} file(s) → ${after.passages} passage(s) at ${args.to}`);
   if (after.removed > 0) log(`          ${after.removed} stale passage(s) removed from shrunken notes`);
 
@@ -544,12 +577,17 @@ try {
     log(`\nRe-run with --json for the machine-readable summary. Nothing is left on disk:`);
     log(`the corpus copy and its database are removed on exit, both hold your content.`);
   }
+} catch (err) {
+  if (err instanceof BacktestAbort) {
+    console.error(`\nbacktest aborted: ${err.message}`);
+    exitCode = 1;
+  } else {
+    // Unexpected failures keep their stack — but only after cleanup below.
+    console.error(err);
+    exitCode = 1;
+  }
 } finally {
-  // Remove the WHOLE working directory, not just the extracted files. The
-  // SQLite database holds a full copy of every ingested passage body, so
-  // deleting the corpus and leaving the DB behind would leave the corpus
-  // behind — in a less obvious container. The JSON summary carries paths and
-  // counts only, and is printed above rather than left on disk for the same
-  // reason.
-  rmSync(work, { recursive: true, force: true });
+  cleanup();
 }
+// Outside the finally, so cleanup has already run by the time the process ends.
+process.exit(exitCode);

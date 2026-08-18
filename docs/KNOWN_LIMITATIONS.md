@@ -212,6 +212,19 @@ which verdict this case produces.
 report a distinct reason — the content is unchanged, only its position moved. The index
 needed for this already exists. Unplanned.
 
+> **Partial fix, 2026-08-18.** The *moved* half of this class is now rescued —
+> for the `hash_mismatch` variant. A 3-month backtest on a real vault (434
+> pins) measured one top-of-note insertion firing all nine pins below it while
+> each body sat byte-identical one slot down; `findMovedWithinFile`
+> (`src/pins.ts`) now re-frames same-file rows at the pin's recorded position
+> and reports those as moved (`relocations` in `verify --json`), not broken.
+> The shrink variant this entry opens with is **still not fixed**: a deleted
+> row leaves `not_found`, and with the row gone there is no recorded position
+> to re-frame against — vdoc ids are opaque hashes, and `belief_source` stores
+> only `(kind, ref_id, snapshot_hash)`. The durable fix is to store the pinned
+> `source_ref` on `belief_source` at commit time; until then a note that
+> shrinks past a moved passage still reports it as vanished.
+
 ## 7. Per-tool MCP drift detection does not exist
 
 > **Correction, 2026-08-13.** This entry's central claim was wrong, and wrong in

@@ -280,14 +280,30 @@ async function callTool(
       const report = verifyBeliefSources(getDb(), { since });
       const broken = report.filter((b) => b.verified === 0);
       const degraded = report.filter((b) => b.verified > 0 && b.failures.length > 0);
+      // Same rendering rule as the CLI: moved is info, never drift. A pin in
+      // this list verified — its title and body are byte-identical at a new
+      // position in the same file (findMovedWithinFile) — so it appears in
+      // neither count above.
+      const moved = report.flatMap((b) => b.relocations);
+      const movedLines =
+        moved.length === 0
+          ? []
+          : [
+              "",
+              `${moved.length} pinned passage(s) moved within their file — support intact:`,
+              ...moved.slice(0, 3).map((m) => `  ${m.from} → ${m.to ?? "(position unknown)"}`),
+              ...(moved.length > 3 ? [`  … and ${moved.length - 3} more`] : []),
+            ];
       const out = [
         `${report.length} belief(s) checked · ${broken.length} with no verified support left · ` +
           `${degraded.length} with some support lost`,
       ];
       if (broken.length === 0 && degraded.length === 0) {
         out.push("", "No drift. Every pinned source still says what it said.");
+        out.push(...movedLines);
         return out.join("\n");
       }
+      out.push(...movedLines);
       for (const b of [...broken, ...degraded]) {
         out.push("", `${b.beliefId}  ${b.verified}/${b.total} pins verified`);
         out.push(`  "${b.content}"`);

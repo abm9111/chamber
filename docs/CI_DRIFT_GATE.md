@@ -26,9 +26,13 @@ chamber verify --json              # exit 1 when any pin no longer holds
 ```
 
 `verify --json` prints one object: the resolved `database`, `checked`,
-`broken`, `degraded`, the sourceless complement, files gone from disk, and
-per-belief failures with reasons. Exit is non-zero when `broken + degraded >
-0` — partial evidence loss fails the run.
+`broken`, `degraded`, the sourceless complement, files gone from disk,
+per-belief failures with reasons, and `relocatedPins` with per-belief
+`relocations` — pins whose passage moved within its file with title and body
+byte-identical (a top-of-note insertion re-slots everything below it). Moves
+are information, not drift: they count as verified and stay out of the exit
+code. Exit is non-zero when `broken + degraded > 0` — partial evidence loss
+fails the run.
 
 ## Reading the failure
 

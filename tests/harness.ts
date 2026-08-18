@@ -707,6 +707,245 @@ test("pins", "a pin whose row was re-identified verifies by content", () => {
 });
 
 /**
+ * The other way a position lies: the row keeps its identity and its slot, and
+ * the *content* moves. One insertion at the top of a note re-slots every
+ * passage below it — the 2026-08-18 vault backtest measured exactly that
+ * firing all nine pins on one file as hash_mismatch while each body sat
+ * byte-identical one position down. The by-snapshot-hash relocation above
+ * cannot see this (the hash it searches for embeds the abandoned position),
+ * so the report path re-frames same-file rows at the pin's recorded position
+ * instead. The gate keeps refusing: only drift reporting opts in.
+ */
+test("pins", "a passage shifted by a top-of-note insertion is moved, not broken", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/board.md#p0",
+    title: "Board › Now",
+    body: "the passage everyone pins",
+    model: LOCAL_HASH_MODEL,
+  });
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: "",
+  }).actualHash!;
+
+  // A section is inserted at the top: slot 0 holds new text, the pinned
+  // passage now sits at slot 1, byte-identical.
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/board.md#p0",
+    title: "Board › New",
+    body: "a section inserted above everything",
+    model: LOCAL_HASH_MODEL,
+  });
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/board.md#p1",
+    title: "Board › Now",
+    body: "the passage everyone pins",
+    model: LOCAL_HASH_MODEL,
+  });
+
+  const gate = verifyPin(db, { kind: "vault_page", refId: doc.id, snapshotHash });
+  assert(
+    !gate.ok && gate.reason === "hash_mismatch",
+    `the commit gate must never relocate: ${JSON.stringify(gate)}`,
+  );
+
+  const report = verifyPin(
+    db,
+    { kind: "vault_page", refId: doc.id, snapshotHash },
+    { allowRelocation: true },
+  );
+  assert(report.ok, `moved-intact passage reported broken: ${JSON.stringify(report)}`);
+  assert(
+    report.relocatedFrom === "notes/board.md#p0",
+    `verdict must carry the pinned position, got ${report.relocatedFrom}`,
+  );
+  assert(
+    report.sourceRef === "notes/board.md#p1",
+    `verdict must carry the current position, got ${report.sourceRef}`,
+  );
+});
+
+/**
+ * Same event, seen from the surface the operator actually reads. The unit
+ * above proves the verdict; this proves the report: a belief whose pin moved
+ * counts as verified, appears in relocations with both positions, and does
+ * not touch broken/degraded — which is what keeps `chamber verify`'s exit
+ * code quiet over an edit that changed nothing the belief cites.
+ */
+test("pins", "verify reports a moved pin as intact support with both positions", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/ops.md#p0",
+    title: "Ops › Current",
+    body: "decision recorded in the ops note",
+    model: LOCAL_HASH_MODEL,
+  });
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: "",
+  }).actualHash!;
+  const committed = commitBelief(db, {
+    type: "inference",
+    text: "the ops note records this decision",
+    sources: [{ kind: "vault_page", refId: doc.id, snapshotHash }],
+    authorFamily: "test",
+    path: "fast",
+    requireVerifiedSupport: true,
+  });
+  assert(committed.ok, `test setup: commit refused: ${JSON.stringify(committed)}`);
+
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/ops.md#p0",
+    title: "Ops › Newer",
+    body: "a newer section on top",
+    model: LOCAL_HASH_MODEL,
+  });
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/ops.md#p1",
+    title: "Ops › Current",
+    body: "decision recorded in the ops note",
+    model: LOCAL_HASH_MODEL,
+  });
+
+  const vr = buildVerifyReport(db, {});
+  assert(
+    vr.broken === 0 && vr.degraded === 0,
+    `moved support must not fail the run: broken=${vr.broken} degraded=${vr.degraded}`,
+  );
+  assert(vr.relocatedPins === 1, `expected 1 relocated pin, got ${vr.relocatedPins}`);
+  const b = vr.beliefs.find((x) => committed.ok && x.beliefId === committed.beliefId);
+  assert(b !== undefined, "committed belief missing from report");
+  assert(
+    b!.verified === b!.total && b!.failures.length === 0,
+    `moved pin must count as verified: ${JSON.stringify(b)}`,
+  );
+  assert(
+    b!.relocations.length === 1 &&
+      b!.relocations[0]!.from === "notes/ops.md#p0" &&
+      b!.relocations[0]!.to === "notes/ops.md#p1",
+    `relocations must carry both positions: ${JSON.stringify(b!.relocations)}`,
+  );
+});
+
+/**
+ * The rescue is a hash check with the file held fixed, and both halves of
+ * that sentence have to survive adversarial input. Byte-identical text in a
+ * different file must not buy support — the file is part of what a citation
+ * claims — and that includes a file whose *name* begins with the pinned
+ * file's ref prefix: vault filenames legitimately contain '#' (the reason
+ * ingest.ts refuses LIKE for this scan), so the range scan captures
+ * `a.md#old.md#p0` when searching `a.md`'s passages, and only the
+ * passagePathOf equality check stands between that row and a false rescue —
+ * its re-framed hash EQUALS the pin's, because re-framing erases the one
+ * column that differs.
+ */
+test("pins", "a moved pin is never rescued by another file's identical text", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "a.md#p0",
+    title: "A › Top",
+    body: "text that exists in three files",
+    model: LOCAL_HASH_MODEL,
+  });
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: "",
+  }).actualHash!;
+
+  // Decoy 1: an unrelated file with identical title and body.
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "b.md#p0",
+    title: "A › Top",
+    body: "text that exists in three files",
+    model: LOCAL_HASH_MODEL,
+  });
+  // Decoy 2: a file NAMED with the pinned ref's prefix — inside the range
+  // scan's bounds, outside the pinned file.
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "a.md#old.md#p0",
+    title: "A › Top",
+    body: "text that exists in three files",
+    model: LOCAL_HASH_MODEL,
+  });
+  // The pinned slot itself is edited, and no same-file copy survives.
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "a.md#p0",
+    title: "A › Top",
+    body: "edited beyond recognition",
+    model: LOCAL_HASH_MODEL,
+  });
+
+  const verdict = verifyPin(
+    db,
+    { kind: "vault_page", refId: doc.id, snapshotHash },
+    { allowRelocation: true },
+  );
+  assert(
+    !verdict.ok && verdict.reason === "hash_mismatch",
+    `another file's text bought support for a changed passage: ${JSON.stringify(verdict)}`,
+  );
+});
+
+/**
+ * NULL and "" are different titles — the formula preserves the distinction
+ * (see vaultPageHash's history of losing it), so the rescue must too: a
+ * same-file, same-body candidate whose title flipped NULL→"" is drift, not a
+ * move.
+ */
+test("pins", "the moved-pin rescue keeps NULL and empty titles distinct", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "n.md#p0",
+    body: "body without a title",
+    model: LOCAL_HASH_MODEL,
+  });
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: "",
+  }).actualHash!;
+
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "n.md#p0",
+    body: "replacement at the pinned slot",
+    model: LOCAL_HASH_MODEL,
+  });
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "n.md#p1",
+    title: "",
+    body: "body without a title",
+    model: LOCAL_HASH_MODEL,
+  });
+
+  const verdict = verifyPin(
+    db,
+    { kind: "vault_page", refId: doc.id, snapshotHash },
+    { allowRelocation: true },
+  );
+  assert(
+    !verdict.ok && verdict.reason === "hash_mismatch",
+    `a NULL-titled pin was rescued by an empty-titled row: ${JSON.stringify(verdict)}`,
+  );
+});
+
+/**
  * Relocation is for *reporting on pins that were already granted*, never for
  * granting one. A content hash proves the text exists somewhere in the corpus;
  * it does not prove the citation named it. Without the id requirement, any
@@ -7764,8 +8003,12 @@ test(
     // Inserting a section at the *top* of a note shifts every passage below it
     // down one ordinal. The pin still resolves — the document id is stable —
     // but `policy.md#p1` is now a different section than the one the belief was
-    // committed against, and the section actually cited sits intact at `#p2`.
-    // A drift line built from the ref alone therefore names content the belief
+    // committed against. Since the moved-within-file rescue landed
+    // (findMovedWithinFile), a cited section that survives *byte-identical*
+    // one ordinal lower is a relocation, not a failure — the moved-intact case
+    // has its own tests above. Here the cited section is edited as well as
+    // shifted, so no same-file copy can rescue it and the failure must stand —
+    // and a drift line built from the ref alone would name content the belief
     // never cited, which is why `verifyPin` surfaces the row's current
     // breadcrumb title: the ref is where the pin was committed, the title is
     // what holds that position today, and this is the case where they diverge.
@@ -7802,9 +8045,11 @@ test(
     });
     assert(committed.ok, `setup: commit failed: ${JSON.stringify(committed)}`);
 
+    const retentionEdited =
+      "## Retention\n\nRecords are retained for five years after the account closes.\n";
     writeFileSync(
       file,
-      `# Policy\n\n## Onboarding\n\nNew operators are enrolled by the desk lead.\n\n${access}${retention}`,
+      `# Policy\n\n## Onboarding\n\nNew operators are enrolled by the desk lead.\n\n${access}${retentionEdited}`,
     );
     ingestDirectory(db, dir);
 
@@ -7833,15 +8078,25 @@ test(
       `the drifted position must not still be reported as the cited section: ${JSON.stringify(f.title)}`,
     );
 
-    // The evidence moved rather than vanished — which is exactly why the old
-    // "re-run `chamber ingest`" remedy was a no-op: re-ingest is what produced
-    // this state, and the section is already indexed, one ordinal lower.
+    // The section survived as a *section* one ordinal lower — but with its
+    // text edited, which is why the rescue must not fire: re-framing #p2 at
+    // the pinned position hashes the edited body, not the cited one. Assert
+    // both halves, so this test fails loudly if the fixture stops exercising
+    // the edited-and-shifted case it exists for.
     const moved = db
-      .prepare(`SELECT title FROM vector_document WHERE source_ref = 'policy.md#p2'`)
-      .get() as { title: string } | undefined;
+      .prepare(`SELECT title, body FROM vector_document WHERE source_ref = 'policy.md#p2'`)
+      .get() as { title: string; body: string } | undefined;
     assert(
       moved !== undefined && moved.title.includes("Retention"),
-      `the cited section should be intact one ordinal lower, got ${JSON.stringify(moved)}`,
+      `the cited section should survive one ordinal lower, got ${JSON.stringify(moved)}`,
+    );
+    assert(
+      moved!.body.includes("five years"),
+      `setup: the moved section must carry the edit, got ${JSON.stringify(moved!.body)}`,
+    );
+    assert(
+      entry!.relocations.length === 0,
+      `an edited section must not be reported as moved intact: ${JSON.stringify(entry!.relocations)}`,
     );
   },
 );

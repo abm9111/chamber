@@ -1472,6 +1472,25 @@ async function main(): Promise<void> {
           console.log(`  … and ${vr.goneFiles.length - 3} more file(s)`);
         }
       }
+      // Moved, not broken: the passage's title and body are byte-identical at
+      // a different position in the same file (see findMovedWithinFile). The
+      // 2026-08-18 vault backtest measured the alternative — one insertion at
+      // the top of a note fired all nine pins below it — and a drift report
+      // that cries wolf on every top-of-note edit is one the operator learns
+      // to skip. Info, not failure, and outside the exit code like goneFiles.
+      if (vr.relocatedPins > 0) {
+        console.log(
+          `${vr.relocatedPins} pinned passage(s) moved within their file — support intact:`,
+        );
+        const moves = vr.beliefs.flatMap((b) => b.relocations);
+        for (const m of moves.slice(0, 3)) {
+          const toPos = m.to ? `#${m.to.split("#").pop()}` : "(position unknown)";
+          console.log(`  moved: ${m.from} → ${toPos}`);
+        }
+        if (moves.length > 3) {
+          console.log(`  … and ${moves.length - 3} more (all in --json)`);
+        }
+      }
       if (vr.broken + vr.degraded > 0) process.exitCode = 1;
       break;
     }

@@ -55,6 +55,15 @@ export interface PinVerdict {
    * `not_found`, because there is no row to have read it from.
    */
   title?: string | null;
+  /**
+   * Present only when the pin verified via the moved-within-file rescue in
+   * `findMovedWithinFile`: the position the pin was committed against
+   * (`path#pN`), while `sourceRef` is where the byte-identical passage lives
+   * now. Absent on every other verdict — including the by-snapshot-hash
+   * relocation above it, where the ref never changed (only the row id did),
+   * so "from" and "to" would be the same string.
+   */
+  relocatedFrom?: string;
 }
 
 export interface PinnedSource {
@@ -230,6 +239,13 @@ export function verifyPin(
 
   const actualHash = vaultPageHash(row);
   if (actualHash !== source.snapshotHash) {
+    // Report path only: before calling intact evidence broken, check whether
+    // it merely moved within its file. See findMovedWithinFile for why the
+    // by-snapshot-hash relocation above cannot catch this case.
+    if (opts.allowRelocation) {
+      const moved = findMovedWithinFile(db, source, row.source_ref);
+      if (moved) return moved;
+    }
     return {
       ok: false,
       reason: "hash_mismatch",
@@ -248,6 +264,96 @@ export function verifyPin(
   };
 }
 
+/**
+ * The moved-within-file rescue, for the report path only.
+ *
+ * Measured before it existed (vault backtest, 2026-08-18): one insertion at
+ * the top of a note re-slotted every passage below it, and all nine pins on
+ * that note fired hash_mismatch while their bodies sat byte-identical one
+ * position down. The mechanism is structural, not bad luck: `source_ref`
+ * (`path#pN`) participates in the snapshot formula, so a moved passage's
+ * stored hash differs from its pin's, and the by-snapshot-hash relocation in
+ * verifyPin searches for a hash that embeds the position the passage left —
+ * it can rescue a row that lost its *id* (ref unchanged), never one that lost
+ * its *position*.
+ *
+ * So this rescue searches the other way around: take each row still in the
+ * pinned file, re-frame its stored [title, body] at the pin's recorded
+ * position, and compare through vaultPageHash — the one formula, not a copy.
+ * Equality proves the candidate's title and body are byte-identical to what
+ * was pinned, with exactly the strength of the primary check; content that
+ * merely resembles the pinned passage cannot pass, so this cannot decay into
+ * a similarity judgement.
+ *
+ * Same file only, by construction: the SQL range scan bounds candidates to
+ * `path#…` (`'#'` sorts immediately below `'$'`), and because vault filenames
+ * legitimately contain `#` (the same reason ingest.ts refuses LIKE for this
+ * scan — `%` and `_` are wildcards there), a range hit is confirmed with a
+ * passagePathOf equality check before hashing. Byte-identical text in a
+ * *different* file stays an alarm: the file is part of what a citation
+ * claims, and the backtest measured file-level accuracy at 100% — that is
+ * the property being preserved.
+ *
+ * Bounds of the rescue, stated rather than implied:
+ *  - The gate never takes it: only drift reporting passes allowRelocation,
+ *    for the reasons on VerifyPinOptions.
+ *  - A pin whose row is *gone* (not_found) cannot take it: vdoc ids are
+ *    opaque hashes, so with the row deleted there is no recorded position to
+ *    re-frame against. A note that shrank past a moved passage therefore
+ *    still reports not_found.
+ *  - A bare ref (`chamber index` rows, no `#pN`) has no position to have
+ *    moved from; skipped.
+ *  - A file holding the same passage twice resolves deterministically
+ *    (ORDER BY id, like the primary relocation) — and honestly: if the pinned
+ *    instance was edited while its twin survived, the twin rescues the pin.
+ *    That is inherited from relocation-by-content generally, not introduced
+ *    here.
+ */
+function findMovedWithinFile(
+  db: DatabaseSync,
+  source: PinnedSource,
+  pinnedRef: string | null,
+): PinVerdict | null {
+  if (typeof pinnedRef !== "string" || pinnedRef === "") return null;
+  const path = passagePathOf(pinnedRef);
+  if (path === pinnedRef) return null;
+  type DocRow = {
+    source_kind: string;
+    title: string | null;
+    body: string;
+    source_ref: string | null;
+  };
+  const candidates = db
+    .prepare(
+      `SELECT source_kind, title, body, source_ref FROM vector_document
+       WHERE source_kind = ? AND source_ref >= ? AND source_ref < ?
+       ORDER BY id`,
+    )
+    .all(source.kind, `${path}#`, `${path}$`) as DocRow[];
+  for (const c of candidates) {
+    if (c.source_ref === pinnedRef) continue;
+    if (typeof c.source_ref !== "string" || passagePathOf(c.source_ref) !== path) {
+      continue;
+    }
+    const reframed = vaultPageHash({
+      title: c.title,
+      body: c.body,
+      source_ref: pinnedRef,
+    });
+    if (reframed === source.snapshotHash) {
+      return {
+        ok: true,
+        actualHash: vaultPageHash(c),
+        sourceRef: c.source_ref,
+        sourceKind: c.source_kind,
+        title: c.title,
+        relocatedFrom: pinnedRef,
+      };
+    }
+  }
+  return null;
+}
+
 export interface BeliefDrift {
   beliefId: string;
   content: string;
@@ -264,6 +370,21 @@ export interface BeliefDrift {
      * against, the title is what occupies that position today, and an edit
      * above the passage is precisely the case where the two disagree.
      */
+    title?: string | null;
+  }[];
+  /**
+   * Pins that verified via the moved-within-file rescue: support intact,
+   * position changed. Counted in `verified`, never in `failures` — the
+   * measured alternative was nine false alarms per top-of-note insertion,
+   * which is how an operator learns to ignore the one report this tool
+   * exists to make. Report-only information; nothing is rewritten.
+   */
+  relocations: {
+    refId: string;
+    /** Position the pin was committed against (`path#pN`). */
+    from: string;
+    /** Position holding the byte-identical passage now. */
+    to: string | null;
     title?: string | null;
   }[];
 }
@@ -321,6 +442,7 @@ export function verifyBeliefSources(
         total: 0,
         verified: 0,
         failures: [],
+        relocations: [],
       };
       byBelief.set(r.belief_id, entry);
     }
@@ -363,8 +485,17 @@ export function verifyBeliefSources(
       },
       { allowRelocation: true },
     );
-    if (verdict.ok) entry.verified += 1;
-    else {
+    if (verdict.ok) {
+      entry.verified += 1;
+      if (verdict.relocatedFrom) {
+        entry.relocations.push({
+          refId: r.ref_id,
+          from: verdict.relocatedFrom,
+          to: verdict.sourceRef ?? null,
+          title: verdict.title ?? null,
+        });
+      }
+    } else {
       entry.failures.push({
         refId: r.ref_id,
         reason: verdict.reason!,
@@ -414,6 +545,13 @@ export interface VerifyRunReport {
   degraded: number;
   unsourcedBeliefs: number;
   goneFiles: { file: string; passages: number }[];
+  /**
+   * Total pins across `beliefs` that verified via the moved-within-file
+   * rescue. Outside the exit code for the same reason goneFiles is: nothing
+   * the belief cites has changed, and exiting non-zero on it is exactly the
+   * false alarm the backtest measured.
+   */
+  relocatedPins: number;
   beliefs: BeliefDrift[];
 }
 
@@ -436,6 +574,7 @@ export function buildVerifyReport(
     degraded,
     unsourcedBeliefs: countUnsourcedBeliefs(db, opts),
     goneFiles: findGonePinnedFiles(db),
+    relocatedPins: beliefs.reduce((n, b) => n + b.relocations.length, 0),
     beliefs,
   };
 }

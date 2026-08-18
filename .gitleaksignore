@@ -1,0 +1,28 @@
+# gitleaks findings reviewed and accepted by the repository owner.
+#
+# Format: <commit>:<path>:<rule-id>:<line>
+#
+# Reviewed 2026-08-18 during the pre-push gate. gitleaks scans full history, so
+# a finding is pinned to the commit that introduced it and cannot be cleared by
+# editing HEAD.
+#
+# a49f4c51 tests/harness.ts — generic-api-key
+#   The match is a TEST NAME, not a credential:
+#       test("oauth", "O11_seal_roundtrip", () => {
+#   The rule keys on a string literal following an "oauth"-ish token. The values
+#   the test actually handles are `Buffer.alloc(32, 7)` (a deterministic all-
+#   sevens key) and the literal "super-secret-token" — a fixture asserting that
+#   sealSecret/openSecret round-trips.
+#
+# Verified independently: trufflehog --results=verified reports 0 over the same
+# history (3,720 chunks, 33MB), and detect-secrets' 15 tracked hits were each
+# opened and withdrawn for the same class of reason (an FTS5 `tokenize='porter'`
+# setting, a published model-weights SHA-256, and test fixtures — two of which
+# exist precisely to prove a key does NOT leak).
+#
+# This file exists so the gate stays meaningful. A scanner that is permanently
+# red teaches its reader to skip it, which is the same failure this codebase
+# fixes in its own drift reporting: an alarm that always fires stops being an
+# alarm. Every entry here must name what was inspected and why it was cleared —
+# an unexplained line is a suppression, not an acceptance.
+a49f4c511e7964228da053e4fb04e54ac15725ae:tests/harness.ts:generic-api-key:1486

@@ -91,7 +91,6 @@
 import { execFileSync } from "node:child_process";
 import {
   cpSync,
-  readdirSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -106,6 +105,7 @@ import { ingestDirectory } from "../src/ingest.ts";
 import { commitBelief } from "../src/commit_belief.ts";
 import { buildVerifyReport } from "../src/pins.ts";
 import { passagePathOf } from "../src/chunk.ts";
+import { markLive, sweepOrphans } from "./backtest_sweep.ts";
 
 /** Below this share of known-true pins classifying as survived, abort. */
 const SELF_TEST_FLOOR = 0.98;
@@ -176,9 +176,19 @@ function parseArgs(argv: string[]): Args {
         // the "refuse a full extraction with no --exclude" gate below on
         // length alone, so one malformed value defeats the exclusion AND the
         // safety net that exists to catch a missing exclusion.
-        const shorthand = /^:[!^]./.test(v);
+        // `:!` and `:^` with no pattern are legitimate: git treats an empty
+        // pattern as matching everything, so they exclude the whole tree —
+        // the same as the bare `:(exclude)` the long-form branch accepts. The
+        // earlier `/^:[!^]./` demanded a character after the sigil and refused
+        // them.
+        const shorthand = /^:[!^]/.test(v);
         const longForm = /^:\(([^)]*)\)/.exec(v);
-        const magic = longForm ? longForm[1]!.split(",").map((w) => w.trim()) : [];
+        // NOT trimmed. git rejects a padded magic word outright
+        // (`:( exclude )` → "Invalid pathspec magic"), so trimming would
+        // accept a value git refuses, turning a clean usage error into a stack
+        // trace from inside materialise. The magic list is a closed grammar;
+        // matching it loosely is the blocklist mistake in miniature.
+        const magic = longForm ? longForm[1]!.split(",") : [];
         if (!shorthand && !magic.includes("exclude")) {
           throw new Error(
             `--exclude got a pathspec that does not exclude: ${JSON.stringify(v)}\n` +
@@ -391,9 +401,16 @@ const cleanup = (): void => {
  * covers `kill -9`, a power loss, and the frustrated Ctrl-C the naive handler
  * would have provoked — none of which any in-process handler could.
  *
- * The handlers are kept because they do work once the synchronous phase ends,
- * and `exit` is added because it fires on every in-process termination route
- * including `process.exit`.
+ * The handlers are kept only so a signal arriving outside the synchronous
+ * phase is not simply ignored — NOT because they make Ctrl-C work. As this
+ * file is written they are very nearly inert: every route ends in an
+ * unconditional `process.exit` as its last synchronous statement, so control
+ * never returns to the event loop while the process is alive, and a queued
+ * signal has no moment in which to be serviced. Verified by sending SIGTERM
+ * three seconds into a seventy-second run: it completed normally and never
+ * reached the handler. `process.on("exit")` is the one that carries weight —
+ * it fires on every in-process termination route including `process.exit`.
+ * The sweep covers the rest and depends on none of this.
  */
 process.on("exit", cleanup);
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
@@ -405,44 +422,21 @@ for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   });
 }
 
-/**
- * Remove working directories left by runs that could not clean up after
- * themselves — see the signal note above for why those exist. Every directory
- * this tool creates is meant to be gone before the process is, so any that
- * survives is by definition an orphan and holds extracted corpus content.
- */
-function sweepOrphans(): number {
-  let swept = 0;
-  const base = tmpdir();
-  let entries: string[];
-  try {
-    entries = readdirSync(base);
-  } catch {
-    return 0;
-  }
-  for (const name of entries) {
-    if (!name.startsWith("chamber-backtest-")) continue;
-    const dir = join(base, name);
-    if (dir === work) continue;
-    try {
-      rmSync(dir, { recursive: true, force: true });
-      swept++;
-    } catch {
-      // Another run may own it, or it may not be ours to remove. Not fatal:
-      // this is a sweep, and the current run's own cleanup is unaffected.
-    }
-  }
-  return swept;
-}
 
 let exitCode = 0;
 try {
   log(`repo      ${repo}`);
   log(`from      ${args.from} → to ${args.to}`);
   log(`excludes  ${args.exclude.length > 0 ? args.exclude.join(", ") : "(none — full revision)"}`);
-  const swept = sweepOrphans();
-  if (swept > 0) {
-    log(`swept     ${swept} orphaned working director${swept === 1 ? "y" : "ies"} from earlier runs`);
+  // Claim this directory BEFORE sweeping, so a sibling starting in the same
+  // instant sees a live marker rather than an unmarked directory.
+  markLive(work);
+  const sweep = sweepOrphans(tmpdir(), work);
+  if (sweep.swept > 0 || sweep.live > 0) {
+    log(
+      `swept     ${sweep.swept} abandoned working director${sweep.swept === 1 ? "y" : "ies"}` +
+        (sweep.live > 0 ? `; left ${sweep.live} belonging to a running sibling alone` : ""),
+    );
   }
   log(`corpus    materialised under ${work} (removed on exit)\n`);
 

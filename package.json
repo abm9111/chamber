@@ -65,7 +65,8 @@
     "calibrate:paraphrase": "node --experimental-strip-types scripts/calibrate_paraphrase_threshold.ts",
     "eval:retrieval": "node --experimental-strip-types scripts/eval_retrieval.ts",
     "build": "tsc -p tsconfig.build.json",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "backtest:drift": "node --experimental-strip-types scripts/backtest_drift.ts"
   },
   "engines": {
     "node": ">=23.6"

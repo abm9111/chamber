@@ -91,6 +91,7 @@
 import { execFileSync } from "node:child_process";
 import {
   cpSync,
+  readdirSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -158,11 +159,36 @@ function parseArgs(argv: string[]): Args {
       case "--pins": out.pins = Number(next()); break;
       case "--exclude": {
         const v = next();
-        // Accept a bare glob and wrap it, so a caller who does not know git
-        // pathspec syntax cannot accidentally pass an *inclusion* — `--exclude
-        // 'Private/**'` as a bare pathspec would restrict the archive TO that
-        // folder, the exact inverse of the request, silently.
-        out.exclude.push(v.startsWith(":") ? v : `:(exclude)${v}`);
+        // A bare glob is wrapped, because passing it through as a pathspec
+        // would restrict the archive TO that folder — the exact inverse of the
+        // request, silently.
+        if (!v.startsWith(":")) {
+          out.exclude.push(`:(exclude)${v}`);
+          break;
+        }
+        // A value that already looks like a pathspec is checked against the
+        // closed set of forms that actually EXCLUDE, rather than trusted for
+        // starting with a colon. CLAUDE.md: validate against closed sets, do
+        // not escape strings — and this is where that rule bites hardest.
+        // `:(glob)Private/**` is a valid pathspec, plausible as a typo for
+        // `:(exclude,glob)Private/**`, and subtracts nothing: the `.` that
+        // always precedes it already matches everything. It would also satisfy
+        // the "refuse a full extraction with no --exclude" gate below on
+        // length alone, so one malformed value defeats the exclusion AND the
+        // safety net that exists to catch a missing exclusion.
+        const shorthand = /^:[!^]./.test(v);
+        const longForm = /^:\(([^)]*)\)/.exec(v);
+        const magic = longForm ? longForm[1]!.split(",").map((w) => w.trim()) : [];
+        if (!shorthand && !magic.includes("exclude")) {
+          throw new Error(
+            `--exclude got a pathspec that does not exclude: ${JSON.stringify(v)}\n` +
+              `  Exclusion is \`:!pattern\`, \`:^pattern\`, or a magic list containing\n` +
+              `  \`exclude\` (e.g. ':(exclude,glob)Private/**'). What you passed would be\n` +
+              `  applied as an ordinary pathspec and subtract nothing, while still counting\n` +
+              `  as "an --exclude was given". Pass a bare glob to have it wrapped for you.`,
+          );
+        }
+        out.exclude.push(v);
         break;
       }
       case "--json": out.json = true; break;
@@ -330,29 +356,83 @@ const ingestOpts = { exclude: [], includeDotted: false, requireExcludeMatch: fal
 const log = (m: string): void => { if (!args.json) console.log(m); };
 
 /**
- * Cleanup is idempotent and reachable from three routes: normal completion,
- * an abort, and a signal. Ctrl-C during a long ingest is not an exotic case —
- * this harness runs for minutes over a large vault, and an interrupted run
- * that leaves an extracted private corpus behind fails in exactly the way the
- * pathspec exclusion exists to prevent.
+ * Cleanup is idempotent and reachable from every route this process controls:
+ * normal completion, an abort, and `exit`.
+ *
+ * The WHOLE working directory goes, not just the extracted files: the SQLite
+ * database holds a full copy of every ingested passage body, so removing the
+ * corpus and leaving the database behind leaves the corpus behind, in a less
+ * obvious container.
  */
 let cleaned = false;
 const cleanup = (): void => {
   if (cleaned) return;
   cleaned = true;
-  // The WHOLE working directory, not just the extracted files: the SQLite
-  // database holds a full copy of every ingested passage body, so removing the
-  // corpus and leaving the database behind leaves the corpus behind, in a less
-  // obvious container.
   rmSync(work, { recursive: true, force: true });
 };
+
+/**
+ * ── What signals can and cannot do here, stated because I got it wrong ─────
+ *
+ * An earlier version of this file registered SIGINT/SIGTERM/SIGHUP handlers
+ * and its commit message claimed that made Ctrl-C an ordinary event. It does
+ * not. This script is entirely synchronous — no `await`, no timers anywhere —
+ * so from `materialise` through the last `commitBelief` it never yields to the
+ * event loop, and a JS signal handler cannot run until it does. Verified by
+ * sending SIGTERM to a live run: the handler never fired and the process ran
+ * to natural completion. A registered handler also SUPPRESSES the default
+ * terminate, so the naive version made Ctrl-C *less* responsive, not more.
+ *
+ * And nothing catches SIGKILL, by design of the kernel. So the residue window
+ * is real and cannot be closed from inside the process.
+ *
+ * What actually closes it is a sweep at startup: an orphaned directory from a
+ * killed run is removed by the next run before anything else happens. That
+ * covers `kill -9`, a power loss, and the frustrated Ctrl-C the naive handler
+ * would have provoked — none of which any in-process handler could.
+ *
+ * The handlers are kept because they do work once the synchronous phase ends,
+ * and `exit` is added because it fires on every in-process termination route
+ * including `process.exit`.
+ */
+process.on("exit", cleanup);
 for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(sig, () => {
     cleanup();
-    // Conventional 128+n, and re-raising is not worth the complexity here: the
-    // point is that the corpus is gone before the process is.
-    process.exit(sig === "SIGINT" ? 130 : 143);
+    // 128 + signal number, per convention: SIGINT 2, SIGTERM 15, SIGHUP 1.
+    // An earlier version returned 143 for SIGHUP, which is SIGTERM's number.
+    process.exit(sig === "SIGINT" ? 130 : sig === "SIGTERM" ? 143 : 129);
   });
+}
+
+/**
+ * Remove working directories left by runs that could not clean up after
+ * themselves — see the signal note above for why those exist. Every directory
+ * this tool creates is meant to be gone before the process is, so any that
+ * survives is by definition an orphan and holds extracted corpus content.
+ */
+function sweepOrphans(): number {
+  let swept = 0;
+  const base = tmpdir();
+  let entries: string[];
+  try {
+    entries = readdirSync(base);
+  } catch {
+    return 0;
+  }
+  for (const name of entries) {
+    if (!name.startsWith("chamber-backtest-")) continue;
+    const dir = join(base, name);
+    if (dir === work) continue;
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      swept++;
+    } catch {
+      // Another run may own it, or it may not be ours to remove. Not fatal:
+      // this is a sweep, and the current run's own cleanup is unaffected.
+    }
+  }
+  return swept;
 }
 
 let exitCode = 0;
@@ -360,6 +440,10 @@ try {
   log(`repo      ${repo}`);
   log(`from      ${args.from} → to ${args.to}`);
   log(`excludes  ${args.exclude.length > 0 ? args.exclude.join(", ") : "(none — full revision)"}`);
+  const swept = sweepOrphans();
+  if (swept > 0) {
+    log(`swept     ${swept} orphaned working director${swept === 1 ? "y" : "ies"} from earlier runs`);
+  }
   log(`corpus    materialised under ${work} (removed on exit)\n`);
 
   // ── 1. OLD state ───────────────────────────────────────────────────────────

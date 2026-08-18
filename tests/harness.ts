@@ -718,11 +718,17 @@ test("pins", "a pin whose row was re-identified verifies by content", () => {
  */
 test("pins", "a passage shifted by a top-of-note insertion is moved, not broken", () => {
   const db = freshDb();
+  // Every row carries an ingestRoot, because every row `chamber ingest` writes
+  // does, and the rescue is root-scoped: source_ref is root-relative, so a
+  // fixture without a root exercises the fail-closed path instead of the one
+  // this test is about. See findMovedWithinFile.
+  const ROOT = "/vaults/main";
   const doc = upsertDocument(db, {
     sourceKind: "vault_page",
     sourceRef: "notes/board.md#p0",
     title: "Board › Now",
     body: "the passage everyone pins",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
   const snapshotHash = verifyPin(db, {
@@ -738,6 +744,7 @@ test("pins", "a passage shifted by a top-of-note insertion is moved, not broken"
     sourceRef: "notes/board.md#p0",
     title: "Board › New",
     body: "a section inserted above everything",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
   upsertDocument(db, {
@@ -745,6 +752,7 @@ test("pins", "a passage shifted by a top-of-note insertion is moved, not broken"
     sourceRef: "notes/board.md#p1",
     title: "Board › Now",
     body: "the passage everyone pins",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
 
@@ -779,11 +787,13 @@ test("pins", "a passage shifted by a top-of-note insertion is moved, not broken"
  */
 test("pins", "verify reports a moved pin as intact support with both positions", () => {
   const db = freshDb();
+  const ROOT = "/vaults/main";
   const doc = upsertDocument(db, {
     sourceKind: "vault_page",
     sourceRef: "notes/ops.md#p0",
     title: "Ops › Current",
     body: "decision recorded in the ops note",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
   const snapshotHash = verifyPin(db, {
@@ -806,6 +816,7 @@ test("pins", "verify reports a moved pin as intact support with both positions",
     sourceRef: "notes/ops.md#p0",
     title: "Ops › Newer",
     body: "a newer section on top",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
   upsertDocument(db, {
@@ -813,6 +824,7 @@ test("pins", "verify reports a moved pin as intact support with both positions",
     sourceRef: "notes/ops.md#p1",
     title: "Ops › Current",
     body: "decision recorded in the ops note",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
 
@@ -850,11 +862,13 @@ test("pins", "verify reports a moved pin as intact support with both positions",
  */
 test("pins", "a moved pin is never rescued by another file's identical text", () => {
   const db = freshDb();
+  const ROOT = "/vaults/main";
   const doc = upsertDocument(db, {
     sourceKind: "vault_page",
     sourceRef: "a.md#p0",
     title: "A › Top",
     body: "text that exists in three files",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
   const snapshotHash = verifyPin(db, {
@@ -869,6 +883,7 @@ test("pins", "a moved pin is never rescued by another file's identical text", ()
     sourceRef: "b.md#p0",
     title: "A › Top",
     body: "text that exists in three files",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
   // Decoy 2: a file NAMED with the pinned ref's prefix — inside the range
@@ -878,6 +893,7 @@ test("pins", "a moved pin is never rescued by another file's identical text", ()
     sourceRef: "a.md#old.md#p0",
     title: "A › Top",
     body: "text that exists in three files",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
   // The pinned slot itself is edited, and no same-file copy survives.
@@ -886,6 +902,7 @@ test("pins", "a moved pin is never rescued by another file's identical text", ()
     sourceRef: "a.md#p0",
     title: "A › Top",
     body: "edited beyond recognition",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
 
@@ -906,12 +923,126 @@ test("pins", "a moved pin is never rescued by another file's identical text", ()
  * same-file, same-body candidate whose title flipped NULL→"" is drift, not a
  * move.
  */
+/**
+ * `source_ref` is ROOT-RELATIVE, so it does not identify a file. Two configured
+ * roots may each hold `policy.md#p0` — src/vector.ts's stableDocumentId says so
+ * in as many words, and the I7 test above pins the behaviour — which means a
+ * scan bounded only by the ref string reads one vault's passage as another
+ * vault's moved evidence.
+ *
+ * Found by adversarial review of the rescue's own "same file only, by
+ * construction" claim (2026-08-18) and reproduced end to end before this test:
+ * root A's policy was genuinely edited, root B held the stale text at the same
+ * relative path, and verify reported `verified`, `failures: []`, exit 0 — the
+ * one failure mode a drift detector cannot have. The rescue is now scoped to a
+ * matching non-empty ingestRoot on BOTH sides.
+ */
+test("pins", "a moved pin is never rescued by an identical ref under another ingest root", () => {
+  const db = freshDb();
+  const ROOT_A = "/vaults/a";
+  const ROOT_B = "/vaults/b";
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "policy.md#p0",
+    title: "Policy › Retention",
+    body: "records are retained for seven years",
+    metadata: { ingestRoot: ROOT_A },
+    model: LOCAL_HASH_MODEL,
+  });
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: "",
+  }).actualHash!;
+
+  // Root A's passage is genuinely edited — real drift, the event verify exists
+  // to catch.
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "policy.md#p0",
+    title: "Policy › Retention",
+    body: "records are retained for three years",
+    metadata: { ingestRoot: ROOT_A },
+    model: LOCAL_HASH_MODEL,
+  });
+  // Root B independently holds the ORIGINAL text at the same relative path.
+  // Identical ref shape, different vault, and the rescue must not cross.
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "policy.md#p9",
+    title: "Policy › Retention",
+    body: "records are retained for seven years",
+    metadata: { ingestRoot: ROOT_B },
+    model: LOCAL_HASH_MODEL,
+  });
+
+  const verdict = verifyPin(
+    db,
+    { kind: "vault_page", refId: doc.id, snapshotHash },
+    { allowRelocation: true },
+  );
+  assert(
+    !verdict.ok && verdict.reason === "hash_mismatch",
+    `another root's copy rescued a genuinely edited passage: ${JSON.stringify(verdict)}`,
+  );
+});
+
+/**
+ * Fail-closed on an unknown root. A row written before ingest roots existed, or
+ * by `chamber index` (which records none), cannot prove which file it belongs
+ * to — and a rescue that cannot establish the file is a rescue that cannot
+ * establish anything. Alarm is the only direction that cannot invent support,
+ * so the absence of a root must refuse the rescue rather than skip the check.
+ */
+test("pins", "a pin with no recorded ingest root is not rescued", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "rootless.md#p0",
+    title: "Rootless › Top",
+    body: "content with no recorded root",
+    model: LOCAL_HASH_MODEL,
+  });
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: "",
+  }).actualHash!;
+
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "rootless.md#p0",
+    title: "Rootless › New",
+    body: "something else entirely",
+    model: LOCAL_HASH_MODEL,
+  });
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "rootless.md#p1",
+    title: "Rootless › Top",
+    body: "content with no recorded root",
+    model: LOCAL_HASH_MODEL,
+  });
+
+  const verdict = verifyPin(
+    db,
+    { kind: "vault_page", refId: doc.id, snapshotHash },
+    { allowRelocation: true },
+  );
+  assert(
+    !verdict.ok && verdict.reason === "hash_mismatch",
+    `a rootless pin took the rescue: ${JSON.stringify(verdict)}`,
+  );
+});
+
 test("pins", "the moved-pin rescue keeps NULL and empty titles distinct", () => {
   const db = freshDb();
+  const ROOT = "/vaults/main";
   const doc = upsertDocument(db, {
     sourceKind: "vault_page",
     sourceRef: "n.md#p0",
     body: "body without a title",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
   const snapshotHash = verifyPin(db, {
@@ -924,6 +1055,7 @@ test("pins", "the moved-pin rescue keeps NULL and empty titles distinct", () => 
     sourceKind: "vault_page",
     sourceRef: "n.md#p0",
     body: "replacement at the pinned slot",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
   upsertDocument(db, {
@@ -931,6 +1063,7 @@ test("pins", "the moved-pin rescue keeps NULL and empty titles distinct", () => 
     sourceRef: "n.md#p1",
     title: "",
     body: "body without a title",
+    metadata: { ingestRoot: ROOT },
     model: LOCAL_HASH_MODEL,
   });
 

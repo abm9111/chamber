@@ -195,11 +195,18 @@ export function verifyPin(
     title: string | null;
     body: string;
     source_ref: string | null;
+    /**
+     * Carried for the moved-within-file rescue only: `source_ref` is
+     * ROOT-RELATIVE (see stableDocumentId in src/vector.ts), so it does not
+     * identify a file on its own. Selected here rather than re-queried there
+     * so the rescue compares the pinned row's own root, not a second lookup's.
+     */
+    metadata_json: string | null;
   };
 
   let row = db
     .prepare(
-      `SELECT source_kind, title, body, source_ref FROM vector_document
+      `SELECT source_kind, title, body, source_ref, metadata_json FROM vector_document
        WHERE id = ? AND source_kind = ?`,
     )
     .get(source.refId, source.kind) as DocRow | undefined;
@@ -228,7 +235,7 @@ export function verifyPin(
     // same way on every run rather than picking arbitrarily.
     row = db
       .prepare(
-        `SELECT source_kind, title, body, source_ref FROM vector_document
+        `SELECT source_kind, title, body, source_ref, metadata_json FROM vector_document
          WHERE snapshot_hash = ? AND source_kind = ?
          ORDER BY id LIMIT 1`,
       )
@@ -243,7 +250,12 @@ export function verifyPin(
     // it merely moved within its file. See findMovedWithinFile for why the
     // by-snapshot-hash relocation above cannot catch this case.
     if (opts.allowRelocation) {
-      const moved = findMovedWithinFile(db, source, row.source_ref);
+      const moved = findMovedWithinFile(
+        db,
+        source,
+        row.source_ref,
+        row.metadata_json,
+      );
       if (moved) return moved;
     }
     return {
@@ -304,28 +316,71 @@ export function verifyPin(
  *  - A bare ref (`chamber index` rows, no `#pN`) has no position to have
  *    moved from; skipped.
  *  - A file holding the same passage twice resolves deterministically
- *    (ORDER BY id, like the primary relocation) — and honestly: if the pinned
- *    instance was edited while its twin survived, the twin rescues the pin.
- *    That is inherited from relocation-by-content generally, not introduced
- *    here.
+ *    (ORDER BY id, like the primary relocation) — and if the pinned instance
+ *    was edited while a byte-identical twin survived elsewhere in the file,
+ *    the twin rescues the pin and lost support reads as a move.
+ *
+ *    This is NOT inherited from relocation-by-content generally, and an
+ *    earlier version of this comment claimed it was. The primary relocation
+ *    matches on `snapshot_hash`, which contains `source_ref` — so it can only
+ *    match a row whose title, body AND position are all byte-identical, i.e.
+ *    proof that nothing moved. Re-framing deliberately breaks that coupling:
+ *    it asks whether some other position's content equals what was pinned,
+ *    which is exactly what lets it follow a shifted passage, and exactly what
+ *    makes it unable to distinguish "the same paragraph, moved" from "a
+ *    different paragraph that reads identically." Content-addressing cannot
+ *    separate those without an identity signal this schema does not store
+ *    (see KNOWN_LIMITATIONS 6: `source_ref` on `belief_source`). Callers must
+ *    therefore not render a relocation as proof the citation is unchanged —
+ *    it is proof the pinned text still exists in that file.
  */
+function ingestRootOf(metadataJson: string | null): string | null {
+  if (!metadataJson) return null;
+  try {
+    const parsed: unknown = JSON.parse(metadataJson);
+    if (parsed !== null && typeof parsed === "object") {
+      const v = (parsed as { ingestRoot?: unknown }).ingestRoot;
+      if (typeof v === "string" && v !== "") return v;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 function findMovedWithinFile(
   db: DatabaseSync,
   source: PinnedSource,
   pinnedRef: string | null,
+  pinnedMetadataJson: string | null,
 ): PinVerdict | null {
   if (typeof pinnedRef !== "string" || pinnedRef === "") return null;
   const path = passagePathOf(pinnedRef);
   if (path === pinnedRef) return null;
+  // `source_ref` is root-relative, so the range scan below bounds candidates to
+  // a *string*, not to a file. Two configured roots may each legitimately hold
+  // `policy.md#p0` — src/vector.ts's stableDocumentId says so in as many words,
+  // and tests/harness.ts I7 pins the behaviour — so without this the rescue
+  // reads one vault's passage as another's moved evidence. Confirmed by repro
+  // during review: root A's genuinely-edited policy reported `verified`, exit
+  // 0, rescued by root B's stale copy of the same relative path.
+  //
+  // Fail closed: a rescue requires both sides to carry the SAME non-empty
+  // ingestRoot. A row with no recorded root (written before roots existed, or
+  // by `chamber index`, which records none) is not rescuable — it alarms
+  // instead, which is the direction that cannot invent support.
+  const pinnedRoot = ingestRootOf(pinnedMetadataJson);
+  if (pinnedRoot === null) return null;
   type DocRow = {
     source_kind: string;
     title: string | null;
     body: string;
     source_ref: string | null;
+    metadata_json: string | null;
   };
   const candidates = db
     .prepare(
-      `SELECT source_kind, title, body, source_ref FROM vector_document
+      `SELECT source_kind, title, body, source_ref, metadata_json FROM vector_document
        WHERE source_kind = ? AND source_ref >= ? AND source_ref < ?
        ORDER BY id`,
     )
@@ -335,6 +390,7 @@ function findMovedWithinFile(
     if (typeof c.source_ref !== "string" || passagePathOf(c.source_ref) !== path) {
       continue;
     }
+    if (ingestRootOf(c.metadata_json) !== pinnedRoot) continue;
     const reframed = vaultPageHash({
       title: c.title,
       body: c.body,

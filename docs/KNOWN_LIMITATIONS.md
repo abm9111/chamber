@@ -224,6 +224,24 @@ needed for this already exists. Unplanned.
 > only `(kind, ref_id, snapshot_hash)`. The durable fix is to store the pinned
 > `source_ref` on `belief_source` at commit time; until then a note that
 > shrinks past a moved passage still reports it as vanished.
+>
+> **And the rescue introduces one limitation of its own** — stated here because
+> the commit that added it wrongly called this inherited. The primary
+> relocation matches on `snapshot_hash`, which *contains* `source_ref`, so it
+> can only ever match a row whose title, body and position are all identical:
+> proof that nothing moved. Re-framing deliberately decouples content identity
+> from position identity, which is what lets it follow a shifted passage — and
+> what leaves it unable to distinguish "the same paragraph, moved" from "a
+> different paragraph that reads identically." So a pinned passage that is
+> **edited** while a byte-identical copy of its old text survives elsewhere in
+> the same file is reported as a relocation, and its belief still counts as
+> fully verified. Reproduced deliberately during review; no attacker privilege
+> is needed, only an ordinary edit plus a duplicate (an appendix, a changelog,
+> a templated section). The rescue is scoped to one `ingestRoot` and one file,
+> and callers no longer render it as "support intact" — but content-addressing
+> cannot close this. The fix is the same one the shrink case needs: store the
+> pinned `source_ref` on `belief_source` at commit time, so a rescue can
+> require a coherent shift rather than a content match alone.
 
 ## 7. Per-tool MCP drift detection does not exist
 

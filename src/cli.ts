@@ -1480,7 +1480,7 @@ async function main(): Promise<void> {
       // to skip. Info, not failure, and outside the exit code like goneFiles.
       if (vr.relocatedPins > 0) {
         console.log(
-          `${vr.relocatedPins} pinned passage(s) moved within their file — support intact:`,
+          `${vr.relocatedPins} pinned passage(s) found at a new position in the same file:`,
         );
         const moves = vr.beliefs.flatMap((b) => b.relocations);
         for (const m of moves.slice(0, 3)) {
@@ -1490,6 +1490,15 @@ async function main(): Promise<void> {
         if (moves.length > 3) {
           console.log(`  … and ${moves.length - 3} more (all in --json)`);
         }
+        // Stated, not implied. The pinned text was found intact at a new
+        // position — that is not the same as proving the citation still holds,
+        // because a byte-identical duplicate elsewhere in the file is
+        // indistinguishable from the passage having moved. Saying "support
+        // intact" here overclaimed exactly that difference.
+        console.log(
+          `  (the pinned text was found intact at these positions; a duplicate` +
+            ` passage in the same file is indistinguishable from a move)`,
+        );
       }
       if (vr.broken + vr.degraded > 0) process.exitCode = 1;
       break;

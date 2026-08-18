@@ -290,7 +290,9 @@ async function callTool(
           ? []
           : [
               "",
-              `${moved.length} pinned passage(s) moved within their file — support intact:`,
+              `${moved.length} pinned passage(s) found at a new position in the same file` +
+                ` (pinned text intact there; a duplicate passage in the same file is` +
+                ` indistinguishable from a move):`,
               ...moved.slice(0, 3).map((m) => `  ${m.from} → ${m.to ?? "(position unknown)"}`),
               ...(moved.length > 3 ? [`  … and ${moved.length - 3} more`] : []),
             ];
@@ -299,7 +301,17 @@ async function callTool(
           `${degraded.length} with some support lost`,
       ];
       if (broken.length === 0 && degraded.length === 0) {
-        out.push("", "No drift. Every pinned source still says what it said.");
+        // "still says what it said" is only true of pins that verified in
+        // place. A relocated pin was matched by content at a different
+        // position, which cannot be told apart from a duplicate — so the
+        // unconditional sentence is false whenever one is present, and a
+        // reader takes it for a clean bill of health.
+        out.push(
+          "",
+          moved.length === 0
+            ? "No drift. Every pinned source still says what it said."
+            : "No drift detected. Note the relocations below — those pins were matched by content, not position.",
+        );
         out.push(...movedLines);
         return out.join("\n");
       }

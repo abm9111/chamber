@@ -67,7 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: abm9111/chamber@v0.1.4
+      - uses: abm9111/chamber@v0.1.5
         with:
           docs-path: docs
           code-path: src          # optional; omit to skip code indexing
@@ -86,9 +86,9 @@ Without the action, the same gate by hand:
         with: { node-version: 26 }   # 26+, not 24: Node 24 refuses type
                                      # stripping under node_modules, which is
                                      # where npx puts the package (KL 18)
-      - run: npx -y @bu7umaid/chamber@0.1.4 ingest ./docs
-      - run: npx -y @bu7umaid/chamber@0.1.4 index-code ./src
-      - run: npx -y @bu7umaid/chamber@0.1.4 verify --json
+      - run: npx -y @bu7umaid/chamber@0.1.5 ingest ./docs
+      - run: npx -y @bu7umaid/chamber@0.1.5 index-code ./src
+      - run: npx -y @bu7umaid/chamber@0.1.5 verify --json
 ```
 
 (Point `CHAMBER_DB`/config at the persisted database per the section above;

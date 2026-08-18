@@ -1,114 +1,63 @@
 /**
- * Orphan-directory sweep for the drift backtest, with a liveness check.
+ * Report — never remove — working directories left behind by earlier backtests.
  *
- * Its own module so `probes/backtest_orphan_sweep.ts` can exercise it without
- * importing `backtest_drift.ts`, whose body runs a whole backtest on import.
+ * ── Why this reports instead of acting ────────────────────────────────────
  *
- * ── Why a liveness check, and what it replaced ────────────────────────────
+ * `backtest_drift.ts` extracts a corpus into a temp directory and removes it on
+ * every route it controls. SIGKILL is uncatchable and its body is synchronous,
+ * so a killed run can still leave one behind, holding extracted content.
  *
- * `backtest_drift.ts` extracts a corpus into a temp directory and must remove
- * it before exiting. Aborts and signals could leave one behind, and SIGKILL is
- * uncatchable, so a sweep at the next startup is the only thing that closes
- * that window from outside the dead process.
+ * Two attempts were made to clean that up automatically, and both were worse
+ * than the leak:
  *
- * The first version swept every `chamber-backtest-*` directory except the
- * current run's, on the reasoning that "a survivor is by definition an
- * orphan." That reasoning is false, and the consequence was worse than the
- * leak it fixed: run two copies of the harness at once — two terminals, a
- * retry before killing the first, a CI matrix sharing a runner's /tmp — and
- * the second one's sweep deletes the FIRST one's corpus and database while it
- * is being read and written. Reproduced during review with two real
- * processes: the sibling aborted mid-ingest with its self-test collapsing from
- * 100% to 0%. It was loud there only by luck. A sweep landing after the
- * self-test has passed would instead let the run finish and report confident,
- * silently wrong recall and precision — which is the exact failure this whole
- * harness exists to detect.
+ *   1. Remove every `chamber-backtest-*` directory but this run's, on the
+ *      reasoning that "a survivor is by definition an orphan." It is not — two
+ *      concurrent runs are ordinary use, and the second run's sweep deleted the
+ *      first's corpus and database mid-flight. Reproduced with two real
+ *      processes.
+ *   2. Gate that on liveness via a `.pid` marker and `kill(pid, 0)`. Pid numbers
+ *      are namespace-local, so this is structurally wrong in exactly the
+ *      topology the fix was written for — a CI matrix sharing a runner's temp
+ *      dir. Proved with two real containers: a process genuinely alive in one
+ *      reads as dead from another (so its live corpus is destroyed), and a dead
+ *      container's pid 1 reads as alive (so its directory becomes immortal and
+ *      the staleness fallback never applies).
  *
- * So a directory is swept only when its owner is demonstrably gone:
+ * The second fix was more elaborate than the first and failed in both
+ * directions at once. That is the argument against a third: no in-process check
+ * can establish that a directory in a shared, unauthenticated namespace belongs
+ * to a process that is gone. `rmSync(recursive, force)` over such a namespace is
+ * the most dangerous thing this tool could do, and it is being done to tidy a
+ * temp directory.
  *
- *   - `.pid` readable and that process is alive  → SKIP, a live sibling
- *   - `.pid` readable and that process is dead   → SWEEP, a killed run
- *   - `.pid` missing or unreadable               → SWEEP only once the
- *                                                  directory is older than
- *                                                  STALE_MS
+ * So the destructive path is removed rather than guarded. What remains cannot
+ * delete anything it did not create: it lists candidates and lets the operator
+ * decide, which is the same choice `findGonePinnedFiles` makes in src/pins.ts —
+ * report the finding, leave the action to someone who knows the context.
  *
- * The last case covers a run killed in the window between `mkdtemp` and the
- * marker write. It is deliberately slow: leaving an orphan for an hour is a
- * bounded, passive failure, and deleting a live run's state is not.
+ * The residual failure is bounded and passive: after a `kill -9`, one temp
+ * directory survives until a human or the OS removes it, and the next run says
+ * so by name.
  */
 
-import { readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 export const DIR_PREFIX = "chamber-backtest-";
-/** How old an unmarked directory must be before it counts as abandoned. */
-export const STALE_MS = 60 * 60 * 1000;
-const PID_FILE = ".pid";
 
-/** Claim a working directory for this process, so a sibling's sweep spares it. */
-export function markLive(dir: string, pid: number = process.pid): void {
-  writeFileSync(join(dir, PID_FILE), `${pid}\n`, "utf8");
+export interface OrphanReport {
+  /** Directories matching this tool's naming that this run does not own. */
+  paths: string[];
+  /** Candidates that could not be inspected. Reported, never assumed empty. */
+  unreadable: number;
 }
 
 /**
- * Is `pid` a process that currently exists?
- *
- * `kill(pid, 0)` sends no signal and only tests reachability. ESRCH means gone;
- * EPERM means it exists but belongs to someone else — alive either way, and
- * treated as alive, because the cost of a false "alive" is one skipped orphan
- * and the cost of a false "dead" is destroying a live run.
+ * Find, and only find. There is deliberately no removal path in this module —
+ * a future edit that adds one has to add it here, where the history above is.
  */
-export function processIsAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-export type SweepDecision = "swept" | "live" | "too-recent" | "failed";
-
-/**
- * Decide one candidate. Exported so the probe can assert the DECISION rather
- * than only its filesystem effect — a sweep that skipped for the wrong reason
- * would otherwise look identical to one that skipped for the right one.
- */
-export function classifyCandidate(dir: string, now: number): SweepDecision {
-  let pidRaw: string | null;
-  try {
-    pidRaw = readFileSync(join(dir, PID_FILE), "utf8");
-  } catch {
-    pidRaw = null;
-  }
-  if (pidRaw !== null) {
-    const pid = Number.parseInt(pidRaw.trim(), 10);
-    if (Number.isInteger(pid) && pid > 0) {
-      return processIsAlive(pid) ? "live" : "swept";
-    }
-  }
-  // No usable marker: fall back to age, and fail SAFE when the age cannot be
-  // read at all.
-  try {
-    return now - statSync(dir).mtimeMs > STALE_MS ? "swept" : "too-recent";
-  } catch {
-    return "failed";
-  }
-}
-
-export interface SweepResult {
-  swept: number;
-  live: number;
-  tooRecent: number;
-  failed: number;
-}
-
-/**
- * Remove abandoned working directories under `base`, never touching `self`.
- */
-export function sweepOrphans(base: string, self: string, now: number = Date.now()): SweepResult {
-  const out: SweepResult = { swept: 0, live: 0, tooRecent: 0, failed: 0 };
+export function findOrphans(base: string, self: string): OrphanReport {
+  const out: OrphanReport = { paths: [], unreadable: 0 };
   let entries: string[];
   try {
     entries = readdirSync(base);
@@ -119,28 +68,14 @@ export function sweepOrphans(base: string, self: string, now: number = Date.now(
     if (!name.startsWith(DIR_PREFIX)) continue;
     const dir = join(base, name);
     if (dir === self) continue;
-    // Directories only. A symlink named with the prefix is not one of ours;
-    // rmSync's lstat-based recursion would unlink the link rather than follow
-    // it, but refusing outright means this loop never has to be reasoned about
-    // in terms of what rmSync does with a link.
-    let isDir: boolean;
     try {
-      isDir = statSync(dir).isDirectory();
+      // Directories only: a symlink or file wearing the prefix is not one of
+      // ours, and naming it would send an operator to delete the wrong thing.
+      if (statSync(dir).isDirectory()) out.paths.push(dir);
     } catch {
-      out.failed++;
-      continue;
-    }
-    if (!isDir) continue;
-    const decision = classifyCandidate(dir, now);
-    if (decision === "live") { out.live++; continue; }
-    if (decision === "too-recent") { out.tooRecent++; continue; }
-    if (decision === "failed") { out.failed++; continue; }
-    try {
-      rmSync(dir, { recursive: true, force: true });
-      out.swept++;
-    } catch {
-      out.failed++;
+      out.unreadable++;
     }
   }
+  out.paths.sort();
   return out;
 }

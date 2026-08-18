@@ -105,7 +105,7 @@ import { ingestDirectory } from "../src/ingest.ts";
 import { commitBelief } from "../src/commit_belief.ts";
 import { buildVerifyReport } from "../src/pins.ts";
 import { passagePathOf } from "../src/chunk.ts";
-import { markLive, sweepOrphans } from "./backtest_sweep.ts";
+import { findOrphans } from "./backtest_sweep.ts";
 
 /** Below this share of known-true pins classifying as survived, abort. */
 const SELF_TEST_FLOOR = 0.98;
@@ -127,6 +127,24 @@ interface Args {
   exclude: string[];
   json: boolean;
   acknowledgeFullHistory: boolean;
+}
+
+/**
+ * The magic words `git` itself recognises inside `:( … )`. A closed set,
+ * checked exactly — see the call site for the value that got through a
+ * membership test.
+ */
+const PATHSPEC_MAGIC: ReadonlySet<string> = new Set([
+  "top",
+  "literal",
+  "icase",
+  "glob",
+  "exclude",
+]);
+
+function isGitPathspecMagic(word: string): boolean {
+  // `attr:<name>` carries an argument; the rest are bare keywords.
+  return PATHSPEC_MAGIC.has(word) || /^attr:[A-Za-z0-9_.-]+$/.test(word);
 }
 
 function parseArgs(argv: string[]): Args {
@@ -183,12 +201,24 @@ function parseArgs(argv: string[]): Args {
         // them.
         const shorthand = /^:[!^]/.test(v);
         const longForm = /^:\(([^)]*)\)/.exec(v);
-        // NOT trimmed. git rejects a padded magic word outright
-        // (`:( exclude )` → "Invalid pathspec magic"), so trimming would
-        // accept a value git refuses, turning a clean usage error into a stack
-        // trace from inside materialise. The magic list is a closed grammar;
-        // matching it loosely is the blocklist mistake in miniature.
+        // EVERY word is checked against git's closed set, not just whether
+        // "exclude" is among them. Checking only for "exclude" is how
+        // `:(exclude, glob)Private/**` passed: the first word is clean, the
+        // stray space rides on the SECOND word, and git rejects the whole
+        // pathspec with "Invalid pathspec magic ' glob'". That value was the
+        // worked example in the commit that claimed to have fixed it — proof
+        // that a membership test is not a grammar check.
         const magic = longForm ? longForm[1]!.split(",") : [];
+        const badWord = magic.find((w) => !isGitPathspecMagic(w));
+        if (longForm && badWord !== undefined) {
+          throw new Error(
+            `--exclude has a pathspec magic word git will reject: ${JSON.stringify(badWord)}\n` +
+              `  in ${JSON.stringify(v)}\n` +
+              `  Valid words: ${[...PATHSPEC_MAGIC].join(", ")}, or attr:<name>.\n` +
+              `  Note git does not tolerate spaces around them — ':(exclude, glob)' is\n` +
+              `  invalid, ':(exclude,glob)' is fine.`,
+          );
+        }
         if (!shorthand && !magic.includes("exclude")) {
           throw new Error(
             `--exclude got a pathspec that does not exclude: ${JSON.stringify(v)}\n` +
@@ -196,6 +226,20 @@ function parseArgs(argv: string[]): Args {
               `  \`exclude\` (e.g. ':(exclude,glob)Private/**'). What you passed would be\n` +
               `  applied as an ordinary pathspec and subtract nothing, while still counting\n` +
               `  as "an --exclude was given". Pass a bare glob to have it wrapped for you.`,
+          );
+        }
+        // An exclude with no pattern (`:!`, `:^`, `:(exclude)`) is accepted by
+        // `ls-files` and `diff` but REFUSED by `git archive` — "pathspec ':!'
+        // did not match any files" — which is the mechanism `--from` uses. It
+        // would therefore validate here and then die inside materialise with a
+        // raw child_process dump. Refused up front, with the reason.
+        const patternStart = shorthand ? 2 : (longForm?.[0]?.length ?? 0);
+        if (v.length <= patternStart) {
+          throw new Error(
+            `--exclude has no pattern: ${JSON.stringify(v)}\n` +
+              `  An empty pattern excludes everything, which \`git archive\` refuses\n` +
+              `  outright ("did not match any files") — so this would fail mid-run\n` +
+              `  rather than here. Give it something to match.`,
           );
         }
         out.exclude.push(v);
@@ -428,15 +472,19 @@ try {
   log(`repo      ${repo}`);
   log(`from      ${args.from} → to ${args.to}`);
   log(`excludes  ${args.exclude.length > 0 ? args.exclude.join(", ") : "(none — full revision)"}`);
-  // Claim this directory BEFORE sweeping, so a sibling starting in the same
-  // instant sees a live marker rather than an unmarked directory.
-  markLive(work);
-  const sweep = sweepOrphans(tmpdir(), work);
-  if (sweep.swept > 0 || sweep.live > 0) {
+  // Reported, never removed — see backtest_sweep.ts for the two automatic
+  // versions of this that each turned out worse than the leak. A candidate may
+  // belong to a run happening right now, and nothing available in here can
+  // tell the difference.
+  const orphans = findOrphans(tmpdir(), work);
+  if (orphans.paths.length > 0) {
     log(
-      `swept     ${sweep.swept} abandoned working director${sweep.swept === 1 ? "y" : "ies"}` +
-        (sweep.live > 0 ? `; left ${sweep.live} belonging to a running sibling alone` : ""),
+      `NOTE      ${orphans.paths.length} working director${orphans.paths.length === 1 ? "y" : "ies"} from other runs of this tool:`,
     );
+    for (const d of orphans.paths.slice(0, 5)) log(`            ${d}`);
+    if (orphans.paths.length > 5) log(`            … and ${orphans.paths.length - 5} more`);
+    log(`          If no other backtest is running, these hold extracted corpus`);
+    log(`          content and can be deleted. This tool will not delete them.`);
   }
   log(`corpus    materialised under ${work} (removed on exit)\n`);
 

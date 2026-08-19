@@ -393,7 +393,16 @@ export function commitBelief(
   // It also has to be inside the try: an unexpected throw out here would
   // unwind the caller instead of failing closed to PARKED, which is exactly
   // what src/pins.ts assumes it is protected from.
-  const verifiedSources: SourceRef[] = [];
+  /**
+   * What survived verification, plus the corpus position each pin resolved to.
+   *
+   * The position is captured HERE, from the verdict, rather than re-queried
+   * later: this is the only moment the row is known to exist. `ref_id` is an
+   * opaque document id that stops resolving the instant ingest deletes the row,
+   * and a pin that cannot name its own position can only ever be reported as
+   * `not_found` — see the `pinned_ref` column comment in sql/schema.sql.
+   */
+  const verifiedSources: { src: SourceRef; pinnedRef: string | null }[] = [];
   /**
    * Why a citation was refused. `belief`-kind sources are checked for
    * existence rather than by formula, so their failure is not one verifyPin
@@ -508,7 +517,8 @@ export function commitBelief(
         // nothing was checked at all. An unverifiable pin never counts as
         // support: a source whose belief row does not exist is dropped like
         // any other, and the defeater rule below still judges the rest.
-        if (citedBelief(s.refId)) verifiedSources.push(s);
+        // A belief-kind source has no corpus position to record.
+        if (citedBelief(s.refId)) verifiedSources.push({ src: s, pinnedRef: null });
         else rejectedSources.push({ refId: s.refId, reason: "belief_not_found" });
         continue;
       }
@@ -517,7 +527,9 @@ export function commitBelief(
         refId: s.refId,
         snapshotHash: s.snapshotHash,
       });
-      if (verdict.ok) verifiedSources.push(s);
+      if (verdict.ok) {
+        verifiedSources.push({ src: s, pinnedRef: verdict.sourceRef ?? null });
+      }
       else rejectedSources.push({ refId: s.refId, reason: verdict.reason! });
     }
 
@@ -691,10 +703,10 @@ export function commitBelief(
     const insSrc = db.prepare(
       `INSERT INTO belief_source (
          id, belief_id, kind, ref_id, snapshot_hash, span_hash, context_hash,
-         provenance, pays_subclaim, retriever_family
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         provenance, pays_subclaim, retriever_family, pinned_ref
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
-    for (const s of verifiedSources) {
+    for (const { src: s, pinnedRef } of verifiedSources) {
       insSrc.run(
         newId("src"),
         beliefId,
@@ -706,6 +718,7 @@ export function commitBelief(
         s.provenance ?? null,
         s.paysSubclaim ?? null,
         s.retrieverFamily ?? null,
+        pinnedRef,
       );
     }
 

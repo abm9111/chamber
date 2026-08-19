@@ -194,8 +194,9 @@ export function proposeDebtPayment(
     try {
       db.prepare(
         `INSERT INTO belief_source (
-           id, belief_id, kind, ref_id, snapshot_hash, provenance, pays_subclaim, retriever_family
-         ) VALUES (?, ?, ?, ?, ?, 'vector', ?, ?)`,
+           id, belief_id, kind, ref_id, snapshot_hash, provenance, pays_subclaim,
+           retriever_family, pinned_ref
+         ) VALUES (?, ?, ?, ?, ?, 'vector', ?, ?, ?)`,
       ).run(
         newId("src"),
         debt.belief_id,
@@ -204,6 +205,12 @@ export function proposeDebtPayment(
         h.snapshotHash,
         debt.id,
         "chamber-vector",
+        // From the verdict, not from the hit: the verdict is what proves a row
+        // was actually read. A pin written here without its position is a pin
+        // that can only ever report not_found once its note shrinks — the same
+        // hole this column closes for commitBelief, and it would have been easy
+        // to close it in one path only.
+        verdict.sourceRef ?? null,
       );
       attached.push(h.documentId);
     } catch (err) {

@@ -48,6 +48,18 @@ CREATE TABLE IF NOT EXISTS belief_source (
                     )),
   ref_id            TEXT NOT NULL,           -- page_id | tweet_id | belief_id | ...
   snapshot_hash     TEXT NOT NULL,           -- content pin; never URL alone
+  -- The `path#pN` this pin was minted against, recorded at commit time.
+  --
+  -- `ref_id` is a document id, which is opaque and stops resolving the moment
+  -- ingest deletes the row — and ingest deletes rows whenever a note shrinks.
+  -- Without the position, a pin whose row is gone can only report `not_found`
+  -- ("your citation was never real") even when the cited text sits intact a
+  -- few passages higher in the same note, because the snapshot hash contains
+  -- the old position and so matches nothing. KNOWN_LIMITATIONS 6.
+  --
+  -- NULL for rows written before this column existed, and for `kind='belief'`
+  -- sources, which are ledger edges rather than corpus positions.
+  pinned_ref        TEXT,
   span_hash         TEXT,                    -- exact quoted span
   context_hash      TEXT,                    -- ±N tokens around span
   provenance        TEXT

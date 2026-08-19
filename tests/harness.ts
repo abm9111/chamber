@@ -937,6 +937,179 @@ test("pins", "a moved pin is never rescued by another file's identical text", ()
  * one failure mode a drift detector cannot have. The rescue is now scoped to a
  * matching non-empty ingestRoot on BOTH sides.
  */
+/**
+ * A note that shrinks deletes its orphaned tail rows, so a pin's document id
+ * stops resolving — while the cited text may still be in the note, a few
+ * passages higher, because a deletion above it shifted everything up. The
+ * snapshot hash cannot find it either: the hash contains the position the text
+ * left. Before `belief_source.pinned_ref` the only available verdict was
+ * `not_found`, which tells an operator their citation was never real about
+ * text they can see. KNOWN_LIMITATIONS 6.
+ *
+ * Uses the real ingest path rather than hand-written rows, because the orphan
+ * sweep that deletes the tail is part of what is being tested.
+ */
+test("pins", "a pin whose row was swept by a shrinking note is found where the text moved", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-shrink-"));
+  const file = join(dir, "note.md");
+  const section = (i: number): string =>
+    `## Section ${i}\n\nBody of section ${i} with distinctive text ${i}.\n`;
+  writeFileSync(file, `# Note\n\n${[0, 1, 2, 3, 4].map(section).join("\n")}`);
+  ingestDirectory(db, dir);
+
+  const pinned = db
+    .prepare(
+      `SELECT id, snapshot_hash FROM vector_document WHERE source_ref = 'note.md#p4'`,
+    )
+    .get() as { id: string; snapshot_hash: string } | undefined;
+  assert(pinned !== undefined, "setup: expected a passage at #p4");
+  const committed = commitBelief(db, {
+    type: "inference",
+    text: "the note records section 4",
+    sources: [
+      { kind: "vault_page", refId: pinned!.id, snapshotHash: pinned!.snapshot_hash },
+    ],
+    authorFamily: "test",
+    path: "fast",
+    requireVerifiedSupport: true,
+  });
+  assert(committed.ok, `setup: commit refused: ${JSON.stringify(committed)}`);
+
+  // The position must have been recorded, or the rest of this proves nothing.
+  const stored = db
+    .prepare(`SELECT pinned_ref FROM belief_source WHERE belief_id = ?`)
+    .get(committed.ok ? committed.beliefId : "") as { pinned_ref: string | null };
+  assert(
+    stored.pinned_ref === "note.md#p4",
+    `commit must record the position it verified, got ${JSON.stringify(stored.pinned_ref)}`,
+  );
+
+  // Two sections deleted from the top: the cited text shifts up to #p2 and the
+  // note's tail rows are swept, taking the pinned id with them.
+  writeFileSync(file, `# Note\n\n${[2, 3, 4].map(section).join("\n")}`);
+  const re = ingestDirectory(db, dir);
+  assert(re.removed > 0, "setup: the shrink must actually orphan rows");
+  const gone = db
+    .prepare(`SELECT id FROM vector_document WHERE id = ?`)
+    .get(pinned!.id) as { id: string } | undefined;
+  assert(gone === undefined, "setup: the pinned row must be gone");
+
+  const vr = buildVerifyReport(db, {});
+  const b = vr.beliefs.find((x) => committed.ok && x.beliefId === committed.beliefId);
+  assert(b !== undefined, "belief missing from report");
+  assert(
+    b!.failures.length === 0 && b!.verified === b!.total,
+    `text still in the note reported as lost: ${JSON.stringify(b)}`,
+  );
+  assert(
+    b!.relocations.length === 1 && b!.relocations[0]!.from === "note.md#p4",
+    `relocation must name the position the pin was minted against: ${JSON.stringify(b!.relocations)}`,
+  );
+  assert(
+    b!.relocations[0]!.to === "note.md#p2",
+    `expected the text at #p2, got ${JSON.stringify(b!.relocations[0]!.to)}`,
+  );
+});
+
+/**
+ * The same shrink, with the text genuinely deleted rather than moved. The
+ * rescue must not turn "the evidence is gone" into "the evidence moved" — that
+ * is the one direction a drift detector cannot fail in, and a stored position
+ * makes it newly reachable.
+ */
+test("pins", "a pin whose text really left the note still reports not_found", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-shrink-gone-"));
+  const file = join(dir, "note.md");
+  const section = (i: number): string =>
+    `## Section ${i}\n\nBody of section ${i} with distinctive text ${i}.\n`;
+  writeFileSync(file, `# Note\n\n${[0, 1, 2, 3, 4].map(section).join("\n")}`);
+  ingestDirectory(db, dir);
+  const pinned = db
+    .prepare(
+      `SELECT id, snapshot_hash FROM vector_document WHERE source_ref = 'note.md#p4'`,
+    )
+    .get() as { id: string; snapshot_hash: string };
+  const committed = commitBelief(db, {
+    type: "inference",
+    text: "the note records section 4",
+    sources: [{ kind: "vault_page", refId: pinned.id, snapshotHash: pinned.snapshot_hash }],
+    authorFamily: "test",
+    path: "fast",
+    requireVerifiedSupport: true,
+  });
+  assert(committed.ok, `setup: commit refused: ${JSON.stringify(committed)}`);
+
+  // Section 4 is deleted outright; the rest stay where they are.
+  writeFileSync(file, `# Note\n\n${[0, 1, 2, 3].map(section).join("\n")}`);
+  ingestDirectory(db, dir);
+
+  const vr = buildVerifyReport(db, {});
+  const b = vr.beliefs.find((x) => committed.ok && x.beliefId === committed.beliefId);
+  assert(
+    b !== undefined && b.failures.length === 1,
+    `deleted evidence must fail: ${JSON.stringify(b)}`,
+  );
+  assert(
+    b!.failures[0]!.reason === "not_found",
+    `expected not_found, got ${b!.failures[0]!.reason}`,
+  );
+  assert(
+    b!.failures[0]!.sourceRef === "note.md#p4",
+    `a not_found must now name where the pin was minted, got ${JSON.stringify(b!.failures[0]!.sourceRef)}`,
+  );
+  assert(b!.relocations.length === 0, "nothing moved; nothing may be reported as moved");
+});
+
+/**
+ * With the pinned row gone there is no recorded root to scope the search, so it
+ * is derived from the candidates — and only when they agree. Two configured
+ * vaults may each hold `note.md`, and picking one arbitrarily is exactly the
+ * cross-root defect this file already carries a test for. Ambiguity refuses.
+ */
+test("pins", "a swept pin is not rescued when two ingest roots hold the same path", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "note.md#p4",
+    title: "Note › Four",
+    body: "the cited passage",
+    metadata: { ingestRoot: "/vaults/a" },
+    model: LOCAL_HASH_MODEL,
+  });
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: "",
+  }).actualHash!;
+  deleteDocument(db, doc.id);
+
+  // The text exists under BOTH roots at the same relative path. Neither can be
+  // shown to be the one the pin was minted against.
+  for (const root of ["/vaults/a", "/vaults/b"]) {
+    upsertDocument(db, {
+      id: `vdoc_forced_${root.replace(/\W/g, "")}`,
+      sourceKind: "vault_page",
+      sourceRef: "note.md#p2",
+      title: "Note › Four",
+      body: "the cited passage",
+      metadata: { ingestRoot: root },
+      model: LOCAL_HASH_MODEL,
+    });
+  }
+
+  const verdict = verifyPin(
+    db,
+    { kind: "vault_page", refId: doc.id, snapshotHash, pinnedRef: "note.md#p4" },
+    { allowRelocation: true },
+  );
+  assert(
+    !verdict.ok && verdict.reason === "not_found",
+    `an ambiguous path was resolved anyway: ${JSON.stringify(verdict)}`,
+  );
+});
+
 test("pins", "a moved pin is never rescued by an identical ref under another ingest root", () => {
   const db = freshDb();
   const ROOT_A = "/vaults/a";

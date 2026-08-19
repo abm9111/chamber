@@ -225,6 +225,24 @@ needed for this already exists. Unplanned.
 > `source_ref` on `belief_source` at commit time; until then a note that
 > shrinks past a moved passage still reports it as vanished.
 >
+> **Shrink case closed, 2026-08-19.** `belief_source.pinned_ref` now records the
+> `path#pN` a pin was minted against, captured from the verdict at commit time —
+> the only moment the row is known to exist. When the row is later swept, the
+> report path re-frames the surviving passages of that file at the recorded
+> position and reports `moved: note.md#p4 → note.md#p2` instead of `not_found`.
+> Measured on the scenario this entry describes: a five-section note losing two
+> sections from the top went from `not_found` with no ref at all, to a
+> relocation naming both positions and the section title, counted as verified.
+>
+> With the row gone there is no recorded root to scope the search, so it is
+> derived from the candidates and only when they agree; two configured vaults
+> holding the same relative path refuse rather than guess. Pins written before
+> the column exists carry NULL and keep the old behaviour — verified against a
+> real 434-pin database, whose numbers were unchanged by the migration.
+>
+> **Genuinely deleted text still reports `not_found`**, and now names the
+> position it was minted against, which the old verdict could not.
+>
 > **And the rescue introduces one limitation of its own** — stated here because
 > the commit that added it wrongly called this inherited. The primary
 > relocation matches on `snapshot_hash`, which *contains* `source_ref`, so it

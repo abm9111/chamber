@@ -31,7 +31,9 @@ per-belief failures with reasons, and `relocatedPins` with per-belief
 `relocations` — pins whose passage moved within its file with title and body
 byte-identical (a top-of-note insertion re-slots everything below it). Moves
 are information, not drift: they count as verified and stay out of the exit
-code. Exit is non-zero when `broken + degraded > 0` — partial evidence loss
+code. A passage whose row was deleted because its note shrank is also reported
+as a move when the text is still in that note, rather than as a missing
+citation. Exit is non-zero when `broken + degraded > 0` — partial evidence loss
 fails the run.
 
 ## Reading the failure

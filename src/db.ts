@@ -31,6 +31,25 @@ function applySchemas(db: DatabaseSync): void {
   } catch {
     /* column exists */
   }
+  // `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that already
+  // exists, so an added column needs an ALTER for databases in the field. This
+  // runs BEFORE the schema files on purpose: on a fresh database the table does
+  // not exist yet, the ALTER fails with "no such table", and schema.sql then
+  // creates it with the column already in the DDL.
+  //
+  // Unlike the blanket catch above, this one checks what it is swallowing. A
+  // migration that fails for a reason other than "already applied" must not be
+  // silent — a missing pinned_ref does not throw at write time (the column is
+  // nullable), it just makes every later drift report worse, which is exactly
+  // the kind of failure this repo keeps finding months late.
+  try {
+    db.exec("ALTER TABLE belief_source ADD COLUMN pinned_ref TEXT");
+  } catch (err) {
+    const msg = String((err as Error)?.message ?? err);
+    const alreadyApplied =
+      /duplicate column name/i.test(msg) || /no such table/i.test(msg);
+    if (!alreadyApplied) throw err;
+  }
   for (const file of SCHEMA_FILES) {
     const sql = readFileSync(join(__dirname, "../sql", file), "utf8");
     db.exec(sql);

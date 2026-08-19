@@ -70,6 +70,21 @@ export interface PinnedSource {
   kind: string;
   refId: string;
   snapshotHash: string;
+  /**
+   * The `path#pN` this pin was minted against, from `belief_source.pinned_ref`.
+   *
+   * Only the report path supplies it, and only for stored pins. It exists for
+   * the one case `refId` cannot serve: ingest deletes a note's orphaned tail
+   * rows when the note shrinks, so a document id can stop resolving while the
+   * cited text is still in the corpus a few passages higher. The snapshot hash
+   * cannot find it either — the hash contains the abandoned position. Without
+   * this the only available verdict is `not_found`, which tells an operator
+   * their citation was never real about text they can see.
+   *
+   * Absent on pins written before the column existed; those keep the old
+   * behaviour rather than guessing.
+   */
+  pinnedRef?: string;
 }
 
 /**
@@ -242,7 +257,16 @@ export function verifyPin(
       .get(source.snapshotHash, source.kind) as DocRow | undefined;
   }
 
-  if (!row) return { ok: false, reason: "not_found" };
+  if (!row) {
+    // The row is gone — but a stored position says where it used to be, and
+    // the text may simply have moved up as the note shrank. Report path only,
+    // same as every other relocation.
+    if (opts.allowRelocation && typeof source.pinnedRef === "string") {
+      const moved = findMovedWithinFile(db, source, source.pinnedRef, null);
+      if (moved) return moved;
+    }
+    return { ok: false, reason: "not_found", sourceRef: source.pinnedRef ?? null };
+  }
 
   const actualHash = vaultPageHash(row);
   if (actualHash !== source.snapshotHash) {
@@ -369,8 +393,15 @@ function findMovedWithinFile(
   // ingestRoot. A row with no recorded root (written before roots existed, or
   // by `chamber index`, which records none) is not rescuable — it alarms
   // instead, which is the direction that cannot invent support.
-  const pinnedRoot = ingestRootOf(pinnedMetadataJson);
-  if (pinnedRoot === null) return null;
+  // When the pinned row still exists, its own recorded root is authoritative.
+  // When it is gone (the shrink case), there is no row to ask, so the root is
+  // derived from the candidates — and only when they agree. Two configured
+  // vaults may each hold `policy.md`, and picking one arbitrarily is how the
+  // cross-root defect worked; ambiguity therefore refuses rather than guesses.
+  const pinnedRoot =
+    pinnedMetadataJson === null ? null : ingestRootOf(pinnedMetadataJson);
+  const requireDerivedRoot = pinnedMetadataJson === null;
+  if (!requireDerivedRoot && pinnedRoot === null) return null;
   type DocRow = {
     source_kind: string;
     title: string | null;
@@ -385,12 +416,31 @@ function findMovedWithinFile(
        ORDER BY id`,
     )
     .all(source.kind, `${path}#`, `${path}$`) as DocRow[];
+
+  // Derived-root case: every candidate for this relative path must belong to
+  // one root, or the path does not identify a file and nothing here can.
+  let derivedRoot: string | null = null;
+  if (requireDerivedRoot) {
+    const roots = new Set<string>();
+    for (const c of candidates) {
+      if (typeof c.source_ref !== "string" || passagePathOf(c.source_ref) !== path) {
+        continue;
+      }
+      const r = ingestRootOf(c.metadata_json);
+      if (r === null) return null; // an unrooted candidate cannot be placed
+      roots.add(r);
+    }
+    if (roots.size !== 1) return null;
+    derivedRoot = [...roots][0]!;
+  }
+  const expectedRoot = requireDerivedRoot ? derivedRoot : pinnedRoot;
+
   for (const c of candidates) {
     if (c.source_ref === pinnedRef) continue;
     if (typeof c.source_ref !== "string" || passagePathOf(c.source_ref) !== path) {
       continue;
     }
-    if (ingestRootOf(c.metadata_json) !== pinnedRoot) continue;
+    if (ingestRootOf(c.metadata_json) !== expectedRoot) continue;
     const reframed = vaultPageHash({
       title: c.title,
       body: c.body,
@@ -474,7 +524,8 @@ export function verifyBeliefSources(
   const rows = db
     .prepare(
       `SELECT b.id AS belief_id, b.content AS content,
-              s.kind AS kind, s.ref_id AS ref_id, s.snapshot_hash AS snapshot_hash
+              s.kind AS kind, s.ref_id AS ref_id, s.snapshot_hash AS snapshot_hash,
+              s.pinned_ref AS pinned_ref
          FROM belief b
          JOIN belief_source s ON s.belief_id = b.id
         WHERE (? IS NULL OR b.created_at >= ?)
@@ -486,6 +537,7 @@ export function verifyBeliefSources(
     kind: string;
     ref_id: string;
     snapshot_hash: string;
+    pinned_ref: string | null;
   }[];
 
   const byBelief = new Map<string, BeliefDrift>();
@@ -538,6 +590,7 @@ export function verifyBeliefSources(
         kind: r.kind,
         refId: r.ref_id,
         snapshotHash: r.snapshot_hash,
+        pinnedRef: r.pinned_ref ?? undefined,
       },
       { allowRelocation: true },
     );

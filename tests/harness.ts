@@ -1063,12 +1063,15 @@ test("pins", "a pin whose text really left the note still reports not_found", ()
 });
 
 /**
- * With the pinned row gone there is no recorded root to scope the search, so it
- * is derived from the candidates — and only when they agree. Two configured
- * vaults may each hold `note.md`, and picking one arbitrarily is exactly the
- * cross-root defect this file already carries a test for. Ambiguity refuses.
+ * Both vaults hold the same relative path AND the same text — so the question
+ * is not whether the rescue refuses, but whether it picks the right corpus.
+ * The pin belongs to root A, root A's own copy has moved within root A, and
+ * that is a legitimate relocation; root B's identical copy must play no part
+ * in it. Asserting `ingestRoot` rather than `sourceRef` is what makes this
+ * test able to tell them apart at all — both rows carry the same
+ * root-relative ref, which is the whole reason a ref does not identify a file.
  */
-test("pins", "a swept pin is not rescued when two ingest roots hold the same path", () => {
+test("pins", "a swept pin resolves inside its own root when two roots hold the same path", () => {
   const db = freshDb();
   const doc = upsertDocument(db, {
     sourceKind: "vault_page",
@@ -1085,8 +1088,6 @@ test("pins", "a swept pin is not rescued when two ingest roots hold the same pat
   }).actualHash!;
   deleteDocument(db, doc.id);
 
-  // The text exists under BOTH roots at the same relative path. Neither can be
-  // shown to be the one the pin was minted against.
   for (const root of ["/vaults/a", "/vaults/b"]) {
     upsertDocument(db, {
       id: `vdoc_forced_${root.replace(/\W/g, "")}`,
@@ -1101,12 +1102,19 @@ test("pins", "a swept pin is not rescued when two ingest roots hold the same pat
 
   const verdict = verifyPin(
     db,
-    { kind: "vault_page", refId: doc.id, snapshotHash, pinnedRef: "note.md#p4" },
+    {
+      kind: "vault_page",
+      refId: doc.id,
+      snapshotHash,
+      pinnedRef: "note.md#p4",
+      pinnedRoot: "/vaults/a",
+    },
     { allowRelocation: true },
   );
+  assert(verdict.ok, `the pin's own root held it: ${JSON.stringify(verdict)}`);
   assert(
-    !verdict.ok && verdict.reason === "not_found",
-    `an ambiguous path was resolved anyway: ${JSON.stringify(verdict)}`,
+    verdict.ingestRoot === "/vaults/a",
+    `resolved into the wrong vault: ${JSON.stringify(verdict.ingestRoot)}`,
   );
 });
 

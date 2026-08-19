@@ -136,7 +136,18 @@ export function runTry(opts: { keep?: boolean } = {}): number {
       line(`${b.beliefId}  ${b.verified}/${b.total} pins verified`);
       for (const f of b.failures) {
         drifted++;
-        line(`  ${red(bold(`${f.reason}: ${f.sourceRef ?? f.refId}`))}`);
+        // Same rule as the CLI and the MCP tool: on not_found the sourceRef
+        // is where the pin was minted, not a place that resolves now. Dormant
+        // in this demo today (its scripted edit produces hash_mismatch), and
+        // written correctly anyway so it does not become a defect the first
+        // time the demo grows a deletion.
+        line(
+          `  ${red(bold(
+            f.reason === "not_found" && f.sourceRef
+              ? `not_found: ${f.refId} — minted against ${f.sourceRef}`
+              : `${f.reason}: ${f.sourceRef ?? f.refId}`,
+          ))}`,
+        );
       }
     }
 

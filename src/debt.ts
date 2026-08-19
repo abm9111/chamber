@@ -195,8 +195,8 @@ export function proposeDebtPayment(
       db.prepare(
         `INSERT INTO belief_source (
            id, belief_id, kind, ref_id, snapshot_hash, provenance, pays_subclaim,
-           retriever_family, pinned_ref
-         ) VALUES (?, ?, ?, ?, ?, 'vector', ?, ?, ?)`,
+           retriever_family, pinned_ref, pinned_root
+         ) VALUES (?, ?, ?, ?, ?, 'vector', ?, ?, ?, ?)`,
       ).run(
         newId("src"),
         debt.belief_id,
@@ -211,6 +211,7 @@ export function proposeDebtPayment(
         // hole this column closes for commitBelief, and it would have been easy
         // to close it in one path only.
         verdict.sourceRef ?? null,
+        verdict.ingestRoot ?? null,
       );
       attached.push(h.documentId);
     } catch (err) {

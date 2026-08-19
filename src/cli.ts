@@ -1425,11 +1425,21 @@ async function main(): Promise<void> {
                 " re-ingesting will not restore the pin.",
             );
           } else if (f.reason === "not_found") {
-            console.log(`  not_found: ${f.refId}`);
+            // The position is printed when the pin recorded one, and marked as
+            // historical. `sourceRef` on a not_found is where the pin was
+            // MINTED, not somewhere that resolves now — an unqualified
+            // `not_found: note.md#p4` reads exactly like a live location, and
+            // the operator's next move would be to open a passage that is not
+            // there. Pins written before belief_source.pinned_ref existed have
+            // no position and fall back to the id, which is all they ever had.
+            const minted = f.sourceRef ? ` — minted against ${f.sourceRef}` : "";
+            console.log(`  not_found: ${f.refId}${minted}`);
             console.log(
               "    nothing is stored under this id — the cited passage left the corpus" +
-                " (the note shrank past this position, or its rows were replaced). The text may still" +
-                " be in the note at a different passage; the citation can no longer reach it.",
+                " (the note shrank past this position, or its rows were replaced)." +
+                (f.sourceRef
+                  ? " That position no longer resolves, and the text was not found elsewhere in that file."
+                  : " The text may still be in the note at a different passage; the citation can no longer reach it."),
             );
           } else {
             // `belief_not_found` and `kind_unregistered`: no corpus row was

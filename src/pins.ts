@@ -64,6 +64,14 @@ export interface PinVerdict {
    * so "from" and "to" would be the same string.
    */
   relocatedFrom?: string;
+  /**
+   * `ingestRoot` of the row this verdict was reached against, so a caller can
+   * record WHICH vault a pin resolved in. `source_ref` is root-relative and
+   * therefore names a path, not a file; without the root, a pin whose row is
+   * later deleted cannot be told apart from an identically-named file in a
+   * different configured vault. Null for rows written without a root.
+   */
+  ingestRoot?: string | null;
 }
 
 export interface PinnedSource {
@@ -85,6 +93,17 @@ export interface PinnedSource {
    * behaviour rather than guessing.
    */
   pinnedRef?: string;
+  /**
+   * `ingestRoot` recorded alongside `pinnedRef`, from
+   * `belief_source.pinned_root`. Required for the swept-row rescue: with the
+   * row gone there is nothing left to ask which vault the pin belonged to, and
+   * the first version of this feature tried to DERIVE it from whichever rows
+   * still held that relative path. Review reproduced the hole — when the pin's
+   * own root had been swept entirely and an unrelated vault happened to hold
+   * the same filename, derivation resolved confidently to the wrong vault. The
+   * derivation is gone; a pin without a recorded root is simply not rescuable.
+   */
+  pinnedRoot?: string;
 }
 
 /**
@@ -261,8 +280,12 @@ export function verifyPin(
     // The row is gone — but a stored position says where it used to be, and
     // the text may simply have moved up as the note shrank. Report path only,
     // same as every other relocation.
-    if (opts.allowRelocation && typeof source.pinnedRef === "string") {
-      const moved = findMovedWithinFile(db, source, source.pinnedRef, null);
+    if (
+      opts.allowRelocation &&
+      typeof source.pinnedRef === "string" &&
+      typeof source.pinnedRoot === "string"
+    ) {
+      const moved = findMovedWithinFile(db, source, source.pinnedRef, source.pinnedRoot);
       if (moved) return moved;
     }
     return { ok: false, reason: "not_found", sourceRef: source.pinnedRef ?? null };
@@ -278,7 +301,7 @@ export function verifyPin(
         db,
         source,
         row.source_ref,
-        row.metadata_json,
+        ingestRootOf(row.metadata_json),
       );
       if (moved) return moved;
     }
@@ -289,6 +312,7 @@ export function verifyPin(
       sourceRef: row.source_ref,
       sourceKind: row.source_kind,
       title: row.title,
+      ingestRoot: ingestRootOf(row.metadata_json),
     };
   }
   return {
@@ -297,6 +321,7 @@ export function verifyPin(
     sourceRef: row.source_ref,
     sourceKind: row.source_kind,
     title: row.title,
+    ingestRoot: ingestRootOf(row.metadata_json),
   };
 }
 
@@ -376,7 +401,7 @@ function findMovedWithinFile(
   db: DatabaseSync,
   source: PinnedSource,
   pinnedRef: string | null,
-  pinnedMetadataJson: string | null,
+  pinnedRoot: string | null,
 ): PinVerdict | null {
   if (typeof pinnedRef !== "string" || pinnedRef === "") return null;
   const path = passagePathOf(pinnedRef);
@@ -393,15 +418,15 @@ function findMovedWithinFile(
   // ingestRoot. A row with no recorded root (written before roots existed, or
   // by `chamber index`, which records none) is not rescuable — it alarms
   // instead, which is the direction that cannot invent support.
-  // When the pinned row still exists, its own recorded root is authoritative.
-  // When it is gone (the shrink case), there is no row to ask, so the root is
-  // derived from the candidates — and only when they agree. Two configured
-  // vaults may each hold `policy.md`, and picking one arbitrarily is how the
-  // cross-root defect worked; ambiguity therefore refuses rather than guesses.
-  const pinnedRoot =
-    pinnedMetadataJson === null ? null : ingestRootOf(pinnedMetadataJson);
-  const requireDerivedRoot = pinnedMetadataJson === null;
-  if (!requireDerivedRoot && pinnedRoot === null) return null;
+  // The root is supplied by the caller — from the pinned row when it exists,
+  // from `belief_source.pinned_root` when it has been swept — and is never
+  // derived. An earlier version derived it from whichever rows still held the
+  // same relative path, requiring them to agree; review showed that only
+  // refuses while BOTH vaults are observable. With the pin's own vault swept
+  // for that file, one unrelated vault holding the same filename was a
+  // majority of one, and the rescue resolved confidently into the wrong
+  // corpus. No root, no rescue.
+  if (pinnedRoot === null) return null;
   type DocRow = {
     source_kind: string;
     title: string | null;
@@ -416,31 +441,12 @@ function findMovedWithinFile(
        ORDER BY id`,
     )
     .all(source.kind, `${path}#`, `${path}$`) as DocRow[];
-
-  // Derived-root case: every candidate for this relative path must belong to
-  // one root, or the path does not identify a file and nothing here can.
-  let derivedRoot: string | null = null;
-  if (requireDerivedRoot) {
-    const roots = new Set<string>();
-    for (const c of candidates) {
-      if (typeof c.source_ref !== "string" || passagePathOf(c.source_ref) !== path) {
-        continue;
-      }
-      const r = ingestRootOf(c.metadata_json);
-      if (r === null) return null; // an unrooted candidate cannot be placed
-      roots.add(r);
-    }
-    if (roots.size !== 1) return null;
-    derivedRoot = [...roots][0]!;
-  }
-  const expectedRoot = requireDerivedRoot ? derivedRoot : pinnedRoot;
-
   for (const c of candidates) {
     if (c.source_ref === pinnedRef) continue;
     if (typeof c.source_ref !== "string" || passagePathOf(c.source_ref) !== path) {
       continue;
     }
-    if (ingestRootOf(c.metadata_json) !== expectedRoot) continue;
+    if (ingestRootOf(c.metadata_json) !== pinnedRoot) continue;
     const reframed = vaultPageHash({
       title: c.title,
       body: c.body,
@@ -454,6 +460,7 @@ function findMovedWithinFile(
         sourceKind: c.source_kind,
         title: c.title,
         relocatedFrom: pinnedRef,
+        ingestRoot: ingestRootOf(c.metadata_json),
       };
     }
   }
@@ -525,7 +532,7 @@ export function verifyBeliefSources(
     .prepare(
       `SELECT b.id AS belief_id, b.content AS content,
               s.kind AS kind, s.ref_id AS ref_id, s.snapshot_hash AS snapshot_hash,
-              s.pinned_ref AS pinned_ref
+              s.pinned_ref AS pinned_ref, s.pinned_root AS pinned_root
          FROM belief b
          JOIN belief_source s ON s.belief_id = b.id
         WHERE (? IS NULL OR b.created_at >= ?)
@@ -538,6 +545,7 @@ export function verifyBeliefSources(
     ref_id: string;
     snapshot_hash: string;
     pinned_ref: string | null;
+    pinned_root: string | null;
   }[];
 
   const byBelief = new Map<string, BeliefDrift>();
@@ -591,6 +599,7 @@ export function verifyBeliefSources(
         refId: r.ref_id,
         snapshotHash: r.snapshot_hash,
         pinnedRef: r.pinned_ref ?? undefined,
+        pinnedRoot: r.pinned_root ?? undefined,
       },
       { allowRelocation: true },
     );

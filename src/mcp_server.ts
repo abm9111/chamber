@@ -320,10 +320,22 @@ async function callTool(
         out.push("", `${b.beliefId}  ${b.verified}/${b.total} pins verified`);
         out.push(`  "${b.content}"`);
         for (const f of b.failures) {
-          out.push(
-            `  ${f.reason}: ${f.sourceRef ?? f.refId}` +
-              (f.title ? ` (now holds: ${f.title})` : ""),
-          );
+          // not_found needs its own branch, as the CLI has. Its `sourceRef`
+          // is the position the pin was MINTED against — historical, and no
+          // longer resolving — so the shared rendering above printed it
+          // exactly like a live location a reader could go and open.
+          if (f.reason === "not_found") {
+            out.push(
+              f.sourceRef
+                ? `  not_found: ${f.refId} — minted against ${f.sourceRef}, which no longer resolves`
+                : `  not_found: ${f.refId}`,
+            );
+          } else {
+            out.push(
+              `  ${f.reason}: ${f.sourceRef ?? f.refId}` +
+                (f.title ? ` (now holds: ${f.title})` : ""),
+            );
+          }
         }
       }
       return out.join("\n");

@@ -60,6 +60,13 @@ CREATE TABLE IF NOT EXISTS belief_source (
   -- NULL for rows written before this column existed, and for `kind='belief'`
   -- sources, which are ledger edges rather than corpus positions.
   pinned_ref        TEXT,
+  -- The ingest root `pinned_ref` is relative to. `source_ref` is root-relative,
+  -- so it names a path and not a file: two configured vaults may each hold
+  -- `notes/index.md`. Recorded for the same reason as pinned_ref — once the row
+  -- is swept there is nothing left to ask which vault the pin belonged to, and
+  -- deriving it from whichever rows still hold that path resolves into the
+  -- wrong corpus as soon as the pin's own vault no longer has the file.
+  pinned_root       TEXT,
   span_hash         TEXT,                    -- exact quoted span
   context_hash      TEXT,                    -- ±N tokens around span
   provenance        TEXT

@@ -234,14 +234,22 @@ needed for this already exists. Unplanned.
 > sections from the top went from `not_found` with no ref at all, to a
 > relocation naming both positions and the section title, counted as verified.
 >
-> With the row gone there is no recorded root to scope the search, so it is
-> derived from the candidates and only when they agree; two configured vaults
-> holding the same relative path refuse rather than guess. Pins written before
-> the column exists carry NULL and keep the old behaviour — verified against a
-> real 434-pin database, whose numbers were unchanged by the migration.
+> `belief_source.pinned_root` records the ingest root alongside it, because
+> `source_ref` is root-relative and so names a path rather than a file. The
+> first version derived the root from whichever rows still held that path and
+> refused when they disagreed; review showed that only refuses while both
+> vaults are observable — with the pin's own vault swept for that file, one
+> unrelated vault holding the same filename was a majority of one and the
+> rescue resolved into the wrong corpus. Nothing is derived now: no recorded
+> root, no rescue. Pins written before these columns existed carry NULL and
+> keep the old behaviour — verified against a real 434-pin database, whose
+> verify counts were unchanged by the migration.
 >
 > **Genuinely deleted text still reports `not_found`**, and now names the
-> position it was minted against, which the old verdict could not.
+> position it was minted against — in the CLI's default output, the `--json`
+> struct and the MCP tool alike, each marked as historical rather than as a
+> place to go and look. The first version of this change put it only in
+> `--json`, so the claim was true of the output almost nobody reads.
 >
 > **And the rescue introduces one limitation of its own** — stated here because
 > the commit that added it wrongly called this inherited. The primary

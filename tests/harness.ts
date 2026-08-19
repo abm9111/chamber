@@ -1063,6 +1063,110 @@ test("pins", "a pin whose text really left the note still reports not_found", ()
 });
 
 /**
+ * The pin's own vault no longer holds the file at all — not a shrink, a sweep —
+ * and an unrelated vault happens to hold the same relative path with the same
+ * text. This is the case the DERIVED-root version resolved into the wrong
+ * corpus: with only one vault visible for that path it was a majority of one.
+ * Nothing is derived now, so the pin's recorded root simply does not match.
+ */
+test("pins", "a swept pin is not rescued by another root that happens to hold the path", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "note.md#p1",
+    title: "Note › One",
+    body: "the cited passage",
+    metadata: { ingestRoot: "/vaults/a" },
+    model: LOCAL_HASH_MODEL,
+  });
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: "",
+  }).actualHash!;
+  deleteDocument(db, doc.id);
+
+  // Root B is now the ONLY root with rows for this path.
+  upsertDocument(db, {
+    id: "vdoc_b_other",
+    sourceKind: "vault_page",
+    sourceRef: "note.md#p0",
+    title: "Note › Other",
+    body: "unrelated content",
+    metadata: { ingestRoot: "/vaults/b" },
+    model: LOCAL_HASH_MODEL,
+  });
+  upsertDocument(db, {
+    id: "vdoc_b_twin",
+    sourceKind: "vault_page",
+    sourceRef: "note.md#p2",
+    title: "Note › One",
+    body: "the cited passage",
+    metadata: { ingestRoot: "/vaults/b" },
+    model: LOCAL_HASH_MODEL,
+  });
+
+  const verdict = verifyPin(
+    db,
+    {
+      kind: "vault_page",
+      refId: doc.id,
+      snapshotHash,
+      pinnedRef: "note.md#p1",
+      pinnedRoot: "/vaults/a",
+    },
+    { allowRelocation: true },
+  );
+  assert(
+    !verdict.ok && verdict.reason === "not_found",
+    `a different vault's content was accepted as this pin's evidence: ${JSON.stringify(verdict)}`,
+  );
+});
+
+/**
+ * A recorded position with no recorded root cannot be placed: the position is
+ * relative, so it names a path in an unknown vault. Every row written before
+ * `pinned_root` existed is in exactly this state, and must degrade to the old
+ * behaviour rather than pick a vault.
+ */
+test("pins", "a pin with a position but no recorded root is not rescued", () => {
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "note.md#p1",
+    title: "Note › One",
+    body: "the cited passage",
+    metadata: { ingestRoot: "/vaults/a" },
+    model: LOCAL_HASH_MODEL,
+  });
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc.id,
+    snapshotHash: "",
+  }).actualHash!;
+  deleteDocument(db, doc.id);
+  upsertDocument(db, {
+    id: "vdoc_moved_here",
+    sourceKind: "vault_page",
+    sourceRef: "note.md#p0",
+    title: "Note › One",
+    body: "the cited passage",
+    metadata: { ingestRoot: "/vaults/a" },
+    model: LOCAL_HASH_MODEL,
+  });
+
+  const verdict = verifyPin(
+    db,
+    { kind: "vault_page", refId: doc.id, snapshotHash, pinnedRef: "note.md#p1" },
+    { allowRelocation: true },
+  );
+  assert(
+    !verdict.ok && verdict.reason === "not_found",
+    `a rootless pin took the rescue: ${JSON.stringify(verdict)}`,
+  );
+});
+
+/**
  * Both vaults hold the same relative path AND the same text — so the question
  * is not whether the rescue refuses, but whether it picks the right corpus.
  * The pin belongs to root A, root A's own copy has moved within root A, and
@@ -1088,9 +1192,17 @@ test("pins", "a swept pin resolves inside its own root when two roots hold the s
   }).actualHash!;
   deleteDocument(db, doc.id);
 
-  for (const root of ["/vaults/a", "/vaults/b"]) {
+  // Ids chosen so the WRONG root sorts first. findMovedWithinFile scans
+  // `ORDER BY id` and takes the first hash match, so with these ids the
+  // assertion below can only pass if the root filter is what selects — an
+  // earlier version used ids that happened to sort the right root first, and
+  // still passed with the filter deleted. A test that cannot fail is not a test.
+  for (const [root, id] of [
+    ["/vaults/b", "vdoc_aaa_wrong_root"],
+    ["/vaults/a", "vdoc_zzz_right_root"],
+  ] as const) {
     upsertDocument(db, {
-      id: `vdoc_forced_${root.replace(/\W/g, "")}`,
+      id,
       sourceKind: "vault_page",
       sourceRef: "note.md#p2",
       title: "Note › Four",

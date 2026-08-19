@@ -1437,8 +1437,20 @@ async function main(): Promise<void> {
             console.log(
               "    nothing is stored under this id — the cited passage left the corpus" +
                 " (the note shrank past this position, or its rows were replaced)." +
+                // Only what is actually known. An earlier version said "that
+                // position no longer resolves", which is a claim about the
+                // corpus NOW and was demonstrably false: `chamber index` can
+                // write a new row at the abandoned ref, and verify then told
+                // the operator a position resolves nowhere while it resolved
+                // fine. It also said the text "was not found elsewhere in that
+                // file", which is only true when a search actually ran — it
+                // needs a recorded root, and pins predating that column have
+                // none. What IS known is narrower and still useful: reaching
+                // not_found here means no row anywhere carries the pinned
+                // content under its hash, so whatever sits at that position
+                // today is not what was cited.
                 (f.sourceRef
-                  ? " That position no longer resolves, and the text was not found elsewhere in that file."
+                  ? " Whatever occupies that position now is not what this belief cited."
                   : " The text may still be in the note at a different passage; the citation can no longer reach it."),
             );
           } else {

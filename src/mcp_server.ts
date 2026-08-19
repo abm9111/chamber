@@ -327,7 +327,11 @@ async function callTool(
           if (f.reason === "not_found") {
             out.push(
               f.sourceRef
-                ? `  not_found: ${f.refId} — minted against ${f.sourceRef}, which no longer resolves`
+                // "which no longer resolves" was a claim about the corpus
+                // now, and false whenever anything was written to that ref
+                // afterwards. What is known is that nothing carries the pinned
+                // content any more, so the position no longer HOLDS it.
+                ? `  not_found: ${f.refId} — minted against ${f.sourceRef}, which no longer holds it`
                 : `  not_found: ${f.refId}`,
             );
           } else {

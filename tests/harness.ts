@@ -849,6 +849,24 @@ test("pins", "verify reports a moved pin as intact support with both positions",
 });
 
 /**
+ * The report is consumed off-box (the Obsidian companion renders it from a
+ * synced copy), and a synced file's mtime is whatever the sync engine set —
+ * so staleness must come from inside the report. Minted in
+ * buildVerifyReport, once per run.
+ */
+test("pins", "the verify report carries its own timestamp", () => {
+  const db = freshDb();
+  const before = Date.now();
+  const vr = buildVerifyReport(db, {});
+  const at = Date.parse(vr.generatedAt);
+  assert(Number.isFinite(at), `generatedAt not ISO-parseable: ${JSON.stringify(vr.generatedAt)}`);
+  assert(
+    at >= before - 1000 && at <= Date.now() + 1000,
+    `generatedAt not from this run: ${vr.generatedAt}`,
+  );
+});
+
+/**
  * The rescue is a hash check with the file held fixed, and both halves of
  * that sentence have to survive adversarial input. Byte-identical text in a
  * different file must not buy support — the file is part of what a citation

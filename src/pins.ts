@@ -670,6 +670,14 @@ export interface VerifyRunReport {
    * false alarm the backtest measured.
    */
   relocatedPins: number;
+  /**
+   * When this report was computed, ISO-8601. The report is read off-box —
+   * the Obsidian companion renders a synced copy — and a synced file's
+   * mtime is whatever the sync engine chose, so staleness has to travel
+   * inside the report. Additive; absent from reports written by older
+   * versions, and consumers must treat absence as "age unknown".
+   */
+  generatedAt: string;
   beliefs: BeliefDrift[];
 }
 
@@ -693,6 +701,7 @@ export function buildVerifyReport(
     unsourcedBeliefs: countUnsourcedBeliefs(db, opts),
     goneFiles: findGonePinnedFiles(db),
     relocatedPins: beliefs.reduce((n, b) => n + b.relocations.length, 0),
+    generatedAt: new Date().toISOString(),
     beliefs,
   };
 }

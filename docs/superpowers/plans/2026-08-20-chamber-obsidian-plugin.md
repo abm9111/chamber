@@ -146,7 +146,7 @@ cd ~/Projects/chamber-obsidian && git init -b main
     "build": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs",
     "test": "vitest run",
-    "check": "tsc --noEmit && eslint src tests"
+    "check": "tsc --noEmit && eslint --no-error-on-unmatched-pattern src tests"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

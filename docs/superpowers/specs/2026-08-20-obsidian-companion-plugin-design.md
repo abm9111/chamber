@@ -33,15 +33,21 @@ Input is the existing `chamber verify --json` output, written by the user's
 scheduled job. Documented one-liner (Chamber-side docs change only — no code):
 
 ```
-chamber verify --json > "<vault>/_chamber/.report.tmp" ; mv "<vault>/_chamber/.report.tmp" "<vault>/_chamber/report.json"
+chamber verify --json > "<vault>/_chamber/.report.tmp" ; [ -s "<vault>/_chamber/.report.tmp" ] && mv "<vault>/_chamber/.report.tmp" "<vault>/_chamber/report.json"
 ```
 
-The temp file lives NEXT to the destination, not in /tmp: `mv` is only an
+Two guards in one line, each earned: the temp file lives NEXT to the destination, not in /tmp: `mv` is only an
 atomic rename within one filesystem, and /tmp is routinely a different one
 (tmpfs on Linux), where mv degrades to copy+unlink — exactly the half-written
 read this line exists to prevent. The dotted temp name keeps it out of the
 vault index; the rename onto `report.json` fires the modify event the plugin
-watches for. Exit code semantics
+watches for. And the `[ -s … ]` guard moves only a NON-EMPTY temp file — the
+redirect creates the file even when the command never runs (wrong PATH under
+launchd, crash before output), and an unguarded `mv` then replaces the last
+known-good report with an empty one. `&&` after verify would be the wrong
+guard: verify EXITS 1 WHEN DRIFT EXISTS — its most important output — so
+gating the move on exit status suppresses exactly the reports that matter.
+Review caught both wrong forms shipping side by side. Exit code semantics
 of the cron job are unchanged.
 
 **Default location `_chamber/report.json` — deliberately NOT dot-prefixed.**

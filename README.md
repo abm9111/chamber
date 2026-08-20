@@ -173,6 +173,14 @@ transcript.
 something drifted. A check that correctly reports nothing on most days is a
 check you stop reading, so it stays quiet until it isn't.
 
+### Render it in Obsidian
+
+The companion plugin [Chamber Drift](https://github.com/abm9111/chamber-obsidian)
+renders `verify --json`'s report as a vault sidebar panel and a per-note
+banner — nothing more. It never verifies and never writes; Chamber does both,
+on its own schedule, outside Obsidian. Setup, including the report-writing
+one-liner and the Obsidian Sync caveat: [`docs/OBSIDIAN.md`](docs/OBSIDIAN.md).
+
 ### Use it from an AI coding agent
 
 `src/mcp_server.ts` exposes three tools over MCP — `chamber_ask`,

@@ -6730,7 +6730,7 @@ test("oauth", "O10_retry_permanent_no_extra", () => {
 });
 
 
-test("oauth", "O11_seal_roundtrip", () => {
+test("oauth", "O11_seal_open_roundtrip", () => {
   process.env.CHAMBER_TOKEN_KEY = Buffer.alloc(32, 7).toString("base64");
   try {
     const s = sealSecret("super-secret-token");

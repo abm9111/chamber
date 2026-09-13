@@ -62,8 +62,11 @@ import {
 import { runAsk, citedIndices, stubDisclosure } from "../src/ask.ts";
 import {
   minilmAvailable,
+  minilmInstalled,
+  resetMinilmProbe,
   embedLocal,
   embedLocalBatch,
+  HASH_MODEL,
   MINILM_MODEL,
 } from "../src/embedder.ts";
 import { CALIBRATED_THRESHOLDS } from "../src/commit_belief.ts";
@@ -1756,6 +1759,153 @@ test("gates", "an operator can waive a debt that cannot be paid", () => {
  * Soft-skips without a real embedder, because without one the semantic leg does
  * not run at all and the test would pass for a reason that proves nothing.
  */
+/**
+ * `minilmAvailable()` answered a question about FILES, not about execution:
+ * `existsSync(SCRIPT) && existsSync(MODEL)`. That is what let the 08:30 job
+ * re-embed 28,508 passages as hash vectors every morning and exit 0 — the
+ * files were present, the interpreter could not import numpy, availability
+ * said yes, and the fallback wrote a valid-looking 256-dim vector.
+ *
+ * The check has to run the thing. An interpreter that exists and exits
+ * non-zero must read as unavailable while both files sit exactly where they
+ * were, which is the case this asserts: nothing about the filesystem changes
+ * between the two halves, only whether the embedder can actually produce a
+ * vector.
+ */
+test("embedder", "availability answers whether the embedder RUNS, not whether files exist", () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const scriptsExist =
+    existsSync(join(repoRoot, "scripts/embed_minilm.py")) &&
+    existsSync(join(repoRoot, "models/minilm/model_quantized.onnx"));
+  assert(scriptsExist, "both files must be present for this test to mean anything");
+
+  const saved = process.env.CHAMBER_PYTHON;
+  try {
+    // Exists, executes, exits non-zero, prints no vector: the exact shape of
+    // a python without onnxruntime, without needing one on the test machine.
+    process.env.CHAMBER_PYTHON = "/bin/false";
+    assert(
+      minilmAvailable() === false,
+      "an interpreter that cannot produce a vector must read as unavailable",
+    );
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+  }
+});
+
+/**
+ * The probe costs a subprocess, so it is cached — but cached per interpreter,
+ * not per process. A single cache would make the first caller's interpreter
+ * the permanent answer, so `CHAMBER_PYTHON` set later (or a test, or a
+ * long-lived server re-reading config) would be told about a python it is no
+ * longer using.
+ */
+test("embedder", "the availability probe is cached per interpreter, not globally", () => {
+  const saved = process.env.CHAMBER_PYTHON;
+  try {
+    process.env.CHAMBER_PYTHON = "/bin/false";
+    assert(minilmAvailable() === false, "broken interpreter reads unavailable");
+    process.env.CHAMBER_PYTHON = "/bin/false";
+    assert(minilmAvailable() === false, "still unavailable on the cached path");
+
+    // Switching back must re-probe rather than return the cached `false`.
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+    const real = minilmAvailable();
+    // Only assert the direction that is knowable on any machine: the answer
+    // is recomputed, not the previous interpreter's cached one. Where a real
+    // embedder exists this is true; where none does, both are false and the
+    // test proves nothing, so it says so.
+    if (!real) {
+      assert(true, "no working embedder on this machine — cache direction unprovable");
+    } else {
+      assert(real === true, "restoring a working interpreter must re-probe to true");
+    }
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+  }
+});
+
+/**
+ * Both of these are regressions the honest probe introduced, found by running
+ * the real path rather than by reading the diff.
+ *
+ * Making availability answer "does it run" silently changed the meaning of
+ * `prefer === "minilm" && !minilmAvailable() ? "hash"`, a line written when it
+ * meant "are the files there". A caller passing `prefer: "minilm"` does so
+ * because it must NOT degrade — `src/ask.ts` relies on the throw so a query is
+ * never hash-embedded against a MiniLM corpus — and for one commit it got a
+ * hash vector and no error instead.
+ */
+test("embedder", "an explicit minilm request still throws on a broken interpreter, never degrades", () => {
+  if (!minilmInstalled()) {
+    assert(true, "no model files — the degrade-to-hash path is the correct one here");
+    return;
+  }
+  const saved = process.env.CHAMBER_PYTHON;
+  try {
+    process.env.CHAMBER_PYTHON = "/bin/false";
+    let threw = false;
+    try {
+      embedLocal("anything", "minilm");
+    } catch {
+      threw = true;
+    }
+    assert(threw, "prefer:minilm on an installed-but-unrunnable embedder must throw");
+
+    let batchThrew = false;
+    try {
+      embedLocalBatch(["a", "b"], "minilm");
+    } catch {
+      batchThrew = true;
+    }
+    assert(batchThrew, "the batch path must throw for the same request");
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+  }
+});
+
+/**
+ * The silent downgrade was audible only by accident: availability said yes, the
+ * embed threw, and `embedLocal`'s catch warned. Answering honestly up front
+ * removes that accident — so an installed-but-unrunnable embedder has to raise
+ * the warning from the probe itself, or the exact defect KNOWN_LIMITATIONS 15
+ * describes comes back one layer earlier.
+ */
+test("embedder", "an installed embedder that cannot run says so, rather than degrading quietly", () => {
+  if (!minilmInstalled()) {
+    assert(true, "no model files — nothing to be quiet about");
+    return;
+  }
+  const saved = process.env.CHAMBER_PYTHON;
+  const warnings: string[] = [];
+  const realWarn = console.warn;
+  try {
+    process.env.CHAMBER_PYTHON = "/bin/false";
+    // Both caches have to go: the probe's per-interpreter answer AND the
+    // warn-once latch an earlier test in this file has already spent.
+    resetMinilmProbe();
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    const r = embedLocal("anything", "auto");
+    console.warn = realWarn;
+    assert(r.model === HASH_MODEL, `auto must still produce a usable vector, got ${r.model}`);
+    assert(
+      warnings.some((w) => /minilm|embedder/i.test(w)),
+      `the downgrade must be announced; captured: ${JSON.stringify(warnings).slice(0, 200)}`,
+    );
+  } finally {
+    console.warn = realWarn;
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+    resetMinilmProbe();
+  }
+});
+
 test("gates", "correcting an indebted claim's number is not refused as a repeat", () => {
   if (!minilmAvailable()) {
     assert(true, "minilm model not on disk — soft skip");

@@ -53,8 +53,96 @@ export type EmbedderKind = "minilm" | "hash" | "ollama";
 
 let resolvedKind: EmbedderKind | null = null;
 
-export function minilmAvailable(): boolean {
+/**
+ * Cached per interpreter path, not per process. A single boolean would make the
+ * first caller's `CHAMBER_PYTHON` the permanent answer for the life of the
+ * process — so a server that re-reads config, or anything that sets the var
+ * later, would be told about an interpreter it is no longer using.
+ */
+const minilmProbe = new Map<string, { ok: boolean; err?: unknown }>();
+
+/**
+ * Whether MiniLM can actually produce a vector here.
+ *
+ * This used to be `existsSync(SCRIPT) && existsSync(MODEL)` — a question about
+ * files, asked in place of a question about execution. Both files are in the
+ * repo, so on any checkout it answered `true` unconditionally, including on
+ * the machine where the resolved `python3` had neither numpy nor onnxruntime.
+ * `embedMinilm` then threw, `embedLocal` caught and wrote a 256-dim hash
+ * vector, and nothing downstream could tell: a hash vector is a valid vector.
+ * The 08:30 job re-embedded 28,508 passages that way every morning and exited
+ * 0. KNOWN_LIMITATIONS 15.
+ *
+ * So the check runs the thing. The files still have to exist — that check is
+ * cheap and its failure is unambiguous — and then the interpreter has to
+ * return a vector of the right width for a fixed input. A probe that only
+ * asked "did it exit 0" would pass on an interpreter that printed nothing,
+ * and one that ignored the width would pass on a script returning hash
+ * vectors, which is the exact substitution being guarded against.
+ *
+ * Costs one subprocess (~158 ms) per interpreter per process, paid only when
+ * something asks whether minilm is available.
+ */
+/**
+ * Whether the model and script are on disk at all — the question the old
+ * `minilmAvailable` was really answering.
+ *
+ * Kept as its own function because two different callers need two different
+ * questions, and collapsing them is what broke the contract below. An
+ * explicit `prefer: "minilm"` on an install with no model files should quietly
+ * use hash vectors: nothing is wrong, this build simply has no embedder. An
+ * explicit `prefer: "minilm"` on an install where the files ARE present and
+ * the interpreter cannot run them must throw, because that is a broken
+ * machine masquerading as a working one.
+ */
+export function minilmInstalled(): boolean {
   return existsSync(SCRIPT) && existsSync(MODEL);
+}
+
+export function minilmAvailable(): boolean {
+  if (!minilmInstalled()) return false;
+  const bin = pythonBin();
+  const cached = minilmProbe.get(bin);
+  if (cached !== undefined) return cached.ok;
+
+  let ok = false;
+  let err: unknown;
+  try {
+    const r = spawnSync(bin, [SCRIPT, "chamber embedder probe"], {
+      encoding: "utf-8",
+      maxBuffer: 4 * 1024 * 1024,
+      // Generous: a cold ONNX load on a loaded machine is slow, and a probe
+      // that times out early would report "unavailable" for a working
+      // embedder — the false negative costs a hash-vector corpus too.
+      timeout: 120_000,
+    });
+    if (r.error) err = r.error;
+    else if (r.status !== 0)
+      err = new Error(
+        `probe exited ${r.status}: ${(r.stderr || "").trim().slice(0, 300)}`,
+      );
+    else {
+      const line = (r.stdout || "").trim().split("\n").filter(Boolean).pop();
+      if (!line) err = new Error("probe produced no vector on stdout");
+      else {
+        const dims = parseVector(line).length;
+        ok = dims === MINILM_DIMS;
+        if (!ok) err = new Error(`probe returned ${dims} dims, expected ${MINILM_DIMS}`);
+      }
+    }
+  } catch (e) {
+    // A spawn that cannot even be attempted is an unavailable embedder, not a
+    // crash: callers degrade or throw on their own terms below.
+    err = e;
+  }
+  minilmProbe.set(bin, { ok, err });
+  // The model is installed and will not run. Before this probe existed that
+  // situation announced itself by accident: availability said yes, the embed
+  // threw, and the catch in `embedLocal` warned. Answering honestly up front
+  // removed that accident, so the warning has to be raised deliberately here
+  // or the downgrade goes back to being silent — the whole defect.
+  if (!ok) warnMinilmFallback(err);
+  return ok;
 }
 
 export function ollamaAvailable(): boolean {
@@ -241,6 +329,21 @@ function warnMinilmFallback(err: unknown): void {
   );
 }
 
+/**
+ * Clear the per-interpreter probe cache and the warn-once latch.
+ *
+ * Exists for the same reason `resetIsolationProbe` does: both caches make the
+ * first answer the process's permanent answer, which is right in production
+ * and makes a test suite order-dependent. Without this, a test asserting the
+ * downgrade is announced passes or fails on whether some earlier test already
+ * spent the one warning.
+ */
+export function resetMinilmProbe(): void {
+  minilmProbe.clear();
+  minilmFallbackWarned = false;
+  resolvedKind = null;
+}
+
 /** True when a silent MiniLM downgrade happened in this process. */
 export function minilmFallbackOccurred(): boolean {
   return minilmFallbackWarned;
@@ -253,7 +356,12 @@ export function embedLocal(
   const kind =
     prefer === "auto"
       ? defaultEmbedderKind()
-      : prefer === "minilm" && !minilmAvailable()
+      : // Deliberately `minilmInstalled`, not `minilmAvailable`: an install
+        // with no model files has no minilm to prefer, but one whose
+        // interpreter is broken must reach the attempt below and throw.
+        // Using availability here silently handed hash vectors to callers
+        // that asked for minilm precisely because they must not degrade.
+        prefer === "minilm" && !minilmInstalled()
         ? "hash"
         : prefer;
 
@@ -324,7 +432,12 @@ export function embedLocalBatch(
   const kind =
     prefer === "auto"
       ? defaultEmbedderKind()
-      : prefer === "minilm" && !minilmAvailable()
+      : // Deliberately `minilmInstalled`, not `minilmAvailable`: an install
+        // with no model files has no minilm to prefer, but one whose
+        // interpreter is broken must reach the attempt below and throw.
+        // Using availability here silently handed hash vectors to callers
+        // that asked for minilm precisely because they must not degrade.
+        prefer === "minilm" && !minilmInstalled()
         ? "hash"
         : prefer;
 

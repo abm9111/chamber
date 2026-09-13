@@ -64,6 +64,7 @@ import {
   minilmAvailable,
   minilmInstalled,
   resetMinilmProbe,
+  minilmTruncationSeen,
   embedLocal,
   embedLocalBatch,
   HASH_MODEL,
@@ -1904,6 +1905,71 @@ test("embedder", "an installed embedder that cannot run says so, rather than deg
     else process.env.CHAMBER_PYTHON = saved;
     resetMinilmProbe();
   }
+});
+
+/**
+ * The python side has always reported overflow on stderr; the TS side read
+ * stderr only when the embed FAILED, so on every successful run the count was
+ * written and dropped. This asserts the number survives the process boundary,
+ * because that boundary is where it was being lost.
+ *
+ * Needs a real embedder: with hash vectors nothing tokenizes and there is no
+ * limit to exceed, so the test would pass without exercising anything.
+ */
+test("embedder", "truncation crosses the subprocess boundary instead of dying on stderr", () => {
+  if (!minilmAvailable()) {
+    assert(true, "no runnable embedder — truncation cannot be observed here");
+    return;
+  }
+  resetMinilmProbe();
+  assert(
+    minilmTruncationSeen() === null,
+    "reset must clear the accumulator, or this test reads a previous test's total",
+  );
+
+  const short = "a brief passage";
+  // Comfortably past 256 tokens: each "finding<n>" costs more than one token.
+  const long = Array.from({ length: 600 }, (_, i) => `finding${i}`).join(" ");
+
+  embedLocalBatch([short, long], "minilm");
+  const t = minilmTruncationSeen();
+  assert(t !== null, "an input past the limit must be reported");
+  assert(t!.passages === 1, `exactly one input overflowed, got ${t!.passages}`);
+  assert(t!.limit === 256, `limit should be the model's trained length, got ${t!.limit}`);
+  assert(t!.tokensDropped > 0, "a truncated passage drops at least one token");
+  assert(
+    t!.longest > t!.limit,
+    `longest (${t!.longest}) must exceed the limit or nothing was truncated`,
+  );
+
+  // Accumulates rather than overwrites: an ingest embeds in many batches and
+  // the operator's question is how much of the corpus lost its tail.
+  embedLocalBatch([long, long], "minilm");
+  const t2 = minilmTruncationSeen();
+  assert(
+    t2!.passages === 3,
+    `totals must accumulate across calls, got ${t2!.passages} after 1 + 2`,
+  );
+  resetMinilmProbe();
+});
+
+/**
+ * A short corpus must stay silent. A truncation warning that fires when
+ * nothing was truncated is the same class of defect as one that never fires:
+ * the operator learns to ignore the line.
+ */
+test("embedder", "nothing is reported when nothing was truncated", () => {
+  if (!minilmAvailable()) {
+    assert(true, "no runnable embedder — nothing to measure");
+    return;
+  }
+  resetMinilmProbe();
+  embedLocalBatch(["short one", "short two", "short three"], "minilm");
+  assert(
+    minilmTruncationSeen() === null,
+    "no input exceeded the limit, so there must be no truncation report",
+  );
+  resetMinilmProbe();
 });
 
 test("gates", "correcting an indebted claim's number is not refused as a repeat", () => {

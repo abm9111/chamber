@@ -23,7 +23,12 @@ import {
 } from "node:fs";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { deleteDocument, upsertDocument } from "./vector.ts";
-import { embedLocalBatch, type EmbedResult } from "./embedder.ts";
+import {
+  embedLocalBatch,
+  minilmTruncationSeen,
+  type EmbedResult,
+  type MinilmTruncation,
+} from "./embedder.ts";
 import { passagePathOf, passageSourceRef, splitPassages } from "./chunk.ts";
 
 /**
@@ -116,6 +121,17 @@ export interface IngestReport {
    * copies of the same broken python.
    */
   embedFallback?: string;
+  /**
+   * Passages whose tail the embedder dropped, when any were.
+   *
+   * 256 tokens is all-MiniLM-L6-v2's trained sequence length, so truncating
+   * is correct; doing it silently is not. A half-embedded passage produces a
+   * perfectly valid vector, verifies (pins hash the body, not the vector),
+   * and counts toward the passage total — the only symptom is a query that
+   * cannot find text the corpus visibly contains, which reads as bad
+   * retrieval rather than as content that was never indexed.
+   */
+  truncated?: MinilmTruncation;
 }
 
 export interface IngestOptions {
@@ -823,6 +839,12 @@ export function ingestDirectory(
 
     report.ingested += 1;
   }
+
+  // Read once at the end rather than per file: the embedder accumulates across
+  // every batch this process ran, and an operator's question is how much of
+  // the corpus lost its tail, not which file was last to lose some.
+  const truncated = minilmTruncationSeen();
+  if (truncated) report.truncated = truncated;
 
   return report;
 }

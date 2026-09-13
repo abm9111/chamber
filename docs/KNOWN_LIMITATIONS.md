@@ -489,48 +489,69 @@ or a model call inside the gate. A belief-kind citation that consulted
 belief — closes the second half with a SELECT the gate already nearly performs.
 Unplanned.
 
-## 15. The embedder can silently downgrade, and runs one subprocess per passage
+## 15. The embedder truncates at 256 tokens, and the chunker overshoots it
 
-`embedMinilm` shells out to `python3` with `scripts/embed_minilm.py`. Two things
-follow from that, and the first one destroyed a real corpus.
+`embedMinilm` shells out to `python3` with `scripts/embed_minilm.py`. Most of
+what this entry used to describe has been closed; what follows separates the
+two.
 
-**It can fail without saying so.** `minilmAvailable()` (`src/embedder.ts:56`)
-tests that two *files* exist. It does not test that the embedder *runs*. So on a
-machine where the resolved `python3` lacks `numpy` or `onnxruntime`, availability
-reports true, `embedMinilm` throws, and `embedLocal(_, "auto")` falls back to a
-256-dimension hash vector. A hash vector is a valid vector, so nothing
-downstream can tell.
+**Closed: the availability check answered the wrong question.**
+`minilmAvailable()` tested that two *files* exist. Both ship in the repo, so it
+returned true on every checkout — including on the machine whose resolved
+`python3` had neither numpy nor onnxruntime. `embedMinilm` threw, `embedLocal`
+caught, a 256-dimension hash vector went in where a 384-dimension semantic one
+belonged, and nothing downstream could tell: a hash vector is a valid vector.
+The 08:30 job re-embedded 28,508 passages that way every morning and exited 0,
+and `chamber ask` answered *"nothing in the corpus matches this question"* for
+material sitting in the index.
 
-Observed on the development machine on 2026-08-05, not reasoned about: an
-interactive shell resolved `python3` to an interpreter with the dependencies,
-while a **login** shell — which is what `launchd` and `systemd` units run —
-resolved it to `/usr/bin/python3`, which has neither. The scheduled 08:30 job
-therefore re-embedded all 28,508 passages with `local-hash-v1` every morning and
-exited 0. `chamber ask` answered *"nothing in the corpus matches this question"*
-for material sitting in the index, because the query was a 384-dimension MiniLM
-vector and every stored vector was a 256-dimension hash.
+It now runs the embedder on a fixed input and requires a 384-dimension vector
+back, cached per interpreter path. `minilmInstalled()` keeps the files
+question, because the two callers need different answers: an install with no
+model files should quietly use hash vectors, while an install whose interpreter
+cannot run the model must throw for anyone who passed `prefer: "minilm"`.
 
-**What it costs.** Every other signal reported health. `verify` exited 0, the
-passage count was correct, and content pins verified — pins hash the stored
-*body*, not the vector, so the citation gate cannot see this. The only visible
-symptom was ingest finishing in two minutes instead of seventy-five, and nothing
-watches for a check being suspiciously fast.
+**Closed: the downgrade is audible, and a mismatched corpus says so.** The
+fallback warns once per process naming the underlying error; `CHAMBER_PYTHON`
+names the interpreter explicitly, because PATH is the thing that differs
+between an interactive and a login shell; and `chamber ask` compares the
+query's model against the corpus's dominant model and says so in its note
+channel rather than returning an empty result with no cause.
 
-**Mitigated, not fixed.** The fallback now prints one warning per process naming
-the underlying error, and `CHAMBER_PYTHON` names the interpreter explicitly —
-PATH is the thing that differs between shells, so a PATH-dependent setting
-cannot resolve it. What remains unfixed is the shape of the check:
-`minilmAvailable()` still answers a question about files rather than about
-execution, which is the same defect `engines/preflight.md` calls "a probe that
-cannot fail". Nothing records, per corpus, which embedder produced it, so a
-database cannot report that its vectors and its queries disagree.
+**Closed: one subprocess per passage.** `embedLocalBatch` is wired into
+`src/ingest.ts`, which was the path that took 75 minutes for 28,500 passages.
+`upsertDocument` still embeds singly for callers that hand it a body rather
+than a vector, which is correct for one-off writes and for query embedding.
 
-**And it is slow.** `upsertDocument` calls `embedLocal` once per passage — a
-fresh python startup and ONNX model load each time, measured at ~158 ms. A
-28,500-passage corpus takes about 75 minutes. `embedLocalBatch`
-(`src/embedder.ts:304`) exists to amortise exactly this and **has no callers**.
-Wiring it in is the single largest performance win available in the ingest path.
-Unplanned.
+**Open: 1.24% of passages lose their tail, and the chunker is why.** 256 tokens
+is all-MiniLM-L6-v2's own trained `max_seq_length`, so truncating there is
+correct — raising it would exceed what the model was trained for. Doing it
+silently was not: a half-embedded passage produces a valid vector, verifies
+(pins hash the stored body, not the vector), and counts toward the passage
+total. The only symptom is a query that cannot find text the corpus visibly
+contains, which reads as bad retrieval rather than as content that was never
+indexed.
+
+`chamber ingest` now reports it — passage count, tokens dropped, longest input
+— on stderr, where a scheduled run greps for surprises.
+
+Measured over a real 43,541-passage corpus on 2026-09-13: **541 passages
+(1.24%) exceeded the limit and 80,989 tokens were dropped**, the worst single
+passage losing 370 of its 626. Narrow, and it was invisible until counted.
+
+What remains is a chunker question, not an embedder one. A two-note test vault
+produced 5 truncated passages from one section, which means passage chunking
+splits on structure without regard to the embedder's token budget: a chunk
+that lands at 300 tokens loses 44 of them every time it is embedded. Fixing it
+means the chunker taking the tokenizer's limit as input, and a re-index of any
+corpus built before that — which is why it is written down here rather than
+done in the same commit.
+
+Also note: `models/minilm/tokenizer.json` declares `truncation.max_length:
+128`. The script overrides it to 256 explicitly, so the model's full length is
+used — but any *other* consumer of that tokenizer file gets 128 silently. A
+measurement script written against it reported "0 passages over 256" for this
+corpus, which was the instrument capping, not the data.
 
 ## The paraphrase gate softens when its embedder is unavailable — deliberately
 

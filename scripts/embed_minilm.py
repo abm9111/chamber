@@ -22,8 +22,14 @@ MODEL_DIR = ROOT / "models" / "minilm"
 ONNX_PATH = MODEL_DIR / "model_quantized.onnx"
 TOK_PATH = MODEL_DIR / "tokenizer.json"
 
+# all-MiniLM-L6-v2's trained sequence length. Inputs longer than this lose
+# their tail; see report_truncation below, which makes that loss visible
+# instead of leaving it to be discovered by a query that finds nothing.
+MAX_TOKENS = 256
+
 _session: ort.InferenceSession | None = None
 _tokenizer: Tokenizer | None = None
+_measurer: Tokenizer | None = None
 
 
 def _load() -> tuple[ort.InferenceSession, Tokenizer]:
@@ -41,10 +47,29 @@ def _load() -> tuple[ort.InferenceSession, Tokenizer]:
         if not TOK_PATH.is_file():
             raise SystemExit(f"missing tokenizer: {TOK_PATH}")
         _tokenizer = Tokenizer.from_file(str(TOK_PATH))
-        # sentence-transformers style: pad/truncate to 128 or 256
-        _tokenizer.enable_truncation(max_length=256)
-        _tokenizer.enable_padding(length=256)
+        # 256 is all-MiniLM-L6-v2's own trained max_seq_length, not a number
+        # picked here -- so this is the model's limit, not a cap worth raising.
+        # It is set explicitly because tokenizer.json ships truncation at 128:
+        # without these two lines every passage would silently lose everything
+        # past 128 tokens, which is half of what the model can actually read.
+        _tokenizer.enable_truncation(max_length=MAX_TOKENS)
+        _tokenizer.enable_padding(length=MAX_TOKENS)
     return _session, _tokenizer
+
+
+def _measuring_tokenizer() -> Tokenizer:
+    """A second tokenizer with no truncation, used only to measure overflow.
+
+    The embedding tokenizer cannot answer "how long was this really": it has
+    already truncated, so every oversized input reports exactly MAX_TOKENS and
+    a passage losing 4 tokens is indistinguishable from one losing 370.
+    """
+    global _measurer
+    if _measurer is None:
+        _measurer = Tokenizer.from_file(str(TOK_PATH))
+        _measurer.no_truncation()
+        _measurer.no_padding()
+    return _measurer
 
 
 def mean_pool(last_hidden: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
@@ -59,9 +84,57 @@ def mean_pool(last_hidden: np.ndarray, attention_mask: np.ndarray) -> np.ndarray
     return emb / norms
 
 
+def report_truncation(texts: list[str], enc: list) -> None:
+    """Announce, on stderr, any input whose tail was dropped.
+
+    Truncation at MAX_TOKENS is correct -- it is what the model was trained
+    for -- but doing it silently is not. A passage that loses its second half
+    still embeds to a perfectly valid vector, still verifies (pins hash the
+    stored body, not the vector), and still counts toward the passage total.
+    The only symptom is a query that cannot find something the corpus
+    visibly contains, which reads as the retrieval being bad rather than as
+    the text never having been indexed.
+
+    Measured over one real 43,541-passage corpus on 2026-09-13: 541 passages
+    (1.24%) exceeded the limit and 80,989 tokens were dropped in total, the
+    worst single passage losing 370 of its 626. Narrow, but not nothing, and
+    invisible until counted.
+
+    Stderr because stdout is the vector protocol. One summary line per
+    process, not one per passage: an ingest of 43k passages must not emit
+    43k lines, and the count is what an operator acts on.
+    """
+    filled = [i for i, e in enumerate(enc) if sum(e.attention_mask) >= MAX_TOKENS]
+    if not filled:
+        return
+    measurer = _measuring_tokenizer()
+    over = []
+    for i in filled:
+        true_len = len(measurer.encode(texts[i]).ids)
+        if true_len > MAX_TOKENS:
+            over.append(true_len)
+    if not over:
+        return
+    print(
+        json.dumps(
+            {
+                "chamber_truncation": {
+                    "limit": MAX_TOKENS,
+                    "passages": len(over),
+                    "of": len(texts),
+                    "tokens_dropped": sum(n - MAX_TOKENS for n in over),
+                    "longest": max(over),
+                }
+            }
+        ),
+        file=sys.stderr,
+    )
+
+
 def embed_texts(texts: list[str]) -> list[list[float]]:
     session, tokenizer = _load()
     enc = tokenizer.encode_batch(texts)
+    report_truncation(texts, enc)
     input_ids = np.array([e.ids for e in enc], dtype=np.int64)
     attention_mask = np.array([e.attention_mask for e in enc], dtype=np.int64)
     token_type_ids = np.zeros_like(input_ids, dtype=np.int64)

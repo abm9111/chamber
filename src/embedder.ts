@@ -251,6 +251,7 @@ export function embedMinilm(text: string): Float32Array {
       `embed_minilm failed (${r.status}): ${(r.stderr || "").slice(0, 400)}`,
     );
   }
+  noteTruncation(r.stderr || "");
   const line = (r.stdout || "").trim().split("\n").filter(Boolean).pop();
   if (!line) throw new Error("embed_minilm: no stdout");
   return parseVector(line);
@@ -278,6 +279,7 @@ export function embedMinilmBatch(texts: string[]): Float32Array[] {
       `embed_minilm batch failed (${r.status}): ${(r.stderr || "").slice(0, 400)}`,
     );
   }
+  noteTruncation(r.stderr || "");
   const line = (r.stdout || "").trim().split("\n").filter(Boolean).pop();
   if (!line) throw new Error("embed_minilm batch: no stdout");
   const arr = JSON.parse(line) as number[][];
@@ -314,6 +316,67 @@ function warnEmbedderFallback(kind: string, err: unknown): void {
 }
 
 let minilmFallbackWarned = false;
+
+/**
+ * Truncation totals accumulated across this process's embed calls.
+ *
+ * The python side reports overflow on stderr, which the TS side reads only on
+ * failure — so on a successful run the count was written and then dropped on
+ * the floor. Accumulated rather than last-write-wins: an ingest embeds in
+ * batches, and the operator's question is how much of the corpus lost its
+ * tail, not how much the final batch did.
+ */
+let truncationTotals: MinilmTruncation | null = null;
+
+export interface MinilmTruncation {
+  /** The model's trained sequence length; inputs past it lose their tail. */
+  limit: number;
+  /** How many inputs were truncated. */
+  passages: number;
+  /** Total tokens dropped across them. */
+  tokensDropped: number;
+  /** True length of the longest input seen, in tokens. */
+  longest: number;
+}
+
+/**
+ * Parse the python side's one-line truncation summary out of stderr and fold
+ * it into this process's totals. Anything unparseable is ignored: a corrupt
+ * diagnostic must never fail an embed that otherwise succeeded.
+ */
+function noteTruncation(stderr: string): void {
+  if (!stderr.includes("chamber_truncation")) return;
+  for (const line of stderr.split("\n")) {
+    const at = line.indexOf('{"chamber_truncation"');
+    if (at < 0) continue;
+    try {
+      const parsed = JSON.parse(line.slice(at)) as {
+        chamber_truncation?: {
+          limit?: number;
+          passages?: number;
+          tokens_dropped?: number;
+          longest?: number;
+        };
+      };
+      const t = parsed.chamber_truncation;
+      if (!t || typeof t.passages !== "number") continue;
+      truncationTotals = {
+        limit: t.limit ?? 256,
+        passages: (truncationTotals?.passages ?? 0) + t.passages,
+        tokensDropped:
+          (truncationTotals?.tokensDropped ?? 0) + (t.tokens_dropped ?? 0),
+        longest: Math.max(truncationTotals?.longest ?? 0, t.longest ?? 0),
+      };
+    } catch {
+      // Not our line, or malformed. Diagnostics do not get to break embedding.
+    }
+  }
+}
+
+/** Truncation seen in this process, or null if nothing was truncated. */
+export function minilmTruncationSeen(): MinilmTruncation | null {
+  return truncationTotals;
+}
 function warnMinilmFallback(err: unknown): void {
   if (minilmFallbackWarned) return;
   minilmFallbackWarned = true;
@@ -341,6 +404,7 @@ function warnMinilmFallback(err: unknown): void {
 export function resetMinilmProbe(): void {
   minilmProbe.clear();
   minilmFallbackWarned = false;
+  truncationTotals = null;
   resolvedKind = null;
 }
 

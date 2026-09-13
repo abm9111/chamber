@@ -1104,6 +1104,21 @@ async function main(): Promise<void> {
             `  [embed_fallback] batch embedder failed; fell back to per-passage embedding: ${r.embedFallback}`,
           );
         }
+        // stderr for the same reason as embed_fallback: it is a surprise worth
+        // grepping for. Truncation at the model's trained length is correct,
+        // so this is not a failure — but a passage that lost its second half
+        // is indexed as something the note does not say, and nothing else in
+        // the run reports it. KNOWN_LIMITATIONS 15.
+        if (r.truncated) {
+          const t = r.truncated;
+          console.error(
+            `  [truncated] ${t.passages} passage(s) exceeded the embedder's ` +
+              `${t.limit}-token limit; ${t.tokensDropped} token(s) dropped, ` +
+              `longest input ${t.longest} tokens. Those passages are indexed ` +
+              `from their first ${t.limit} tokens only — split the notes if ` +
+              `their tails need to be findable.`,
+          );
+        }
         // A shrunken note's stale passages are deleted rather than left to keep
         // answering from content the note no longer holds. That is a corpus
         // deletion, so it is reported rather than done quietly.

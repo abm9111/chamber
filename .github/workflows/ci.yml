@@ -105,3 +105,62 @@ jobs:
       # Everywhere else it can only show the refusal. A demo that drifts from
       # what the tool does is worse than no demo, so a failure is a red build.
       - run: npm run demos
+
+  # The image was the one part of this project nothing scanned. npm audit and
+  # Dependabot read package.json, and runtime dependencies here are
+  # deliberately empty -- so both reported a clean project while the base
+  # carried 62 HIGH/CRITICAL CVEs. A dependency gate that cannot see the
+  # operating system is not an image gate.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Built locally and never pushed: the point is to scan what this
+      # Dockerfile produces, not what a registry happens to hold.
+      - run: docker build -f deploy/Dockerfile -t chamber:ci .
+      # --ignore-unfixed is the whole policy, and it is a tradeoff worth naming.
+      # The base carries 56 HIGH/CRITICAL with NO fix available upstream,
+      # including 4 CRITICAL (zlib's is marked will_not_fix). Failing on those
+      # would make this job red on the day it was added and red every day
+      # after, which is the failure this repo keeps fixing elsewhere: an alarm
+      # that always fires is one its reader learns to wave through. So the gate
+      # blocks on what an operator can actually act on -- a CVE with a fix --
+      # and the unfixable remainder is printed below and recorded in
+      # docs/KNOWN_LIMITATIONS.md rather than silently dropped.
+      #
+      # Measured 2026-09-13: 6 fixable HIGH before the Dockerfile's apt upgrade
+      # and npm removal, 0 after. This job going red therefore means something
+      # newly actionable appeared, not that the baseline drifted.
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: chamber:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+      # Runs even when the gate above passes, so the unfixable set stays
+      # visible instead of becoming folklore. `if: always()` is deliberate: on
+      # a red build this is the context needed to read the failure.
+      - if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: chamber:ci
+          severity: HIGH,CRITICAL
+          # The inverse of the gate above: everything, fix or no fix. exit-code
+          # 0 because this step reports, it does not judge.
+          ignore-unfixed: false
+          exit-code: '0'
+          format: table
+          output: unfixed.txt
+      - if: always()
+        run: |
+          {
+            echo '### Image CVEs, including those with no fix available'
+            echo
+            echo 'The `image` job blocks only on CVEs with a fix. This is the'
+            echo 'full HIGH/CRITICAL set, unfixable included.'
+            echo
+            echo '```'
+            cat unfixed.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

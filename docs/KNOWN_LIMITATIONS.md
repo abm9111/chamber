@@ -735,3 +735,40 @@ disclosure each surface phrases for itself is one a surface eventually drops.
 on the stub, deliberately, because `chamber try` and the demos depend on an
 offline deterministic path. A reader who ignores five lines of capitals gets
 the old behaviour back.
+
+## 20. The runtime image ships 56 HIGH/CRITICAL CVEs with no fix available
+
+Nothing scanned the image until 2026-09-13. `npm audit` and Dependabot read
+`package.json`, and runtime dependencies here are deliberately empty — so both
+reported a clean project while `node:24-bookworm-slim` carried **62 HIGH or
+CRITICAL CVEs**. A dependency gate that cannot see the operating system is not
+an image gate, and the absence of findings was the absence of a scanner.
+
+**Fixed, in part.** `deploy/Dockerfile` now applies the base's security
+updates and deletes npm, npx and corepack — never used at runtime, and the
+carrier of three of the six fixable HIGHs (its bundled `tar`,
+`brace-expansion` and `ip-address`). That took the fixable count from 6 to 0,
+measured. CI's `image` job builds the Dockerfile and fails on any HIGH or
+CRITICAL **that has a fix available**.
+
+**What remains, and it is the larger number.** 56 HIGH/CRITICAL have no
+upstream fix — 52 HIGH and 4 CRITICAL, one of which (zlib) upstream has marked
+`will_not_fix`. The `image` job passes `--ignore-unfixed`, so none of them
+blocks a build.
+
+That is a deliberate tradeoff, and the honest way to read the green badge is:
+*no CVE with an available fix is present*, not *the image is free of critical
+vulnerabilities*. The alternative — failing on the unfixable set — makes the
+job red on the day it is added and red every day after, which is the failure
+this project keeps fixing elsewhere: an alarm that always fires is one its
+reader learns to wave through. The full set, unfixable included, is printed to
+the job summary on every run so the number stays visible rather than becoming
+folklore.
+
+**What would actually close it:** a smaller base. Most of the 56 are in
+Debian packages this image never executes. `node:24-alpine` or a distroless
+base would remove them by removing the surface, which is the same choice the
+npm deletion made. Not done here because the embedder path's Python
+dependencies (`scripts/embed_minilm.py`, numpy/onnxruntime) are not yet proven
+on musl, and shipping an image whose semantic gate silently degrades to hash
+vectors would trade a scanner number for a correctness regression.

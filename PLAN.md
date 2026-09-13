@@ -41,7 +41,7 @@ Shipped and load-bearing:
 
 ## Open
 
-Nothing here is a surprise; `docs/KNOWN_LIMITATIONS.md` carries 19 entries with
+Nothing here is a surprise; `docs/KNOWN_LIMITATIONS.md` carries 20 entries with
 what each costs and what would fix it. What follows is only the subset that is
 actually next, grouped by what kind of thing is missing.
 
@@ -50,10 +50,15 @@ actually next, grouped by what kind of thing is missing.
 - **The paraphrase threshold has no good value.** 25 labelled pairs
   (`npm run calibrate:paraphrase`) show no FP-free cutoff exists between 0.50
   and 0.99. The real fix is NLI, not a better constant — that is a scope call.
-- **`node:24-slim` carries a CRITICAL zlib (`will_not_fix`) and HIGH CVEs in
-  perl/util-linux and npm's bundled `tar`.** Pre-existing to the base image,
-  found 2026-08-16, owned by nobody. Options: pin a digest, add a trivy image
-  scan to CI, or document and accept.
+- **The image's 56 unfixable CVEs need a smaller base, or acceptance.** Scanned
+  and gated since 2026-09-13 (KL 20): CI's `image` job builds the Dockerfile
+  and fails on any HIGH/CRITICAL *with a fix available*, which is 0 now that
+  the base is patched and npm is gone. The remaining 56 have no upstream fix —
+  4 CRITICAL, zlib's marked `will_not_fix` — and `--ignore-unfixed` means none
+  of them blocks a build. Closing it means `node:24-alpine` or distroless,
+  which is a real scope call: the embedder's numpy/onnxruntime path is not
+  proven on musl, and trading a scanner number for a semantic gate that
+  silently degrades to hash vectors would be the worse deal.
 
 **Needs measurement before it can be designed**
 

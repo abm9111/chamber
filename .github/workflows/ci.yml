@@ -154,6 +154,15 @@ jobs:
           output: unfixed.txt
       - if: always()
         run: |
+          # A report step that publishes nothing still exits 0: `cat` of an
+          # empty file succeeds, and the summary is not something a build
+          # failure would ever point at. So the step asserts its own output
+          # exists and is non-empty -- without this, "the unfixable set stays
+          # visible" is a claim the workflow never checks.
+          if [ ! -s unfixed.txt ]; then
+            echo "trivy wrote no report to unfixed.txt -- the image summary would have been empty" >&2
+            exit 1
+          fi
           {
             echo '### Image CVEs, including those with no fix available'
             echo

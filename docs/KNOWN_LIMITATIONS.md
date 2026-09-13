@@ -539,13 +539,38 @@ Measured over a real 43,541-passage corpus on 2026-09-13: **541 passages
 (1.24%) exceeded the limit and 80,989 tokens were dropped**, the worst single
 passage losing 370 of its 626. Narrow, and it was invisible until counted.
 
-What remains is a chunker question, not an embedder one. A two-note test vault
-produced 5 truncated passages from one section, which means passage chunking
-splits on structure without regard to the embedder's token budget: a chunk
-that lands at 300 tokens loses 44 of them every time it is embedded. Fixing it
-means the chunker taking the tokenizer's limit as input, and a re-index of any
-corpus built before that — which is why it is written down here rather than
-done in the same commit.
+**Mostly closed, 2026-09-13: the estimator, not the cap, was wrong.** The
+chunker does bound every passage — at 220 *estimated* tokens, with deliberate
+margin under 256. The estimate was the defect: `ceil(len/6)` per alphanumeric
+run undershot the real wordpiece count on 47.7% of that corpus, so 541
+passages sat under the cap while exceeding the window. One content shape
+explains it — long runs containing a digit (base64, hashes, API tokens, UUIDs)
+split near one token per 1.5 characters, and an 800-character blob charged 134
+tokens cost 573. Non-ASCII was not implicated: of 2,628 passages over 20%
+non-ASCII, zero exceeded the limit.
+
+Opaque runs are now charged accordingly. Measured by re-chunking the 154
+affected files and counting real wordpieces: passages over the window fell
+from 540 to 113, and **tokens silently dropped fell from 80,970 to 2,846** —
+96.5% of the lost text recovered.
+
+The narrowness of the predicate is the interesting part. A first version
+treated anything not purely lowercase/Capitalised as opaque, which swept in
+every CamelCase product name (`OpenClaw`, `TestFlight`) and removed the last
+breaches at the cost of re-chunking 54.8% of files and 73.7% of all passages.
+Boundary churn is cumulative — shifting one unit's estimate moves every
+packing boundary after it — so a 2% change in estimated size is not a 2%
+change in the corpus. The shipped predicate touches 154 files instead, and
+before accepting even that: of the 47 pins in the corpus that resolve to a
+passage, zero are in a file that re-chunks, so no belief loses its evidence.
+
+**Still open.** 113 passages (0.34%) overshoot by small margins, and they are
+mostly single unsplittable opaque runs where the oversized-unit path bounds by
+characters rather than wordpieces. No estimator closes that; only splitting on
+a real tokenizer would, and that would make chunk boundaries depend on whether
+python is installed — different machines chunking the same note differently,
+which is a worse defect than a truncated tail. A corpus ingested before this
+change keeps its old boundaries until re-ingested.
 
 Also note: `models/minilm/tokenizer.json` declares `truncation.max_length:
 128`. The script overrides it to 256 explicitly, so the model's full length is

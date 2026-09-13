@@ -4380,6 +4380,75 @@ test(
   },
 );
 
+/**
+ * The estimator's job is to predict the real wordpiece count, and it undershot
+ * on 47.7% of a 43,541-passage corpus — 541 of them past 256 tokens while
+ * sitting under the 220 cap. The cause was one content shape: long runs with a
+ * digit in them (base64, hashes, tokens, UUIDs), charged ceil(len/6) where the
+ * tokenizer spends closer to len/1.5. An 800-character blob was estimated at
+ * 134 tokens and cost 573.
+ *
+ * Asserted as a ratio against the old formula rather than against a magic
+ * number, because what matters is that an opaque run is charged several times
+ * what a prose run of the same length is.
+ */
+test("pins", "an opaque run is charged far more than prose of the same length", () => {
+  const blob = "v3k4pkWfZLXQXuqJHWdnHsVcsjy7Ihz9taiAHDT5io6ADA1RsVyDtXroGgKhGb40";
+  const prose = "warehouse reconciliation throughput manifests couriers nightly batch";
+  assert(blob.length >= 60 && prose.length >= 60, "comparable lengths");
+
+  const blobTokens = estimateTokens(blob);
+  const proseTokens = estimateTokens(prose);
+  assert(
+    blobTokens > proseTokens * 2,
+    `an opaque run must cost multiples of prose: blob ${blobTokens} vs prose ${proseTokens}`,
+  );
+  // ceil(64/1.5) = 43. Guards against the predicate silently ceasing to fire.
+  assert(
+    blobTokens >= 40,
+    `a 64-char opaque run should cost ~43 tokens, got ${blobTokens}`,
+  );
+});
+
+/**
+ * The regression that the first version of this fix caused, and the reason the
+ * predicate is narrow. Treating everything not purely lowercase/Capitalised as
+ * opaque swept in every CamelCase product name a note mentions — words the
+ * vocabulary knows in two or three pieces — and re-chunked 54.8% of files and
+ * 73.7% of passages to remove the last 55 breaches.
+ *
+ * Boundary churn is cumulative and therefore unforgiving: shifting one unit's
+ * estimate moves every packing boundary after it in that file. So this asserts
+ * the cheap-to-check property that keeps churn bounded — ordinary words,
+ * whatever their capitalisation, are not opaque.
+ */
+test("pins", "CamelCase product names are not charged as opaque blobs", () => {
+  for (const word of [
+    "OpenClaw",
+    "TestFlight",
+    "GitHub",
+    "LocalForge",
+    "CloudStorage",
+    "ProtonDrive",
+    "reconciliation",
+    "MINILM",
+  ]) {
+    const t = estimateTokens(word);
+    assert(
+      t <= Math.ceil(word.length / 6) + 1,
+      `${word} is a word, not a blob: charged ${t} tokens for ${word.length} chars`,
+    );
+  }
+  // A digit alone must not make a short identifier opaque either: dates,
+  // versions and ordinals are everywhere in these notes.
+  for (const tok of ["2026", "v0.1.5", "Q3", "p7", "256"]) {
+    assert(
+      estimateTokens(tok) <= 6,
+      `${tok} should stay cheap, got ${estimateTokens(tok)}`,
+    );
+  }
+});
+
 test("pins", "splitPassages bounds a passage even when the heading itself is enormous", () => {
   // The breadcrumb is prepended to every passage body, so it is charged
   // against the same window as the content. A heading long enough to exhaust

@@ -109,23 +109,95 @@ export interface Passage {
  * hyphens are each roughly a token, and they are exactly what collapses the
  * character-per-token ratio in real notes.
  *
- * Calibration against the measured 256-token truncation boundary of the three
- * corpora described in the module header — the estimate at each true boundary:
- *   easy prose        327   (over-estimates by ~28%; splits early, which is safe)
- *   dense markdown    242
- *   mixed vault note  255
- * Two of three land within 5% of 256 and the third errs towards splitting
- * sooner. Erring that way is the correct direction: an over-estimate costs a
- * slightly smaller passage, an under-estimate costs silently truncated text.
+ * Calibrated 2026-09-13 against the real wordpiece count of every passage in a
+ * 43,541-passage corpus, replacing a three-sample calibration that looked
+ * healthy and was not: the original `ceil(len/6)` undershot the true count on
+ * 47.7% of passages, and 541 of them (1.24%) exceeded 256 tokens while sitting
+ * at or under the 220 cap. The cap was never violated — in estimated tokens.
+ * The estimate was simply wrong, and in the one direction that costs text.
+ *
+ * The cause was a single content shape: high-entropy alphanumeric runs
+ * (base64, hashes, tokens, UUIDs). An 800-character blob was charged 134
+ * tokens where the tokenizer spent 573 — 3.43x. Non-ASCII, the suspect worth
+ * checking, was not implicated at all: of 2,628 passages that are over 20%
+ * non-ASCII, zero exceeded the limit, because one-token-per-character is
+ * already the right charge for CJK and Arabic.
+ *
+ * Two axes matter, and optimising the first alone is a trap. Passages left over
+ * 256 tokens under a 220 cap, against how much of the corpus re-chunks:
+ *   ceil(len/6) everywhere              541 breaches    baseline
+ *   anything not word-shaped @ /1.5       1 breach      54.8% of files re-chunk
+ *   len>=20 any shape @ /1.5            100 breaches
+ *   len>=16 with a digit @ /1.5   <-     56 breaches     8.0% of files re-chunk
+ *
+ * The second row is the tempting one and the wrong one. It sweeps in every
+ * CamelCase product name a note mentions — words wordpiece knows in two or
+ * three pieces — and re-chunks 73.7% of all passages to remove the last 55
+ * breaches. Boundary churn is cumulative: shifting one unit's estimate moves
+ * every packing boundary after it in that file, so a 2% change in estimated
+ * size is not a 2% change in the corpus.
+ *
+ * The chosen row leaves 56 passages truncated, a 90% reduction, and touches
+ * 154 files. Checked before accepting that churn: of the 47 pins in that
+ * corpus that resolve to a passage, ZERO are in a file that re-chunks, so no
+ * belief loses its evidence to this. A corpus with pins in those files would
+ * want the re-ingest staged rather than done in one pass.
+ *
+ * Erring towards over-estimation stays the correct direction: an over-estimate
+ * costs a slightly smaller passage, an under-estimate costs silently truncated
+ * text. The 56 that remain are mostly single unsplittable opaque runs, where
+ * the oversized-unit path bounds by characters rather than wordpieces — no
+ * estimator fixes those, only splitting on a real tokenizer would, and that
+ * would make chunk boundaries depend on whether python is installed.
  *
  * Whitespace is deliberately uncounted, which is what lets the packer add
  * `\n\n` between units without having to re-measure the join.
  */
+/**
+ * Whether a run is opaque to the wordpiece vocabulary: long AND carrying a
+ * digit among its letters. That is the shape of base64, hashes, API tokens and
+ * UUIDs, which split close to per-character.
+ *
+ * Both conditions are load-bearing, and the narrowness is the point. A first
+ * version treated anything not purely lowercase/Capitalised/acronym as opaque,
+ * which swept in every CamelCase product name a note mentions — `OpenClaw`,
+ * `TestFlight`, `GitHub` — words the vocabulary knows in two or three pieces.
+ * It cut truncation to a single passage and re-chunked 54.8% of files and
+ * 73.7% of passages to do it. Boundary churn is cumulative: a 2% shift in
+ * estimated size moves every packing boundary after it, so a change that reads
+ * as small in the estimate is enormous in the corpus. Length alone was no
+ * better — `len>=20` of any shape still touched 3.8% of estimates for a worse
+ * breach count than this.
+ */
+function opaqueRun(t: string): boolean {
+  if (t.length < 16) return false;
+  let hasDigit = false;
+  for (let i = 0; i < t.length; i++) {
+    const c = t.charCodeAt(i);
+    if (c >= 48 && c <= 57) {
+      hasDigit = true;
+      break;
+    }
+  }
+  return hasDigit;
+}
+
+/** Divisor for opaque runs. See the calibration table above. */
+const OPAQUE_CHARS_PER_TOKEN = 1.5;
+
 export function estimateTokens(text: string): number {
   let n = 0;
   for (const m of text.matchAll(/[A-Za-z0-9]+|[^\sA-Za-z0-9]/g)) {
     const t = m[0]!;
-    n += t.length > 1 ? Math.ceil(t.length / 6) : 1;
+    if (t.length === 1) {
+      n += 1;
+    } else if (opaqueRun(t)) {
+      // The case that produced 541 truncated passages: `ceil(len/6)` charged
+      // an 800-character base64 blob 134 tokens where the tokenizer spent 573.
+      n += Math.ceil(t.length / OPAQUE_CHARS_PER_TOKEN);
+    } else {
+      n += Math.ceil(t.length / 6);
+    }
   }
   return n;
 }

@@ -56,6 +56,8 @@ import {
   verifyBeliefSources,
   countUnsourcedBeliefs,
   findGonePinnedFiles,
+  findGoneDocuments,
+  pruneGoneDocuments,
   buildVerifyReport,
   CITABLE_SOURCE_KINDS,
 } from "../src/pins.ts";
@@ -218,7 +220,7 @@ import {
   loadConfig,
   explainConfig,
 } from "../src/config.ts";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync, spawn, execFileSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
@@ -4392,6 +4394,160 @@ test(
  * number, because what matters is that an opaque run is charged several times
  * what a prose run of the same length is.
  */
+/**
+ * KNOWN_LIMITATIONS 5: a deleted note's rows stay fully live, and retrieval
+ * never consults the filesystem, so a deleted note still answers questions.
+ *
+ * The entry argues deletion is unsafe because "a file absent from the walk is
+ * indistinguishable from one an --exclude pattern pruned". That is true of
+ * walk attendance and false of existence: an excluded file is still on disk.
+ * So the sweep is keyed on existsSync, which is what these tests fix in place.
+ */
+test("pins", "a document whose file is gone is reported, and one merely excluded is not", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-gone-"));
+  const keep = join(dir, "keep.md");
+  const drop = join(dir, "drop.md");
+  writeFileSync(keep, "# Keep\n\n## S\n\nThe kept note describes warehouse throughput.\n");
+  writeFileSync(drop, "# Drop\n\n## S\n\nThe dropped note describes courier manifests.\n");
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+
+  assert(findGoneDocuments(db).length === 0, "nothing is gone while both files exist");
+
+  // Compare resolved paths: the ingest root is stored as a realpath, and on
+  // macOS mkdtemp hands back /var/... while the stored root is /private/var/...
+  const resolvedDrop = realpathSync(dirname(drop)) + "/" + basename(drop);
+  rmSync(drop);
+  const gone = findGoneDocuments(db);
+  assert(gone.length === 1, `exactly one file is gone, got ${gone.length}`);
+  assert(
+    gone[0]!.file === resolvedDrop,
+    `expected ${resolvedDrop}, got ${gone[0]!.file}`,
+  );
+  assert(gone[0]!.passages >= 1, "the gone file had at least one passage");
+
+  // The exclude hazard the limitation names: keep.md is still on disk, so it
+  // must never appear in the gone set however it was filtered at ingest time.
+  assert(
+    !gone.some((g) => g.file === keep),
+    "a file that exists must never be reported gone, whatever an exclude did",
+  );
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/**
+ * The guard that makes pruning safe at all, and the reason it is written before
+ * the prune itself. An unmounted volume or a renamed parent makes EVERY file
+ * under a root look deleted, so a sweep that trusted existsSync per file would
+ * delete an entire corpus on a mount failure — the same shape as the orphan
+ * sweep that destroyed running siblings. A root that is not reachable is
+ * unknown, never empty.
+ */
+test("pins", "an unreachable ingest root reports nothing gone rather than everything", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-unmount-"));
+  writeFileSync(join(dir, "a.md"), "# A\n\n## S\n\nFirst note about reconciliation.\n");
+  writeFileSync(join(dir, "b.md"), "# B\n\n## S\n\nSecond note about manifests.\n");
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  assert(findGoneDocuments(db).length === 0, "both files exist");
+
+  // Simulate the volume going away: the root itself disappears, taking every
+  // file with it. Per-file existsSync would now report both as deleted.
+  rmSync(dir, { recursive: true, force: true });
+  const gone = findGoneDocuments(db);
+  assert(
+    gone.length === 0,
+    `an unreachable root must yield no gone files, got ${gone.length} — this is the mass-deletion path`,
+  );
+});
+
+/**
+ * Pruning deletes the corpus rows of vanished files — and must not touch a row
+ * a belief cites. That pin still verifies against stored content, and since
+ * the file is gone from disk, the stored body is the LAST copy of the evidence
+ * the claim rests on. Trading a reported, recoverable state for an
+ * unrecoverable one is not hygiene.
+ */
+test("pins", "prune removes gone passages but never one a belief still cites", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-prune-"));
+  const cited = join(dir, "cited.md");
+  const orphan = join(dir, "orphan.md");
+  writeFileSync(cited, "# Cited\n\n## S\n\nThe refund window is thirty days from delivery.\n");
+  writeFileSync(orphan, "# Orphan\n\n## S\n\nNobody ever cited this note about manifests.\n");
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+
+  // Pin a belief to a passage of cited.md.
+  const doc = db
+    .prepare(`SELECT id FROM vector_document WHERE source_ref LIKE ?`)
+    .get("cited.md#%") as { id: string } | undefined;
+  assert(doc !== undefined, "cited.md produced a passage");
+  // A pin carries the content hash it was minted against; verifyPin with an
+  // empty hash is how the rest of this file reads the current one.
+  const snapshotHash = verifyPin(db, {
+    kind: "vault_page",
+    refId: doc!.id,
+    snapshotHash: "",
+  }).actualHash!;
+  const r = commitBelief(db, {
+    type: "inference",
+    text: "the cited note records a thirty day refund window",
+    sources: [{ kind: "vault_page", refId: doc!.id, snapshotHash }],
+    authorFamily: "test",
+    path: "fast",
+    requireVerifiedSupport: true,
+  });
+  assert(r.ok, `test setup: commit refused: ${JSON.stringify(r)}`);
+
+  const before = db.prepare(`SELECT COUNT(*) AS c FROM vector_document`).get() as { c: number };
+  rmSync(cited);
+  rmSync(orphan);
+
+  const out = pruneGoneDocuments(db);
+  assert(out.passages >= 1, `expected the orphan's passages removed, got ${out.passages}`);
+  assert(
+    out.pinnedSkipped >= 1,
+    `expected at least one pinned passage kept, got ${out.pinnedSkipped}`,
+  );
+  const stillThere = db
+    .prepare(`SELECT COUNT(*) AS c FROM vector_document WHERE id = ?`)
+    .get(doc!.id) as { c: number };
+  assert(stillThere.c === 1, "the cited passage must survive the prune");
+  const after = db.prepare(`SELECT COUNT(*) AS c FROM vector_document`).get() as { c: number };
+  assert(after.c < before.c, "something was actually deleted");
+
+  // And the belief still verifies, against stored content, as goneFiles says.
+  const vr = buildVerifyReport(db);
+  assert(vr.broken === 0, `the pinned belief must not break, broken=${vr.broken}`);
+  assert(vr.goneFiles.length >= 1, "verify still reports the cited file as gone");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/**
+ * The mass-deletion path, asserted on the destructive function rather than
+ * only on the read-only one: an unreachable root must delete NOTHING. A prune
+ * that trusted per-file existence would empty the corpus the first time a
+ * volume failed to mount.
+ */
+test("pins", "prune deletes nothing when the ingest root itself is unreachable", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-prune-unmount-"));
+  writeFileSync(join(dir, "a.md"), "# A\n\n## S\n\nFirst note about reconciliation.\n");
+  writeFileSync(join(dir, "b.md"), "# B\n\n## S\n\nSecond note about manifests.\n");
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  const before = db.prepare(`SELECT COUNT(*) AS c FROM vector_document`).get() as { c: number };
+  assert(before.c > 0, "the corpus has rows to lose");
+
+  rmSync(dir, { recursive: true, force: true });
+  const out = pruneGoneDocuments(db);
+  assert(
+    out.passages === 0,
+    `an unreachable root must prune nothing, deleted ${out.passages}`,
+  );
+  const after = db.prepare(`SELECT COUNT(*) AS c FROM vector_document`).get() as { c: number };
+  assert(after.c === before.c, "the corpus must be untouched");
+});
+
 test("pins", "an opaque run is charged far more than prose of the same length", () => {
   const blob = "v3k4pkWfZLXQXuqJHWdnHsVcsjy7Ihz9taiAHDT5io6ADA1RsVyDtXroGgKhGb40";
   const prose = "warehouse reconciliation throughput manifests couriers nightly batch";

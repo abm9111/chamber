@@ -156,6 +156,33 @@ of code.
 
 ## 5. The corpus has no notion of deletion
 
+> **Correction, 2026-09-13.** The central objection below — that deletion is
+> unsafe because "a file absent from the walk is indistinguishable from one an
+> `--exclude` pattern pruned" — is true of walk attendance and false of
+> existence: an excluded file is still on disk. `findGoneDocuments`
+> (`src/pins.ts`) therefore keys on `existsSync` and covers the whole corpus,
+> not just the pinned slice; `chamber verify` reports the count, and
+> `chamber prune` removes them (dry run by default, `--confirm` to act).
+>
+> Two guards make that safe, and both are pinned by tests. An ingest root that
+> does not resolve to a directory is skipped whole, because an unmounted
+> volume makes every file under it look deleted and a per-file sweep would
+> delete the corpus on the first mount failure — unreachable is unknown, never
+> empty. And a passage a belief still cites is never pruned: its file is gone,
+> so the stored body is the last copy of that evidence, and `verify` already
+> reports it. Prune also names unreadable roots rather than reporting "nothing
+> to prune", since those are opposite states that otherwise print the same
+> sentence.
+>
+> What still stands: **renames still duplicate.** Identity is
+> `(root, relative path)`, so a renamed file is ingested fresh while the old
+> path's rows survive — `prune` now removes the old copy once the rename means
+> its path no longer exists, but nothing recognises the two as the same note,
+> so a pin on the old path does not follow the rename. The original text stays
+> below, dated.
+
+
+
 Re-ingesting a directory does delete, and the boundary is worth stating precisely,
 because an earlier revision of this entry said flatly that it never removes rows. For a
 file it actually walked and read, the shrink sweep (`src/ingest.ts:758-775`) removes the

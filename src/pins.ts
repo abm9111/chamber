@@ -10,7 +10,7 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { sha256 } from "./hash.ts";
 import { passagePathOf } from "./chunk.ts";
@@ -664,6 +664,15 @@ export interface VerifyRunReport {
   unsourcedBeliefs: number;
   goneFiles: { file: string; passages: number }[];
   /**
+   * Every corpus document whose file is gone, pinned or not — the unpinned
+   * remainder KNOWN_LIMITATIONS 5 is about. `goneFiles` above is the subset
+   * something cites; these are rows that keep answering questions with no
+   * belief attached and nothing to notice them. Report-only and outside the
+   * exit code: a missing file is not evidence drift, and `chamber prune` is
+   * where an operator acts on it.
+   */
+  staleDocuments: { file: string; passages: number }[];
+  /**
    * Total pins across `beliefs` that verified via the moved-within-file
    * rescue. Outside the exit code for the same reason goneFiles is: nothing
    * the belief cites has changed, and exiting non-zero on it is exactly the
@@ -700,6 +709,7 @@ export function buildVerifyReport(
     degraded,
     unsourcedBeliefs: countUnsourcedBeliefs(db, opts),
     goneFiles: findGonePinnedFiles(db),
+    staleDocuments: findGoneDocuments(db),
     relocatedPins: beliefs.reduce((n, b) => n + b.relocations.length, 0),
     generatedAt: new Date().toISOString(),
     beliefs,
@@ -761,6 +771,192 @@ export function findGonePinnedFiles(
     if (!existsSync(file)) gone.push({ file, passages });
   }
   return gone.sort((a, b) => b.passages - a.passages);
+}
+
+/**
+ * Every document in the corpus whose file is no longer on disk — the whole
+ * corpus, not just the pinned slice `findGonePinnedFiles` covers.
+ *
+ * KNOWN_LIMITATIONS 5 is about the unpinned remainder: retrieval never
+ * consults the filesystem, so a deleted note keeps answering questions and
+ * nothing says so. That entry argues deletion is unsafe because "a file absent
+ * from the walk is indistinguishable from one an `--exclude` pattern pruned" —
+ * which is true of walk attendance and false of existence. An excluded file is
+ * still on disk. Keying on existence is what makes this answerable at all.
+ *
+ * THE ROOT CHECK IS THE LOAD-BEARING PART. An unmounted volume, a renamed
+ * parent, or a revoked permission makes every file under a root look deleted
+ * at once. A per-file `existsSync` sweep would then report an entire corpus as
+ * gone, and anything that pruned on that report would destroy it. So a root
+ * that does not itself resolve to a directory is skipped whole: unreachable is
+ * unknown, never empty. Same lesson as the orphan sweep that deleted the
+ * directories of live sibling processes — the guard comes before the sweep.
+ */
+export function findGoneDocuments(
+  db: DatabaseSync,
+): { file: string; passages: number }[] {
+  const rows = db
+    .prepare(
+      `SELECT source_ref AS ref, metadata_json AS meta
+         FROM vector_document
+        WHERE source_ref IS NOT NULL AND metadata_json IS NOT NULL`,
+    )
+    .all() as { ref: string | null; meta: string | null }[];
+
+  const byFile = new Map<string, number>();
+  const rootOf = new Map<string, string>();
+  for (const r of rows) {
+    if (!r.ref || !r.meta) continue;
+    let root: unknown;
+    try {
+      root = (JSON.parse(r.meta) as { ingestRoot?: unknown }).ingestRoot;
+    } catch {
+      continue;
+    }
+    if (typeof root !== "string" || root === "") continue;
+    const file = join(root, passagePathOf(r.ref));
+    byFile.set(file, (byFile.get(file) ?? 0) + 1);
+    rootOf.set(file, root);
+  }
+
+  // Resolve each root once. A root is checked with statSync rather than
+  // existsSync because a root that has become a *file* is as unusable as one
+  // that is missing, and both must read as unreachable rather than as "every
+  // document under it was deleted".
+  const rootUsable = new Map<string, boolean>();
+  for (const root of new Set(rootOf.values())) {
+    let ok: boolean;
+    try {
+      ok = statSync(root).isDirectory();
+    } catch {
+      ok = false;
+    }
+    rootUsable.set(root, ok);
+  }
+
+  const gone: { file: string; passages: number }[] = [];
+  for (const [file, passages] of byFile) {
+    const root = rootOf.get(file)!;
+    if (!rootUsable.get(root)) continue;
+    if (!existsSync(file)) gone.push({ file, passages });
+  }
+  return gone.sort((a, b) => b.passages - a.passages);
+}
+
+/**
+ * Every ingest root the corpus references, with whether it currently resolves
+ * to a directory and how many documents depend on it.
+ *
+ * Exists so callers can tell "nothing is gone" from "nothing could be
+ * checked". `findGoneDocuments` skips unreachable roots by design, which makes
+ * its empty result ambiguous on its own — and an empty result that reads as
+ * reassurance is the failure this codebase keeps finding in its own gates.
+ */
+export function ingestRootStatus(
+  db: DatabaseSync,
+): { root: string; reachable: boolean; documents: number }[] {
+  const rows = db
+    .prepare(
+      `SELECT metadata_json AS meta FROM vector_document WHERE metadata_json IS NOT NULL`,
+    )
+    .all() as { meta: string | null }[];
+  const counts = new Map<string, number>();
+  for (const r of rows) {
+    if (!r.meta) continue;
+    let root: unknown;
+    try {
+      root = (JSON.parse(r.meta) as { ingestRoot?: unknown }).ingestRoot;
+    } catch {
+      continue;
+    }
+    if (typeof root !== "string" || root === "") continue;
+    counts.set(root, (counts.get(root) ?? 0) + 1);
+  }
+  const out: { root: string; reachable: boolean; documents: number }[] = [];
+  for (const [root, documents] of counts) {
+    let reachable: boolean;
+    try {
+      reachable = statSync(root).isDirectory();
+    } catch {
+      reachable = false;
+    }
+    out.push({ root, reachable, documents });
+  }
+  return out.sort((a, b) => b.documents - a.documents);
+}
+
+/**
+ * Delete the corpus rows whose files are gone — except any a belief still
+ * cites.
+ *
+ * The exception is the point. A pin over a vanished file still verifies
+ * against stored content, and `verify` reports it (`goneFiles`). Deleting that
+ * row converts a reported, recoverable state into an unrecoverable one: the
+ * file is gone from disk, so the stored body is the last copy of the evidence
+ * the belief rests on. Corpus hygiene is not worth destroying the only
+ * remaining witness for a claim someone committed.
+ *
+ * Inherits `findGoneDocuments`'s root-reachability guard, which is what stops
+ * an unmounted volume from being read as "the whole corpus was deleted".
+ */
+export function pruneGoneDocuments(db: DatabaseSync): {
+  files: number;
+  passages: number;
+  pinnedSkipped: number;
+} {
+  const gone = findGoneDocuments(db);
+  if (gone.length === 0) return { files: 0, passages: 0, pinnedSkipped: 0 };
+
+  const goneSet = new Set(gone.map((g) => g.file));
+  const rows = db
+    .prepare(
+      `SELECT d.id AS id, d.source_ref AS ref, d.metadata_json AS meta,
+              EXISTS (SELECT 1 FROM belief_source s WHERE s.ref_id = d.id) AS pinned
+         FROM vector_document d
+        WHERE d.source_ref IS NOT NULL AND d.metadata_json IS NOT NULL`,
+    )
+    .all() as {
+    id: string;
+    ref: string | null;
+    meta: string | null;
+    pinned: number;
+  }[];
+
+  const doomed: string[] = [];
+  let pinnedSkipped = 0;
+  const files = new Set<string>();
+  for (const r of rows) {
+    if (!r.ref || !r.meta) continue;
+    let root: unknown;
+    try {
+      root = (JSON.parse(r.meta) as { ingestRoot?: unknown }).ingestRoot;
+    } catch {
+      continue;
+    }
+    if (typeof root !== "string" || root === "") continue;
+    const file = join(root, passagePathOf(r.ref));
+    if (!goneSet.has(file)) continue;
+    if (r.pinned) {
+      pinnedSkipped++;
+      continue;
+    }
+    doomed.push(r.id);
+    files.add(file);
+  }
+
+  // One transaction: a partial prune leaves a corpus that is neither the state
+  // the operator saw in the dry run nor the one they asked for.
+  let passages = 0;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const del = db.prepare(`DELETE FROM vector_document WHERE id = ?`);
+    for (const id of doomed) passages += Number(del.run(id).changes ?? 0);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+  return { files: files.size, passages, pinnedSkipped };
 }
 
 export function countUnsourcedBeliefs(

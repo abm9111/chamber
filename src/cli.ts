@@ -57,7 +57,12 @@ import {
 import { completeSync, syncCompletionAvailable } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { runAsk, stubDisclosure } from "./ask.ts";
-import { buildVerifyReport } from "./pins.ts";
+import {
+  buildVerifyReport,
+  findGoneDocuments,
+  ingestRootStatus,
+  pruneGoneDocuments,
+} from "./pins.ts";
 import { runExpiryJob } from "./expiry.ts";
 import { indexCodeTree, searchCode } from "./code_index.ts";
 import {
@@ -1509,6 +1514,16 @@ async function main(): Promise<void> {
           console.log(`  … and ${vr.goneFiles.length - 3} more file(s)`);
         }
       }
+      // The unpinned remainder: rows that keep answering retrieval with no
+      // belief attached. Printed only when it exceeds what goneFiles already
+      // said, so the two lines never restate each other.
+      if (vr.staleDocuments.length > vr.goneFiles.length) {
+        const total = vr.staleDocuments.reduce((n, g) => n + g.passages, 0);
+        console.log(
+          `${total} passage(s) in ${vr.staleDocuments.length} file(s) no longer on disk are still ` +
+            `in the corpus and still answer retrieval — \`chamber prune\` removes them`,
+        );
+      }
       // Moved, not broken: the passage's title and body are byte-identical at
       // a different position in the same file (see findMovedWithinFile). The
       // 2026-08-18 vault backtest measured the alternative — one insertion at
@@ -1545,6 +1560,86 @@ async function main(): Promise<void> {
       console.log(
         `expiry: scanned=${report.scanned} expired=${report.expired} tickets=${report.tickets}`,
       );
+      break;
+    }
+    case "prune": {
+      // Dry run is the default, and the flag is `--confirm` rather than
+      // `--dry-run`, so the destructive reading is the one you have to ask
+      // for. Deleting corpus is not recoverable by re-ingesting: the files
+      // are gone, which is the whole premise of the command.
+      const unknown = rest.filter((a) => a.startsWith("--") && a !== "--confirm");
+      if (unknown.length > 0) {
+        console.error(
+          `unrecognized flag(s) for prune: ${unknown.join(", ")} — only --confirm is accepted`,
+        );
+        process.exitCode = 1;
+        break;
+      }
+      const confirm = rest.includes("--confirm");
+      const stale = findGoneDocuments(db);
+      if (stale.length === 0) {
+        // "Nothing to prune" is the same sentence whether every file is
+        // present or no root could be read, and those are opposite states.
+        // findGoneDocuments skips unreachable roots on purpose, so the
+        // unreachable ones are named here rather than silently counted as
+        // clean — an empty result that reads as reassurance is the exact
+        // failure this codebase keeps finding in its own gates.
+        const roots = ingestRootStatus(db);
+        const unreachable = roots.filter((r) => !r.reachable);
+        const checked = roots
+          .filter((r) => r.reachable)
+          .reduce((n, r) => n + r.documents, 0);
+        if (unreachable.length > 0) {
+          const stranded = unreachable.reduce((n, r) => n + r.documents, 0);
+          console.log(
+            `nothing pruned, and ${unreachable.length} ingest root(s) could not be read — ` +
+              `${stranded} document(s) were NOT checked:`,
+          );
+          for (const r of unreachable.slice(0, 5)) {
+            console.log(`  unreachable: ${r.root}  (${r.documents} document(s))`);
+          }
+          console.log(
+            `An unreadable root makes every file under it look deleted, so those ` +
+              `documents are left alone. Mount or restore the root, then re-run.`,
+          );
+          if (checked > 0) {
+            console.log(`${checked} document(s) in reachable roots all still have their files.`);
+          }
+          break;
+        }
+        console.log(
+          `nothing to prune — all ${checked} document(s) across ${roots.length} reachable root(s) still have their files`,
+        );
+        break;
+      }
+      const passages = stale.reduce((n, g) => n + g.passages, 0);
+      console.log(
+        `${passages} passage(s) in ${stale.length} file(s) no longer on disk:`,
+      );
+      for (const g of stale.slice(0, 10)) {
+        console.log(`  ${g.file}  (${g.passages} passage(s))`);
+      }
+      if (stale.length > 10) console.log(`  … and ${stale.length - 10} more file(s)`);
+
+      if (!confirm) {
+        console.log(
+          `dry run — nothing deleted. Re-run with --confirm to remove these ${passages} passage(s).`,
+        );
+        break;
+      }
+      const removed = pruneGoneDocuments(db);
+      console.log(
+        `pruned ${removed.passages} passage(s) from ${removed.files} file(s)`,
+      );
+      if (removed.pinnedSkipped > 0) {
+        // Pins are evidence. A belief citing a passage whose file is gone
+        // still verifies against stored content, and deleting the row would
+        // turn a reported, recoverable state into an unrecoverable one.
+        console.log(
+          `kept ${removed.pinnedSkipped} passage(s) that a belief still cites — ` +
+            `verify reports them as gone rather than losing them`,
+        );
+      }
       break;
     }
     case "index-code": {

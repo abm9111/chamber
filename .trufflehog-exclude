@@ -1,0 +1,16 @@
+# trufflehog filesystem-mode excludes for this repo, concatenated by the
+# push gate with ~/.ai/githooks/trufflehog-exclude-default.txt (which
+# excludes only .git/). One regex per line.
+#
+# node_modules: vendored, regenerable, gitignored, and never pushed. The 14
+# findings it produced on 2026-09-12 were all third-party documentation and
+# type stubs — a MongoDB connection string in keyv's README, `URI` patterns
+# in @types/node's http/https/url .d.ts files, and one dependency's dist
+# bundles — 0 verified live, none owner-authored. The estate's gitleaks
+# config (~/.ai/skills/cloud-doctor/sweep.toml) already allowlists this same
+# tree for the same reason; this file brings the second scanner in line.
+#
+# Scope note, deliberately narrow: build output is NOT excluded here. A key
+# baked into a shipped bundle is a real leak of exactly the class this gate
+# exists to catch, and dist/ is owner-authored output, not vendored input.
+(^|/)node_modules/

@@ -390,9 +390,37 @@ Worth noting that the repository's *other* FTS5 table does set a tokenizer expli
 (`sql/schema_hermes_parity.sql:44-50`), so this is an omission rather than a considered
 default.
 
-**What would fix it.** A tokenizer that segments CJK — the `trigram` tokenizer that ships
-with SQLite is the zero-dependency option and handles CJK acceptably; a proper segmenter
-would be better and would cost a dependency Chamber does not currently have. Unplanned.
+**Measured, 2026-09-13**, against a real 43,541-passage corpus, comparing FTS5
+`MATCH` recall to ground truth (`body LIKE`) for one probe term per script:
+
+| probe   | passages containing it | FTS matches | recall |
+|---------|-----------------------:|------------:|-------:|
+| English |                     56 |          53 |    95% |
+| Arabic  |                     13 |          13 |   100% |
+| CJK     |                     80 |           6 |   7.5% |
+
+Two corrections to the text above. It is not "no results, consistently" — a CJK
+run matches when a query happens to reproduce a whole token exactly, which is
+7.5% of the time here rather than 0%. And the entry's silence about other
+non-Latin scripts reads as though they share the problem: **Arabic does not**.
+`unicode61` splits on Unicode category boundaries, and Arabic is
+space-separated, so its words tokenize normally — full recall on this corpus,
+which holds more Arabic (1,786 passages, 4.10%) than CJK (1,236, 2.84%).
+
+**What would fix it, and why it is not being done.** A tokenizer that segments
+CJK — SQLite's `trigram` is the zero-dependency option; a proper segmenter
+would cost a dependency Chamber does not have.
+
+The reason to leave it: the tokenizer is a property of the FTS table, so
+changing it rebuilds the index for the *entire* corpus and changes matching
+semantics for every language in it, to raise recall on 2.84% of passages that
+are — in this corpus — scraped third-party Chinese pages (`grizzlysms.com/cn`,
+`zh-CN` product docs) rather than operator-authored notes. Trigram also matches
+substrings, which changes Latin ranking as a side effect.
+
+That calculus is corpus-dependent, not permanent: a corpus whose CJK is
+first-class content should make the swap, and the measurement above is the way
+to decide rather than guess. Unplanned, deliberately.
 
 ## 12. Retrieval quality has no corpus-level regression guard
 

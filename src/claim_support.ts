@@ -52,8 +52,25 @@ const DOMAIN = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|ae|net|org|io|co|a
 // A leading minus stays with its number when it is a sign, not a range dash:
 // "-5%" and "5%" satisfied each other (VIGIL AIML-003), while "19-25" is two
 // numbers.
+// `k` and `m` only glued to the number: a spaced `k` was captured as "5 k"
+// but could not match itself once spacing was refused for single letters
+// (round-5 review).
 const NUMBER =
-  /(?:(?<![\p{L}\p{N}])[-−])?\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})m(?![\p{L}\p{N}])|\s?%)?/giu;
+  /(?:(?<![\p{L}\p{N}])-)?\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})[km](?![\p{L}\p{N}])|\s?%)?/giu;
+
+/**
+ * Applied to claim and passage alike, so both sides read one spelling.
+ * Every dash that serves as a minus (en dash, the Unicode minus, hyphen and
+ * fullwidth forms — not the em dash, which is punctuation) becomes `-`:
+ * "fell –5%" and "fell −5%" were read unsigned (round-5 review). Dotted
+ * initialisms lose their dots, so `U.S.` and `US` are one term rather than
+ * `U` and `S`.
+ */
+function normalize(text: string): string {
+  return text
+    .replace(/[‐‑‒–−﹣－]/g, "-")
+    .replace(/(?<![\p{L}\p{N}])((?:\p{Lu}\.){2,})/gu, (m) => m.replace(/\./g, ""));
+}
 /**
  * A name: a capitalised word or acronym in any script (`Škoda`, `Möbius` —
  * an ASCII class cut the latter to `M`), optionally led by digits (`9XFabs`,
@@ -97,7 +114,13 @@ function atSentenceStart(text: string, index: number): boolean {
   return !(
     ABBREVIATION.test(before) ||
     /(?:^|[\s(])(?:\p{L}{1,3}\.){2,}$/u.test(before) ||
-    /(?:^|[\s(])\p{L}{1,2}\.$/u.test(before)
+    // A short capitalised word (Jr., Sgt., Dept., Univ.). Not any short word:
+    // "went up. Shipping" read "up." as an abbreviation and flagged the next
+    // sentence's opening word (round-5 review). Up to five letters catches
+    // the titles VIGIL listed (Sgt, Gen, Rev, Bros, Dept, Ave, Univ); a real
+    // sentence ending in a short capitalised name only means the next word
+    // is checked — the safe direction.
+    /(?:^|[\s(])\p{Lu}\p{Ll}{0,4}\.$/u.test(before)
   );
 }
 
@@ -130,7 +153,7 @@ function bareNumber(n: string): string {
  * case-insensitively. Exported for tests and for the diagnostic reason string.
  */
 export function specificTerms(claim: string): string[] {
-  let text = stripMarkup(claim);
+  let text = stripMarkup(normalize(claim));
   const out: string[] = [];
   const seen = new Set<string>();
   const add = (t: string): void => {
@@ -144,7 +167,7 @@ export function specificTerms(claim: string): string[] {
   // term, not as the name `Amazon` plus nothing.
   for (const m of text.matchAll(DOMAIN)) add(m[0]);
   text = text.replace(DOMAIN, " ");
-  for (const m of text.matchAll(NUMBER)) add(bareNumber(m[0].replace(/−/g, "-")));
+  for (const m of text.matchAll(NUMBER)) add(bareNumber(m[0]));
   for (const m of text.matchAll(NAME)) {
     if (CONNECTIVES.has(m[0].toLowerCase())) continue;
     if (atSentenceStart(text, m.index) && !looksLikeName(m[0])) continue;
@@ -162,8 +185,8 @@ export function specificTerms(claim: string): string[] {
  * found inside `Moonlight`.
  */
 export function missingTerms(claim: string, passages: string[]): string[] {
-  const haystack = passages.join("\n");
-  const numeric = haystack.replace(THOUSANDS, "$1").replace(/−/g, "-");
+  const haystack = normalize(passages.join("\n"));
+  const numeric = haystack.replace(THOUSANDS, "$1");
   return specificTerms(claim).filter((term) => {
     const num = /^(-?[\p{Nd}][\p{Nd},.]*)(.*)$/u.exec(term);
     const suffix = num?.[2]!.trim() ?? "";
@@ -202,14 +225,15 @@ function numberFound(numeric: string, digits: string, suffix: string): boolean {
     suffix === ""
       ? "(?![\\p{Nd}]|[.,]\\p{Nd})"
       : `${space}${escapeRegex(suffix)}(?![\\p{L}\\p{N}])`;
-  // An unsigned number must not sit behind a sign ("5%" inside "-5%"). A dash
-  // is a sign only after a space, a bracket or the start: after a digit it is
-  // a range ("19-25"), after a letter a version or id ("AGPL-3.0",
-  // "TASK-003") — both were flagged by a first version of this rule.
-  const unsigned = digits.startsWith("-") ? "" : "(?<!(?:^|[\\s(])-)";
-  return new RegExp(`(?<![\\p{Nd}.,])${unsigned}${escapeRegex(digits)}${tail}`, "iu").test(
-    numeric,
-  );
+  // A dash is a sign when nothing alphanumeric stands before it — after a
+  // space, `(`, `|`, `=`, `:`, a quote, a comma... (round-5 review: "|-5%|"
+  // and "change=-5%" satisfied an unsigned "5%"). After a digit it is a
+  // range ("19-25"), after a letter a version or id ("AGPL-3.0", "TASK-003").
+  // A signed claim needs the same: "-3.0" is not satisfied by "AGPL-3.0".
+  const before = digits.startsWith("-")
+    ? "(?<![\\p{L}\\p{N}.,])"
+    : "(?<![\\p{Nd}.,])(?<!(?:^|[^\\p{L}\\p{N}])-)";
+  return new RegExp(`${before}${escapeRegex(digits)}${tail}`, "iu").test(numeric);
 }
 
 /**

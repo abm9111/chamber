@@ -9037,6 +9037,44 @@ test("pins", "claim support: abbreviations by shape, and the sign of a number", 
   }
 });
 
+test("pins", "claim support: round-5 review — signs, spaced k, short words, initialisms", () => {
+  const miss = (c: string, p: string): string[] => missingTerms(c, [p]);
+  // Signs after punctuation, and other dash characters, are signs.
+  for (const e of ["run by Sgt. Tesla [1]", "the Dept. Tesla office [1]", "on Ave. Tesla [1]"]) {
+    assert(miss(e, "Kingroon sells PLA").length > 0, `${JSON.stringify(e)} must check Tesla`);
+  }
+  for (const p of ["| Q3 |-5%|", "change=-5%", "change:-5%", '"-5%"', "[-5%]", "3%,-5%", "/-5%", "fell –5%", "fell －5%", "fell −5%"]) {
+    assert(miss("Sales grew 5% [1]", p).length > 0, `"5%" must not be satisfied by ${JSON.stringify(p)}`);
+  }
+  assert(miss("fell –5% [1]", "fell -5%").length === 0, "an en-dash minus is the same sign");
+  // A signed number is not satisfied by a version or id.
+  assert(miss("Sales fell -3.0 [1]", "licensed AGPL-3.0").length > 0, "-3.0 is not AGPL-3.0");
+  // Spaced k matches itself.
+  assert(miss("It costs 5 k [1]", "it costs 5 k").length === 0, `"5 k" flagged ${JSON.stringify(miss("It costs 5 k [1]", "it costs 5 k"))}`);
+  // Ordinary short words ending a sentence are not abbreviations.
+  const sw = miss("Prices went up. Shipping is slow [1]", "Prices went up and delivery is slow");
+  assert(sw.length === 0, `"Shipping" after "up." flagged ${JSON.stringify(sw)}`);
+  // Initialisms with and without dots are one term.
+  for (const [c, p] of [["sold in the U.S. [1]", "sold in the US"], ["sold in the US [1]", "sold in the U.S."]] as [string, string][]) {
+    assert(miss(c, p).length === 0, `${JSON.stringify(c)} vs ${JSON.stringify(p)} flagged ${JSON.stringify(miss(c, p))}`);
+  }
+});
+
+test("pins", "debt payment writes nothing for a debt that is no longer pending", () => {
+  // Round-5 review: status was read outside the lock and never re-checked — a
+  // waived debt auto-paid, and re-proposing a paid debt wrote a duplicate pin.
+  const db = freshDb();
+  upsertDocument(db, { id: "note_aed", sourceKind: "vault_page", sourceRef: "aed.md", title: "Currency", body: "User base currency is AED (UAE dirham).", model: "local-hash-v1" });
+  const bel = commitBelief(db, { type: "belief", text: "User base currency is AED", sources: [], authorFamily: "test", path: "deep" });
+  assert(bel.ok, JSON.stringify(bel));
+  const debt = (db.prepare(`SELECT id FROM citation_debt WHERE belief_id = ? AND status = 'pending'`).get(bel.beliefId!) as { id: string }).id;
+  db.prepare(`UPDATE citation_debt SET status = 'waived' WHERE id = ?`).run(debt);
+  const r = proposeDebtPayment(db, debt, { minScore: 0.05, model: "local-hash-v1", autoPay: true });
+  const status = (db.prepare(`SELECT status FROM citation_debt WHERE id = ?`).get(debt) as { status: string }).status;
+  const pins = (db.prepare(`SELECT count(*) n FROM belief_source WHERE belief_id = ?`).get(bel.beliefId!) as { n: number }).n;
+  assert(status === "waived" && pins === 0, `a waived debt must stay waived with no pin: status=${status} pins=${pins} ${r.status}`);
+});
+
 test("pins", "prune keeps a row a belief started citing after it was listed", () => {
   const dir = mkdtempSync(join(tmpdir(), "chamber-prune-late-pin-"));
   mkdirSync(join(dir, "drafts"));
@@ -13267,6 +13305,51 @@ function mcpSession(env: NodeJS.ProcessEnv): {
     stop: () => child.kill(),
   };
 }
+
+test("cli", "prune removes a cited passage whose file was excluded and then deleted", () => {
+  // Round-5 review, through the CLI because the gap was in the CLI: a file
+  // both excluded and gone was filtered out as merely gone, so its cited
+  // passage was kept and "search --exact" still found the private text.
+  // Also VIGIL EGRESS-001: the audit entry must not carry the file's path.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-prune-excl-gone-"));
+  const vault = join(dir, "vault");
+  mkdirSync(join(vault, "private"), { recursive: true });
+  writeFileSync(join(vault, "private", "passport.md"), "# P\n\n## S\n\nZebra passport code QX77.\n");
+  const cfg = join(dir, "cfg.json");
+  const dbPath = join(dir, "c.sqlite");
+  const writeCfg = (exclude: string[]): void =>
+    writeFileSync(cfg, JSON.stringify({ database: dbPath, ingest: [{ root: vault, exclude }] }));
+  writeCfg([]);
+  const env = { ...process.env, CHAMBER_CONFIG: cfg, CHAMBER_EMBEDDER: "hash" };
+  const cli = (...args: string[]): ReturnType<typeof spawnSync> =>
+    spawnSync(process.execPath, ["--experimental-strip-types", CLI_PATH, ...args], { encoding: "utf8", timeout: 60_000, env });
+  assert(cli("ingest").status === 0, "setup: ingest");
+  const db = openChamberDb(dbPath);
+  const id = (db.prepare(`SELECT id FROM vector_document WHERE source_ref LIKE 'private/passport.md#%'`).get() as { id: string }).id;
+  const snapshotHash = verifyPin(db, { kind: "vault_page", refId: id, snapshotHash: "" }).actualHash!;
+  const bel = commitBelief(db, {
+    type: "inference",
+    text: "the passport code is private",
+    sources: [{ kind: "vault_page", refId: id, snapshotHash }],
+    authorFamily: "test",
+    path: "fast",
+    requireVerifiedSupport: true,
+  });
+  assert(bel.ok, JSON.stringify(bel));
+  db.close();
+  writeCfg(["private"]);
+  rmSync(join(vault, "private", "passport.md"));
+  const pr = cli("prune", "--confirm");
+  assert(pr.status === 0, `prune failed: ${String(pr.stderr)}`);
+  const search = cli("search", "--exact", "QX77");
+  assert(/no hits/.test(String(search.stdout)), `the private text must be gone: ${String(search.stdout)}`);
+  const db2 = openChamberDb(dbPath);
+  const audit = db2.prepare(`SELECT detail_json AS d FROM audit_event WHERE action = 'evidence_pruned'`).all() as { d: string }[];
+  assert(audit.length === 1, `one evidence_pruned entry, got ${audit.length}`);
+  assert(!audit[0]!.d.includes("passport"), `the audit chain must not keep the excluded path: ${audit[0]!.d}`);
+  db2.close();
+  rmSync(dir, { recursive: true, force: true });
+});
 
 test("cli", "chamber --version prints the package version with no usable config", () => {
   // `chamber --version` used to answer "unknown command". It must work on a

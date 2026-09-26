@@ -1063,7 +1063,12 @@ export function pruneDocuments(
           actor: "operator",
           subjectKind: "vector_document",
           subjectId: id,
-          detail: { reason: "excluded", documentId: id, sourceRef: r.ref, beliefIds: beliefs },
+          // No path: the chain is permanent and hash-linked, and an exclude
+          // is usually a privacy act — writing the excluded file's name into
+          // it would keep what the prune was asked to remove (VIGIL
+          // EGRESS-001). The opaque id and the citing beliefs are enough to
+          // explain a not_found later.
+          detail: { reason: "excluded", documentId: id, beliefIds: beliefs },
         });
         pinnedDeleted++;
       }

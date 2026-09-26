@@ -42,7 +42,8 @@ export interface DebtPaymentProposal {
   debtId: string;
   claimText: string;
   hits: VectorHit[];
-  status: "proposed_paid" | "insufficient" | "paid";
+  /** `not_open`: the debt was already paid or waived when the lock was taken — nothing written. */
+  status: "proposed_paid" | "insufficient" | "paid" | "not_open";
   reason: string;
   /** Pins actually written to belief_source, in the order they were attached. */
   attached: string[];
@@ -179,6 +180,29 @@ export function proposeDebtPayment(
   if (own) db.exec("BEGIN IMMEDIATE");
   try {
     const result = ((): DebtPaymentProposal => {
+      // Re-read under the lock. The status above was read before it, and was
+      // never checked at all: a waived debt with autoPay came back `paid` with
+      // a pin written, and re-proposing a paid debt wrote a duplicate pin
+      // (round-5 review, VIGIL). Only an open debt can be paid.
+      const now = (
+        db.prepare(`SELECT status FROM citation_debt WHERE id = ?`).get(debt.id) as
+          | { status: string }
+          | undefined
+      )?.status;
+      if (now !== "pending" && now !== "proposed_paid") {
+        return {
+          debtId: debt.id,
+          claimText: debt.claim_text,
+          hits,
+          status: "not_open",
+          reason: `debt is ${now ?? "gone"} — nothing written`,
+          attached: [],
+          rejected: [],
+        };
+      }
+      const alreadyPinned = db.prepare(
+        `SELECT 1 AS x FROM belief_source WHERE belief_id = ? AND ref_id = ? AND snapshot_hash = ?`,
+      );
       const attached: string[] = [];
       const rejected: RejectedSource[] = [];
       for (const h of hits.slice(0, 3)) {
@@ -198,6 +222,12 @@ export function proposeDebtPayment(
         // No belief to hang it on: the pin verified, but a belief_source row needs
         // a belief_id, so record it as proposed evidence and let the human see it.
         if (!debt.belief_id) {
+          attached.push(h.documentId);
+          continue;
+        }
+        // Already pinned by an earlier proposal: there is no uniqueness on
+        // belief_source, so re-proposing wrote the same pin twice.
+        if (alreadyPinned.get(debt.belief_id, h.documentId, h.snapshotHash)) {
           attached.push(h.documentId);
           continue;
         }
@@ -244,7 +274,7 @@ export function proposeDebtPayment(
         db.prepare(
           `UPDATE citation_debt
            SET status = 'paid', paid_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-           WHERE id = ?`,
+           WHERE id = ? AND status IN ('pending', 'proposed_paid')`,
         ).run(debt.id);
         db.prepare(
           `INSERT INTO gate_event (id, gate, action, subject_kind, subject_id, detail_json)

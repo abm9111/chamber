@@ -1600,9 +1600,12 @@ async function main(): Promise<void> {
       // Without this an exclude added after ingest steered only future walks,
       // and the passages already written kept answering retrieval.
       const goneFiles = new Set(stale.map((g) => g.file));
-      const excluded = findExcludedDocuments(db, loadedConfig!.ingest).filter(
-        (g) => !goneFiles.has(g.file),
-      );
+      // Every excluded row, gone or not: a file excluded and then deleted —
+      // the natural privacy sequence — was filtered out here as merely gone,
+      // so its cited passage was kept and stayed searchable (round-5 review).
+      const allExcluded = findExcludedDocuments(db, loadedConfig!.ingest);
+      const excludedAllIds = new Set(allExcluded.flatMap((g) => g.ids));
+      const excluded = allExcluded.filter((g) => !goneFiles.has(g.file));
       if (stale.length === 0 && excluded.length === 0) {
         // "Nothing to prune" is the same sentence whether every file is
         // present or no root could be read, and those are opposite states.
@@ -1651,8 +1654,8 @@ async function main(): Promise<void> {
       const excludedIds = new Set(
         excluded.flatMap((g) => g.ids).filter((id) => !goneIds.has(id)),
       );
-      const gonePinned = countPinned(db, goneIds);
-      const excludedPinned = countPinned(db, excludedIds);
+      const gonePinned = countPinned(db, [...goneIds].filter((id) => !excludedAllIds.has(id)));
+      const excludedPinned = countPinned(db, excludedAllIds);
       if (stale.length > 0) {
         console.log(`${goneIds.size} passage(s) in ${stale.length} file(s) no longer on disk:`);
         listFiles(stale);
@@ -1676,11 +1679,20 @@ async function main(): Promise<void> {
         // Deleted anyway: an exclude asks for the passage to go, and a kept
         // cited one went on answering retrieval (owner decision, 2026-09-26).
         // Named here, before anything is deleted, so the loss is chosen.
-        const citing = db
-          .prepare(
-            `SELECT DISTINCT belief_id AS b FROM belief_source WHERE ref_id IN (${[...excludedIds].map(() => "?").join(",")})`,
-          )
-          .all(...excludedIds) as { b: string }[];
+        // Batched: one IN (...) over every id hit SQLite's variable limit
+        // past ~250k excluded rows (round-5 review).
+        const citingSet = new Set<string>();
+        const ids = [...excludedAllIds];
+        for (let i = 0; i < ids.length; i += 500) {
+          const batch = ids.slice(i, i + 500);
+          const rows = db
+            .prepare(
+              `SELECT DISTINCT belief_id AS b FROM belief_source WHERE ref_id IN (${batch.map(() => "?").join(",")})`,
+            )
+            .all(...batch) as { b: string }[];
+          for (const r of rows) citingSet.add(r.b);
+        }
+        const citing = [...citingSet].map((b) => ({ b }));
         console.log(
           `  ${excludedPinned} of the excluded passage(s) are cited by ${citing.length} belief(s) and will be ` +
             `deleted too — the audit log records each, and verify will report those citations not_found:`,
@@ -1699,7 +1711,7 @@ async function main(): Promise<void> {
         break;
       }
       const removed = pruneDocuments(db, new Set([...goneIds, ...excludedIds]), {
-        deletePinned: excludedIds,
+        deletePinned: excludedAllIds,
       });
       console.log(`pruned ${removed.passages} passage(s) from ${removed.files} file(s)`);
       if (removed.pinnedDeleted > 0) {

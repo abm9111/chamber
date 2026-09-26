@@ -13,7 +13,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { commitBelief } from "./commit_belief.ts";
 import type { RejectedSource, SourceRef } from "./types.ts";
 
-export type ClaimKind = "observation" | "assertion" | "aporia" | "chatter";
+export type ClaimKind = "observation" | "assertion" | "aporia" | "chatter" | "heading";
 
 export interface ClassifiedClaim {
   kind: ClaimKind;
@@ -38,7 +38,7 @@ export interface ContractResult {
    * `action='absent'` that no surface reads. A status that reads as an
    * endorsement is worse than a refusal, because nobody goes looking.
    */
-  status: "ALLOWED" | "REFUSED" | "APORIA" | "DEBT" | "UNSUPPORTED";
+  status: "ALLOWED" | "REFUSED" | "APORIA" | "DEBT" | "UNSUPPORTED" | "HEADING";
   reason?: string;
   beliefId?: string;
   debtIds?: string[];
@@ -51,11 +51,37 @@ export interface ContractResult {
   rejectedSources?: RejectedSource[];
 }
 
+const ASSERTION_VERB = /\b(is|are|was|were|will|must|always|never|fact:)\b/i;
+/** The citation shape `citedIndices` reads (src/ask.ts). */
+const CITATION = /\[\d{1,2}\]/;
+
+/**
+ * A line that organises an answer rather than saying anything: a markdown
+ * heading, a line that is bold end to end, or a short label ending in a colon.
+ *
+ * Each was committed as an unsourced observation and printed `[UNSUPPORTED]`
+ * — one ledger row of noise per heading, on every answer a model formats.
+ *
+ * The exclusions are what keep this from being a way around the gate. A line
+ * with a citation is a claim about its source; a line with an assertion verb
+ * is a claim. What is left can still be a fact in label form ("Kingroon
+ * cheapest:"), so a heading is printed `[HEADING]` rather than dropped: it is
+ * not recorded and not endorsed, and the reader can see it was neither.
+ */
+function isHeading(text: string): boolean {
+  if (CITATION.test(text) || ASSERTION_VERB.test(text)) return false;
+  if (/^#{1,6}\s+\S/.test(text)) return true;
+  if (/^(\*\*|__)(?:(?!\1).)+\1:?$/.test(text)) return true;
+  return text.length <= 80 && text.endsWith(":");
+}
+
 /** Heuristic claim classifier — conservative on assertions. */
 export function classifyClaims(reply: string): ClassifiedClaim[] {
+  // A bullet is a marker followed by whitespace. `^[-*•]\s*` also ate the
+  // first `*` of `**bold**`, so every bolded claim was stored as `*Name**…`.
   const lines = reply
     .split(/\n+/)
-    .map((l) => l.replace(/^[-*•]\s*/, "").trim())
+    .map((l) => l.trim().replace(/^[-*•]\s+/, "").trim())
     .filter(Boolean);
   const out: ClassifiedClaim[] = [];
   for (const text of lines) {
@@ -65,14 +91,18 @@ export function classifyClaims(reply: string): ClassifiedClaim[] {
       )
     ) {
       out.push({ kind: "aporia", text });
+    } else if (isHeading(text)) {
+      out.push({ kind: "heading", text });
     } else if (
+      // A line that cites a source is a claim about it, whatever else it says.
+      // Without the citation test, "As noted, X is Y [1]" was chatter: status
+      // ALLOWED, never committed, never printed — the claim skipped the gate
+      // and the rejection of its citation went nowhere.
+      !CITATION.test(text) &&
       /\b(you said|you asked|noted|acknowledged|queued|see spend)\b/i.test(text)
     ) {
       out.push({ kind: "chatter", text });
-    } else if (
-      /\b(is|are|was|were|will|must|always|never|fact:)\b/i.test(text) &&
-      text.length > 20
-    ) {
+    } else if (ASSERTION_VERB.test(text) && text.length > 20) {
       out.push({ kind: "assertion", text });
     } else {
       out.push({ kind: "observation", text });
@@ -120,6 +150,12 @@ export function enforceClaimContract(
 
   if (claim.kind === "chatter") {
     return { ok: true, status: "ALLOWED", reason: "non-load-bearing chatter" };
+  }
+
+  // No commitBelief: nothing is written, so nothing needs a source. Its own
+  // status rather than chatter's ALLOWED, which would read as an endorsement.
+  if (claim.kind === "heading") {
+    return { ok: true, status: "HEADING", reason: "structural line — not recorded" };
   }
 
   if (claim.kind === "aporia") {

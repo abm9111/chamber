@@ -103,7 +103,11 @@ and personalised items cannot be returned once dispatched [1].
 The model is shown `[1]`…`[k]` and never a document id or a hash, so it cannot
 fabricate a citation even in principle — the numbers are resolved back to files
 after the answer is written. A sentence that cites nothing is marked
-`UNSUPPORTED`: recorded, but not treated as load-bearing.
+`UNSUPPORTED`: recorded, but not treated as load-bearing. A sentence whose
+numbers, names or domains are not in the passage it cites loses that citation
+too, and says which terms were missing (`terms_absent`) — a real passage is not
+evidence for a claim it does not contain. Headings in an answer print as
+`[HEADING]` and are not recorded.
 
 Asking something the corpus cannot answer is the more important case:
 

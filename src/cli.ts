@@ -459,7 +459,9 @@ function runTurn(db: DatabaseSync, message: string): void {
             ? "○"
             : r.status === "UNSUPPORTED"
               ? "⚠"
-              : "✗";
+              : r.status === "HEADING"
+                ? "·"
+                : "✗";
     console.log(
       `  ${mark} contract ${c.kind}/${r.status}${r.reason ? ` — ${r.reason}` : ""}`,
     );

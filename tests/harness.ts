@@ -8377,6 +8377,77 @@ test("pins", "runAsk withholds pins from a claim whose specifics its passage lac
   );
 });
 
+// ─── headings are structure, not claims ──────────────────────────────────────
+
+test("pins", "classifyClaims reads headings and labels as headings", () => {
+  const kinds = (s: string): string => classifyClaims(s).map((c) => c.kind).join(",");
+  assert(kinds("## Tier 1") === "heading", kinds("## Tier 1"));
+  assert(kinds("**Tier 1 / easily available:**") === "heading", "whole-line bold label");
+  assert(kinds("**Tier 1**:") === "heading", "colon outside the bold");
+  assert(kinds("Not available / not recommended for UAE:") === "heading", "plain label");
+  // Anything that could carry weight stays a claim.
+  assert(kinds("**Elegoo is the cheapest:**") !== "heading", "a verb makes it a claim");
+  assert(kinds("**Kingroon:** cheapest option [2]") !== "heading", "a citation makes it a claim");
+  assert(kinds("## Elegoo [1]") !== "heading", "a cited heading is a claim");
+});
+
+test("pins", "a cited line is never chatter, whatever words it uses", async () => {
+  // "noted" put a line on the chatter branch: status ALLOWED, never committed,
+  // never printed. With a citation on it, that skipped the gate entirely.
+  assert(
+    classifyClaims("As noted, Kingroon is made on the Moon [1].")[0]!.kind !== "chatter",
+    "a citation makes it a claim",
+  );
+  assert(classifyClaims("Noted — queued for later.")[0]!.kind === "chatter", "real chatter stays");
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "n.md",
+    title: "N",
+    body: "Kingroon PLA sells for about $9 per kg on AliExpress.",
+    model: "local-hash-v1",
+  });
+  const r = await runAsk(db, "Kingroon", {
+    complete: async () => "As noted, Kingroon is made on the Moon [1].",
+    model: "local-hash-v1",
+  });
+  assert(
+    r.claims[0]!.status !== "ALLOWED",
+    `a fabricated cited claim must not ride the chatter branch: ${JSON.stringify(r.claims[0])}`,
+  );
+});
+
+test("pins", "classifyClaims strips a bullet but never the opening of bold", () => {
+  const texts = classifyClaims("**Elegoo** — on Amazon.ae [1]\n- The index is local.\n* Also here.")
+    .map((c) => c.text);
+  assert(texts[0] === "**Elegoo** — on Amazon.ae [1]", `bold mangled: ${JSON.stringify(texts[0])}`);
+  assert(texts[1] === "The index is local.", `dash bullet: ${JSON.stringify(texts[1])}`);
+  assert(texts[2] === "Also here.", `star bullet: ${JSON.stringify(texts[2])}`);
+});
+
+test("pins", "a heading in an answer is reported, never recorded", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/filament.md",
+    title: "Filament",
+    body: "Elegoo PLA is sold on Amazon.ae.",
+    model: "local-hash-v1",
+  });
+  const before = (db.prepare(`SELECT count(*) n FROM belief`).get() as { n: number }).n;
+  const r = await runAsk(db, "filament", {
+    complete: async () => "**Tier 1 / easily available:**",
+    model: "local-hash-v1",
+  });
+  const after = (db.prepare(`SELECT count(*) n FROM belief`).get() as { n: number }).n;
+  assert(r.claims.length === 1, JSON.stringify(r.claims));
+  assert(r.claims[0]!.status === "HEADING", `got ${r.claims[0]!.status}`);
+  assert(after === before, `a heading must write no belief row (${before} -> ${after})`);
+
+  const turn = enforceReplyContract(db, "## Sources");
+  assert(turn.results[0]!.status === "HEADING", "the turn path classifies it the same way");
+});
+
 // ─── VERIFY (longitudinal pin drift, src/pins.ts verifyBeliefSources) ────────
 //
 // Within one ask, pin verification is close to tautological: the hash is read

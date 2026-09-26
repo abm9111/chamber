@@ -56,7 +56,7 @@ const DOMAIN = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|ae|net|org|io|co|a
 // but could not match itself once spacing was refused for single letters
 // (round-5 review).
 const NUMBER =
-  /(?:(?<![\p{L}\p{N}%°+)\]])-)?\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})m(?![\p{L}\p{N}])|\s?%)?/giu;
+  /(?:(?<![\p{L}\p{N}%°+)\]]\uE000*)-\uE000*)?\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})m(?![\p{L}\p{N}])|\s?%)?/giu;
 
 /**
  * Applied to claim and passage alike, so both sides read one spelling.
@@ -66,13 +66,23 @@ const NUMBER =
  * initialisms lose their dots, so `U.S.` and `US` are one term rather than
  * `U` and `S`.
  */
+/**
+ * Where markup stood: not alphanumeric, so a word edge; skipped by signs.
+ * A private-use code point, so it cannot occur in text by accident (and is
+ * not a control character, which lint rightly refuses in a regex).
+ */
+const SEP = "\uE000";
+
 function normalize(text: string): string {
   return text
-    // Emphasis and code markers go before anything reads signs or ranges:
-    // one rule per emphasis position was patched four times ("**-5%**",
-    // "**10%**–20%", "-**5%**", "**−**5%" — VIGIL rounds on 9207e6d..11be031)
-    // and each fix exposed the mirror case. Claim and passage alike.
-    .replace(/[*`]/g, "")
+    // Markup becomes SEP, a boundary for words and numbers that the sign
+    // rules see through. Deleting it (359d706) merged neighbours — "2*3"
+    // satisfied "23", "Tes*la" satisfied "Tesla" — and covered only `*` and
+    // backticks, so "-_5%_", "-~~5%~~", "-<b>5%</b>" still hid a sign
+    // (VIGIL on 359d706). Claim and passage alike.
+    .replace(/<\/?[A-Za-z][^<>]{0,30}>/g, SEP)
+    .replace(/~~|==/g, SEP)
+    .replace(/[*`_]/g, SEP)
     .replace(/[‐‑‒–−﹣－]/g, "-")
     // Spaced forms too ("J. R. R.", "U. S."), without eating the space after
     // the last dot — round-6 review flagged "J.R.R." against "J. R. R.".
@@ -93,10 +103,7 @@ function stripMarkup(text: string): string {
   return text
     .replace(/^\s*\d{1,3}[.)]\s+/, "") // list numbering is not a claimed number
     .replace(/\[\d{1,2}\]/g, " ") // citations are not claims about the source
-    // Emphasis markers removed, not spaced: "**10%**–20%" must keep its
-    // dash next to the quantity it follows, or the range reads as a minus.
-    .replace(/[*`]/g, "")
-    .replace(/[_#>]/g, " ");
+    .replace(/[#>]/g, " ");
 }
 
 /**
@@ -155,7 +162,7 @@ const THOUSANDS = /(\p{Nd}),(?=\p{Nd}{3}(?!\p{Nd}))/gu;
 function bareNumber(n: string): string {
   // A trailing comma is punctuation ("Tier 1, easily"), not part of the
   // number — leaving it flagged "1," on the vault eval.
-  return n.replace(THOUSANDS, "$1").replace(/[.,]+$/, "");
+  return n.replace(/\uE000/g, "").replace(THOUSANDS, "$1").replace(/[.,]+$/, "");
 }
 
 /**
@@ -249,11 +256,15 @@ function numberFound(numeric: string, digits: string, suffix: string): boolean {
   const range = "[\\p{L}\\p{N}%°+)\\]]";
   // `[^]`, not `.`: `.` does not match a line break, so a minus opening a
   // line read unsigned — "Sales grew 5%" came back ALLOWED over "…:\n-5%"
-  // end to end (VIGIL on 6e20674). Emphasis is already gone (normalize).
-  const before = digits.startsWith("-")
-    ? `(?<!${range}|[.,])`
-    : `(?<![\\p{Nd}.,])(?<!(?:^|(?!${range})[^])-)`;
-  return new RegExp(`${before}${escapeRegex(digits)}${tail}`, "iu").test(numeric);
+  // end to end (VIGIL on 6e20674). SEP (markup) is skipped on both sides of
+  // the dash, so "-_5%_" keeps its sign and "**10%**–20%" stays a range.
+  const sep = "\\uE000*";
+  const signed = digits.startsWith("-");
+  const body = signed ? `-${sep}${escapeRegex(digits.slice(1))}` : escapeRegex(digits);
+  const before = signed
+    ? `(?<!${range}${sep}|[.,])`
+    : `(?<![\\p{Nd}.,])(?<!(?:^|(?!${range})(?!\\uE000)[^])${sep}-${sep})`;
+  return new RegExp(`${before}${body}${tail}`, "iu").test(numeric);
 }
 
 /**

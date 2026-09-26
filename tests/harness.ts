@@ -9161,6 +9161,26 @@ test("pins", "claim support: emphasis is stripped on both sides before signs are
   }
 });
 
+test("pins", "claim support: markup is a boundary for words and transparent for signs", async () => {
+  // VIGIL on 359d706: deleting `*` merged its neighbours ("2*3" satisfied
+  // "23", "Tes*la" satisfied "Tesla"), and markup other than `*`/backtick
+  // still hid a sign ("-_5%_", "-~~5%~~", "-==5%==", "-<b>5%</b>").
+  const miss = (c: string, p: string): string[] => missingTerms(c, [p]);
+  for (const p of ["sales: -_5%_", "-__5%__", "_−_5%", "-~~5%~~", "-==5%==", "-<b>5%</b>", "sales: -**5%**", "-`5%`", "**−**5%"]) {
+    assert(JSON.stringify(miss("Sales grew 5% [1]", p)) === '["5%"]', `"5%" must not be satisfied by ${JSON.stringify(p)}: ${JSON.stringify(miss("Sales grew 5% [1]", p))}`);
+  }
+  for (const [c, p] of [["batch size was 23 [1]", "batch 2*3"], ["exponent 102 [1]", "10**2"], ["made by Tesla [1]", "made by Tes*la"]] as [string, string][]) {
+    assert(miss(c, p).length > 0, `${JSON.stringify(c)} must not be satisfied by ${JSON.stringify(p)}`);
+  }
+  for (const [c, p] of [["Efficacy reached 20% [1]", "Efficacy was **10%**–20%."], ["Sold by **Kingroon** [1]", "Sold by Kingroon"], ["Sold by Kingroon [1]", "Sold by **Kingroon**"], ["uses `MAX_K` [1]", "set `MAX_K` to 5"], ["fell -5% [1]", "fell -**5%**"], ["fell -5% [1]", "fell <b>-5%</b>"]] as [string, string][]) {
+    assert(miss(c, p).length === 0, `${JSON.stringify(c)} vs ${JSON.stringify(p)} flagged ${JSON.stringify(miss(c, p))}`);
+  }
+  const db = freshDb();
+  upsertDocument(db, { sourceKind: "vault_page", sourceRef: "s.md", title: "Sales", body: "Q3 change in sales: -_5%_", model: "local-hash-v1" });
+  const r = await runAsk(db, "sales change", { model: "local-hash-v1", complete: async () => "Q3 sales grew 5% [1]" });
+  assert(r.claims[0]!.status !== "ALLOWED", `end to end: ${JSON.stringify(r.claims[0])}`);
+});
+
 test("pins", "debt payment does not write the same pin twice", () => {
   // Round-6 review: the duplicate-pin skip had no test.
   const db = freshDb();

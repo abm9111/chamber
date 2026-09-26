@@ -68,6 +68,11 @@ const NUMBER =
  */
 function normalize(text: string): string {
   return text
+    // Emphasis and code markers go before anything reads signs or ranges:
+    // one rule per emphasis position was patched four times ("**-5%**",
+    // "**10%**–20%", "-**5%**", "**−**5%" — VIGIL rounds on 9207e6d..11be031)
+    // and each fix exposed the mirror case. Claim and passage alike.
+    .replace(/[*`]/g, "")
     .replace(/[‐‑‒–−﹣－]/g, "-")
     // Spaced forms too ("J. R. R.", "U. S."), without eating the space after
     // the last dot — round-6 review flagged "J.R.R." against "J. R. R.".
@@ -242,14 +247,12 @@ function numberFound(numeric: string, digits: string, suffix: string): boolean {
   // on it: "**-5%**" certified "Sales grew 5%" (VIGIL AIML-002). Every
   // character not known to end a quantity now leaves the dash a sign.
   const range = "[\\p{L}\\p{N}%°+)\\]]";
-  // Closing emphasis may sit between the quantity and the dash
-  // ("**10%**–20%"). `[^]`, not `.`: `.` does not match a line break, so a
-  // minus opening a line read unsigned — "Sales grew 5%" came back ALLOWED
-  // over "…:\n-5%" end to end (VIGIL on 6e20674).
-  const closers = "[*_`]*";
+  // `[^]`, not `.`: `.` does not match a line break, so a minus opening a
+  // line read unsigned — "Sales grew 5%" came back ALLOWED over "…:\n-5%"
+  // end to end (VIGIL on 6e20674). Emphasis is already gone (normalize).
   const before = digits.startsWith("-")
-    ? `(?<!${range}${closers}|[.,])`
-    : `(?<![\\p{Nd}.,])(?<!(?:^|(?![*_\`])(?!${range})[^])${closers}-)`;
+    ? `(?<!${range}|[.,])`
+    : `(?<![\\p{Nd}.,])(?<!(?:^|(?!${range})[^])-)`;
   return new RegExp(`${before}${escapeRegex(digits)}${tail}`, "iu").test(numeric);
 }
 

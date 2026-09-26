@@ -9147,6 +9147,20 @@ test("pins", "claim support: a minus at a line start, and emphasis between a qua
   assert(r.claims[0]!.status !== "ALLOWED", `end to end: ${JSON.stringify(r.claims[0])}`);
 });
 
+test("pins", "claim support: emphasis is stripped on both sides before signs are read", () => {
+  // VIGIL on 11be031 (AIML-002): emphasis between the minus and the number —
+  // "-**5%**", "-`5%`", "**−**5%" — hid the sign. Each round had patched one
+  // emphasis position; passages now lose `*` and backticks exactly as claims
+  // do, so no position of emphasis can separate a sign from its number.
+  const miss = (c: string, p: string): string[] => missingTerms(c, [p]);
+  for (const p of ["sales: -**5%**", "-*5%*", "-`5%`", "**−**5%", "**-5%**", "_-5%_", "Change:\n-**5%**"]) {
+    assert(JSON.stringify(miss("Sales grew 5% [1]", p)) === '["5%"]', `"5%" must not be satisfied by ${JSON.stringify(p)}: ${JSON.stringify(miss("Sales grew 5% [1]", p))}`);
+  }
+  for (const [c, p] of [["Efficacy reached 20% [1]", "Efficacy was **10%**–20%."], ["Sold by **Kingroon** [1]", "Sold by Kingroon"], ["Sold by Kingroon [1]", "Sold by **Kingroon**"], ["uses `MAX_K` [1]", "set `MAX_K` to 5"]] as [string, string][]) {
+    assert(miss(c, p).length === 0, `${JSON.stringify(c)} vs ${JSON.stringify(p)} flagged ${JSON.stringify(miss(c, p))}`);
+  }
+});
+
 test("pins", "debt payment does not write the same pin twice", () => {
   // Round-6 review: the duplicate-pin skip had no test.
   const db = freshDb();

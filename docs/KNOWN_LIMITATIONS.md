@@ -132,9 +132,11 @@ deployment machine is the stated entry criterion for any capability level above 
 > tried and reverted because "Paris." and "Sony." then flagged the next
 > ordinary sentence. A leading minus is part of its number (`-5%` ≠ `5%`)
 > unless the dash directly follows a letter, a digit, a unit or a closing
-> bracket, where it is a range or an id (`19-25`, `2°–8°C`, `10%–20%`,
-> `AGPL-3.0`); a first version listed sign positions instead and missed
-> markdown (`**-5%**`), `$9m` / `lakh` / `%` reducing to a bare number, and a
+> bracket (closing emphasis between them allowed: `**10%**–20%`), where it
+> is a range or an id (`19-25`, `2°–8°C`, `10%–20%`, `AGPL-3.0`); a first
+> version listed sign positions instead and missed markdown (`**-5%**`), a
+> second missed a minus opening a line. Accepted, fail-closed: `p.-5` and
+> `1.-5%` read the dash as a minus, `$9m` / `lakh` / `%` reducing to a bare number, and a
 > passage's own `1,000 million` being flagged. Accepted, knowingly: a
 > capitalised ordinary word after a label or dash is now checked, so
 > "Delivery: Roughly 5 days [1]" is flagged when the passage lacks

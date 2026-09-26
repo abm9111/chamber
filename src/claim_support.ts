@@ -88,7 +88,10 @@ function stripMarkup(text: string): string {
   return text
     .replace(/^\s*\d{1,3}[.)]\s+/, "") // list numbering is not a claimed number
     .replace(/\[\d{1,2}\]/g, " ") // citations are not claims about the source
-    .replace(/[*_`#>]/g, " ");
+    // Emphasis markers removed, not spaced: "**10%**–20%" must keep its
+    // dash next to the quantity it follows, or the range reads as a minus.
+    .replace(/[*`]/g, "")
+    .replace(/[_#>]/g, " ");
 }
 
 /**
@@ -239,9 +242,14 @@ function numberFound(numeric: string, digits: string, suffix: string): boolean {
   // on it: "**-5%**" certified "Sales grew 5%" (VIGIL AIML-002). Every
   // character not known to end a quantity now leaves the dash a sign.
   const range = "[\\p{L}\\p{N}%°+)\\]]";
+  // Closing emphasis may sit between the quantity and the dash
+  // ("**10%**–20%"). `[^]`, not `.`: `.` does not match a line break, so a
+  // minus opening a line read unsigned — "Sales grew 5%" came back ALLOWED
+  // over "…:\n-5%" end to end (VIGIL on 6e20674).
+  const closers = "[*_`]*";
   const before = digits.startsWith("-")
-    ? `(?<!${range}|[.,])`
-    : `(?<![\\p{Nd}.,])(?<!(?:^|(?!${range}).)-)`;
+    ? `(?<!${range}${closers}|[.,])`
+    : `(?<![\\p{Nd}.,])(?<!(?:^|(?![*_\`])(?!${range})[^])${closers}-)`;
   return new RegExp(`${before}${escapeRegex(digits)}${tail}`, "iu").test(numeric);
 }
 

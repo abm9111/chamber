@@ -9126,6 +9126,27 @@ test("pins", "claim support: a dash is a range only after a letter, digit, unit 
   }
 });
 
+test("pins", "claim support: a minus at a line start, and emphasis between a quantity and a dash", async () => {
+  // VIGIL on 6e20674: `.` in the sign lookbehind does not match a newline, so
+  // a minus opening a line read unsigned — "Q3 sales grew 5% [1]" came back
+  // ALLOWED over "Change in sales:\n-5% year on year." end to end.
+  const miss = (c: string, p: string): string[] => missingTerms(c, [p]);
+  // The claim holds nothing but the number, so only the sign can flag it —
+  // a first draft said "Q3 sales grew", and "Q3" absent from the passage
+  // flagged it for the wrong reason: a test that passed on broken code.
+  for (const p of ["Change in sales:\n-5% year on year.", "Change in sales:\r\n-5%", "first passage\u2028-5%"]) {
+    const m = miss("Sales grew 5% [1]", p);
+    assert(JSON.stringify(m) === '["5%"]', `line-start minus in ${JSON.stringify(p)}: ${JSON.stringify(m)}`);
+  }
+  // A range whose first end is emphasised is still a range.
+  assert(miss("Efficacy reached 20% [1]", "Efficacy was **10%**–20%.").length === 0, "emphasised range start");
+  assert(miss("Efficacy was **10%**–20% [1]", "Efficacy was 10% to 20%.").length === 0, "emphasised range in the claim");
+  const db = freshDb();
+  upsertDocument(db, { sourceKind: "vault_page", sourceRef: "s.md", title: "Sales", body: "Q3 change in sales:\n-5% year on year.", model: "local-hash-v1" });
+  const r = await runAsk(db, "sales change", { model: "local-hash-v1", complete: async () => "Q3 sales grew 5% [1]" });
+  assert(r.claims[0]!.status !== "ALLOWED", `end to end: ${JSON.stringify(r.claims[0])}`);
+});
+
 test("pins", "debt payment does not write the same pin twice", () => {
   // Round-6 review: the duplicate-pin skip had no test.
   const db = freshDb();

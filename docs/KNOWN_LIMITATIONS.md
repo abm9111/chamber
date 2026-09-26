@@ -638,6 +638,17 @@ Unplanned.
 > full 2k. A section cut by the cap is announced only when the answer cites
 > it (6 of 10 answers on that run), because a note on every answer is one
 > nobody reads.
+>
+> Sections are identified by the chunker's own section number, stored in each
+> passage's metadata at ingest. Title and position could not tell one split
+> section from consecutive sections sharing a heading — a daily log's run of
+> `## Entry` sections was shown as one section, with a bogus "partial" note
+> (round-3 review). A passage ingested before this change has no section
+> number and gets no expansion until the next `chamber ingest`, which rewrites
+> metadata without touching pins (the pin hash covers title, body and ref
+> only). Measured on a re-ingested copy of the vault: every one of 44,037
+> passages numbered; 8,258 of 18,809 sections split (43.9%); the filament
+> question 8 of 8 brands, three of three.
 
 `embedMinilm` shells out to `python3` with `scripts/embed_minilm.py`. Most of
 what this entry used to describe has been closed; what follows separates the

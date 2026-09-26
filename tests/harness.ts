@@ -8673,13 +8673,14 @@ function sibRow(
   title: string,
   root = "/r",
   body = `body of ${ref}`,
+  section: string | number = title,
 ): { documentId: string; sourceRef: string; title: string; body: string; snapshotHash: string; sourceKind: string } {
   const r = upsertDocument(db, {
     sourceKind: "vault_page",
     sourceRef: ref,
     title,
     body,
-    metadata: { ingestRoot: root },
+    metadata: { ingestRoot: root, section },
     model: "local-hash-v1",
   });
   const row = db
@@ -8730,7 +8731,7 @@ test("pins", "siblings: two sections under the same heading are two sections", (
   // a hit on one pulled in unrelated entries and reported 3 pieces "cut" when
   // nothing was split. A section's pieces are one unbroken run of #pN.
   const db = freshDb();
-  const rows = Array.from({ length: 8 }, (_, i) => sibRow(db, `log.md#p${i * 2}`, "log › Entry"));
+  const rows = Array.from({ length: 8 }, (_, i) => sibRow(db, `log.md#p${i * 2}`, "log › Entry", "/r", `entry ${i}`, i * 2));
   for (let i = 0; i < 8; i++) sibRow(db, `log.md#p${i * 2 + 1}`, "log › Other");
   const e = withSiblings(db, [rows[3]!], 8);
   assert(
@@ -8742,11 +8743,49 @@ test("pins", "siblings: two sections under the same heading are two sections", (
   // A real split next to a same-titled but separate section.
   const a = [sibRow(db, "n.md#p0", "n › Status"), sibRow(db, "n.md#p1", "n › Status")];
   sibRow(db, "n.md#p2", "n › Other");
-  const far = sibRow(db, "n.md#p3", "n › Status");
+  const far = sibRow(db, "n.md#p3", "n › Status", "/r", "body of n.md#p3", "n › Status (second)");
   const e2 = withSiblings(db, [a[0]!], 8);
   const refs = e2.passages.map((p) => p.sourceRef);
   assert(JSON.stringify(refs) === '["n.md#p0","n.md#p1"]', `only the run the hit is in: ${JSON.stringify(refs)}`);
   assert(!refs.includes(far.sourceRef), "a later section with the same heading is another section");
+});
+
+test("pins", "siblings: consecutive same-heading sections in a real note stay separate", async () => {
+  // Round-3 review repro: one daily log with eight consecutive `## Entry`
+  // sections ingests as p0..p7, all titled alike, one unbroken run — so title
+  // plus adjacency merged them all. Only the chunker knows where a section
+  // ends; it now records a section number that sibling expansion keys on.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-daily-"));
+  const entries = Array.from({ length: 8 }, (_, i) => `## Entry\n\nTopic${i} notes for the day about item${i}.`);
+  writeFileSync(join(dir, "log.md"), `# Log\n\n${entries.join("\n\n")}\n`);
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  const rows = db
+    .prepare(`SELECT id, source_ref AS r FROM vector_document ORDER BY source_ref`)
+    .all() as { id: string; r: string }[];
+  assert(rows.length === 8, `setup: eight entries, got ${rows.length}`);
+  const r = await runAsk(db, "Topic3 notes item3", {
+    k: 1,
+    model: "local-hash-v1",
+    complete: async () => "The day covered one topic. [1]",
+  });
+  const shown = r.passages.map((p) => p.sourceRef ?? "");
+  assert(shown.length === 1, `an unsplit entry has no siblings, got ${JSON.stringify(shown)}`);
+  assert(!(r.note ?? "").includes("not shown"), `nothing was cut: ${JSON.stringify(r.note)}`);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("pins", "siblings: a row ingested before section numbers gets no expansion", () => {
+  const db = freshDb();
+  const mk = (ref: string): ReturnType<typeof sibRow> => {
+    const r = upsertDocument(db, { sourceKind: "vault_page", sourceRef: ref, title: "T", body: ref, metadata: { ingestRoot: "/r" }, model: "local-hash-v1" });
+    const h = (db.prepare(`SELECT snapshot_hash AS h FROM vector_document WHERE id = ?`).get(r.id) as { h: string }).h;
+    return { documentId: r.id, sourceRef: ref, title: "T", body: ref, snapshotHash: h, sourceKind: "vault_page" };
+  };
+  const a = mk("old.md#p0");
+  mk("old.md#p1");
+  const e = withSiblings(db, [a], 8);
+  assert(e.passages.length === 1, `no section number, no guessing: ${JSON.stringify(e.passages.map((p) => p.sourceRef))}`);
 });
 
 test("pins", "siblings: passage numbers never pass what a citation can name", () => {

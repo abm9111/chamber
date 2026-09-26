@@ -857,7 +857,7 @@ export function ingestDirectory(
         // as drift on every passage under it.
         title: passageTitle(docTitle, p.headings),
         body: p.body,
-        metadata: { ingestRoot: root },
+        metadata: { ingestRoot: root, section: p.section },
         ...(embeds
           ? { embedding: embeds[i]!.vector, model: embeds[i]!.model }
           : {}),

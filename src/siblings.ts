@@ -14,9 +14,8 @@
  * own numbered passage — citing it verifies exactly like citing a hit. Nothing
  * here widens what a citation can prove.
  *
- * A section is (source_kind, ingestRoot, file, title) *and* one unbroken run
- * of piece numbers, and its pieces are the rows whose source_ref is exactly
- * `file#p<digits>`. Two roots can hold the
+ * A section is (source_kind, ingestRoot, file, the chunker's section number),
+ * and its pieces are the rows whose source_ref is exactly `file#p<digits>`. Two roots can hold the
  * same relative path under the same headings, and a file may itself be named
  * `a#pfoo` — both are other notes, and a first version showed them as part of
  * this one (review, 2026-09-26).
@@ -86,6 +85,20 @@ function ingestRootOf(meta: string | null): string | null {
   }
 }
 
+/**
+ * The chunker's section number, as ingest stored it. Compared with `===`, so
+ * a number and the string a test fixture may use are both exact identities.
+ */
+function sectionOf(meta: string | null): string | number | undefined {
+  if (!meta) return undefined;
+  try {
+    const v = (JSON.parse(meta) as { section?: unknown }).section;
+    return typeof v === "number" || typeof v === "string" ? v : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function byPiece(a: PassageRow, b: PassageRow): number {
   return (pieceIndex(a.sourceRef ?? "") ?? 0) - (pieceIndex(b.sourceRef ?? "") ?? 0);
 }
@@ -136,39 +149,36 @@ export function withSiblings<T extends PassageRow>(
       order.push(h);
       continue;
     }
-    const root = ingestRootOf(
-      (metaOf.get(h.documentId) as { meta: string | null } | undefined)?.meta ?? null,
-    );
+    const meta = (metaOf.get(h.documentId) as { meta: string | null } | undefined)?.meta ?? null;
+    const root = ingestRootOf(meta);
+    const section = sectionOf(meta);
+    // No section number — a row ingested before the chunker recorded one — no
+    // expansion. Title and adjacency cannot tell a split section from
+    // consecutive sections that share a heading (a daily log's `## Entry`
+    // runs), and guessing merged them (round-3 review). One `chamber ingest`
+    // writes the numbers; until then the hit is shown alone, as before.
+    if (section === undefined) {
+      order.push(h);
+      continue;
+    }
     const file = passagePathOf(h.sourceRef);
-    const rows = (piecesOf.all(`${file}#p`, `${file}#q`, h.title) as unknown as Row[])
-      .filter((r) => r.source_kind === h.sourceKind)
-      .filter((r) => /^\d+$/.test(r.source_ref.slice(file.length + 2)))
-      .filter((r) => ingestRootOf(r.meta) === root);
-    // One section is one unbroken run of #pN around the hit. The title alone
-    // is a heading path, and a file can repeat it — eight `## Entry` sections
-    // in a daily log — so keying on title merged unrelated sections and
-    // reported pieces "cut" that were never split (round-2 review).
-    const byIndex = new Map(rows.map((r) => [pieceIndex(r.source_ref)!, r]));
-    let lo = at;
-    while (byIndex.has(lo - 1)) lo--;
-    let hi = at;
-    while (byIndex.has(hi + 1)) hi++;
-    const key = JSON.stringify([h.sourceKind, root, file, h.title, lo]);
+    const key = JSON.stringify([h.sourceKind, root, file, section]);
     let s = sections.get(key);
     if (!s) {
-      const pieces: PassageRow[] = [];
-      for (let i = lo; i <= hi; i++) {
-        const r = byIndex.get(i);
-        if (!r) continue;
-        pieces.push({
+      const pieces: PassageRow[] = (
+        piecesOf.all(`${file}#p`, `${file}#q`, h.title) as unknown as Row[]
+      )
+        .filter((r) => r.source_kind === h.sourceKind)
+        .filter((r) => /^\d+$/.test(r.source_ref.slice(file.length + 2)))
+        .filter((r) => ingestRootOf(r.meta) === root && sectionOf(r.meta) === section)
+        .map((r) => ({
           documentId: r.id,
           sourceRef: r.source_ref,
           title: r.title,
           body: r.body,
           snapshotHash: r.snapshot_hash,
           sourceKind: r.source_kind,
-        });
-      }
+        }));
       s = { key, pieces, hits: new Set(), shown: new Set() };
       sections.set(key, s);
       order.push(s);
@@ -204,14 +214,14 @@ export function withSiblings<T extends PassageRow>(
     else passages.push(o);
   }
 
-  const sectionOf = new Map<string, Section>();
-  for (const s of sections.values()) for (const p of s.pieces) sectionOf.set(p.documentId, s);
+  const sectionOfPiece = new Map<string, Section>();
+  for (const s of sections.values()) for (const p of s.pieces) sectionOfPiece.set(p.documentId, s);
   return {
     passages,
     omittedFromCited: (cited) => {
       const cut = new Set<Section>();
       for (const id of cited) {
-        const s = sectionOf.get(id);
+        const s = sectionOfPiece.get(id);
         if (s) cut.add(s);
       }
       let n = 0;

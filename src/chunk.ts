@@ -97,6 +97,16 @@ export interface Passage {
    * unless "# Policy Manual / ## Data / ### Retention" travels with it.
    */
   body: string;
+  /**
+   * Which section of the note this passage came from — the parse's own
+   * section identity, so one section split into several passages shares one
+   * number and two sections that happen to share a heading do not. Nothing
+   * else can tell them apart once they are stored: a daily log's consecutive
+   * `## Entry` sections and one long split `## Entry` look identical by title
+   * and position (round-3 review, 2026-09-26). Like `index`, a pure function
+   * of the body.
+   */
+  section: number;
 }
 
 /**
@@ -519,6 +529,7 @@ export function splitPassages(body: string): Passage[] {
         index: passages.length,
         headings: s.headings,
         body: prefix === "" ? c : c === "" ? prefix : `${prefix}\n\n${c}`,
+        section: s.id,
       });
     }
   }
@@ -535,6 +546,7 @@ export function splitPassages(body: string): Passage[] {
       index: i,
       headings: [],
       body: b,
+      section: 0,
     }));
   }
   return passages;

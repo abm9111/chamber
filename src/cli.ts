@@ -1474,7 +1474,8 @@ async function main(): Promise<void> {
             console.log(`  not_found: ${f.refId}${minted}`);
             console.log(
               "    nothing is stored under this id — the cited passage left the corpus" +
-                " (the note shrank past this position, or its rows were replaced)." +
+                " (the note shrank past this position, its rows were replaced, or prune" +
+                " removed it — an excluded file's cited passage is logged as evidence_pruned)." +
                 // Only what is actually known. An earlier version said "that
                 // position no longer resolves", which is a claim about the
                 // corpus NOW and was demonstrably false: `chamber index` can
@@ -1672,12 +1673,22 @@ async function main(): Promise<void> {
         );
       }
       if (excludedPinned > 0) {
+        // Deleted anyway: an exclude asks for the passage to go, and a kept
+        // cited one went on answering retrieval (owner decision, 2026-09-26).
+        // Named here, before anything is deleted, so the loss is chosen.
+        const citing = db
+          .prepare(
+            `SELECT DISTINCT belief_id AS b FROM belief_source WHERE ref_id IN (${[...excludedIds].map(() => "?").join(",")})`,
+          )
+          .all(...excludedIds) as { b: string }[];
         console.log(
-          `  ${excludedPinned} of the excluded passage(s) are cited by a belief and will be kept — ` +
-            `they still answer retrieval until that belief no longer cites them`,
+          `  ${excludedPinned} of the excluded passage(s) are cited by ${citing.length} belief(s) and will be ` +
+            `deleted too — the audit log records each, and verify will report those citations not_found:`,
         );
+        for (const c of citing.slice(0, 10)) console.log(`    ${c.b}`);
+        if (citing.length > 10) console.log(`    … and ${citing.length - 10} more`);
       }
-      const removable = goneIds.size + excludedIds.size - gonePinned - excludedPinned;
+      const removable = goneIds.size + excludedIds.size - gonePinned;
 
       if (!confirm) {
         console.log(
@@ -1687,10 +1698,17 @@ async function main(): Promise<void> {
         );
         break;
       }
-      const removed = pruneDocuments(db, new Set([...goneIds, ...excludedIds]));
+      const removed = pruneDocuments(db, new Set([...goneIds, ...excludedIds]), {
+        deletePinned: excludedIds,
+      });
       console.log(`pruned ${removed.passages} passage(s) from ${removed.files} file(s)`);
+      if (removed.pinnedDeleted > 0) {
+        console.log(
+          `  ${removed.pinnedDeleted} of them were cited — recorded as evidence_pruned in the audit log`,
+        );
+      }
       if (removed.pinnedSkipped > 0) {
-        console.log(`kept ${removed.pinnedSkipped} passage(s) that a belief still cites`);
+        console.log(`kept ${removed.pinnedSkipped} passage(s) of gone files that a belief still cites`);
       }
       break;
     }

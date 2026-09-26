@@ -4641,7 +4641,47 @@ test("pins", "prune: a symlinked file whose target is excluded, and rows from an
   rmSync(base, { recursive: true, force: true });
 });
 
-test("pins", "an excluded passage a belief cites survives the prune", () => {
+test("pins", "an excluded passage is removed even when cited, and the loss is recorded", () => {
+  // Owner decision, 2026-09-26: an exclude is usually a privacy act, and a
+  // cited passage kept by prune went on answering retrieval. It is deleted;
+  // each belief that cited it is named in the hash-chained audit log, and
+  // verify then reports those pins not_found — visible, not silent. A *gone*
+  // file's cited passage is still kept: there the stored body is the last
+  // copy of the evidence, and nothing asked for it to go.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-prune-excl-cited-"));
+  mkdirSync(join(dir, "private"));
+  writeFileSync(join(dir, "private", "p.md"), "# P\n\n## S\n\nZebra private fact.\n");
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  const id = (db.prepare(`SELECT id FROM vector_document WHERE source_ref LIKE 'private/p.md#%'`).get() as { id: string }).id;
+  const snapshotHash = verifyPin(db, { kind: "vault_page", refId: id, snapshotHash: "" }).actualHash!;
+  const bel = commitBelief(db, {
+    type: "inference",
+    text: "the zebra fact is private",
+    sources: [{ kind: "vault_page", refId: id, snapshotHash }],
+    authorFamily: "test",
+    path: "fast",
+    requireVerifiedSupport: true,
+  });
+  assert(bel.ok, JSON.stringify(bel));
+
+  const excluded = new Set(findExcludedDocuments(db, [{ root: dir, exclude: ["private"] }]).flatMap((g) => g.ids));
+  const out = pruneDocuments(db, excluded, { deletePinned: excluded });
+  const left = (db.prepare(`SELECT count(*) n FROM vector_document WHERE id = ?`).get(id) as { n: number }).n;
+  assert(left === 0 && out.pinnedDeleted === 1, `the cited excluded row must go: ${JSON.stringify(out)}`);
+  const audit = db
+    .prepare(`SELECT detail_json AS d FROM audit_event WHERE action = 'evidence_pruned'`)
+    .all() as { d: string }[];
+  assert(
+    audit.length === 1 && audit[0]!.d.includes(bel.beliefId!) && audit[0]!.d.includes(id),
+    `the loss must be in the audit log with the belief and the row: ${JSON.stringify(audit)}`,
+  );
+  const vr = buildVerifyReport(db);
+  assert(vr.broken + vr.degraded > 0, "verify must now report the belief's evidence as missing");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("pins", "pruneDocuments keeps a cited row unless told to delete it", () => {
   const dir = mkdtempSync(join(tmpdir(), "chamber-prune-excl-pin-"));
   mkdirSync(join(dir, "drafts"));
   writeFileSync(join(dir, "drafts", "c.md"), "# C\n\n## S\n\nRefunds close after thirty days.\n");

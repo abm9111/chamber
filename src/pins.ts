@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { sha256 } from "./hash.ts";
 import { passagePathOf } from "./chunk.ts";
 import { excludeMatcher } from "./ingest.ts";
+import { appendAuditInTx } from "./audit.ts";
 
 export type PinFailure = "not_found" | "hash_mismatch" | "kind_unregistered";
 
@@ -1010,20 +1011,34 @@ export function countPinned(db: DatabaseSync, ids: Iterable<string>): number {
 export function pruneDocuments(
   db: DatabaseSync,
   ids: ReadonlySet<string>,
-): { files: number; passages: number; pinnedSkipped: number } {
-  if (ids.size === 0) return { files: 0, passages: 0, pinnedSkipped: 0 };
+  opts: {
+    /**
+     * Ids to delete even though a belief cites them. The CLI passes the
+     * excluded rows: an exclude is usually a privacy act, and a kept cited
+     * passage went on answering retrieval (owner decision, 2026-09-26). Gone
+     * files are never passed here — their stored body is the last copy of the
+     * evidence. Each deletion names its citing beliefs in the audit chain, in
+     * the same transaction, and verify then reports those pins not_found.
+     */
+    deletePinned?: ReadonlySet<string>;
+  } = {},
+): { files: number; passages: number; pinnedSkipped: number; pinnedDeleted: number } {
+  if (ids.size === 0) return { files: 0, passages: 0, pinnedSkipped: 0, pinnedDeleted: 0 };
   // The pin check is part of the DELETE, inside BEGIN IMMEDIATE. Reading it
   // before the lock — as the first version did — let a belief committed in
   // between (the MCP server runs alongside) lose the row it cites: a
   // precondition checked outside the write it guards (VIGIL DATA-001).
   const info = db.prepare(`SELECT source_ref AS ref, metadata_json AS meta FROM vector_document WHERE id = ?`);
-  const del = db.prepare(
+  const delUnpinned = db.prepare(
     `DELETE FROM vector_document
       WHERE id = ? AND NOT EXISTS (SELECT 1 FROM belief_source s WHERE s.ref_id = ?)`,
   );
+  const delAny = db.prepare(`DELETE FROM vector_document WHERE id = ?`);
+  const citers = db.prepare(`SELECT DISTINCT belief_id AS b FROM belief_source WHERE ref_id = ?`);
   const exists = db.prepare(`SELECT 1 AS x FROM vector_document WHERE id = ?`);
   let passages = 0;
   let pinnedSkipped = 0;
+  let pinnedDeleted = 0;
   const files = new Set<string>();
   // One transaction: a partial prune leaves a corpus that is neither the state
   // the operator saw in the dry run nor the one they asked for.
@@ -1032,9 +1047,25 @@ export function pruneDocuments(
     for (const id of ids) {
       const r = info.get(id) as { ref: string | null; meta: string | null } | undefined;
       if (!r) continue; // already gone
-      if (Number(del.run(id, id).changes ?? 0) === 0) {
-        if (exists.get(id)) pinnedSkipped++;
-        continue;
+      if (Number(delUnpinned.run(id, id).changes ?? 0) === 0) {
+        if (!exists.get(id)) continue;
+        if (!opts.deletePinned?.has(id)) {
+          pinnedSkipped++;
+          continue;
+        }
+        const beliefs = (citers.all(id) as { b: string }[]).map((x) => x.b);
+        delAny.run(id);
+        // `audit_event.action` is free text (CLAUDE.md: gate_event's CHECK
+        // vocabulary would reject a new verb and park the whole prune).
+        appendAuditInTx(db, {
+          category: "ledger",
+          action: "evidence_pruned",
+          actor: "operator",
+          subjectKind: "vector_document",
+          subjectId: id,
+          detail: { reason: "excluded", documentId: id, sourceRef: r.ref, beliefIds: beliefs },
+        });
+        pinnedDeleted++;
       }
       passages++;
       let root = "";
@@ -1051,7 +1082,7 @@ export function pruneDocuments(
     db.exec("ROLLBACK");
     throw err;
   }
-  return { files: files.size, passages, pinnedSkipped };
+  return { files: files.size, passages, pinnedSkipped, pinnedDeleted };
 }
 
 export function countUnsourcedBeliefs(

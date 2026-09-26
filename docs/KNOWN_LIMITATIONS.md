@@ -253,7 +253,14 @@ of code.
 > stored rows against each configured root's `exclude` list with the walk's
 > own normalisation (`excludeMatcher`, `src/ingest.ts`), and `chamber prune`
 > lists them in their own section and removes them with the same dry run, the
-> same pin exception and the same single transaction. The mistyped-exclude
+> same pin exception and the same single transaction. (Revised the same day,
+> owner decision: an *excluded* passage is removed even when a belief cites
+> it — an exclude is usually a privacy act, and a kept cited passage went on
+> answering retrieval. The dry run names each citing belief before anything is
+> deleted, each deletion is written to the audit chain as `evidence_pruned`
+> in the same transaction, and verify reports those pins `not_found`. A gone
+> file's cited passage is still kept: its stored body is the last copy of the
+> evidence.) The mistyped-exclude
 > risk the text below raises is bounded by the dry run, which names every file
 > before anything is deleted, and by `ingest` refusing a pattern that matches
 > nothing. Still open: a symlink inside a root retargeted to somewhere outside

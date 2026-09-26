@@ -871,6 +871,7 @@ function help(): void {
 Usage:
   init [--force]                     write a starter config file
   config show                        print every setting and where it came from
+  --version                          print the version (works with a broken config)
   chamber turn "<message>"     Run one gated turn (stub model)
   chamber status               Spend + queue + counts
   chamber queue                List pending writes
@@ -949,6 +950,18 @@ async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   if (!cmd || cmd === "help" || cmd === "-h" || cmd === "--help") {
     help();
+    return;
+  }
+
+  // Before any config load: "what version is this" gets asked most when
+  // something is broken, and a broken config must not stop the answer.
+  // `../package.json` resolves from src/ in a clone and from dist/ in the
+  // published tarball alike.
+  if (cmd === "--version" || cmd === "-v" || cmd === "version") {
+    const pkg = JSON.parse(
+      readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../package.json"), "utf8"),
+    ) as { version: string };
+    console.log(pkg.version);
     return;
   }
 

@@ -12776,6 +12776,27 @@ function mcpSession(env: NodeJS.ProcessEnv): {
   };
 }
 
+test("cli", "chamber --version prints the package version with no usable config", () => {
+  // `chamber --version` used to answer "unknown command". It must work on a
+  // machine whose config is broken — that is when someone asks what they run.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-version-"));
+  const bad = join(dir, "config.json");
+  writeFileSync(bad, "{ not json");
+  const pkg = JSON.parse(
+    readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../package.json"), "utf8"),
+  ) as { version: string };
+  for (const flag of ["--version", "-v", "version"]) {
+    const r = spawnSync(process.execPath, ["--experimental-strip-types", CLI_PATH, flag], {
+      encoding: "utf8",
+      timeout: 30_000,
+      env: { ...process.env, CHAMBER_CONFIG: bad },
+    });
+    assert(r.status === 0, `${flag} exited ${r.status}: ${r.stderr}`);
+    assert(r.stdout.trim() === pkg.version, `${flag} printed ${JSON.stringify(r.stdout)}, want ${pkg.version}`);
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("cli", "chamber_ask follows a config edit without a reconnect", async () => {
   // The server copied the model settings into its environment on the first
   // tool call and never looked again. Editing the base while a host held it

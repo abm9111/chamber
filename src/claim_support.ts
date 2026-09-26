@@ -56,7 +56,7 @@ const DOMAIN = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|ae|net|org|io|co|a
 // but could not match itself once spacing was refused for single letters
 // (round-5 review).
 const NUMBER =
-  /(?:(?<![\p{L}\p{N}%°+)\]]\uE000*)-\uE000*)?\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})m(?![\p{L}\p{N}])|\s?%)?/giu;
+  /(?:(?<![\p{N}%°+)\]]\uE000*)(?<![\p{L}_])-\uE000*)?\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})m(?![\p{L}\p{N}])|\s?%)?/giu;
 
 /**
  * Applied to claim and passage alike, so both sides read one spelling.
@@ -80,9 +80,17 @@ function normalize(text: string): string {
     // satisfied "23", "Tes*la" satisfied "Tesla" — and covered only `*` and
     // backticks, so "-_5%_", "-~~5%~~", "-<b>5%</b>" still hid a sign
     // (VIGIL on 359d706). Claim and passage alike.
-    .replace(/<\/?[A-Za-z][^<>]{0,30}>/g, SEP)
+    // Minus entities are minus signs (VIGIL AIML-006).
+    .replace(/&minus;|&#8722;|&#x2212;/gi, "-")
+    .replace(/<\/?[A-Za-z][^<>]{0,200}>/g, SEP)
     .replace(/~~|==/g, SEP)
-    .replace(/[*`_]/g, SEP)
+    // `_` inside a token is part of it — "1_000", "MAX_PASSAGES" — and only
+    // at a token's edge is it emphasis. Turning every `_` into a boundary
+    // let "1" be satisfied by "1_000" (VIGIL AIML-007). A digit group
+    // separator is dropped so "1_000" reads as 1000.
+    .replace(/(\p{Nd})_(?=\p{Nd})/gu, "$1")
+    .replace(/(?<![\p{L}\p{N}])_+|_+(?![\p{L}\p{N}])/gu, SEP)
+    .replace(/[*`]/g, SEP)
     .replace(/[‐‑‒–−﹣－]/g, "-")
     // Spaced forms too ("J. R. R.", "U. S."), without eating the space after
     // the last dot — round-6 review flagged "J.R.R." against "J. R. R.".
@@ -97,7 +105,7 @@ function normalize(text: string): string {
  * Hyphens and apostrophes inside are kept.
  */
 const NAME =
-  /(?<![\p{L}\p{N}])(?:\p{N}*\p{Lu}[\p{L}\p{N}]*|\p{Ll}+\p{Lu}[\p{L}\p{N}]*)(?:['’-][\p{L}\p{N}]+)*/gu;
+  /(?<![\p{L}\p{N}_])(?:\p{N}*\p{Lu}[\p{L}\p{N}_]*|\p{Ll}+\p{Lu}[\p{L}\p{N}_]*)(?:['’-][\p{L}\p{N}_]+)*/gu;
 
 function stripMarkup(text: string): string {
   return text
@@ -253,17 +261,20 @@ function numberFound(numeric: string, digits: string, suffix: string): boolean {
   // other way round — a closed list of sign positions — and markdown was not
   // on it: "**-5%**" certified "Sales grew 5%" (VIGIL AIML-002). Every
   // character not known to end a quantity now leaves the dash a sign.
-  const range = "[\\p{L}\\p{N}%°+)\\]]";
-  // `[^]`, not `.`: `.` does not match a line break, so a minus opening a
-  // line read unsigned — "Sales grew 5%" came back ALLOWED over "…:\n-5%"
-  // end to end (VIGIL on 6e20674). SEP (markup) is skipped on both sides of
-  // the dash, so "-_5%_" keeps its sign and "**10%**–20%" stays a range.
+  // A dash is a range or id marker right after a letter (AGPL-3.0), or
+  // after a quantity — a digit, %, °, +, a closing bracket — with or without
+  // markup between (19-25, 2°–8°C, **10%**–20%). Anywhere else, including
+  // after a letter *and markup* ("<td>Q3 sales</td><td>-5%" — VIGIL
+  // AIML-005, which 4693bfb introduced by skipping markup after letters
+  // too), it is a minus.
+  // `[^]`, not `.`: `.` does not match a line break (VIGIL on 6e20674).
+  const quantity = "[\\p{N}%°+)\\]]";
   const sep = "\\uE000*";
   const signed = digits.startsWith("-");
   const body = signed ? `-${sep}${escapeRegex(digits.slice(1))}` : escapeRegex(digits);
   const before = signed
-    ? `(?<!${range}${sep}|[.,])`
-    : `(?<![\\p{Nd}.,])(?<!(?:^|(?!${range})(?!\\uE000)[^])${sep}-${sep})`;
+    ? `(?<!${quantity}${sep})(?<![\\p{L}_.,])`
+    : `(?<![\\p{Nd}.,])(?<!(?<!${quantity}${sep})(?<![\\p{L}_])-${sep})`;
   return new RegExp(`${before}${body}${tail}`, "iu").test(numeric);
 }
 
@@ -289,7 +300,8 @@ function nameFound(haystack: string, term: string): boolean {
   return parts.length > 1 && parts.every((p) => nameFound(haystack, p));
 }
 
-const isAlnum = (c: string | undefined): boolean => c !== undefined && /[\p{L}\p{N}]/u.test(c);
+// `_` counts: "MAX_PASSAGES" is one token, not satisfied by "MAX_OTHER".
+const isAlnum = (c: string | undefined): boolean => c !== undefined && /[\p{L}\p{N}_]/u.test(c);
 const isLower = (c: string | undefined): boolean => c !== undefined && /\p{Ll}/u.test(c);
 const isUpper = (c: string | undefined): boolean => c !== undefined && /\p{Lu}/u.test(c);
 

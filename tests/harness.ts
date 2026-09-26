@@ -9181,6 +9181,26 @@ test("pins", "claim support: markup is a boundary for words and transparent for 
   assert(r.claims[0]!.status !== "ALLOWED", `end to end: ${JSON.stringify(r.claims[0])}`);
 });
 
+test("pins", "claim support: VIGIL on 4693bfb — markup after a letter, entities, underscores", async () => {
+  const miss = (c: string, p: string): string[] => missingTerms(c, [p]);
+  // AIML-005: letter, markup, dash is a minus, not an id.
+  // AIML-006: minus entities and long tags.
+  for (const p of ["<tr><td>Q3 sales</td><td>-5%</td></tr>", "delta==-5%", "_Q3 sales_-5%", "&minus;5%", "&#8722;5%", "&#x2212;5%", '-<span class="negative-value-highlight">5%</span>']) {
+    assert(JSON.stringify(miss("Sales grew 5% [1]", p)) === '["5%"]', `"5%" must not be satisfied by ${JSON.stringify(p)}: ${JSON.stringify(miss("Sales grew 5% [1]", p))}`);
+  }
+  // AIML-007: underscores inside a token keep it whole.
+  for (const [c, p] of [["the limit is 1 [1]", "limit 1_000"], ["set MAX_PASSAGES [1]", "MAX_OTHER and PASSAGES_MIN"]] as [string, string][]) {
+    assert(miss(c, p).length > 0, `${JSON.stringify(c)} must not be satisfied by ${JSON.stringify(p)}`);
+  }
+  for (const [c, p] of [["the limit is 1000 [1]", "limit 1_000"], ["set MAX_PASSAGES [1]", "we set MAX_PASSAGES = 8"], ["AGPL-3.0 [1]", "Skyvern is AGPL-3.0."], ["Efficacy reached 20% [1]", "**10%**–20%"], ["fell -5% [1]", "<td>-5%</td>"]] as [string, string][]) {
+    assert(miss(c, p).length === 0, `${JSON.stringify(c)} vs ${JSON.stringify(p)} flagged ${JSON.stringify(miss(c, p))}`);
+  }
+  const db = freshDb();
+  upsertDocument(db, { sourceKind: "vault_page", sourceRef: "t.md", title: "T", body: "<tr><td>Q3 sales</td><td>-5%</td></tr>", model: "local-hash-v1" });
+  const r = await runAsk(db, "Q3 sales", { model: "local-hash-v1", complete: async () => "Q3 sales grew 5% [1]" });
+  assert(r.claims[0]!.status !== "ALLOWED", `end to end: ${JSON.stringify(r.claims[0])}`);
+});
+
 test("pins", "debt payment does not write the same pin twice", () => {
   // Round-6 review: the duplicate-pin skip had no test.
   const db = freshDb();

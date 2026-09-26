@@ -59,9 +59,10 @@ import { enforceReplyContract } from "./contract.ts";
 import { runAsk, stubDisclosure } from "./ask.ts";
 import {
   buildVerifyReport,
+  findExcludedDocuments,
   findGoneDocuments,
   ingestRootStatus,
-  pruneGoneDocuments,
+  pruneFiles,
 } from "./pins.ts";
 import { runExpiryJob } from "./expiry.ts";
 import { indexCodeTree, searchCode } from "./code_index.ts";
@@ -1579,7 +1580,14 @@ async function main(): Promise<void> {
       }
       const confirm = rest.includes("--confirm");
       const stale = findGoneDocuments(db);
-      if (stale.length === 0) {
+      // Still on disk, but a configured root's exclude list now covers it.
+      // Without this an exclude added after ingest steered only future walks,
+      // and the passages already written kept answering retrieval.
+      const goneFiles = new Set(stale.map((g) => g.file));
+      const excluded = findExcludedDocuments(db, loadedConfig!.ingest).filter(
+        (g) => !goneFiles.has(g.file),
+      );
+      if (stale.length === 0 && excluded.length === 0) {
         // "Nothing to prune" is the same sentence whether every file is
         // present or no root could be read, and those are opposite states.
         // findGoneDocuments skips unreachable roots on purpose, so the
@@ -1614,14 +1622,25 @@ async function main(): Promise<void> {
         );
         break;
       }
-      const passages = stale.reduce((n, g) => n + g.passages, 0);
-      console.log(
-        `${passages} passage(s) in ${stale.length} file(s) no longer on disk:`,
-      );
-      for (const g of stale.slice(0, 10)) {
-        console.log(`  ${g.file}  (${g.passages} passage(s))`);
+      const listFiles = (files: { file: string; passages: number }[]): void => {
+        for (const g of files.slice(0, 10)) {
+          console.log(`  ${g.file}  (${g.passages} passage(s))`);
+        }
+        if (files.length > 10) console.log(`  … and ${files.length - 10} more file(s)`);
+      };
+      const gonePassages = stale.reduce((n, g) => n + g.passages, 0);
+      const excludedPassages = excluded.reduce((n, g) => n + g.passages, 0);
+      if (stale.length > 0) {
+        console.log(`${gonePassages} passage(s) in ${stale.length} file(s) no longer on disk:`);
+        listFiles(stale);
       }
-      if (stale.length > 10) console.log(`  … and ${stale.length - 10} more file(s)`);
+      if (excluded.length > 0) {
+        console.log(
+          `${excludedPassages} passage(s) in ${excluded.length} file(s) now covered by an ingest root's exclude list:`,
+        );
+        listFiles(excluded);
+      }
+      const passages = gonePassages + excludedPassages;
 
       if (!confirm) {
         console.log(
@@ -1629,7 +1648,12 @@ async function main(): Promise<void> {
         );
         break;
       }
-      const removed = pruneGoneDocuments(db);
+      // The files listed above, not a fresh sweep: what is deleted is exactly
+      // what this run showed, even if the disk or the config moved since.
+      const removed = pruneFiles(
+        db,
+        new Set([...stale, ...excluded].map((g) => g.file)),
+      );
       console.log(
         `pruned ${removed.passages} passage(s) from ${removed.files} file(s)`,
       );

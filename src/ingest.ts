@@ -330,6 +330,39 @@ function matchExclude(
   return undefined;
 }
 
+/**
+ * The walk's exclude test, for rows already in the corpus.
+ *
+ * An exclude only ever steered the walk, so adding one to a root that had
+ * already been ingested left every passage beneath it in the index, answering
+ * retrieval, with nothing on disk changed that `prune` could notice. This
+ * exposes the same normalisation and the same segment matching the walk uses,
+ * so "excluded" means one thing in both places.
+ *
+ * `root` is the realpath, as `ingestDirectory` stores it in `ingestRoot`. A
+ * root that no longer resolves gets a plain resolve, which then equals no
+ * stored root and matches nothing — unreachable is never read as excluded.
+ * A pattern `normalizeExclude` rejects is skipped here; `ingest` is the place
+ * that refuses it out loud.
+ */
+export function excludeMatcher(
+  rootInput: string,
+  exclude: readonly string[],
+): { root: string; matches: (relPath: string) => boolean } {
+  const root = realpathOrResolve(rootInput);
+  const patterns: ExcludePattern[] = [];
+  for (const raw of exclude) {
+    const norm = normalizeExclude(raw, root);
+    if (norm.ok) {
+      patterns.push({ raw, pattern: norm.pattern, segmented: norm.segmented, matched: 0 });
+    }
+  }
+  return {
+    root,
+    matches: (relPath) => matchExclude(patterns, toPosix(relPath)) !== undefined,
+  };
+}
+
 // ─── walk ────────────────────────────────────────────────────────────────────
 
 interface WalkContext {

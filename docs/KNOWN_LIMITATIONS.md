@@ -214,6 +214,20 @@ of code.
 > so a pin on the old path does not follow the rename. The original text stays
 > below, dated.
 
+> **Correction, 2026-09-26.** The other half — a file still on disk that an
+> exclude now covers — was open until today, and it was the half an operator
+> actually reaches for: adding `exclude` to a root that had already been
+> ingested steered only the next walk, and every passage already written
+> stayed and kept answering retrieval. `prune` could not see them, because
+> their files existed. `findExcludedDocuments` (`src/pins.ts`) now matches
+> stored rows against each configured root's `exclude` list with the walk's
+> own normalisation (`excludeMatcher`, `src/ingest.ts`), and `chamber prune`
+> lists them in their own section and removes them with the same dry run, the
+> same pin exception and the same single transaction. The mistyped-exclude
+> risk the text below raises is bounded by the dry run, which names every file
+> before anything is deleted, and by `ingest` refusing a pattern that matches
+> nothing.
+
 
 
 Re-ingesting a directory does delete, and the boundary is worth stating precisely,

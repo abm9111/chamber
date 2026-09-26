@@ -14,6 +14,7 @@ import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { sha256 } from "./hash.ts";
 import { passagePathOf } from "./chunk.ts";
+import { excludeMatcher } from "./ingest.ts";
 
 export type PinFailure = "not_found" | "hash_mismatch" | "kind_unregistered";
 
@@ -904,10 +905,72 @@ export function pruneGoneDocuments(db: DatabaseSync): {
   passages: number;
   pinnedSkipped: number;
 } {
-  const gone = findGoneDocuments(db);
-  if (gone.length === 0) return { files: 0, passages: 0, pinnedSkipped: 0 };
+  return pruneFiles(db, new Set(findGoneDocuments(db).map((g) => g.file)));
+}
 
-  const goneSet = new Set(gone.map((g) => g.file));
+/**
+ * Every document whose file an ingest root's `exclude` list now covers.
+ *
+ * The counterpart to `findGoneDocuments` for a file that is still on disk:
+ * an exclude added after a root was ingested stops the walk from reaching it,
+ * and nothing else ever removed what the walk had already written. Matching
+ * is `excludeMatcher`'s, which is the walk's own, and it is keyed on the
+ * stored `ingestRoot` — a document ingested through a different root, or by a
+ * bare path, is outside every configured root and never matches.
+ */
+export function findExcludedDocuments(
+  db: DatabaseSync,
+  roots: readonly { root: string; exclude: readonly string[] }[],
+): { file: string; passages: number }[] {
+  const matchers = new Map<string, (rel: string) => boolean>();
+  for (const r of roots) {
+    if (r.exclude.length === 0) continue;
+    const m = excludeMatcher(r.root, r.exclude);
+    matchers.set(m.root, m.matches);
+  }
+  if (matchers.size === 0) return [];
+
+  const rows = db
+    .prepare(
+      `SELECT source_ref AS ref, metadata_json AS meta
+         FROM vector_document
+        WHERE source_ref IS NOT NULL AND metadata_json IS NOT NULL`,
+    )
+    .all() as { ref: string | null; meta: string | null }[];
+  const byFile = new Map<string, number>();
+  for (const r of rows) {
+    if (!r.ref || !r.meta) continue;
+    let root: unknown;
+    try {
+      root = (JSON.parse(r.meta) as { ingestRoot?: unknown }).ingestRoot;
+    } catch {
+      continue;
+    }
+    if (typeof root !== "string" || root === "") continue;
+    const matches = matchers.get(root);
+    if (!matches) continue;
+    const rel = passagePathOf(r.ref);
+    if (!matches(rel)) continue;
+    const file = join(root, rel);
+    byFile.set(file, (byFile.get(file) ?? 0) + 1);
+  }
+  return [...byFile]
+    .map(([file, passages]) => ({ file, passages }))
+    .sort((a, b) => b.passages - a.passages);
+}
+
+/**
+ * Delete the corpus rows of the given files — except any a belief still cites.
+ * The one deletion path behind both gone and excluded files, so the pin
+ * exception cannot hold for one and be forgotten for the other.
+ */
+export function pruneFiles(
+  db: DatabaseSync,
+  targets: ReadonlySet<string>,
+): { files: number; passages: number; pinnedSkipped: number } {
+  if (targets.size === 0) return { files: 0, passages: 0, pinnedSkipped: 0 };
+
+  const goneSet = targets;
   const rows = db
     .prepare(
       `SELECT d.id AS id, d.source_ref AS ref, d.metadata_json AS meta,

@@ -58,6 +58,8 @@ import {
   findGonePinnedFiles,
   findGoneDocuments,
   pruneGoneDocuments,
+  pruneFiles,
+  findExcludedDocuments,
   buildVerifyReport,
   CITABLE_SOURCE_KINDS,
 } from "../src/pins.ts";
@@ -4547,6 +4549,87 @@ test("pins", "prune deletes nothing when the ingest root itself is unreachable",
   );
   const after = db.prepare(`SELECT COUNT(*) AS c FROM vector_document`).get() as { c: number };
   assert(after.c === before.c, "the corpus must be untouched");
+});
+
+/**
+ * An exclude added after a root was ingested used to steer only the next
+ * walk: the passages already written stayed and kept answering retrieval, and
+ * `prune` could not see them because their files were still on disk.
+ */
+test("pins", "prune finds and removes files a root's exclude list now covers", () => {
+  const base = mkdtempSync(join(tmpdir(), "chamber-prune-excl-"));
+  // The root sits under a directory named `private` on purpose: the pattern
+  // must match below the root only, never the root's own ancestry.
+  const dir = join(base, "private", "vault");
+  mkdirSync(join(dir, "private"), { recursive: true });
+  mkdirSync(join(dir, "notes", "private"), { recursive: true });
+  writeFileSync(join(dir, "keep.md"), "# Keep\n\n## S\n\nA note that stays.\n");
+  writeFileSync(join(dir, "private", "a.md"), "# A\n\n## S\n\nSecret one.\n");
+  writeFileSync(join(dir, "notes", "private", "b.md"), "# B\n\n## S\n\nSecret two.\n");
+  // Configured through a symlink, as ~/Vault is: the stored ingestRoot is the
+  // realpath, and the config names the link.
+  const link = join(base, "link");
+  symlinkSync(dir, link);
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+
+  const found = findExcludedDocuments(db, [{ root: link, exclude: ["private"] }]);
+  const names = found.map((g) => g.file.split("/").slice(-2).join("/")).sort();
+  assert(
+    JSON.stringify(names) === '["private/a.md","private/b.md"]',
+    `expected the two private files at any depth, got ${JSON.stringify(names)}`,
+  );
+  assert(
+    findExcludedDocuments(db, [{ root: link, exclude: [] }]).length === 0,
+    "no exclude list, nothing excluded",
+  );
+  assert(
+    findExcludedDocuments(db, [{ root: join(base, "elsewhere"), exclude: ["private"] }])
+      .length === 0,
+    "a pattern on another root must not touch this one",
+  );
+
+  const out = pruneFiles(db, new Set(found.map((g) => g.file)));
+  assert(out.files === 2 && out.passages >= 2, JSON.stringify(out));
+  const left = db
+    .prepare(`SELECT source_ref AS r FROM vector_document`)
+    .all() as { r: string }[];
+  assert(
+    left.length > 0 && left.every((x) => x.r.startsWith("keep.md")),
+    `only keep.md may remain, got ${JSON.stringify(left)}`,
+  );
+  rmSync(base, { recursive: true, force: true });
+});
+
+test("pins", "an excluded passage a belief cites survives the prune", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-prune-excl-pin-"));
+  mkdirSync(join(dir, "drafts"));
+  writeFileSync(join(dir, "drafts", "c.md"), "# C\n\n## S\n\nRefunds close after thirty days.\n");
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  const doc = db
+    .prepare(`SELECT id FROM vector_document WHERE source_ref LIKE ?`)
+    .get("drafts/c.md#%") as { id: string };
+  const snapshotHash = verifyPin(db, { kind: "vault_page", refId: doc.id, snapshotHash: "" })
+    .actualHash!;
+  const r = commitBelief(db, {
+    type: "inference",
+    text: "refunds close after thirty days",
+    sources: [{ kind: "vault_page", refId: doc.id, snapshotHash }],
+    authorFamily: "test",
+    path: "fast",
+    requireVerifiedSupport: true,
+  });
+  assert(r.ok, `setup: ${JSON.stringify(r)}`);
+
+  const found = findExcludedDocuments(db, [{ root: dir, exclude: ["drafts"] }]);
+  const out = pruneFiles(db, new Set(found.map((g) => g.file)));
+  assert(out.pinnedSkipped >= 1, `the cited passage must be kept, got ${JSON.stringify(out)}`);
+  const still = db
+    .prepare(`SELECT COUNT(*) AS c FROM vector_document WHERE id = ?`)
+    .get(doc.id) as { c: number };
+  assert(still.c === 1, "the pinned row must survive");
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("pins", "an opaque run is charged far more than prose of the same length", () => {

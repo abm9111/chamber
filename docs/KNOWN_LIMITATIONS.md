@@ -126,13 +126,15 @@ deployment machine is the stated entry criterion for any capability level above 
 > Later rounds narrowed names after abbreviations: listed ones (`e.g.`,
 > `Dr.`, `Sgt.`, `Dept.`, `Ave.`, …), dotted initials in either spacing
 > (`U.S.`, `a.k.a.`, `J. R. R.`) and capitalised one- or two-letter words
-> (`Jr.`, `Mt.`). An abbreviation that is none of those — `Messrs.`, all-caps
-> `GEN.` — still hides the next name; a wider shape rule (any capitalised
-> word of up to five letters) was tried and reverted because "Paris." and
-> "Sony." then flagged the next ordinary sentence. A leading minus is part of
-> its number (`-5%` ≠ `5%`) only in sign position — after a space, `(`, `[`,
-> `|`, `=`, `:`, `,`, `/`, a quote or an em dash; after a digit, a letter or
-> a unit (`2°–8°C`, `10%–20%`, `AGPL-3.0`) a dash is a range or an id, `$9m` / `lakh` / `%` reducing to a bare number, and a
+> (`Jr.`, `Mt.`); the list is case-insensitive, so `GEN.` counts. An
+> abbreviation that is none of those — `Messrs.` — still hides the next
+> name; a wider shape rule (any capitalised word of up to five letters) was
+> tried and reverted because "Paris." and "Sony." then flagged the next
+> ordinary sentence. A leading minus is part of its number (`-5%` ≠ `5%`)
+> unless the dash directly follows a letter, a digit, a unit or a closing
+> bracket, where it is a range or an id (`19-25`, `2°–8°C`, `10%–20%`,
+> `AGPL-3.0`); a first version listed sign positions instead and missed
+> markdown (`**-5%**`), `$9m` / `lakh` / `%` reducing to a bare number, and a
 > passage's own `1,000 million` being flagged. Accepted, knowingly: a
 > capitalised ordinary word after a label or dash is now checked, so
 > "Delivery: Roughly 5 days [1]" is flagged when the passage lacks

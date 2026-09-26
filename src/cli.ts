@@ -64,6 +64,7 @@ import {
   ingestRootStatus,
   countPinned,
   documentIdsOfFiles,
+  forgetExcludedPinPaths,
   pruneDocuments,
 } from "./pins.ts";
 import { runExpiryJob } from "./expiry.ts";
@@ -1717,7 +1718,13 @@ async function main(): Promise<void> {
       const removed = pruneDocuments(db, new Set([...goneIds, ...excludedIds]), {
         deletePinned: excludedAllIds,
       });
+      // Pins whose rows were swept by an earlier re-ingest still name their
+      // file; an exclude means the name goes too (VIGIL EGRESS-002).
+      const forgotten = forgetExcludedPinPaths(db, loadedConfig!.ingest);
       console.log(`pruned ${removed.passages} passage(s) from ${removed.files} file(s)`);
+      if (forgotten > 0) {
+        console.log(`  cleared the excluded file name from ${forgotten} citation(s)`);
+      }
       if (removed.pinnedDeleted > 0) {
         console.log(
           `  ${removed.pinnedDeleted} of them were cited — recorded as evidence_pruned in the audit log`,

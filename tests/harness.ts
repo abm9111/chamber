@@ -59,6 +59,7 @@ import {
   findGoneDocuments,
   pruneGoneDocuments,
   pruneDocuments,
+  forgetExcludedPinPaths,
   documentIdsOfFiles,
   findExcludedDocuments,
   buildVerifyReport,
@@ -4681,6 +4682,33 @@ test("pins", "an excluded passage is removed even when cited, and the loss is re
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("pins", "no pin keeps an excluded file's name, even when its row was swept earlier", () => {
+  // VIGIL EGRESS-002 on 9207e6d: prune cleared pinned_ref only for rows it
+  // deleted. A pin whose row an earlier re-ingest had already swept (the note
+  // shrank) kept "private/passport.md#p1" forever.
+  const db = freshDb();
+  const root = mkdtempSync(join(tmpdir(), "chamber-forget-"));
+  mkdirSync(join(root, "private"));
+  writeFileSync(join(root, "private", "passport.md"), "# P\n");
+  const realRoot = realpathSync(root);
+  const bel = commitBelief(db, { type: "belief", text: "an unsourced claim to hang a pin on", sources: [], authorFamily: "test", path: "deep" });
+  assert(bel.ok, JSON.stringify(bel));
+  db.prepare(
+    `INSERT INTO belief_source (id, belief_id, kind, ref_id, snapshot_hash, provenance, pinned_ref, pinned_root)
+     VALUES ('src_x', ?, 'vault_page', 'vdoc_gone', 'h', 'vector', 'private/passport.md#p1', ?)`,
+  ).run(bel.beliefId!, realRoot);
+  db.prepare(
+    `INSERT INTO belief_source (id, belief_id, kind, ref_id, snapshot_hash, provenance, pinned_ref, pinned_root)
+     VALUES ('src_y', ?, 'vault_page', 'vdoc_keep', 'h', 'vector', 'notes/public.md#p0', ?)`,
+  ).run(bel.beliefId!, realRoot);
+  const n = forgetExcludedPinPaths(db, [{ root, exclude: ["private"] }]);
+  const rows = db.prepare(`SELECT id, pinned_ref AS r FROM belief_source ORDER BY id`).all() as { id: string; r: string | null }[];
+  assert(n === 1, `one pin forgotten, got ${n}`);
+  assert(rows.find((x) => x.id === "src_x")!.r === null, "the excluded path must be cleared");
+  assert(rows.find((x) => x.id === "src_y")!.r === "notes/public.md#p0", "other pins keep their position");
+  rmSync(root, { recursive: true, force: true });
+});
+
 test("pins", "pruneDocuments keeps a cited row unless told to delete it", () => {
   const dir = mkdtempSync(join(tmpdir(), "chamber-prune-excl-pin-"));
   mkdirSync(join(dir, "drafts"));
@@ -9081,6 +9109,20 @@ test("pins", "claim support: round-6 review — unit ranges, short proper nouns,
   // Still refused: round-5 signs and titles, and a spaced k that is not in the passage.
   for (const [c, p] of [["Sales grew 5% [1]", "change=-5%"], ["Sales grew 5% [1]", "| Q3 |-5%|"], ["run by Sgt. Tesla [1]", "Kingroon"], ["Revenue was 900 k [1]", "We had 900 users"]] as [string, string][]) {
     assert(miss(c, p).length > 0, `${JSON.stringify(c)} must not be satisfied by ${JSON.stringify(p)}`);
+  }
+});
+
+test("pins", "claim support: a dash is a range only after a letter, digit, unit or closing bracket", () => {
+  // VIGIL AIML-002 on 9207e6d: round 6 listed the characters after which a
+  // dash is a minus, and markdown was not on the list — "**-5%**" certified
+  // "Sales grew 5%". The rule is now the other way round.
+  const miss = (c: string, p: string): string[] => missingTerms(c, [p]);
+  for (const p of ["**-5%**", "*-5%*", "_-5%_", "`-5%`", ";-5%", "~-5%", ">-5%", "change=-5%", "| Q3 |-5%|"]) {
+    assert(miss("Sales grew 5% [1]", p).length > 0, `"5%" must not be satisfied by ${JSON.stringify(p)}`);
+  }
+  assert(miss("Sales fell -5 [1]", "**-5**").length === 0, "a signed claim matches a signed passage in emphasis");
+  for (const [c, p] of [["Store at 8°C max [1]", "Store at 2°–8°C."], ["Efficacy reached 20% [1]", "10%–20%"], ["He is 18 [1]", "Ages 12+–18."], ["Sizes 25 [1]", "Sizes 19-25."], ["licensed AGPL-3.0 [1]", "Skyvern is AGPL-3.0."], ["see (a)-3 [1]", "see (a)-3"]] as [string, string][]) {
+    assert(miss(c, p).length === 0, `${JSON.stringify(c)} vs ${JSON.stringify(p)} flagged ${JSON.stringify(miss(c, p))}`);
   }
 });
 

@@ -56,7 +56,7 @@ const DOMAIN = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|ae|net|org|io|co|a
 // but could not match itself once spacing was refused for single letters
 // (round-5 review).
 const NUMBER =
-  /(?:(?<=^|[\s([|=:,/"'“”‘’—])-)?\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})m(?![\p{L}\p{N}])|\s?%)?/giu;
+  /(?:(?<![\p{L}\p{N}%°+)\]])-)?\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})m(?![\p{L}\p{N}])|\s?%)?/giu;
 
 /**
  * Applied to claim and passage alike, so both sides read one spelling.
@@ -232,15 +232,16 @@ function numberFound(numeric: string, digits: string, suffix: string): boolean {
   // and "change=-5%" satisfied an unsigned "5%"). After a digit it is a
   // range ("19-25"), after a letter a version or id ("AGPL-3.0", "TASK-003").
   // A signed claim needs the same: "-3.0" is not satisfied by "AGPL-3.0".
-  // A dash is a minus only in sign position: at the start, after space, or
-  // after ( [ | = : , / a quote or an em dash. After a digit it is a range
-  // ("19-25"), after a letter an id ("AGPL-3.0"), and after a unit or symbol
-  // (`%`, `°`, `+`, `)`) it is a range too — round 5's "any non-alphanumeric"
-  // read "2°–8°C" and "10%–20%" as negative (round-6 review).
-  const signAt = `(?:^|[\\s(\\[|=:,\\/"'“”‘’—])`;
+  // A dash is a range or id marker only right after a letter, a digit, a
+  // unit or a closing bracket ("19-25", "AGPL-3.0", "2°–8°C", "10%–20%",
+  // "12+–18", "(a)-3"); anywhere else it is a minus. Round 6 had it the
+  // other way round — a closed list of sign positions — and markdown was not
+  // on it: "**-5%**" certified "Sales grew 5%" (VIGIL AIML-002). Every
+  // character not known to end a quantity now leaves the dash a sign.
+  const range = "[\\p{L}\\p{N}%°+)\\]]";
   const before = digits.startsWith("-")
-    ? `(?<=${signAt})`
-    : `(?<![\\p{Nd}.,])(?<!${signAt}-)`;
+    ? `(?<!${range}|[.,])`
+    : `(?<![\\p{Nd}.,])(?<!(?:^|(?!${range}).)-)`;
   return new RegExp(`${before}${escapeRegex(digits)}${tail}`, "iu").test(numeric);
 }
 

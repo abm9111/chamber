@@ -966,6 +966,52 @@ export function findExcludedDocuments(
     .sort((a, b) => b.passages - a.passages);
 }
 
+/**
+ * Clear the stored position of every pin that points into an excluded file.
+ *
+ * prune clears it for pins of rows it deletes, but a pin can outlive its row:
+ * a re-ingest that finds a note shorter sweeps the tail rows and leaves their
+ * pins behind, still naming "private/passport.md#p1" (VIGIL EGRESS-002). The
+ * pin keeps its id and hash — verify still reports it not_found — but not the
+ * name of a file the operator excluded. Returns how many pins were cleared.
+ */
+export function forgetExcludedPinPaths(
+  db: DatabaseSync,
+  roots: readonly { root: string; exclude: readonly string[] }[],
+): number {
+  const matchers = new Map<string, (rel: string) => boolean>();
+  for (const r of roots) {
+    if (r.exclude.length === 0) continue;
+    const m = excludeMatcher(r.root, r.exclude);
+    matchers.set(m.root, m.matches);
+  }
+  if (matchers.size === 0) return 0;
+  const pins = db
+    .prepare(
+      `SELECT id, pinned_ref AS ref, pinned_root AS root FROM belief_source
+        WHERE pinned_ref IS NOT NULL AND pinned_root IS NOT NULL`,
+    )
+    .all() as { id: string; ref: string; root: string }[];
+  const clear = db.prepare(
+    `UPDATE belief_source SET pinned_ref = NULL, pinned_root = NULL WHERE id = ?`,
+  );
+  let n = 0;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const p of pins) {
+      const matches = matchers.get(p.root);
+      if (matches && matches(passagePathOf(p.ref))) {
+        n += Number(clear.run(p.id).changes ?? 0);
+      }
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+  return n;
+}
+
 /** Ids of every corpus row whose file (ingestRoot + path) is in `files`. */
 export function documentIdsOfFiles(
   db: DatabaseSync,

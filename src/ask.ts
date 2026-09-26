@@ -32,6 +32,7 @@ import {
   CITABLE_SOURCE_KINDS,
 } from "./pins.ts";
 import { complete } from "./model.ts";
+import { withSiblings } from "./siblings.ts";
 
 export type CompleteFn = (prompt: string) => Promise<string>;
 
@@ -515,15 +516,19 @@ export async function runAsk(
           onLexicalError,
         });
 
-  const passages = hits.map((h, i) => ({
+  // A retrieved piece of a split section brings the rest of that section, each
+  // piece as its own numbered, pinned passage (src/siblings.ts).
+  const expanded = withSiblings(db, hits, k);
+  const passages = expanded.passages.map((h, i) => ({
     index: i + 1,
     documentId: h.documentId,
     sourceRef: h.sourceRef,
     title: h.title,
     body: h.body,
     snapshotHash: h.snapshotHash,
-    sourceKind: h.sourceKind,
+    sourceKind: h.sourceKind as (typeof hits)[number]["sourceKind"],
   }));
+
 
   // Skipped under `exact`: the user already aimed the lexical leg, and a
   // probe that re-finds what exact mode just retrieved would either be
@@ -668,6 +673,17 @@ export async function runAsk(
     });
   }
 
+  // Rejected citations count too: a claim that lost its pins to terms_absent
+  // is the case where the missing piece of its section matters most.
+  const cut = expanded.omittedFromCited(
+    out.flatMap((c) => [...c.citedRefs, ...c.rejected.map((rj) => rj.refId)]),
+  );
+  const siblingNotice =
+    cut > 0
+      ? `${cut} more piece(s) of a section this answer cites were not shown (cap); ` +
+        `the answer may be partial`
+      : undefined;
+
   return {
     answer,
     claims: out,
@@ -684,6 +700,7 @@ export async function runAsk(
     // over a restricted view of the corpus.
     note: joinNotes(
       uncitable.length > 0 ? withheldNote(uncitable) : undefined,
+      siblingNotice,
       embedderMismatchNote(db, queryEmbedModel),
       missedExactNote(missedExact),
       lexicalError && lexicalDegradedNote(lexicalError),

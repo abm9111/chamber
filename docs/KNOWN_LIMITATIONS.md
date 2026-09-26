@@ -597,6 +597,20 @@ Unplanned.
 
 ## 15. The embedder truncates at 256 tokens, and the chunker overshoots it
 
+> **Added 2026-09-26 — a split section reached the model in part.** Keeping
+> passages under the embedder's limit splits 8,242 of the vault's 18,755
+> sections into pieces, and retrieval ranks pieces independently. The
+> filament note's Tier 1 table had its header, Eryone and Geeetech in one
+> piece and Elegoo alone in the next; retrieval returned the second, and three
+> of three answers named 4 of the 8 brands the note lists. `ask` now shows a
+> retrieved piece's siblings — same file, root and heading path — as their
+> own numbered, pinned passages (`src/siblings.ts`), up to 5 per section and
+> 2k in total; the same question then named 8 of 8, three of three. The cost
+> is prompt size: on a 10-question vault run nearly every answer used the
+> full 2k. A section cut by the cap is announced only when the answer cites
+> it (6 of 10 answers on that run), because a note on every answer is one
+> nobody reads.
+
 `embedMinilm` shells out to `python3` with `scripts/embed_minilm.py`. Most of
 what this entry used to describe has been closed; what follows separates the
 two.

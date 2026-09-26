@@ -8507,6 +8507,118 @@ test("pins", "the support check holds at the commit, for every caller that passe
   );
 });
 
+// ─── a retrieved piece of a split section brings the rest of it ─────────────
+
+/**
+ * A section over the passage budget is split, and retrieval can rank one piece
+ * and not the others. Measured on the vault, 2026-09-26: the filament note's
+ * Tier 1 table was split so its header, Eryone and Geeetech sat in p32 and
+ * Elegoo alone in p33; retrieval returned p33, and every answer named 4 of the
+ * 8 brands the note lists. 8,242 of 18,755 sections in the vault are split.
+ */
+function splitTableVault(rows: number): { dir: string; brands: string[] } {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-siblings-"));
+  const brands = Array.from({ length: rows }, (_, i) => `Brand${String.fromCharCode(65 + i)}x`);
+  const table = [
+    "| Brand | Channel | Price | Range |",
+    "|-------|---------|-------|-------|",
+    ...brands.map(
+      (b, i) =>
+        `| **${b}** | Amazon.ae plus AliExpress official store | $${10 + i}-${20 + i} | PLA PETG ABS ASA TPU nylon carbon fibre silk matte |`,
+    ),
+  ].join("\n");
+  writeFileSync(join(dir, "filament.md"), `# Filament\n\n## Tier 1\n\n${table}\n\n## Other\n\nUnrelated closing note.\n`);
+  return { dir, brands };
+}
+
+test("pins", "runAsk shows every piece of a split section a retrieved piece belongs to", async () => {
+  const { dir, brands } = splitTableVault(12);
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  const pieces = db
+    .prepare(`SELECT source_ref AS r FROM vector_document WHERE title LIKE '%Tier 1'`)
+    .all() as { r: string }[];
+  assert(pieces.length >= 2, `precondition: the table must be split, got ${pieces.length} piece(s)`);
+
+  let prompt = "";
+  const r = await runAsk(db, "Brand table Tier 1 PLA", {
+    k: 1,
+    model: "local-hash-v1",
+    complete: async (p) => {
+      prompt = p;
+      return "BrandAx is sold on Amazon.ae. [1]";
+    },
+  });
+  for (const b of brands) assert(prompt.includes(b), `${b} never reached the model`);
+  assert(
+    r.passages.length === pieces.length,
+    `expected the ${pieces.length} pieces as passages, got ${r.passages.length}`,
+  );
+  // Each piece is its own numbered, pinned passage: a claim from a sibling
+  // cites it and verifies like any other.
+  const last = brands[brands.length - 1]!;
+  const n = r.passages.find((p) => {
+    const body = (db.prepare(`SELECT body FROM vector_document WHERE id = ?`).get(p.documentId) as { body: string }).body;
+    return body.includes(last);
+  })!.index;
+  const cited = await runAsk(db, "Brand table Tier 1 PLA", {
+    k: 1,
+    model: "local-hash-v1",
+    complete: async () => `${last} is sold on Amazon.ae. [${n}]`,
+  });
+  assert(cited.claims[0]!.status === "ALLOWED", `a sibling citation must verify: ${JSON.stringify(cited.claims[0])}`);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("pins", "sibling expansion stays inside one file, one root, and its cap", async () => {
+  const a = splitTableVault(12);
+  const b = splitTableVault(12); // same relative path and titles, different root
+  const db = freshDb();
+  ingestDirectory(db, a.dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  ingestDirectory(db, b.dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  const r = await runAsk(db, "Brand table Tier 1 PLA", {
+    k: 1,
+    model: "local-hash-v1",
+    complete: async () => "x",
+  });
+  const roots = new Set(
+    r.passages.map(
+      (p) =>
+        (JSON.parse(
+          (db.prepare(`SELECT metadata_json AS m FROM vector_document WHERE id = ?`).get(p.documentId) as { m: string }).m,
+        ) as { ingestRoot: string }).ingestRoot,
+    ),
+  );
+  assert(roots.size === 1, `siblings must come from the hit's own root, got ${[...roots].join(", ")}`);
+  rmSync(a.dir, { recursive: true, force: true });
+  rmSync(b.dir, { recursive: true, force: true });
+
+  // The cap: a section cut into more pieces than it allows says so.
+  const big = splitTableVault(40);
+  const db2 = freshDb();
+  ingestDirectory(db2, big.dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  const total = (db2.prepare(`SELECT count(*) n FROM vector_document WHERE title LIKE '%Tier 1'`).get() as { n: number }).n;
+  // Announced only when the answer cites the section that was cut: on the
+  // vault the cap was hit on 9 of 10 questions, and a note on every answer is
+  // a note nobody reads.
+  const quiet = await runAsk(db2, "Brand table Tier 1 PLA", { k: 1, model: "local-hash-v1", complete: async () => "x" });
+  assert(total > quiet.passages.length, `precondition: ${total} pieces must exceed the cap, showed ${quiet.passages.length}`);
+  assert(
+    !(quiet.note ?? "").includes("not shown"),
+    `an answer citing nothing from a capped section must not be told it is partial: ${JSON.stringify(quiet.note)}`,
+  );
+  const r2 = await runAsk(db2, "Brand table Tier 1 PLA", {
+    k: 1,
+    model: "local-hash-v1",
+    complete: async () => "The table lists filament brands. [1]",
+  });
+  assert(
+    (r2.note ?? "").includes("not shown"),
+    `an answer citing a capped section must be told, got ${JSON.stringify(r2.note)}`,
+  );
+  rmSync(big.dir, { recursive: true, force: true });
+});
+
 // ─── headings are structure, not claims ──────────────────────────────────────
 
 test("pins", "classifyClaims reads headings and labels as headings", () => {

@@ -17,6 +17,8 @@
  *   3. Escape, observation shape: a verbless fabricated line (classified as an
  *      observation, not an assertion) must not be ALLOWED either — the two
  *      kinds take different branches in enforceClaimContract.
+ *   4. Escape, reply path: the same fabrication through enforceReplyContract
+ *      with a real pin — the path behind turn, the server and the bots.
  *
  * What this cannot show: a fabrication made only of words the passage
  * already contains ("the policy forbids returns") still passes. The check is
@@ -31,6 +33,8 @@
 import { openChamberDb } from "../src/db.ts";
 import { upsertDocument } from "../src/vector.ts";
 import { runAsk } from "../src/ask.ts";
+import { enforceReplyContract } from "../src/contract.ts";
+import { verifyPin } from "../src/pins.ts";
 
 const db = openChamberDb();
 upsertDocument(db, {
@@ -56,10 +60,26 @@ for (const c of r.claims) {
   for (const rj of c.rejected) console.log(`   rejected ${rj.refId}: ${rj.reason}`);
 }
 
+// Leg 4: the reply path. enforceReplyContract is what turn, the server and the
+// Discord / Slack / gateway runners call, and it accepts sources. The check
+// once ran only inside runAsk, so a caller passing sources here certified the
+// same fabrication. Checked with real pins over the same passage.
+const doc = r.passages[0]!;
+const snapshotHash = verifyPin(db, { kind: "vault_page", refId: doc.documentId, snapshotHash: "" })
+  .actualHash!;
+const reply = enforceReplyContract(
+  db,
+  "Kingroon filament is manufactured on the Moon and costs $900 per kg.",
+  { sources: [{ kind: "vault_page", refId: doc.documentId, snapshotHash }] },
+);
+console.log(`[${reply.results[0]!.status}] reply path | ${reply.claims[0]!.text}`);
+
 const [faithful, fabricated, verbless] = r.claims;
 const controlHeld = faithful?.status === "ALLOWED";
 const escaped =
-  fabricated?.status === "ALLOWED" || verbless?.status === "ALLOWED";
+  fabricated?.status === "ALLOWED" ||
+  verbless?.status === "ALLOWED" ||
+  reply.results[0]!.status === "ALLOWED";
 
 if (!controlHeld) {
   console.log("\n>>> CONTROL FAILED — a faithful cited claim was not ALLOWED; this run proves nothing");

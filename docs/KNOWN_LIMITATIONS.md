@@ -89,12 +89,16 @@ deployment machine is the stated entry criterion for any capability level above 
 > parsing (versions, addresses, scraped cells glued together), each fixed and
 > pinned by a regression test before this shipped.
 >
-> **Only `ask` runs it.** `enforceReplyContract` — the path behind `chamber
-> turn`, the server, and the Discord, Slack and gateway runners — does not:
-> there a claim with a real citation and fabricated specifics still commits
-> `ALLOWED`. That path hands every claim in a reply the same source list and
-> has no passage bodies to compare against, so closing it is a design change,
-> not a call site. Open as of this correction.
+> **It runs at the commit, for every caller.** The check lives in
+> `enforceClaimContract` and reads the cited passages from the corpus, so
+> `ask` and every path through `enforceReplyContract` — `chamber turn`, the
+> server, the Discord, Slack and gateway runners — get the same rule. (A first
+> version ran inside `ask` only. Those other paths pass no sources today, so
+> nothing on them could be certified `ALLOWED` anyway — verified — but the
+> function accepted `sources`, and the first caller to pass them would have
+> certified fabricated specifics. Leg 4 of the probe holds that shut.) Only
+> pins that verify are judged: a missing or drifted row is rejected by the
+> commit with its own reason, never relabelled `terms_absent`.
 >
 > The judgement below still stands for everything that check cannot see. It
 > is not entailment. A fabrication built from words the passage already holds

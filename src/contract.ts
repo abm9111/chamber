@@ -11,6 +11,8 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { commitBelief } from "./commit_belief.ts";
+import { missingTerms } from "./claim_support.ts";
+import { verifyPin } from "./pins.ts";
 import type { RejectedSource, SourceRef } from "./types.ts";
 
 export type ClaimKind = "observation" | "assertion" | "aporia" | "chatter" | "heading";
@@ -119,6 +121,42 @@ function dropped(r: {
 }
 
 /**
+ * Split cited sources into those whose passages contain the claim's specifics
+ * and those withheld for lacking them. Only `vault_page` rows have a body to
+ * check; any other kind is passed through, and commitBelief drops it as
+ * kind_unregistered as before. The check is all-or-nothing over the union of
+ * cited passages: a claim whose numbers, names or domains are absent from
+ * every one of them keeps no citation at all.
+ */
+function withholdUnsupported(
+  db: DatabaseSync,
+  text: string,
+  cited: SourceRef[],
+): { kept: SourceRef[]; rejected: RejectedSource[] } {
+  const read = db.prepare(
+    `SELECT body FROM vector_document WHERE id = ? AND source_kind = 'vault_page'`,
+  );
+  // Only pins that verify are judged here. A row that is missing, or whose
+  // content drifted from the pinned hash, is left for commitBelief to reject
+  // with its true reason (not_found, hash_mismatch); checking a drifted body
+  // would report terms_absent against text the claim never cited.
+  const bodyOf = new Map<SourceRef, string>();
+  for (const s of cited) {
+    if (s.kind !== "vault_page" || !verifyPin(db, s).ok) continue;
+    const row = read.get(s.refId) as { body: string } | undefined;
+    if (row) bodyOf.set(s, row.body);
+  }
+  if (bodyOf.size === 0) return { kept: cited, rejected: [] };
+  const missing = missingTerms(text, [...bodyOf.values()]);
+  if (missing.length === 0) return { kept: cited, rejected: [] };
+  const reason = `terms_absent: ${missing.join(", ")}`;
+  return {
+    kept: cited.filter((s) => !bodyOf.has(s)),
+    rejected: [...bodyOf.keys()].map((s) => ({ refId: s.refId, reason })),
+  };
+}
+
+/**
  * Enforce contract on a single claim before it can become load-bearing.
  * Assertions without sources → commitBelief still runs but mints debt / or refuse mode.
  */
@@ -140,7 +178,7 @@ export function enforceClaimContract(
     strict?: boolean;
   } = {},
 ): ContractResult {
-  const sources: SourceRef[] = (opts.sources ?? []).map((s) => ({
+  const cited: SourceRef[] = (opts.sources ?? []).map((s) => ({
     kind: s.kind,
     refId: s.refId,
     snapshotHash: s.snapshotHash,
@@ -190,6 +228,17 @@ export function enforceClaimContract(
         };
   }
 
+  // A verified pin proves a passage is real, not that it says this claim.
+  // Checked here, at the commit, so every caller gets it: runAsk, and the
+  // turn / server / Discord / Slack / gateway paths through
+  // enforceReplyContract, which accepted `sources` and never checked them.
+  const support = withholdUnsupported(db, claim.text, cited);
+  const sources = support.kept;
+  const rejectedWith = (r: { rejectedSources?: RejectedSource[] }): RejectedSource[] | undefined => {
+    const all = [...support.rejected, ...(r.rejectedSources ?? [])];
+    return all.length ? all : undefined;
+  };
+
   if (claim.kind === "assertion") {
     // Cited nothing: refusable without opening a transaction, because no
     // verification can change a count of zero.
@@ -199,6 +248,7 @@ export function enforceClaimContract(
         status: "REFUSED",
         reason:
           "completion contract: load-bearing assertion lacks source pins (strict)",
+        rejectedSources: rejectedWith({}),
       };
     }
     // Cited something: whether any of it *survives* is not knowable out here.
@@ -224,7 +274,7 @@ export function enforceClaimContract(
         status: "REFUSED",
         reason: r.reason,
         debtIds: r.debtIds,
-        rejectedSources: dropped(r),
+        rejectedSources: rejectedWith(r),
       };
     }
     // Unsourced belief path mints debt inside commitBelief
@@ -240,14 +290,14 @@ export function enforceClaimContract(
         reason: "committed with open citation debt — not load-bearing until paid",
         beliefId: r.beliefId,
         debtIds: debts.map((d) => d.id),
-        rejectedSources: dropped(r),
+        rejectedSources: rejectedWith(r),
       };
     }
     return {
       ok: true,
       status: "ALLOWED",
       beliefId: r.beliefId,
-      rejectedSources: dropped(r),
+      rejectedSources: rejectedWith(r),
     };
   }
 
@@ -273,7 +323,7 @@ export function enforceClaimContract(
       ok: false,
       status: "REFUSED",
       reason: r.reason,
-      rejectedSources: dropped(r),
+      rejectedSources: rejectedWith(r),
     };
   }
   // An observation is not an assertion, so commitBelief mints no debt for it
@@ -286,7 +336,7 @@ export function enforceClaimContract(
       ok: true,
       status: "ALLOWED",
       beliefId: r.beliefId,
-      rejectedSources: dropped(r),
+      rejectedSources: rejectedWith(r),
     };
   }
   return {
@@ -294,7 +344,7 @@ export function enforceClaimContract(
     status: "UNSUPPORTED",
     reason: "recorded with no verified source — not evidence for anything",
     beliefId: r.beliefId,
-    rejectedSources: dropped(r),
+    rejectedSources: rejectedWith(r),
   };
 }
 

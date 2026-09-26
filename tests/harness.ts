@@ -8460,6 +8460,53 @@ test("pins", "runAsk withholds pins from a claim whose specifics its passage lac
   );
 });
 
+test("pins", "the support check holds at the commit, for every caller that passes sources", () => {
+  // runAsk used to be the only place the check ran. enforceReplyContract (turn,
+  // server, Discord, Slack, gateway) accepts `sources` and never ran it, so a
+  // caller that passed them would certify fabricated specifics.
+  const db = freshDb();
+  const doc = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/filament.md",
+    title: "Filament",
+    body: "Kingroon PLA sells for about $9 per kg on AliExpress.",
+    model: "local-hash-v1",
+  });
+  const snapshotHash = verifyPin(db, { kind: "vault_page", refId: doc.id, snapshotHash: "" })
+    .actualHash!;
+  const sources = [{ kind: "vault_page" as const, refId: doc.id, snapshotHash }];
+
+  const ok = enforceClaimContract(
+    db,
+    { kind: "assertion", text: "Kingroon PLA is about $9 per kg on AliExpress." },
+    { sources },
+  );
+  assert(ok.status === "ALLOWED", `control: ${JSON.stringify(ok)}`);
+
+  const reply = enforceReplyContract(
+    db,
+    "Kingroon filament is made on the Moon and is $900 per kg.\nKingroon PLA: shipped from Mars.",
+    { sources },
+  );
+  for (const r of reply.results) {
+    assert(r.status !== "ALLOWED", `fabricated specifics certified: ${JSON.stringify(r)}`);
+    assert(
+      (r.rejectedSources ?? []).some((x) => x.reason.startsWith("terms_absent:")),
+      `the missing terms must be named: ${JSON.stringify(r)}`,
+    );
+  }
+  const strict = enforceClaimContract(
+    db,
+    { kind: "assertion", text: "Kingroon filament is made on the Moon and is $900 per kg." },
+    { sources, strict: true },
+  );
+  assert(strict.status === "REFUSED", `strict: ${JSON.stringify(strict)}`);
+  assert(
+    (strict.rejectedSources ?? []).some((x) => x.reason.startsWith("terms_absent:")),
+    `a strict refusal must still say why: ${JSON.stringify(strict)}`,
+  );
+});
+
 // ─── headings are structure, not claims ──────────────────────────────────────
 
 test("pins", "classifyClaims reads headings and labels as headings", () => {

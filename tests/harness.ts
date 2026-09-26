@@ -9060,6 +9060,43 @@ test("pins", "claim support: round-5 review — signs, spaced k, short words, in
   }
 });
 
+test("pins", "claim support: round-6 review — unit ranges, short proper nouns, spaced initials and k", () => {
+  const miss = (c: string, p: string): string[] => missingTerms(c, [p]);
+  // Faithful: a range whose first end carries a unit or symbol is a range.
+  const faithful: [string, string][] = [
+    ["Efficacy reached 20% [1]", "Efficacy was 10%–20%."],
+    ["Efficacy reached 20% [1]", "Efficacy was 10%-20%."],
+    ["Store at 8°C max [1]", "Store at 2°–8°C."],
+    ["Heat to 20° [1]", "Heat to 10°–20°."],
+    ["He is 18 [1]", "Ages 12+–18."],
+    ["Efficacy was 10%–20% [1]", "Efficacy was 10% to 20%."],
+    ["I moved to Paris. Shipping was slow [1]", "Moved to Paris; shipping was slow."],
+    ["made in China. Delivery took weeks [1]", "Made in China, delivery took weeks."],
+    ["by J.R.R. Tolkien [1]", "by J. R. R. Tolkien"],
+    ["It costs 5 k [1]", "it costs 5 k"],
+  ];
+  for (const [c, p] of faithful) {
+    assert(miss(c, p).length === 0, `${JSON.stringify(c)} vs ${JSON.stringify(p)} flagged ${JSON.stringify(miss(c, p))}`);
+  }
+  // Still refused: round-5 signs and titles, and a spaced k that is not in the passage.
+  for (const [c, p] of [["Sales grew 5% [1]", "change=-5%"], ["Sales grew 5% [1]", "| Q3 |-5%|"], ["run by Sgt. Tesla [1]", "Kingroon"], ["Revenue was 900 k [1]", "We had 900 users"]] as [string, string][]) {
+    assert(miss(c, p).length > 0, `${JSON.stringify(c)} must not be satisfied by ${JSON.stringify(p)}`);
+  }
+});
+
+test("pins", "debt payment does not write the same pin twice", () => {
+  // Round-6 review: the duplicate-pin skip had no test.
+  const db = freshDb();
+  upsertDocument(db, { id: "note_aed", sourceKind: "vault_page", sourceRef: "aed.md", title: "Currency", body: "User base currency is AED (UAE dirham).", model: "local-hash-v1" });
+  const bel = commitBelief(db, { type: "belief", text: "User base currency is AED", sources: [], authorFamily: "test", path: "deep" });
+  assert(bel.ok, JSON.stringify(bel));
+  const debt = (db.prepare(`SELECT id FROM citation_debt WHERE belief_id = ? AND status = 'pending'`).get(bel.beliefId!) as { id: string }).id;
+  proposeDebtPayment(db, debt, { minScore: 0.05, model: "local-hash-v1" });
+  proposeDebtPayment(db, debt, { minScore: 0.05, model: "local-hash-v1" });
+  const pins = (db.prepare(`SELECT count(*) n FROM belief_source WHERE belief_id = ? AND ref_id = 'note_aed'`).get(bel.beliefId!) as { n: number }).n;
+  assert(pins === 1, `proposing twice must leave one pin, got ${pins}`);
+});
+
 test("pins", "debt payment writes nothing for a debt that is no longer pending", () => {
   // Round-5 review: status was read outside the lock and never re-checked — a
   // waived debt auto-paid, and re-proposing a paid debt wrote a duplicate pin.
@@ -13347,6 +13384,12 @@ test("cli", "prune removes a cited passage whose file was excluded and then dele
   const audit = db2.prepare(`SELECT detail_json AS d FROM audit_event WHERE action = 'evidence_pruned'`).all() as { d: string }[];
   assert(audit.length === 1, `one evidence_pruned entry, got ${audit.length}`);
   assert(!audit[0]!.d.includes("passport"), `the audit chain must not keep the excluded path: ${audit[0]!.d}`);
+  // Round-6 review: belief_source.pinned_ref still held "private/passport.md#p0".
+  const refs = db2.prepare(`SELECT pinned_ref AS r, pinned_root AS t FROM belief_source`).all() as { r: string | null; t: string | null }[];
+  assert(
+    refs.every((x) => !(x.r ?? "").includes("passport") && !(x.t ?? "").includes("private")),
+    `no citation may keep the excluded file's name: ${JSON.stringify(refs)}`,
+  );
   db2.close();
   rmSync(dir, { recursive: true, force: true });
 });

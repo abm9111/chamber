@@ -1035,6 +1035,9 @@ export function pruneDocuments(
   );
   const delAny = db.prepare(`DELETE FROM vector_document WHERE id = ?`);
   const citers = db.prepare(`SELECT DISTINCT belief_id AS b FROM belief_source WHERE ref_id = ?`);
+  const forgetPath = db.prepare(
+    `UPDATE belief_source SET pinned_ref = NULL, pinned_root = NULL WHERE ref_id = ?`,
+  );
   const exists = db.prepare(`SELECT 1 AS x FROM vector_document WHERE id = ?`);
   let passages = 0;
   let pinnedSkipped = 0;
@@ -1055,6 +1058,11 @@ export function pruneDocuments(
         }
         const beliefs = (citers.all(id) as { b: string }[]).map((x) => x.b);
         delAny.run(id);
+        // The citing pins keep their id and hash — verify must still say what
+        // was cited and that it is gone — but not the excluded file's name:
+        // pinned_ref / pinned_root held "private/passport.md#p0" after the
+        // row itself was deleted (round-6 review).
+        forgetPath.run(id);
         // `audit_event.action` is free text (CLAUDE.md: gate_event's CHECK
         // vocabulary would reject a new verb and park the whole prune).
         appendAuditInTx(db, {

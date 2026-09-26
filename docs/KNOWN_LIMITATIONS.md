@@ -123,11 +123,16 @@ deployment machine is the stated entry criterion for any capability level above 
 > else. On the final 10-question vault run: 40 cited claims, 2 flagged, both
 > correctly (terms absent from every cited passage), 0 wrongly.
 >
-> A third round (review plus VIGIL) narrowed names after abbreviations
-> (`e.g. Tesla` by list; since the fourth, `U.S.`, `a.k.a.`, `Jr.` by shape —
-> an abbreviation that is neither listed nor dotted nor one or two letters
-> still hides the next name), made a leading minus part of its number
-> (`-5%` ≠ `5%`), `$9m` / `lakh` / `%` reducing to a bare number, and a
+> Later rounds narrowed names after abbreviations: listed ones (`e.g.`,
+> `Dr.`, `Sgt.`, `Dept.`, `Ave.`, …), dotted initials in either spacing
+> (`U.S.`, `a.k.a.`, `J. R. R.`) and capitalised one- or two-letter words
+> (`Jr.`, `Mt.`). An abbreviation that is none of those — `Messrs.`, all-caps
+> `GEN.` — still hides the next name; a wider shape rule (any capitalised
+> word of up to five letters) was tried and reverted because "Paris." and
+> "Sony." then flagged the next ordinary sentence. A leading minus is part of
+> its number (`-5%` ≠ `5%`) only in sign position — after a space, `(`, `[`,
+> `|`, `=`, `:`, `,`, `/`, a quote or an em dash; after a digit, a letter or
+> a unit (`2°–8°C`, `10%–20%`, `AGPL-3.0`) a dash is a range or an id, `$9m` / `lakh` / `%` reducing to a bare number, and a
 > passage's own `1,000 million` being flagged. Accepted, knowingly: a
 > capitalised ordinary word after a label or dash is now checked, so
 > "Delivery: Roughly 5 days [1]" is flagged when the passage lacks

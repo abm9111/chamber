@@ -1693,9 +1693,13 @@ async function main(): Promise<void> {
           for (const r of rows) citingSet.add(r.b);
         }
         const citing = [...citingSet].map((b) => ({ b }));
+        // "excluded" here includes files that are also gone — listed above
+        // under "no longer on disk" but removed as excluded (round-6 review:
+        // the two sections did not add up without saying so).
         console.log(
-          `  ${excludedPinned} of the excluded passage(s) are cited by ${citing.length} belief(s) and will be ` +
-            `deleted too — the audit log records each, and verify will report those citations not_found:`,
+          `  ${excludedPinned} excluded passage(s) — counting any whose file is also gone — are cited by ` +
+            `${citing.length} belief(s) and will be deleted too; the audit log records each, and verify ` +
+            `will report those citations not_found:`,
         );
         for (const c of citing.slice(0, 10)) console.log(`    ${c.b}`);
         if (citing.length > 10) console.log(`    … and ${citing.length - 10} more`);

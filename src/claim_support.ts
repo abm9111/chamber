@@ -56,7 +56,7 @@ const DOMAIN = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|ae|net|org|io|co|a
 // but could not match itself once spacing was refused for single letters
 // (round-5 review).
 const NUMBER =
-  /(?:(?<![\p{L}\p{N}])-)?\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})[km](?![\p{L}\p{N}])|\s?%)?/giu;
+  /(?:(?<=^|[\s([|=:,/"'“”‘’—])-)?\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})m(?![\p{L}\p{N}])|\s?%)?/giu;
 
 /**
  * Applied to claim and passage alike, so both sides read one spelling.
@@ -69,7 +69,11 @@ const NUMBER =
 function normalize(text: string): string {
   return text
     .replace(/[‐‑‒–−﹣－]/g, "-")
-    .replace(/(?<![\p{L}\p{N}])((?:\p{Lu}\.){2,})/gu, (m) => m.replace(/\./g, ""));
+    // Spaced forms too ("J. R. R.", "U. S."), without eating the space after
+    // the last dot — round-6 review flagged "J.R.R." against "J. R. R.".
+    .replace(/(?<![\p{L}\p{N}])(?:\p{Lu}\.(?:\s(?=\p{Lu}\.))?){2,}/gu, (m) =>
+      m.replace(/[.\s]/g, ""),
+    );
 }
 /**
  * A name: a capitalised word or acronym in any script (`Škoda`, `Möbius` —
@@ -114,18 +118,16 @@ function atSentenceStart(text: string, index: number): boolean {
   return !(
     ABBREVIATION.test(before) ||
     /(?:^|[\s(])(?:\p{L}{1,3}\.){2,}$/u.test(before) ||
-    // A short capitalised word (Jr., Sgt., Dept., Univ.). Not any short word:
-    // "went up. Shipping" read "up." as an abbreviation and flagged the next
-    // sentence's opening word (round-5 review). Up to five letters catches
-    // the titles VIGIL listed (Sgt, Gen, Rev, Bros, Dept, Ave, Univ); a real
-    // sentence ending in a short capitalised name only means the next word
-    // is checked — the safe direction.
-    /(?:^|[\s(])\p{Lu}\p{Ll}{0,4}\.$/u.test(before)
+    // A capitalised one- or two-letter word (Jr., Sr., Mt.); longer titles
+    // are listed. Round 5 widened this to any capitalised word of up to five
+    // letters, and "Paris.", "China.", "Sony." then hid nothing but flagged
+    // the next sentence's ordinary opening word (round-6 review).
+    /(?:^|[\s(])\p{Lu}\p{Ll}?\.$/u.test(before)
   );
 }
 
 const ABBREVIATION =
-  /(?:^|[\s(])(?:e\.g|i\.e|vs|etc|approx|ca|cf|incl|esp|Dr|Mr|Mrs|Ms|Prof|St|Inc|Ltd|Co|Corp|No|Fig|Vol|p|pp)\.$/i;
+  /(?:^|[\s(])(?:e\.g|i\.e|vs|etc|approx|ca|cf|incl|esp|Dr|Mr|Mrs|Ms|Prof|St|Inc|Ltd|Co|Corp|No|Fig|Vol|p|pp|Sgt|Gen|Rev|Bros|Dept|Ave|Univ|Col|Capt|Lt|Gov|Sen|Rep|Ft|Blvd|Rd|Est|Assn|Jr|Sr)\.$/i;
 
 function looksLikeName(word: string): boolean {
   return /\p{N}/u.test(word) || /^.+\p{Lu}/u.test(word);
@@ -217,7 +219,7 @@ const UNIT = /^(?:%|k|m|mn|bn|thousand|million|billion|trillion|lakh|crore)$/i;
  * allowed, "$5m" was satisfied by "5 m long" — metres certifying millions —
  * and "3M tape" by "3 m tape" (round-4 review).
  */
-const SPACED_UNIT = /^(?:%|mn|bn|thousand|million|billion|trillion|lakh|crore)$/i;
+const SPACED_UNIT = /^(?:%|k|mn|bn|thousand|million|billion|trillion|lakh|crore)$/i;
 
 function numberFound(numeric: string, digits: string, suffix: string): boolean {
   const space = SPACED_UNIT.test(suffix) ? "\\s?" : "";
@@ -230,9 +232,15 @@ function numberFound(numeric: string, digits: string, suffix: string): boolean {
   // and "change=-5%" satisfied an unsigned "5%"). After a digit it is a
   // range ("19-25"), after a letter a version or id ("AGPL-3.0", "TASK-003").
   // A signed claim needs the same: "-3.0" is not satisfied by "AGPL-3.0".
+  // A dash is a minus only in sign position: at the start, after space, or
+  // after ( [ | = : , / a quote or an em dash. After a digit it is a range
+  // ("19-25"), after a letter an id ("AGPL-3.0"), and after a unit or symbol
+  // (`%`, `°`, `+`, `)`) it is a range too — round 5's "any non-alphanumeric"
+  // read "2°–8°C" and "10%–20%" as negative (round-6 review).
+  const signAt = `(?:^|[\\s(\\[|=:,\\/"'“”‘’—])`;
   const before = digits.startsWith("-")
-    ? "(?<![\\p{L}\\p{N}.,])"
-    : "(?<![\\p{Nd}.,])(?<!(?:^|[^\\p{L}\\p{N}])-)";
+    ? `(?<=${signAt})`
+    : `(?<![\\p{Nd}.,])(?<!${signAt}-)`;
   return new RegExp(`${before}${escapeRegex(digits)}${tail}`, "iu").test(numeric);
 }
 

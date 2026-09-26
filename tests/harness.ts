@@ -65,6 +65,7 @@ import {
 } from "../src/pins.ts";
 import { runAsk, citedIndices, stubDisclosure } from "../src/ask.ts";
 import { missingTerms, specificTerms } from "../src/claim_support.ts";
+import { withSiblings } from "../src/siblings.ts";
 import {
   minilmAvailable,
   minilmInstalled,
@@ -8617,6 +8618,89 @@ test("pins", "sibling expansion stays inside one file, one root, and its cap", a
     `an answer citing a capped section must be told, got ${JSON.stringify(r2.note)}`,
   );
   rmSync(big.dir, { recursive: true, force: true });
+});
+
+/** A passage row for withSiblings, inserted directly (review repros, 2026-09-26). */
+function sibRow(
+  db: DatabaseSync,
+  ref: string,
+  title: string,
+  root = "/r",
+  body = `body of ${ref}`,
+): { documentId: string; sourceRef: string; title: string; body: string; snapshotHash: string; sourceKind: string } {
+  const r = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: ref,
+    title,
+    body,
+    metadata: { ingestRoot: root },
+    model: "local-hash-v1",
+  });
+  const row = db
+    .prepare(`SELECT snapshot_hash AS h FROM vector_document WHERE id = ?`)
+    .get(r.id) as { h: string };
+  return { documentId: r.id, sourceRef: ref, title, body, snapshotHash: row.h, sourceKind: "vault_page" };
+}
+
+test("pins", "siblings: a file whose name starts with `path#p` is another file", () => {
+  const db = freshDb();
+  const hit = sibRow(db, "a#p1", "H");
+  sibRow(db, "a#p2", "H");
+  sibRow(db, "a#pfoo#p1", "H");
+  sibRow(db, "a#p1.md#p0", "H");
+  const refs = withSiblings(db, [hit], 4).passages.map((p) => p.sourceRef);
+  assert(JSON.stringify(refs) === '["a#p1","a#p2"]', `only a#p1..pN are siblings, got ${JSON.stringify(refs)}`);
+});
+
+test("pins", "siblings: two hits in one section are one contiguous, exactly-counted section", () => {
+  const db = freshDb();
+  const c = Array.from({ length: 6 }, (_, i) => sibRow(db, `c.md#p${i + 1}`, "C"));
+  const order = withSiblings(db, [c[4]!, c[1]!], 8).passages.map((p) => p.sourceRef!);
+  const nums = order.map((r) => Number(r.split("#p")[1]));
+  assert(
+    nums.every((n, i) => i === 0 || n > nums[i - 1]!) && order.includes("c.md#p2") && order.includes("c.md#p5"),
+    `one section, file order, both hits shown: ${order.join(" ")}`,
+  );
+
+  // Double counting: 20 pieces, hits at both ends, room for 10.
+  const b = Array.from({ length: 20 }, (_, i) => sibRow(db, `b.md#p${i + 1}`, "B"));
+  const e4 = withSiblings(db, [b[0]!, b[19]!], 5);
+  const shown = e4.passages.length;
+  const told = e4.omittedFromCited([b[0]!.documentId, b[19]!.documentId]);
+  assert(told === 20 - shown, `omitted must be the true count ${20 - shown}, got ${told}`);
+
+  // Silence: a front hit eats the cap; the section the answer cites is cut.
+  const x = [sibRow(db, "x.md#p1", "S"), ...Array.from({ length: 5 }, (_, i) => sibRow(db, `x.md#p${i + 2}`, "S"))];
+  const s = Array.from({ length: 6 }, (_, i) => sibRow(db, `s.md#p${i + 1}`, "T"));
+  const e = withSiblings(db, [x[0]!, s[2]!, s[3]!], 3);
+  const shownS = e.passages.filter((p) => p.sourceRef?.startsWith("s.md")).length;
+  const cut = e.omittedFromCited([s[3]!.documentId]);
+  assert(cut === 6 - shownS, `citing a cut section must report ${6 - shownS} missing, got ${cut}`);
+});
+
+test("pins", "siblings: passage numbers never pass what a citation can name", () => {
+  const db = freshDb();
+  const hits = Array.from({ length: 60 }, (_, i) => sibRow(db, `h${i}.md#p1`, `T${i}`));
+  for (let i = 0; i < 60; i++) sibRow(db, `h${i}.md#p2`, `T${i}`);
+  const n = withSiblings(db, hits, 60).passages.length;
+  assert(n <= 99, `citedIndices reads [1]..[99]; ${n} passages would leave some uncitable`);
+});
+
+test("pins", "the missed-exact note does not report a passage the model was shown", async () => {
+  const db = freshDb();
+  sibRow(db, "f.md#p1", "Notes > Section", "/r", "Printer filament brands table: Elegoo, Eryone.");
+  sibRow(db, "f.md#p2", "Notes > Section", "/r", "More rows. Elegoo zqxwvtoken appears here.");
+  const r = await runAsk(db, "printer filament brands table zqxwvtoken", {
+    k: 1,
+    model: "local-hash-v1",
+    complete: async () => "Elegoo is listed. [2]",
+  });
+  const shown = r.passages.map((p) => p.sourceRef);
+  assert(shown.includes("f.md#p2"), `precondition: p2 shown as a sibling, got ${JSON.stringify(shown)}`);
+  assert(
+    !(r.note ?? "").includes("f.md#p2"),
+    `a shown passage must not be reported as missed: ${JSON.stringify(r.note)}`,
+  );
 });
 
 // ─── headings are structure, not claims ──────────────────────────────────────

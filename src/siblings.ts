@@ -14,18 +14,22 @@
  * own numbered passage — citing it verifies exactly like citing a hit. Nothing
  * here widens what a citation can prove.
  *
- * Identity is (source_kind, ingestRoot, file, title): two roots can hold the
- * same relative path under the same headings, and a sibling from the wrong
- * root would be a passage from a different note.
+ * A section is (source_kind, ingestRoot, file, title), and its pieces are the
+ * rows whose source_ref is exactly `file#p<digits>`. Two roots can hold the
+ * same relative path under the same headings, and a file may itself be named
+ * `a#pfoo` — both are other notes, and a first version showed them as part of
+ * this one (review, 2026-09-26).
  */
 
 import type { DatabaseSync } from "node:sqlite";
 import { passagePathOf } from "./chunk.ts";
 
-/** Pieces shown per retrieved passage, the hit included. */
+/** Pieces shown per section, retrieved pieces included. */
 export const SIBLINGS_PER_HIT = 5;
 /** Passages shown in total, hits and siblings together, as a multiple of k. */
 export const SIBLING_TOTAL_FACTOR = 2;
+/** `citedIndices` reads one or two digits: a passage numbered 100 is uncitable. */
+export const MAX_PASSAGES = 99;
 
 export interface PassageRow {
   documentId: string;
@@ -54,6 +58,16 @@ interface Row {
   body: string;
   snapshot_hash: string;
   source_kind: string;
+  meta: string | null;
+}
+
+interface Section {
+  key: string;
+  /** Every piece of the section, in file order. */
+  pieces: PassageRow[];
+  /** Ids of the pieces retrieval itself returned. */
+  hits: Set<string>;
+  shown: Set<string>;
 }
 
 function pieceIndex(sourceRef: string): number | undefined {
@@ -71,102 +85,124 @@ function ingestRootOf(meta: string | null): string | null {
   }
 }
 
+function byPiece(a: PassageRow, b: PassageRow): number {
+  return (pieceIndex(a.sourceRef ?? "") ?? 0) - (pieceIndex(b.sourceRef ?? "") ?? 0);
+}
+
 /**
- * `hits` in rank order, each followed by the other pieces of its section in
- * file order, deduplicated, and capped. What did not fit is kept per section,
- * so the answer note can say so exactly when the answer cites a cut section —
- * a section shown in part with no word said is the failure this exists to fix.
+ * `hits` grouped into their sections, sections in the rank order of their
+ * best hit, each section's shown pieces contiguous and in file order. Every
+ * hit is shown — a sibling never displaces something retrieval ranked.
+ * Siblings fill the remaining room section by section, nearest a hit first.
+ *
+ * Counting is per real section: a first version keyed sections by the hit
+ * that found them, so two hits in one section double-counted what was cut,
+ * and a section whose pieces another hit had claimed reported nothing cut.
  */
 export function withSiblings<T extends PassageRow>(
   db: DatabaseSync,
   hits: T[],
   k: number,
 ): SiblingExpansion {
-  // Never below one section's cap: with k=1 a 2k total showed half a table.
-  const total = Math.max(hits.length, k * SIBLING_TOTAL_FACTOR, SIBLINGS_PER_HIT);
+  // Never below one section's cap (k=1 showed half a table), never above
+  // what a citation can name.
+  const total = Math.min(
+    MAX_PASSAGES,
+    Math.max(hits.length, k * SIBLING_TOTAL_FACTOR, SIBLINGS_PER_HIT),
+  );
   const metaOf = db.prepare(`SELECT metadata_json AS meta FROM vector_document WHERE id = ?`);
+  // A range on source_ref, not substr(): the range can use the source_ref
+  // index, where substr() scanned every row of the kind (~140 ms per ask on a
+  // 44k-row vault, measured in review). '#p' < '#q', so [file#p, file#q)
+  // holds every ref starting with file#p; the digits test narrows it to this
+  // file's own pieces.
+  //
+  // source_kind is filtered below, not here: with it in the WHERE clause the
+  // planner chose idx_vector_doc_kind and scanned the whole kind anyway
+  // (EXPLAIN QUERY PLAN, 2026-09-26) — the range alone is what selects.
   const piecesOf = db.prepare(
     `SELECT id, source_ref, title, body, snapshot_hash, source_kind, metadata_json AS meta
        FROM vector_document
-      WHERE source_kind = ? AND title IS ?
-        AND substr(source_ref, 1, length(?)) = ?`,
+      WHERE source_ref >= ? AND source_ref < ? AND title IS ?`,
   );
 
-  // Every hit is shown first: a sibling never displaces something retrieval
-  // actually ranked. Siblings then fill the remaining room, nearest first.
-  const out: PassageRow[] = [];
-  const seen = new Set<string>();
-  for (const h of hits) {
-    out.push(h);
-    seen.add(h.documentId);
-  }
+  const sections = new Map<string, Section>();
+  const order: (Section | PassageRow)[] = [];
 
-  const omittedBy = new Map<string, number>();
-  const cut = (hit: string, n: number): void => {
-    if (n > 0) omittedBy.set(hit, (omittedBy.get(hit) ?? 0) + n);
-  };
-  const groups: { hitAt: number; extra: PassageRow[] }[] = [];
   for (const h of hits) {
-    if (!h.sourceRef) continue;
-    const at = pieceIndex(h.sourceRef);
-    if (at === undefined) continue;
-    const root = ingestRootOf((metaOf.get(h.documentId) as { meta: string | null } | undefined)?.meta ?? null);
-    const prefix = `${passagePathOf(h.sourceRef)}#p`;
-    const rows = (piecesOf.all(h.sourceKind, h.title, prefix, prefix) as unknown as (Row & { meta: string | null })[])
-      .filter((r) => ingestRootOf(r.meta) === root && pieceIndex(r.source_ref) !== undefined)
-      .filter((r) => !seen.has(r.id));
-    // Nearest to the hit first, so a cap keeps the pieces most likely to be
-    // the rest of what the hit started.
-    rows.sort(
-      (a, b) =>
-        Math.abs(pieceIndex(a.source_ref)! - at) - Math.abs(pieceIndex(b.source_ref)! - at),
+    const at = h.sourceRef ? pieceIndex(h.sourceRef) : undefined;
+    if (!h.sourceRef || at === undefined) {
+      order.push(h);
+      continue;
+    }
+    const root = ingestRootOf(
+      (metaOf.get(h.documentId) as { meta: string | null } | undefined)?.meta ?? null,
     );
-    const room = SIBLINGS_PER_HIT - 1;
-    cut(h.documentId, rows.length - room);
-    const extra: PassageRow[] = [];
-    for (const r of rows.slice(0, room)) {
-      if (seen.has(r.id)) continue;
-      seen.add(r.id);
-      extra.push({
+    const file = passagePathOf(h.sourceRef);
+    const key = JSON.stringify([h.sourceKind, root, file, h.title]);
+    let s = sections.get(key);
+    if (!s) {
+      const rows = (
+        piecesOf.all(`${file}#p`, `${file}#q`, h.title) as unknown as Row[]
+      )
+        .filter((r) => r.source_kind === h.sourceKind)
+        .filter((r) => /^\d+$/.test(r.source_ref.slice(file.length + 2)))
+        .filter((r) => ingestRootOf(r.meta) === root);
+      const pieces: PassageRow[] = rows.map((r) => ({
         documentId: r.id,
         sourceRef: r.source_ref,
         title: r.title,
         body: r.body,
         snapshotHash: r.snapshot_hash,
         sourceKind: r.source_kind,
-      });
+      }));
+      s = { key, pieces, hits: new Set(), shown: new Set() };
+      sections.set(key, s);
+      order.push(s);
     }
-    groups.push({ hitAt: out.findIndex((p) => p.documentId === h.documentId), extra });
+    // A hit the query did not return (a caller-built row) is still shown.
+    if (!s.pieces.some((p) => p.documentId === h.documentId)) s.pieces.push(h);
+    s.pieces.sort(byPiece);
+    s.hits.add(h.documentId);
+    s.shown.add(h.documentId);
   }
 
-  // Fill in rank order until the total cap; whatever does not fit is counted.
-  const admitted = new Map<string, PassageRow[]>();
-  let room = total - out.length;
-  for (const g of groups) {
-    const take = g.extra.slice(0, Math.max(0, room));
-    const hit = out[g.hitAt]!.documentId;
-    cut(hit, g.extra.length - take.length);
-    room -= take.length;
-    admitted.set(hit, take);
+  let room = total - hits.length;
+  for (const s of sections.values()) {
+    const hitAt = s.pieces
+      .filter((p) => s.hits.has(p.documentId))
+      .map((p) => pieceIndex(p.sourceRef!)!);
+    const distance = (p: PassageRow): number =>
+      Math.min(...hitAt.map((h) => Math.abs(pieceIndex(p.sourceRef!)! - h)));
+    const candidates = s.pieces
+      .filter((p) => !s.shown.has(p.documentId))
+      .sort((a, b) => distance(a) - distance(b));
+    const cap = Math.max(SIBLINGS_PER_HIT, s.hits.size);
+    for (const p of candidates) {
+      if (room <= 0 || s.shown.size >= cap) break;
+      s.shown.add(p.documentId);
+      room--;
+    }
   }
 
-  // Each hit's section in file order, hit included, then the next hit.
-  const ordered: PassageRow[] = [];
-  const sectionOf = new Map<string, string>();
-  for (const p of out) {
-    const section = [p, ...(admitted.get(p.documentId) ?? [])];
-    for (const x of section) sectionOf.set(x.documentId, p.documentId);
-    section.sort(
-      (a, b) => (pieceIndex(a.sourceRef ?? "") ?? 0) - (pieceIndex(b.sourceRef ?? "") ?? 0),
-    );
-    ordered.push(...section);
+  const passages: PassageRow[] = [];
+  for (const o of order) {
+    if ("key" in o) passages.push(...o.pieces.filter((p) => o.shown.has(p.documentId)));
+    else passages.push(o);
   }
+
+  const sectionOf = new Map<string, Section>();
+  for (const s of sections.values()) for (const p of s.pieces) sectionOf.set(p.documentId, s);
   return {
-    passages: ordered,
+    passages,
     omittedFromCited: (cited) => {
+      const cut = new Set<Section>();
+      for (const id of cited) {
+        const s = sectionOf.get(id);
+        if (s) cut.add(s);
+      }
       let n = 0;
-      const sections = new Set([...cited].map((id) => sectionOf.get(id)).filter(Boolean));
-      for (const s of sections) n += omittedBy.get(s!) ?? 0;
+      for (const s of cut) n += s.pieces.length - s.shown.size;
       return n;
     },
   };

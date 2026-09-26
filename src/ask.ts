@@ -538,7 +538,7 @@ export async function runAsk(
   const missedExact =
     opts.exact === true
       ? []
-      : findMissedExactMatches(db, question, hits, k, opts.model, onLexicalError);
+      : findMissedExactMatches(db, question, passages, k, opts.model, onLexicalError);
 
   // Zero passages means the model would be answering from nothing but its own
   // weights, at cost, with no citation it could possibly make good on. Skip it

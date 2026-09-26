@@ -90,30 +90,65 @@ interface JsonRpcRequest {
  * asked for.
  */
 let db: DatabaseSync | null = null;
+let openedDatabase = "";
+
+/**
+ * The model variables the operator set before this process started. Only
+ * these outrank config. Everything else was seeded by `applyModelEnv` from the
+ * config file and is re-seeded on every call.
+ *
+ * applyModelEnv seeds only what is unset, which is what makes env outrank
+ * config — and it also meant a config edit could never reach a server that had
+ * already run one tool call, because the first call's seeded values then read
+ * as "set". Editing the model base while a host held this process open gave
+ * ECONNREFUSED against the old address until the owner reconnected by hand
+ * (2026-09-26). Telling the operator's values from seeded ones is what lets a
+ * refresh follow the file without overriding an explicit env.
+ */
+const MODEL_ENV = ["CHAMBER_API_BASE", "CHAMBER_API_MODEL", "CHAMBER_MODEL"] as const;
+const operatorModelEnv = new Set(
+  MODEL_ENV.filter((k) => (process.env[k] ?? "").trim() !== ""),
+);
+let lastModel = "";
+
 function getDb(): DatabaseSync {
+  // Re-read on every call, not once. A config file that no longer parses
+  // throws here and fails this call out loud rather than serving the old
+  // settings as if nothing had changed.
+  //
+  // Cleared before loading, not after: loadConfig itself reads these
+  // variables as env overrides, so a value seeded by the previous call would
+  // otherwise come back as if the operator had set it — which is exactly how
+  // the first version of this refresh kept serving the old base.
+  for (const k of MODEL_ENV) {
+    if (!operatorModelEnv.has(k)) delete process.env[k];
+  }
+  const config = loadConfig();
+  // Not optional, and not cosmetic: without it `complete()` reads its default
+  // and every answer comes from the canned stub, in fluent prose, while the
+  // config file says `"mode": "openai"`. Measured on this machine — the first
+  // version of this file omitted it and `chamber_ask` returned stub text that
+  // a reader would have taken for a real refusal.
+  applyModelEnv(config);
+
+  const model =
+    `model=${process.env.CHAMBER_MODEL} base=${process.env.CHAMBER_API_BASE ?? "(unset)"}`;
+  if (model !== lastModel) {
+    console.error(`chamber mcp: ${lastModel === "" ? "" : "config changed — "}${model}`);
+    lastModel = model;
+  }
+
   if (!db) {
-    const config = loadConfig();
-    // Not optional, and not cosmetic: without it `complete()` reads its
-    // default and every answer comes from the canned stub, in fluent prose,
-    // while the config file says `"mode": "openai"`. Measured on this machine
-    // — the first version of this file omitted it and `chamber_ask` returned
-    // stub text that a reader would have taken for a real refusal.
-    applyModelEnv(config);
     db = openChamberDb(config.database);
-    // Announced because this process pins these values for its whole life.
-    //
-    // applyModelEnv seeds only what is unset, which is what makes env outrank
-    // config — and it also means a config edit can never reach a server that
-    // has already run one tool call. Editing the model base while a host held
-    // this process open produced ECONNREFUSED against the *old* address, which
-    // reads as a broken config rather than a stale daemon; the CLI answered
-    // fine from the same file at the same moment. One line on stderr, which
-    // the host keeps in its MCP log, is the difference between diagnosing that
-    // in a minute and doubting the config file.
+    openedDatabase = config.database;
+    console.error(`chamber mcp: db=${config.database} — pinned for this process`);
+  } else if (config.database !== openedDatabase) {
+    // The database stays pinned: a tool call may be awaiting the model with
+    // this handle open, and swapping it underneath would split one call across
+    // two databases. Said on every call until the server is reconnected.
     console.error(
-      `chamber mcp: db=${config.database} model=${process.env.CHAMBER_MODEL} ` +
-        `base=${process.env.CHAMBER_API_BASE ?? "(unset)"} ` +
-        `— pinned for this process; reconnect the server after editing config`,
+      `chamber mcp: config now names db=${config.database}; still using ` +
+        `${openedDatabase} — reconnect the server to switch databases`,
     );
   }
   return db;

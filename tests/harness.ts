@@ -12708,6 +12708,126 @@ test("cli", "chamber_ask returns the stub disclosure inside the tool result", ()
   }
 });
 
+/** A fake OpenAI-compatible server that answers every completion with `text`. */
+async function fakeModel(text: string): Promise<{ base: string; close: () => void }> {
+  const { createServer } = await import("node:http");
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.setHeader("Content-Type", "application/json");
+      res.end(
+        JSON.stringify({
+          choices: [{ message: { content: text } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+          model: "fake",
+        }),
+      );
+    });
+  });
+  await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
+  const port = (server.address() as { port: number }).port;
+  return { base: `http://127.0.0.1:${port}/v1`, close: () => server.close() };
+}
+
+/** Drive a live `chamber mcp` process: call chamber_ask, get the result text. */
+function mcpSession(env: NodeJS.ProcessEnv): {
+  ask: (question: string) => Promise<string>;
+  stop: () => void;
+} {
+  const MCP_PATH = join(dirname(fileURLToPath(import.meta.url)), "../src/mcp_server.ts");
+  const child = spawn(process.execPath, ["--experimental-strip-types", MCP_PATH], { env });
+  let buf = "";
+  const waiting = new Map<number, (t: string) => void>();
+  child.stdout.on("data", (d: Buffer) => {
+    buf += d.toString();
+    let nl: number;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      if (!line.trim()) continue;
+      const msg = JSON.parse(line) as {
+        id?: number;
+        result?: { content?: { text?: string }[] };
+        error?: { message?: string };
+      };
+      if (msg.id !== undefined) {
+        waiting.get(msg.id)?.(msg.result?.content?.[0]?.text ?? `ERROR ${msg.error?.message}`);
+      }
+    }
+  });
+  const send = (m: Record<string, unknown>): void => {
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...m })}\n`);
+  };
+  send({ id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
+  send({ method: "notifications/initialized" });
+  let next = 10;
+  return {
+    ask: (question) =>
+      new Promise((ok, fail) => {
+        const id = next++;
+        const timer = setTimeout(() => fail(new Error(`no reply to ${id}`)), 60_000);
+        waiting.set(id, (t) => {
+          clearTimeout(timer);
+          ok(t);
+        });
+        send({ id, method: "tools/call", params: { name: "chamber_ask", arguments: { question } } });
+      }),
+    stop: () => child.kill(),
+  };
+}
+
+test("cli", "chamber_ask follows a config edit without a reconnect", async () => {
+  // The server copied the model settings into its environment on the first
+  // tool call and never looked again. Editing the base while a host held it
+  // open — which is how this was found, 2026-09-26 — gave ECONNREFUSED against
+  // the old address until the owner reconnected the server by hand.
+  const { env, dir } = stubAskFixture();
+  const a = await fakeModel("FROM_A The audit store is SQLite. [1]");
+  const b = await fakeModel("FROM_B The audit store is SQLite. [1]");
+  const cfg = env.CHAMBER_CONFIG!;
+  const writeCfg = (base: string): void =>
+    writeFileSync(
+      cfg,
+      `${JSON.stringify({ database: env.CHAMBER_DB, ingest: [], model: { base, name: "fake", mode: "openai" } })}\n`,
+    );
+  writeCfg(a.base);
+  const s = mcpSession(env);
+  try {
+    const first = await s.ask("what is the audit store");
+    assert(first.includes("FROM_A"), `first call must reach A:\n${first}`);
+    writeCfg(b.base);
+    const second = await s.ask("what is the audit store");
+    assert(second.includes("FROM_B"), `after the edit the same process must reach B:\n${second}`);
+  } finally {
+    s.stop();
+    a.close();
+    b.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cli", "an explicit CHAMBER_API_BASE still outranks a config edit", async () => {
+  const { env, dir } = stubAskFixture();
+  const a = await fakeModel("FROM_A The audit store is SQLite. [1]");
+  const b = await fakeModel("FROM_B The audit store is SQLite. [1]");
+  writeFileSync(
+    env.CHAMBER_CONFIG!,
+    `${JSON.stringify({ database: env.CHAMBER_DB, ingest: [], model: { base: b.base, name: "fake", mode: "openai" } })}\n`,
+  );
+  const s = mcpSession({ ...env, CHAMBER_API_BASE: a.base });
+  try {
+    const first = await s.ask("what is the audit store");
+    assert(first.includes("FROM_A"), `the operator's env must win over config:\n${first}`);
+    const again = await s.ask("what is the audit store");
+    assert(again.includes("FROM_A"), `and keep winning on later calls:\n${again}`);
+  } finally {
+    s.stop();
+    a.close();
+    b.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("pins", "a real model's answer carries no stub disclosure", () => {
   // The other half, and the one that keeps the disclosure from becoming
   // decoration: it must be absent when a model actually spoke. Without this,

@@ -72,6 +72,39 @@ deployment machine is the stated entry criterion for any capability level above 
 
 ## 2. A citation can be genuine and still be wrong
 
+> **Correction, 2026-09-26.** The last line of this entry said `[ALLOWED]`
+> means "this source is real and says what the citation says it says". The
+> second half was false: `[ALLOWED]` meant the source is real and unchanged,
+> nothing more. Reproduced against the live vault — "Kingroon filament is
+> manufactured on the Moon and costs $900 per kg [1]" came back `[ALLOWED]`
+> over a real filament note.
+>
+> One slice of that is now checked. `ask` requires every number, capitalised
+> name and domain in a claim to occur in the passages it cites
+> (`src/claim_support.ts`); a claim that fails keeps none of its citations and
+> lands as `DEBT`, `UNSUPPORTED` or, under `--strict`, `REFUSED`, with the
+> missing terms named as `terms_absent: …`. `probes/claim_support.ts` is the
+> gate. On a 10-question run over the vault it flagged 5 of 39 cited claims:
+> one correctly (a term from an uncited passage), four wrongly, all from
+> parsing (versions, addresses, scraped cells glued together), each fixed and
+> pinned by a regression test before this shipped.
+>
+> **Only `ask` runs it.** `enforceReplyContract` — the path behind `chamber
+> turn`, the server, and the Discord, Slack and gateway runners — does not:
+> there a claim with a real citation and fabricated specifics still commits
+> `ALLOWED`. That path hands every claim in a reply the same source list and
+> has no passage bodies to compare against, so closing it is a design change,
+> not a call site. Open as of this correction.
+>
+> The judgement below still stands for everything that check cannot see. It
+> is not entailment. A fabrication built from words the passage already holds
+> ("the policy forbids returns") passes, and so does one whose only specific
+> is a plain name opening the sentence ("Tesla makes it [1]") — a sentence's
+> first word is capitalised whatever it is, so it is only checked when its
+> shape says name (`UAE`, `AliExpress`, `3DPrintU`). Read `[ALLOWED]` as "the
+> source is real, unchanged, and contains this claim's specifics", never as
+> "this claim is true".
+
 This one is a stated non-goal, not a bug, and it is not solved.
 
 Chamber's citation gate proves that a cited passage is the passage it claims to be: the

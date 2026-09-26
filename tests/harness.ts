@@ -62,6 +62,7 @@ import {
   CITABLE_SOURCE_KINDS,
 } from "../src/pins.ts";
 import { runAsk, citedIndices, stubDisclosure } from "../src/ask.ts";
+import { missingTerms, specificTerms } from "../src/claim_support.ts";
 import {
   minilmAvailable,
   minilmInstalled,
@@ -8264,6 +8265,118 @@ test("pins", "citedIndices dedupes, preserves order, and ignores non-citations",
   );
 });
 
+// ─── claim support: cited passages must contain the claim's specifics ────────
+
+test("pins", "specificTerms reads numbers, names and domains, not citations or connectives", () => {
+  const t = specificTerms(
+    "However, **Kingroon** sells 1,210 spools at $9.50 on Amazon.ae and 3DPrintU.ae [2].",
+  );
+  const got = JSON.stringify(t);
+  assert(t.includes("Amazon.ae") && t.includes("3DPrintU.ae"), `domains whole: ${got}`);
+  assert(!t.includes("Amazon"), `a domain must not also yield its first label as a name: ${got}`);
+  assert(t.includes("1210") && t.includes("9.50"), `numbers, separators dropped: ${got}`);
+  assert(t.includes("Kingroon"), `bold markup must not hide a name: ${got}`);
+  assert(!t.includes("However"), `a connective is not a name: ${got}`);
+  assert(!t.includes("2"), `a citation number is not a claim about the source: ${got}`);
+});
+
+test("pins", "missingTerms matches on boundaries, not substrings", () => {
+  const passage = "Kingroon sells 1210 spools at $900 in Moonlight Mall, 2090 edition.";
+  assert(missingTerms("It costs $900 [1]", [passage]).length === 0, "exact number");
+  assert(
+    JSON.stringify(missingTerms("It costs $90 [1]", [passage])) === '["90"]',
+    "90 must not be found inside 900 or 2090",
+  );
+  assert(missingTerms("They sold 1,210 spools", [passage]).length === 0, "1,210 == 1210");
+  assert(missingTerms("KINGROON spools", [passage]).length === 0, "names are case-insensitive");
+  assert(
+    JSON.stringify(missingTerms("Made on the Moon", [passage])) === '["Moon"]',
+    "Moon must not be found inside Moonlight",
+  );
+  assert(
+    missingTerms("Sold by Kingroon", ["unrelated", passage]).length === 0,
+    "any cited passage can supply a term",
+  );
+});
+
+test("pins", "missingTerms: the false flags measured on the vault stay fixed", () => {
+  // Each line is a real claim from the 2026-09-26 eval that the first version
+  // flagged although its cited passage says exactly that.
+  const cases: [string, string][] = [
+    ["Pi 0.84.4 extension API, Python 3.14 [2]", "TypeScript (Pi 0.84.4 extension API), Python 3.14"],
+    ["an API server bound to 127.0.0.1:8642 [1]", "API server on 127.0.0.1:8642 behind a bearer"],
+    ["Soap Making & Forming / Handicraft workshops (9609019) [5]", "| 9609019 | Soap Making & FormingHandicraft workshops | ✓ |"],
+    ["Educational Services (8890006) [6]", "| 8890006 | Educational ServicesEducation | ✓ |"],
+  ];
+  for (const [claim, passage] of cases) {
+    const m = missingTerms(claim, [passage]);
+    assert(m.length === 0, `${JSON.stringify(claim)} flagged ${JSON.stringify(m)}`);
+  }
+  // Inflected and joined names, found in review: each part is in the passage.
+  const names = "Kingroon PLA sells on AliExpress. A Coca-Cola can.";
+  for (const claim of ["buy Kingroon's PLA", "buy Kingroon’s PLA", "two Kingroons", "the AliExpress-Kingroon deal", "a Coca-Cola can"]) {
+    const m = missingTerms(claim, [names]);
+    assert(m.length === 0, `${JSON.stringify(claim)} flagged ${JSON.stringify(m)}`);
+  }
+  // The fallbacks must not make an absent name present.
+  assert(
+    JSON.stringify(missingTerms("the AliExpress-Tesla deal", [names])) === '["AliExpress-Tesla"]',
+    "a join with one absent part stays missing",
+  );
+  assert(
+    JSON.stringify(missingTerms("buy Tesla's PLA", [names])) === `["Tesla's"]`,
+    "an absent possessive stays missing",
+  );
+  // And the same machinery still sees a wrong version or address.
+  assert(
+    JSON.stringify(missingTerms("Pi 0.84.5 [2]", ["Pi 0.84.4 and 0.84.45"])) === '["0.84.5"]',
+    "a different version must be missing, not found as a prefix",
+  );
+  assert(
+    JSON.stringify(missingTerms("bound to 127.0.0.2 [1]", ["127.0.0.1"])) === '["127.0.0.2"]',
+    "a different address must be missing",
+  );
+});
+
+test("pins", "runAsk withholds pins from a claim whose specifics its passage lacks", async () => {
+  const db = freshDb();
+  upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "notes/filament.md",
+    title: "Filament",
+    body: "Kingroon PLA sells for about $9 per kg on AliExpress and ships to Dubai.",
+    model: "local-hash-v1",
+  });
+  const fake = async () =>
+    [
+      "Kingroon PLA is about $9 per kg on AliExpress. [1]",
+      "Kingroon filament is made on the Moon and is $900 per kg. [1]",
+    ].join("\n");
+  const r = await runAsk(db, "Kingroon price", { complete: fake, model: "local-hash-v1" });
+  const [ok, bad] = r.claims;
+  assert(ok!.status === "ALLOWED" && ok!.citedRefs.length === 1, `control: ${JSON.stringify(ok)}`);
+  assert(bad!.status === "DEBT", `fabricated specifics must not certify: ${JSON.stringify(bad)}`);
+  assert(bad!.citedRefs.length === 0, "no citation may be rendered for it");
+  const reason = bad!.rejected[0]?.reason ?? "";
+  assert(
+    reason.startsWith("terms_absent:") && reason.includes("Moon") && reason.includes("900"),
+    `the missing terms must be named: ${reason}`,
+  );
+  // The state that matters: only the faithful claim left a pin in the ledger.
+  const pins = db.prepare(`SELECT count(*) n FROM belief_source`).get() as { n: number };
+  assert(pins.n === 1, `exactly one belief_source row expected, got ${pins.n}`);
+
+  const strict = await runAsk(db, "Kingroon price", {
+    complete: async () => "Kingroon filament ships from Mars and is $900 per kg. [1]",
+    model: "local-hash-v1",
+    strict: true,
+  });
+  assert(
+    strict.claims[0]!.status === "REFUSED",
+    `strict must refuse it, got ${JSON.stringify(strict.claims[0])}`,
+  );
+});
+
 // ─── VERIFY (longitudinal pin drift, src/pins.ts verifyBeliefSources) ────────
 //
 // Within one ask, pin verification is close to tautological: the hash is read
@@ -9352,7 +9465,13 @@ test(
       body: "Our currency policy for the base rate is reviewed annually.",
       model: "local-hash-v1",
     });
-    const fake = async () => "The base currency is AED, the UAE dirham. [1]";
+    // This answer used to be "The base currency is AED, the UAE dirham. [1]",
+    // citing the policy passage — which never mentions AED. The test asserted
+    // ALLOWED for it, which is the fabricated-specifics escape the support
+    // check closes (probes/claim_support.ts). The claim below is one the cited
+    // passage does contain; what this test is about is the withheld note.
+    const fake = async () =>
+      "The currency policy for the base rate is reviewed annually. [1]";
     const r = await runAsk(db, "What is the base currency?", {
       complete: fake,
       model: "local-hash-v1",

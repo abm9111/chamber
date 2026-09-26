@@ -14,6 +14,7 @@ That inversion is deliberate: when a probe starts passing, promote it into
 | `gate_audit.ts` | `commit_belief` / `try_activate_skill` write only unchained `gate_event` | Phase 1.2 |
 | `pin_bypass.ts` | The citation gate is satisfied by a fabricated source pin | Phase 1.3 |
 | `debt_paraphrase.ts` | Citation debt blocks verbatim repetition only; a paraphrase of a blocked claim commits freely | — |
+| `claim_support.ts` | A claim whose numbers, names or domains are absent from its cited passage came back `[ALLOWED]` | 2026-09-26 |
 | `verify_partial_drift.ts` | A belief losing only some pins still makes `chamber verify` exit 0 | — |
 | `harness_declaration_guards.ts` | A test declared past the harness's drain loop or summary is never invoked, and the suite still prints `N/N passed`, exit 0 | 2026-08-16 |
 | `seatbelt/` | What macOS `sandbox-exec` can and cannot enforce — read before writing the seatbelt backend | Phase 1.1 |
@@ -25,6 +26,7 @@ CHAMBER_SANDBOX_REQUIRED=1 node --experimental-strip-types probes/sandbox_escape
 node --experimental-strip-types probes/gate_audit.ts
 node --experimental-strip-types probes/pin_bypass.ts
 node --experimental-strip-types probes/debt_paraphrase.ts
+node --experimental-strip-types probes/claim_support.ts
 node --experimental-strip-types probes/verify_partial_drift.ts
 node --experimental-strip-types probes/harness_declaration_guards.ts
 ```

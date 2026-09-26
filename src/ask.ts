@@ -32,6 +32,7 @@ import {
   CITABLE_SOURCE_KINDS,
 } from "./pins.ts";
 import { complete } from "./model.ts";
+import { missingTerms } from "./claim_support.ts";
 
 export type CompleteFn = (prompt: string) => Promise<string>;
 
@@ -632,6 +633,26 @@ export async function runAsk(
         snapshotHash: p.snapshotHash,
         provenance: "vector",
       });
+    }
+
+    // A verified pin proves the passage is real, not that it says this. Every
+    // number, name and domain in the claim must occur in what it cites, or no
+    // citation is passed on — the claim then commits with nothing holding it
+    // up (DEBT / UNSUPPORTED / REFUSED under strict), and `rejected` names the
+    // terms the passages lack. Checked against the union of cited passages,
+    // and before enforceClaimContract, because that call is the commit: a
+    // check after it would relabel a row already written as evidence.
+    if (sources.length > 0) {
+      const cited = new Set(sources.map((s) => s.refId));
+      const bodies = passages.filter((p) => cited.has(p.documentId)).map((p) => p.body);
+      const missing = missingTerms(claim.text, bodies);
+      if (missing.length > 0) {
+        for (const s of sources) {
+          rejected.push({ refId: s.refId, reason: `terms_absent: ${missing.join(", ")}` });
+        }
+        sources.length = 0;
+        citedRefs.length = 0;
+      }
     }
 
     // Per claim, not per reply: enforceReplyContract applies one source list to

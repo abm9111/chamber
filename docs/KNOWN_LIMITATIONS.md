@@ -123,8 +123,11 @@ deployment machine is the stated entry criterion for any capability level above 
 > else. On the final 10-question vault run: 40 cited claims, 2 flagged, both
 > correctly (terms absent from every cited passage), 0 wrongly.
 >
-> A third round (review plus VIGIL) closed names after abbreviations
-> (`e.g. Tesla`), `$9m` / `lakh` / `%` reducing to a bare number, and a
+> A third round (review plus VIGIL) narrowed names after abbreviations
+> (`e.g. Tesla` by list; since the fourth, `U.S.`, `a.k.a.`, `Jr.` by shape —
+> an abbreviation that is neither listed nor dotted nor one or two letters
+> still hides the next name), made a leading minus part of its number
+> (`-5%` ≠ `5%`), `$9m` / `lakh` / `%` reducing to a bare number, and a
 > passage's own `1,000 million` being flagged. Accepted, knowingly: a
 > capitalised ordinary word after a label or dash is now checked, so
 > "Delivery: Roughly 5 days [1]" is flagged when the passage lacks

@@ -49,8 +49,11 @@ const DOMAIN = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|ae|net|org|io|co|a
 // claim that wrote its number that way was checked for nothing. A scale word
 // or suffix stays attached, so `$9 billion` and `9k` are not satisfied by a
 // passage that says `$9` (review, 2026-09-26).
+// A leading minus stays with its number when it is a sign, not a range dash:
+// "-5%" and "5%" satisfied each other (VIGIL AIML-003), while "19-25" is two
+// numbers.
 const NUMBER =
-  /\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})m(?![\p{L}\p{N}])|\s?%)?/giu;
+  /(?:(?<![\p{L}\p{N}])[-−])?\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})m(?![\p{L}\p{N}])|\s?%)?/giu;
 /**
  * A name: a capitalised word or acronym in any script (`Škoda`, `Möbius` —
  * an ASCII class cut the latter to `M`), optionally led by digits (`9XFabs`,
@@ -87,7 +90,15 @@ function atSentenceStart(text: string, index: number): boolean {
   if (!/[.!?]$/.test(before)) return false;
   // A period after an abbreviation ends no sentence: "e.g. Tesla" and
   // "Dr. Tesla" left the name unchecked (round-2 review, VIGIL AIML-001).
-  return !ABBREVIATION.test(before);
+  // By list, and by shape: the list alone was a blocklist, and "a.k.a.",
+  // "U.S.", "Jr." each hid the next name (VIGIL AIML-001). Dotted initials and
+  // one- or two-letter words before a period are read as abbreviations. Being
+  // wrong here only means the next word is checked — the safe direction.
+  return !(
+    ABBREVIATION.test(before) ||
+    /(?:^|[\s(])(?:\p{L}{1,3}\.){2,}$/u.test(before) ||
+    /(?:^|[\s(])\p{L}{1,2}\.$/u.test(before)
+  );
 }
 
 const ABBREVIATION =
@@ -133,7 +144,7 @@ export function specificTerms(claim: string): string[] {
   // term, not as the name `Amazon` plus nothing.
   for (const m of text.matchAll(DOMAIN)) add(m[0]);
   text = text.replace(DOMAIN, " ");
-  for (const m of text.matchAll(NUMBER)) add(bareNumber(m[0]));
+  for (const m of text.matchAll(NUMBER)) add(bareNumber(m[0].replace(/−/g, "-")));
   for (const m of text.matchAll(NAME)) {
     if (CONNECTIVES.has(m[0].toLowerCase())) continue;
     if (atSentenceStart(text, m.index) && !looksLikeName(m[0])) continue;
@@ -152,9 +163,9 @@ export function specificTerms(claim: string): string[] {
  */
 export function missingTerms(claim: string, passages: string[]): string[] {
   const haystack = passages.join("\n");
-  const numeric = haystack.replace(THOUSANDS, "$1");
+  const numeric = haystack.replace(THOUSANDS, "$1").replace(/−/g, "-");
   return specificTerms(claim).filter((term) => {
-    const num = /^([\p{Nd}][\p{Nd},.]*)(.*)$/u.exec(term);
+    const num = /^(-?[\p{Nd}][\p{Nd},.]*)(.*)$/u.exec(term);
     const suffix = num?.[2]!.trim() ?? "";
     // Only a bare number or a number with a unit takes the number path. A
     // digit-led *name* (`3DPrintU`, `9XFabs`) sent there lost its word edge
@@ -191,7 +202,14 @@ function numberFound(numeric: string, digits: string, suffix: string): boolean {
     suffix === ""
       ? "(?![\\p{Nd}]|[.,]\\p{Nd})"
       : `${space}${escapeRegex(suffix)}(?![\\p{L}\\p{N}])`;
-  return new RegExp(`(?<![\\p{Nd}.,])${escapeRegex(digits)}${tail}`, "iu").test(numeric);
+  // An unsigned number must not sit behind a sign ("5%" inside "-5%"). A dash
+  // is a sign only after a space, a bracket or the start: after a digit it is
+  // a range ("19-25"), after a letter a version or id ("AGPL-3.0",
+  // "TASK-003") — both were flagged by a first version of this rule.
+  const unsigned = digits.startsWith("-") ? "" : "(?<!(?:^|[\\s(])-)";
+  return new RegExp(`(?<![\\p{Nd}.,])${unsigned}${escapeRegex(digits)}${tail}`, "iu").test(
+    numeric,
+  );
 }
 
 /**

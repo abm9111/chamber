@@ -8876,6 +8876,127 @@ test("pins", "claim support: round-4 review — units, digit-led names", () => {
   }
 });
 
+/**
+ * A second connection to the same file, and a wrapper over the first that
+ * runs `interleave` at a chosen statement. SQLite serialises writers across
+ * connections, so this is how "another writer lands between the check and the
+ * write" is made to happen in one process — a single connection cannot race
+ * itself, and a test that never forces the window passes against broken code
+ * (VIGIL CODE-001).
+ */
+function interleaved(
+  db: DatabaseSync,
+  when: (method: "prepare" | "exec", sql: string) => boolean,
+  interleave: () => void,
+): DatabaseSync {
+  let fired = false;
+  return new Proxy(db, {
+    get(target, prop) {
+      // Read against the real handle: node:sqlite's getters (isTransaction)
+      // throw "Illegal invocation" when their receiver is the proxy.
+      const v = Reflect.get(target, prop, target) as unknown;
+      if ((prop === "prepare" || prop === "exec") && typeof v === "function") {
+        return (sql: string) => {
+          if (!fired && when(prop, sql)) {
+            fired = true;
+            interleave();
+          }
+          return (v as (s: string) => unknown).call(target, sql);
+        };
+      }
+      return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+}
+
+test("pins", "debt payment verifies and writes its pin under one lock", () => {
+  // VIGIL DATA-002: proposeDebtPayment ran verifyPin, then an unguarded
+  // INSERT. A prune landing between them left the debt proposed_paid over a
+  // row that was gone. Here a second connection tries that delete at the
+  // moment the INSERT is prepared: under the lock it cannot, and either way a
+  // written pin must point at a row that exists.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-debt-race-"));
+  const path = join(dir, "c.sqlite");
+  const db = openChamberDb(path);
+  upsertDocument(db, { id: "note_aed", sourceKind: "vault_page", sourceRef: "aed.md", title: "Currency", body: "User base currency is AED (UAE dirham).", model: "local-hash-v1" });
+  const bel = commitBelief(db, { type: "belief", text: "User base currency is AED", sources: [], authorFamily: "test", path: "deep" });
+  assert(bel.ok, JSON.stringify(bel));
+  const debt = (db.prepare(`SELECT id FROM citation_debt WHERE belief_id = ? AND status = 'pending'`).get(bel.beliefId!) as { id: string }).id;
+  const other = openChamberDb(path);
+  other.exec("PRAGMA busy_timeout = 0");
+  let blocked = false;
+  const racing = interleaved(
+    db,
+    (m, sql) => m === "prepare" && sql.includes("INSERT INTO belief_source"),
+    () => {
+      try {
+        other.prepare(`DELETE FROM vector_document WHERE id = 'note_aed'`).run();
+      } catch {
+        blocked = true;
+      }
+    },
+  );
+  const prop = proposeDebtPayment(racing, debt, { minScore: 0.05, model: "local-hash-v1" });
+  const pinned = (db.prepare(`SELECT count(*) n FROM belief_source WHERE ref_id = 'note_aed'`).get() as { n: number }).n;
+  const exists = (db.prepare(`SELECT count(*) n FROM vector_document WHERE id = 'note_aed'`).get() as { n: number }).n;
+  assert(prop.attached.length > 0, `setup: the payment must reach the INSERT: ${prop.reason}`);
+  assert(blocked, "the second writer must be held off while the pin is verified and written");
+  assert(pinned === 0 || exists === 1, `a pin was written for a row that is gone (pinned=${pinned}, exists=${exists})`);
+  other.close();
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("pins", "prune: a citation committed as prune takes its lock keeps the row", () => {
+  // VIGIL CODE-001: the test below passed against the pre-fix pruneDocuments,
+  // which read "is it cited" before BEGIN IMMEDIATE. This one commits the
+  // citation at exactly that moment: the old code has already decided to
+  // delete; the fixed code checks inside the DELETE.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-prune-race-"));
+  mkdirSync(join(dir, "drafts"));
+  writeFileSync(join(dir, "drafts", "c.md"), "# C\n\n## S\n\nRefunds close after thirty days.\n");
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  const listed = findExcludedDocuments(db, [{ root: dir, exclude: ["drafts"] }]).flatMap((g) => g.ids);
+  const id = listed[0]!;
+  const snapshotHash = verifyPin(db, { kind: "vault_page", refId: id, snapshotHash: "" }).actualHash!;
+  const racing = interleaved(
+    db,
+    (m, sql) => m === "exec" && sql === "BEGIN IMMEDIATE",
+    () => {
+      const r = commitBelief(db, {
+        type: "inference",
+        text: "refunds close after thirty days",
+        sources: [{ kind: "vault_page", refId: id, snapshotHash }],
+        authorFamily: "test",
+        path: "fast",
+        requireVerifiedSupport: true,
+      });
+      assert(r.ok, `setup: ${JSON.stringify(r)}`);
+    },
+  );
+  pruneDocuments(racing, new Set(listed));
+  const still = (db.prepare(`SELECT count(*) n FROM vector_document WHERE id = ?`).get(id) as { n: number }).n;
+  assert(still === 1, "a row cited before prune took its lock must survive");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("pins", "claim support: abbreviations by shape, and the sign of a number", () => {
+  // VIGIL AIML-001 (narrowed): the abbreviation list was a blocklist, so any
+  // abbreviation not on it — "a.k.a.", "U.S.", "Jr." — hid the next name.
+  // AIML-003: "-5%" and "5%" satisfied each other.
+  const passage = "Kingroon sells PLA in the U.S. through Jr. staff. Margin is 5%. Loss is -3%.";
+  for (const e of ["Kingroon, a.k.a. Tesla, sells PLA [1]", "sold in the U.S. Tesla stores [1]", "run by Jr. Tesla [1]", "Margin is -5% [1]", "Loss is 3% [1]"]) {
+    assert(missingTerms(e, [passage]).length > 0, `${JSON.stringify(e)} must not pass`);
+  }
+  // The last two were flagged on the vault eval by a first version of the sign
+  // rule, which read the hyphen in "AGPL-3.0" and "TASK-003" as a minus.
+  for (const ok of ["Loss is -3% [1]", "Margin is 5% [1]", "Sizes 19-25 [1]", "licensed AGPL-3.0 [1]", "before TASK-003 [1]"]) {
+    const m = missingTerms(ok, [passage + " Sizes 19-25. Skyvern is AGPL-3.0. Do this before TASK-003 work."]);
+    assert(m.length === 0, `${JSON.stringify(ok)} flagged ${JSON.stringify(m)}`);
+  }
+});
+
 test("pins", "prune keeps a row a belief started citing after it was listed", () => {
   const dir = mkdtempSync(join(tmpdir(), "chamber-prune-late-pin-"));
   mkdirSync(join(dir, "drafts"));

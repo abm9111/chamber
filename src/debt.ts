@@ -169,127 +169,144 @@ export function proposeDebtPayment(
   //
   // Both writers now agree on what a valid pin is, because both go through
   // verifyPin and both key on the document id.
-  const attached: string[] = [];
-  const rejected: RejectedSource[] = [];
-  for (const h of hits.slice(0, 3)) {
-    if (!isCitableSourceKind(h.sourceKind)) {
-      rejected.push({ refId: h.documentId, reason: "kind_unregistered" });
-      continue;
-    }
-    const verdict = verifyPin(db, {
-      kind: h.sourceKind,
-      refId: h.documentId,
-      snapshotHash: h.snapshotHash,
-    });
-    if (!verdict.ok) {
-      rejected.push({ refId: h.documentId, reason: verdict.reason! });
-      continue;
-    }
-    // No belief to hang it on: the pin verified, but a belief_source row needs
-    // a belief_id, so record it as proposed evidence and let the human see it.
-    if (!debt.belief_id) {
-      attached.push(h.documentId);
-      continue;
-    }
-    try {
+  // Verify, write and settle are one transaction. verifyPin used to run
+  // before an unguarded INSERT, so a prune landing between them left the debt
+  // `proposed_paid` over a row that no longer existed and verify reported
+  // not_found (VIGIL DATA-002, forced on HEAD). The same law commitBelief
+  // states as FM-6: the check and the write it guards share one lock.
+  // Retrieval above stays outside it — it reads nothing the write depends on.
+  const own = !db.isTransaction;
+  if (own) db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = ((): DebtPaymentProposal => {
+      const attached: string[] = [];
+      const rejected: RejectedSource[] = [];
+      for (const h of hits.slice(0, 3)) {
+        if (!isCitableSourceKind(h.sourceKind)) {
+          rejected.push({ refId: h.documentId, reason: "kind_unregistered" });
+          continue;
+        }
+        const verdict = verifyPin(db, {
+          kind: h.sourceKind,
+          refId: h.documentId,
+          snapshotHash: h.snapshotHash,
+        });
+        if (!verdict.ok) {
+          rejected.push({ refId: h.documentId, reason: verdict.reason! });
+          continue;
+        }
+        // No belief to hang it on: the pin verified, but a belief_source row needs
+        // a belief_id, so record it as proposed evidence and let the human see it.
+        if (!debt.belief_id) {
+          attached.push(h.documentId);
+          continue;
+        }
+        try {
+          db.prepare(
+            `INSERT INTO belief_source (
+               id, belief_id, kind, ref_id, snapshot_hash, provenance, pays_subclaim,
+               retriever_family, pinned_ref, pinned_root
+             ) VALUES (?, ?, ?, ?, ?, 'vector', ?, ?, ?, ?)`,
+          ).run(
+            newId("src"),
+            debt.belief_id,
+            h.sourceKind,
+            h.documentId,
+            h.snapshotHash,
+            debt.id,
+            "chamber-vector",
+            // From the verdict, not from the hit: the verdict is what proves a row
+            // was actually read. A pin written here without its position is a pin
+            // that can only ever report not_found once its note shrinks — the same
+            // hole this column closes for commitBelief, and it would have been easy
+            // to close it in one path only.
+            verdict.sourceRef ?? null,
+            verdict.ingestRoot ?? null,
+          );
+          attached.push(h.documentId);
+        } catch (err) {
+          // Duplicate or FK. Reported rather than swallowed: a pin that verified
+          // and still did not land is exactly the state that made this bug
+          // invisible for as long as it was.
+          rejected.push({ refId: h.documentId, reason: `not_written: ${String(err)}` });
+        }
+      }
+
+      const auto =
+        opts.autoPay === true || process.env.CHAMBER_AUTO_PAY_DEBT === "1";
+      const strong = best.score >= 0.35;
+
+      // Auto-pay closes a debt without a human ever looking, so it must be backed
+      // by a pin that verified — not merely by a similarity score. Retrieval
+      // proximity is not warrant (see the module header); a debt marked `paid` with
+      // zero stored evidence is the gate lying about itself.
+      if (auto && strong && attached.length > 0) {
+        db.prepare(
+          `UPDATE citation_debt
+           SET status = 'paid', paid_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE id = ?`,
+        ).run(debt.id);
+        db.prepare(
+          `INSERT INTO gate_event (id, gate, action, subject_kind, subject_id, detail_json)
+           VALUES (?, 'debt', 'passed', 'debt', ?, ?)`,
+        ).run(
+          newId("ge"),
+          debt.id,
+          JSON.stringify({
+            mode: "auto_pay",
+            score: best.score,
+            doc: best.documentId,
+            pins: attached,
+          }),
+        );
+        return {
+          debtId: debt.id,
+          claimText: debt.claim_text,
+          hits,
+          status: "paid",
+          reason: `auto-paid via ${best.title ?? best.documentId} score=${best.score.toFixed(3)}`,
+          attached,
+          rejected,
+        };
+      }
+
       db.prepare(
-        `INSERT INTO belief_source (
-           id, belief_id, kind, ref_id, snapshot_hash, provenance, pays_subclaim,
-           retriever_family, pinned_ref, pinned_root
-         ) VALUES (?, ?, ?, ?, ?, 'vector', ?, ?, ?, ?)`,
+        `UPDATE citation_debt SET status = 'proposed_paid' WHERE id = ? AND status = 'pending'`,
+      ).run(debt.id);
+      db.prepare(
+        `INSERT INTO gate_event (id, gate, action, subject_kind, subject_id, detail_json)
+         VALUES (?, 'debt', 'escalated', 'debt', ?, ?)`,
       ).run(
-        newId("src"),
-        debt.belief_id,
-        h.sourceKind,
-        h.documentId,
-        h.snapshotHash,
+        newId("ge"),
         debt.id,
-        "chamber-vector",
-        // From the verdict, not from the hit: the verdict is what proves a row
-        // was actually read. A pin written here without its position is a pin
-        // that can only ever report not_found once its note shrinks — the same
-        // hole this column closes for commitBelief, and it would have been easy
-        // to close it in one path only.
-        verdict.sourceRef ?? null,
-        verdict.ingestRoot ?? null,
+        JSON.stringify({
+          mode: "proposed",
+          score: best.score,
+          doc: best.documentId,
+          pins: attached,
+          rejected,
+        }),
       );
-      attached.push(h.documentId);
-    } catch (err) {
-      // Duplicate or FK. Reported rather than swallowed: a pin that verified
-      // and still did not land is exactly the state that made this bug
-      // invisible for as long as it was.
-      rejected.push({ refId: h.documentId, reason: `not_written: ${String(err)}` });
-    }
+
+      return {
+        debtId: debt.id,
+        claimText: debt.claim_text,
+        hits,
+        status: "proposed_paid",
+        reason:
+          `proposed ${hits.length} source(s), ${attached.length} pinned` +
+          `${rejected.length ? `, ${rejected.length} unpinnable` : ""}; ` +
+          `best=${best.score.toFixed(3)} — human/epistemology to confirm paid`,
+        attached,
+        rejected,
+      };
+    })();
+    if (own) db.exec("COMMIT");
+    return result;
+  } catch (err) {
+    if (own) db.exec("ROLLBACK");
+    throw err;
   }
-
-  const auto =
-    opts.autoPay === true || process.env.CHAMBER_AUTO_PAY_DEBT === "1";
-  const strong = best.score >= 0.35;
-
-  // Auto-pay closes a debt without a human ever looking, so it must be backed
-  // by a pin that verified — not merely by a similarity score. Retrieval
-  // proximity is not warrant (see the module header); a debt marked `paid` with
-  // zero stored evidence is the gate lying about itself.
-  if (auto && strong && attached.length > 0) {
-    db.prepare(
-      `UPDATE citation_debt
-       SET status = 'paid', paid_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-       WHERE id = ?`,
-    ).run(debt.id);
-    db.prepare(
-      `INSERT INTO gate_event (id, gate, action, subject_kind, subject_id, detail_json)
-       VALUES (?, 'debt', 'passed', 'debt', ?, ?)`,
-    ).run(
-      newId("ge"),
-      debt.id,
-      JSON.stringify({
-        mode: "auto_pay",
-        score: best.score,
-        doc: best.documentId,
-        pins: attached,
-      }),
-    );
-    return {
-      debtId: debt.id,
-      claimText: debt.claim_text,
-      hits,
-      status: "paid",
-      reason: `auto-paid via ${best.title ?? best.documentId} score=${best.score.toFixed(3)}`,
-      attached,
-      rejected,
-    };
-  }
-
-  db.prepare(
-    `UPDATE citation_debt SET status = 'proposed_paid' WHERE id = ? AND status = 'pending'`,
-  ).run(debt.id);
-  db.prepare(
-    `INSERT INTO gate_event (id, gate, action, subject_kind, subject_id, detail_json)
-     VALUES (?, 'debt', 'escalated', 'debt', ?, ?)`,
-  ).run(
-    newId("ge"),
-    debt.id,
-    JSON.stringify({
-      mode: "proposed",
-      score: best.score,
-      doc: best.documentId,
-      pins: attached,
-      rejected,
-    }),
-  );
-
-  return {
-    debtId: debt.id,
-    claimText: debt.claim_text,
-    hits,
-    status: "proposed_paid",
-    reason:
-      `proposed ${hits.length} source(s), ${attached.length} pinned` +
-      `${rejected.length ? `, ${rejected.length} unpinnable` : ""}; ` +
-      `best=${best.score.toFixed(3)} — human/epistemology to confirm paid`,
-    attached,
-    rejected,
-  };
 }
 
 /** Human/epistemology confirms payment. */

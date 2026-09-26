@@ -648,7 +648,14 @@ Unplanned.
 > metadata without touching pins (the pin hash covers title, body and ref
 > only). Measured on a re-ingested copy of the vault: every one of 44,037
 > passages numbered; 8,258 of 18,809 sections split (43.9%); the filament
-> question 8 of 8 brands, three of three.
+> question 8 of 8 brands, three of three. Open: section numbers are stable
+> for identical bytes but renumber when a section is inserted above, and
+> `ingestDirectory` writes a file's rows without a per-file transaction — an
+> ingest interrupted mid-file can leave old-numbered pieces beside new ones,
+> and until the next complete ingest of that file a hit may be shown with a
+> stale piece of a different section (round-4 review, reproduced with a
+> simulated crash; the title-and-adjacency rule before it had the same
+> window). Each piece still carries its own pin, so no citation is affected.
 
 `embedMinilm` shells out to `python3` with `scripts/embed_minilm.py`. Most of
 what this entry used to describe has been closed; what follows separates the

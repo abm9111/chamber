@@ -155,7 +155,14 @@ export function missingTerms(claim: string, passages: string[]): string[] {
   const numeric = haystack.replace(THOUSANDS, "$1");
   return specificTerms(claim).filter((term) => {
     const num = /^([\p{Nd}][\p{Nd},.]*)(.*)$/u.exec(term);
-    if (num) return !numberFound(numeric, num[1]!, num[2]!.trim());
+    const suffix = num?.[2]!.trim() ?? "";
+    // Only a bare number or a number with a unit takes the number path. A
+    // digit-led *name* (`3DPrintU`, `9XFabs`) sent there lost its word edge
+    // ("Buy3DPrintU" satisfied it) and its possessive/hyphen handling
+    // (round-4 review); names keep the name rules.
+    if (num && (suffix === "" || UNIT.test(suffix))) {
+      return !numberFound(numeric, num[1]!, suffix);
+    }
     return !nameFound(haystack, term);
   });
 }
@@ -169,11 +176,21 @@ export function missingTerms(claim: string, passages: string[]): string[] {
  * (round-3 review). One optional space between number and suffix, so "9%"
  * and "9 %" are the same claim.
  */
+/** The units a number-led term may carry; anything else makes it a name. */
+const UNIT = /^(?:%|k|m|mn|bn|thousand|million|billion|trillion|lakh|crore)$/i;
+/**
+ * Units a space may separate from their number. Not `m` or `k`: with a space
+ * allowed, "$5m" was satisfied by "5 m long" — metres certifying millions —
+ * and "3M tape" by "3 m tape" (round-4 review).
+ */
+const SPACED_UNIT = /^(?:%|mn|bn|thousand|million|billion|trillion|lakh|crore)$/i;
+
 function numberFound(numeric: string, digits: string, suffix: string): boolean {
+  const space = SPACED_UNIT.test(suffix) ? "\\s?" : "";
   const tail =
     suffix === ""
       ? "(?![\\p{Nd}]|[.,]\\p{Nd})"
-      : `\\s?${escapeRegex(suffix)}(?![\\p{L}\\p{N}])`;
+      : `${space}${escapeRegex(suffix)}(?![\\p{L}\\p{N}])`;
   return new RegExp(`(?<![\\p{Nd}.,])${escapeRegex(digits)}${tail}`, "iu").test(numeric);
 }
 

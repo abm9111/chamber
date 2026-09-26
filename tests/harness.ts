@@ -8848,6 +8848,34 @@ test("pins", "claim support: a number with a unit or scale is found on digit bou
   }
 });
 
+test("pins", "claim support: round-4 review — units, digit-led names", () => {
+  // 67263a9 sent every digit-led term down the number path with an optional
+  // space before any suffix: metres certified millions, and names like
+  // 3DPrintU lost their word edge and their possessive/hyphen handling.
+  const escapes: [string, string][] = [
+    ["Revenue $5m [1]", "The rod is 5 m long."],
+    ["Revenue $5m [1]", "Speed 5 M/s"],
+    ["Uses 3M tape [1]", "Uses 3 m tape"],
+    ["Brand 9XFabs [1]", "brand 9 xfabs"],
+    ["Sold via 3DPrintU [1]", "Sold via Buy3DPrintU"],
+    ["Brand 9XFabs [1]", "brand A9XFabs"],
+  ];
+  for (const [c, p] of escapes) {
+    assert(missingTerms(c, [p]).length > 0, `${JSON.stringify(c)} must not be satisfied by ${JSON.stringify(p)}`);
+  }
+  const faithful: [string, string][] = [
+    ["Sold via 3DPrintU's store [1]", "Sold via 3DPrintU store"],
+    ["the 9XFabs-Kingroon deal [1]", "9XFabs and Kingroon"],
+    ["grew 9 % [1]", "grew 9%."],
+    ["hit 5 million [1]", "hit 5 million users"],
+    ["Revenue $5m [1]", "Revenue $5m in Q3"],
+  ];
+  for (const [c, p] of faithful) {
+    const m = missingTerms(c, [p]);
+    assert(m.length === 0, `${JSON.stringify(c)} vs ${JSON.stringify(p)} flagged ${JSON.stringify(m)}`);
+  }
+});
+
 test("pins", "prune keeps a row a belief started citing after it was listed", () => {
   const dir = mkdtempSync(join(tmpdir(), "chamber-prune-late-pin-"));
   mkdirSync(join(dir, "drafts"));

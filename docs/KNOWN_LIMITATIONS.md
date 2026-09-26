@@ -122,6 +122,15 @@ deployment machine is the stated entry criterion for any capability level above 
 > non-acronym names — which costs those claims their `[ALLOWED]` and nothing
 > else. On the final 10-question vault run: 40 cited claims, 2 flagged, both
 > correctly (terms absent from every cited passage), 0 wrongly.
+>
+> A third round (review plus VIGIL) closed names after abbreviations
+> (`e.g. Tesla`), `$9m` / `lakh` / `%` reducing to a bare number, and a
+> passage's own `1,000 million` being flagged. Accepted, knowingly: a
+> capitalised ordinary word after a label or dash is now checked, so
+> "Delivery: Roughly 5 days [1]" is flagged when the passage lacks
+> "roughly" — the cost of catching "Manufacturer: Tesla [1]"; and a number
+> restated in another form (`9 million` for `$9M`, `10 thousand` for
+> `10,000`, Indian digit grouping) is flagged rather than matched.
 
 This one is a stated non-goal, not a bug, and it is not solved.
 
@@ -244,7 +253,12 @@ of code.
 > same pin exception and the same single transaction. The mistyped-exclude
 > risk the text below raises is bounded by the dry run, which names every file
 > before anything is deleted, and by `ingest` refusing a pattern that matches
-> nothing.
+> nothing. Still open: a symlink inside a root retargeted to somewhere outside
+> it is skipped by the walk as `symlink_escape`, but the rows an earlier
+> ingest wrote through it are neither gone nor excluded, so prune does not
+> list them. And when the config stops parsing, `chamber_corpus` and
+> `chamber_verify` keep answering from the open database with the notice on
+> stderr only, not in the tool result.
 
 
 

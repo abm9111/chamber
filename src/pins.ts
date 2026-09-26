@@ -1012,39 +1012,40 @@ export function pruneDocuments(
   ids: ReadonlySet<string>,
 ): { files: number; passages: number; pinnedSkipped: number } {
   if (ids.size === 0) return { files: 0, passages: 0, pinnedSkipped: 0 };
-  const info = db.prepare(
-    `SELECT d.source_ref AS ref, d.metadata_json AS meta,
-            EXISTS (SELECT 1 FROM belief_source s WHERE s.ref_id = d.id) AS pinned
-       FROM vector_document d WHERE d.id = ?`,
+  // The pin check is part of the DELETE, inside BEGIN IMMEDIATE. Reading it
+  // before the lock — as the first version did — let a belief committed in
+  // between (the MCP server runs alongside) lose the row it cites: a
+  // precondition checked outside the write it guards (VIGIL DATA-001).
+  const info = db.prepare(`SELECT source_ref AS ref, metadata_json AS meta FROM vector_document WHERE id = ?`);
+  const del = db.prepare(
+    `DELETE FROM vector_document
+      WHERE id = ? AND NOT EXISTS (SELECT 1 FROM belief_source s WHERE s.ref_id = ?)`,
   );
-  const doomed: string[] = [];
+  const exists = db.prepare(`SELECT 1 AS x FROM vector_document WHERE id = ?`);
+  let passages = 0;
   let pinnedSkipped = 0;
   const files = new Set<string>();
-  for (const id of ids) {
-    const r = info.get(id) as { ref: string | null; meta: string | null; pinned: number } | undefined;
-    if (!r) continue;
-    if (r.pinned) {
-      pinnedSkipped++;
-      continue;
-    }
-    doomed.push(id);
-    let root = "";
-    try {
-      const v = (JSON.parse(r.meta ?? "{}") as { ingestRoot?: unknown }).ingestRoot;
-      if (typeof v === "string") root = v;
-    } catch {
-      // counted under its id below
-    }
-    files.add(r.ref ? join(root, passagePathOf(r.ref)) : id);
-  }
-
   // One transaction: a partial prune leaves a corpus that is neither the state
   // the operator saw in the dry run nor the one they asked for.
-  let passages = 0;
   db.exec("BEGIN IMMEDIATE");
   try {
-    const del = db.prepare(`DELETE FROM vector_document WHERE id = ?`);
-    for (const id of doomed) passages += Number(del.run(id).changes ?? 0);
+    for (const id of ids) {
+      const r = info.get(id) as { ref: string | null; meta: string | null } | undefined;
+      if (!r) continue; // already gone
+      if (Number(del.run(id, id).changes ?? 0) === 0) {
+        if (exists.get(id)) pinnedSkipped++;
+        continue;
+      }
+      passages++;
+      let root = "";
+      try {
+        const v = (JSON.parse(r.meta ?? "{}") as { ingestRoot?: unknown }).ingestRoot;
+        if (typeof v === "string") root = v;
+      } catch {
+        // counted under its id below
+      }
+      files.add(r.ref ? join(root, passagePathOf(r.ref)) : id);
+    }
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");

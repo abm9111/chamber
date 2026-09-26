@@ -50,7 +50,7 @@ const DOMAIN = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|ae|net|org|io|co|a
 // or suffix stays attached, so `$9 billion` and `9k` are not satisfied by a
 // passage that says `$9` (review, 2026-09-26).
 const NUMBER =
-  /\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|bn|thousand|million|billion|trillion)(?![\p{L}\p{N}]))?/giu;
+  /\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|mn|bn|thousand|million|billion|trillion|lakh|crore)(?![\p{L}\p{N}])|(?<=\p{Nd})m(?![\p{L}\p{N}])|\s?%)?/giu;
 /**
  * A name: a capitalised word or acronym in any script (`Škoda`, `Möbius` —
  * an ASCII class cut the latter to `M`), optionally led by digits (`9XFabs`,
@@ -83,8 +83,15 @@ function atSentenceStart(text: string, index: number): boolean {
   // openers, which skipped every name after a label or a dash —
   // "Manufacturer: Tesla [1]" and "Kingroon PLA (Tesla) [1]" were ALLOWED.
   const before = text.slice(0, index).trimEnd();
-  return before === "" || /[.!?]$/.test(before);
+  if (before === "") return true;
+  if (!/[.!?]$/.test(before)) return false;
+  // A period after an abbreviation ends no sentence: "e.g. Tesla" and
+  // "Dr. Tesla" left the name unchecked (round-2 review, VIGIL AIML-001).
+  return !ABBREVIATION.test(before);
 }
+
+const ABBREVIATION =
+  /(?:^|[\s(])(?:e\.g|i\.e|vs|etc|approx|ca|cf|incl|esp|Dr|Mr|Mrs|Ms|Prof|St|Inc|Ltd|Co|Corp|No|Fig|Vol|p|pp)\.$/i;
 
 function looksLikeName(word: string): boolean {
   return /\p{N}/u.test(word) || /^.+\p{Lu}/u.test(word);
@@ -150,7 +157,10 @@ export function missingTerms(claim: string, passages: string[]): string[] {
     if (/^[0-9.]+$/.test(term)) {
       return !new RegExp(`(?<![\\d.])${escapeRegex(term)}(?!\\.?\\d)`).test(numeric);
     }
-    return !nameFound(haystack, term);
+    // A number with its scale word ("1,000 million") is searched in the
+    // passage with thousands separators removed, as bare numbers are: the
+    // identical sentence copied from the passage was flagged (round-2 review).
+    return !nameFound(/^\p{Nd}/u.test(term) ? numeric : haystack, term);
   });
 }
 

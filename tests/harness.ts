@@ -8724,6 +8724,31 @@ test("pins", "siblings: two hits in one section are one contiguous, exactly-coun
   assert(cut === 6 - shownS, `citing a cut section must report ${6 - shownS} missing, got ${cut}`);
 });
 
+test("pins", "siblings: two sections under the same heading are two sections", () => {
+  // Round-2 review repro. A daily log with eight `## Entry` sections stores
+  // eight rows sharing one title; keyed by title they were one "section", so
+  // a hit on one pulled in unrelated entries and reported 3 pieces "cut" when
+  // nothing was split. A section's pieces are one unbroken run of #pN.
+  const db = freshDb();
+  const rows = Array.from({ length: 8 }, (_, i) => sibRow(db, `log.md#p${i * 2}`, "log › Entry"));
+  for (let i = 0; i < 8; i++) sibRow(db, `log.md#p${i * 2 + 1}`, "log › Other");
+  const e = withSiblings(db, [rows[3]!], 8);
+  assert(
+    e.passages.length === 1,
+    `a section that is not split has no siblings, got ${JSON.stringify(e.passages.map((p) => p.sourceRef))}`,
+  );
+  assert(e.omittedFromCited([rows[3]!.documentId]) === 0, "nothing was cut");
+
+  // A real split next to a same-titled but separate section.
+  const a = [sibRow(db, "n.md#p0", "n › Status"), sibRow(db, "n.md#p1", "n › Status")];
+  sibRow(db, "n.md#p2", "n › Other");
+  const far = sibRow(db, "n.md#p3", "n › Status");
+  const e2 = withSiblings(db, [a[0]!], 8);
+  const refs = e2.passages.map((p) => p.sourceRef);
+  assert(JSON.stringify(refs) === '["n.md#p0","n.md#p1"]', `only the run the hit is in: ${JSON.stringify(refs)}`);
+  assert(!refs.includes(far.sourceRef), "a later section with the same heading is another section");
+});
+
 test("pins", "siblings: passage numbers never pass what a citation can name", () => {
   const db = freshDb();
   const hits = Array.from({ length: 60 }, (_, i) => sibRow(db, `h${i}.md#p1`, `T${i}`));
@@ -8747,6 +8772,41 @@ test("pins", "the missed-exact note does not report a passage the model was show
     !(r.note ?? "").includes("f.md#p2"),
     `a shown passage must not be reported as missed: ${JSON.stringify(r.note)}`,
   );
+});
+
+test("pins", "claim support: round-2 review cases", () => {
+  const passage = "Kingroon PLA sells for about $9 per kg. Population 1,000 million. Growth was 12 points.";
+  // Escapes: a name after an abbreviation, and scale suffixes that reduced to a bare number.
+  for (const e of ["Kingroon PLA, e.g. Tesla, is sold [1]", "sold vs. Tesla [1]", "made by Dr. Tesla [1]", "Revenue hit $9m [1]", "sold 9 lakh units [1]", "it grew 9% [1]"]) {
+    assert(missingTerms(e, [passage]).length > 0, `${JSON.stringify(e)} must not pass`);
+  }
+  // Faithful: the passage's own number with its scale word.
+  const same = missingTerms("Population 1,000 million [1]", [passage]);
+  assert(same.length === 0, `an exact copy was flagged ${JSON.stringify(same)}`);
+});
+
+test("pins", "prune keeps a row a belief started citing after it was listed", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-prune-late-pin-"));
+  mkdirSync(join(dir, "drafts"));
+  writeFileSync(join(dir, "drafts", "c.md"), "# C\n\n## S\n\nRefunds close after thirty days.\n");
+  const db = freshDb();
+  ingestDirectory(db, dir, { embedBatch: (texts) => embedLocalBatch(texts, "hash") });
+  const listed = findExcludedDocuments(db, [{ root: dir, exclude: ["drafts"] }]).flatMap((g) => g.ids);
+  const id = listed[0]!;
+  const snapshotHash = verifyPin(db, { kind: "vault_page", refId: id, snapshotHash: "" }).actualHash!;
+  const r = commitBelief(db, {
+    type: "inference",
+    text: "refunds close after thirty days",
+    sources: [{ kind: "vault_page", refId: id, snapshotHash }],
+    authorFamily: "test",
+    path: "fast",
+    requireVerifiedSupport: true,
+  });
+  assert(r.ok, JSON.stringify(r));
+  const out = pruneDocuments(db, new Set(listed));
+  const still = db.prepare(`SELECT count(*) n FROM vector_document WHERE id = ?`).get(id) as { n: number };
+  assert(still.n === 1 && out.pinnedSkipped === 1, `a cited row must survive: ${JSON.stringify(out)}`);
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("pins", "claim support: the escapes found in review stay closed", async () => {

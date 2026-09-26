@@ -154,14 +154,27 @@ export function missingTerms(claim: string, passages: string[]): string[] {
   const haystack = passages.join("\n");
   const numeric = haystack.replace(THOUSANDS, "$1");
   return specificTerms(claim).filter((term) => {
-    if (/^[0-9.]+$/.test(term)) {
-      return !new RegExp(`(?<![\\d.])${escapeRegex(term)}(?!\\.?\\d)`).test(numeric);
-    }
-    // A number with its scale word ("1,000 million") is searched in the
-    // passage with thousands separators removed, as bare numbers are: the
-    // identical sentence copied from the passage was flagged (round-2 review).
-    return !nameFound(/^\p{Nd}/u.test(term) ? numeric : haystack, term);
+    const num = /^([\p{Nd}][\p{Nd},.]*)(.*)$/u.exec(term);
+    if (num) return !numberFound(numeric, num[1]!, num[2]!.trim());
+    return !nameFound(haystack, term);
   });
+}
+
+/**
+ * Every number-led term — bare, or with `%`, `m`, `k`, `lakh`, a scale word —
+ * is found on digit boundaries in the thousands-normalised passage: no digit,
+ * `.` or `,` before it, no further digit (or decimal part) after it. Matching
+ * the suffixed forms as words, which `d4bb231` did, treated `.` as a word
+ * edge, and "5%" was found inside "0.5%", "5 million" inside "2.5 million"
+ * (round-3 review). One optional space between number and suffix, so "9%"
+ * and "9 %" are the same claim.
+ */
+function numberFound(numeric: string, digits: string, suffix: string): boolean {
+  const tail =
+    suffix === ""
+      ? "(?![\\p{Nd}]|[.,]\\p{Nd})"
+      : `\\s?${escapeRegex(suffix)}(?![\\p{L}\\p{N}])`;
+  return new RegExp(`(?<![\\p{Nd}.,])${escapeRegex(digits)}${tail}`, "iu").test(numeric);
 }
 
 /**

@@ -8785,6 +8785,30 @@ test("pins", "claim support: round-2 review cases", () => {
   assert(same.length === 0, `an exact copy was flagged ${JSON.stringify(same)}`);
 });
 
+test("pins", "claim support: a number with a unit or scale is found on digit boundaries only", () => {
+  // Round-3 review, 2026-09-26: once `%`, `m`, `lakh` and scale words stayed
+  // attached, the term was matched as a word — and `.` is a word edge, so
+  // "5%" was found in "0.5%" and "5 million" in "2.5 million": a tenfold
+  // error certified. Every number-led term now uses the digit-boundary rule.
+  const pairs: [string, string][] = [
+    ["Margin is 5% [1]", "Margin is 0.5%."],
+    ["Margin is 5% [1]", "Margin is 12.5%."],
+    ["Revenue $5m [1]", "Revenue $2.5m."],
+    ["sold 5 lakh [1]", "sold 2.5 lakh."],
+    ["sold 5 million [1]", "sold 2.5 million."],
+    ["sold 5 million [1]", "sold 1,5 million."],
+    ["sold 5k [1]", "sold 2.5k."],
+  ];
+  for (const [claim, passage] of pairs) {
+    const m = missingTerms(claim, [passage]);
+    assert(m.length > 0, `${JSON.stringify(claim)} must not be satisfied by ${JSON.stringify(passage)}`);
+  }
+  for (const [claim, passage] of [["grew 9% [1]", "grew 9 %."], ["grew 9 % [1]", "grew 9%."], ["hit 5 million [1]", "hit 5 million users"]] as [string, string][]) {
+    const m = missingTerms(claim, [passage]);
+    assert(m.length === 0, `${JSON.stringify(claim)} vs ${JSON.stringify(passage)} flagged ${JSON.stringify(m)}`);
+  }
+});
+
 test("pins", "prune keeps a row a belief started citing after it was listed", () => {
   const dir = mkdtempSync(join(tmpdir(), "chamber-prune-late-pin-"));
   mkdirSync(join(dir, "drafts"));
@@ -8835,8 +8859,10 @@ test("pins", "claim support: the escapes found in review stay closed", async () 
   }
   // Faithful lines over the same passage must still pass.
   // The last two were false flags on the vault eval after the first round of
-  // these fixes: a trailing comma kept on "1," and the lost acronym plural.
-  for (const ok of ["Kingroon PLA sells for about $9 per kg [1]", "Contact Müller at the depot [1]", "It costs 1,5 EUR [1]", "Tier 1: Kingroon [1]", "Tier 1, sold by Kingroon [1]", "Kingroon ships PLAs [1]"]) {
+  // these fixes: a trailing comma kept on "5," and the lost acronym plural.
+  // (These used "Tier 1", which passed only because the passage's decimal
+  // "1,5" was read as containing a 1 — the digit-boundary rule now refuses.)
+  for (const ok of ["Kingroon PLA sells for about $9 per kg [1]", "Contact Müller at the depot [1]", "It costs 1,5 EUR [1]", "Checked Mar 5: Kingroon [1]", "Mar 5, sold by Kingroon [1]", "Kingroon ships PLAs [1]"]) {
     const m = missingTerms(ok, [passage]);
     assert(m.length === 0, `${JSON.stringify(ok)} flagged ${JSON.stringify(m)}`);
   }

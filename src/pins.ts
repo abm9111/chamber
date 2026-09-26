@@ -905,7 +905,10 @@ export function pruneGoneDocuments(db: DatabaseSync): {
   passages: number;
   pinnedSkipped: number;
 } {
-  return pruneFiles(db, new Set(findGoneDocuments(db).map((g) => g.file)));
+  return pruneDocuments(
+    db,
+    documentIdsOfFiles(db, new Set(findGoneDocuments(db).map((g) => g.file))),
+  );
 }
 
 /**
@@ -921,7 +924,7 @@ export function pruneGoneDocuments(db: DatabaseSync): {
 export function findExcludedDocuments(
   db: DatabaseSync,
   roots: readonly { root: string; exclude: readonly string[] }[],
-): { file: string; passages: number }[] {
+): { file: string; passages: number; ids: string[] }[] {
   const matchers = new Map<string, (rel: string) => boolean>();
   for (const r of roots) {
     if (r.exclude.length === 0) continue;
@@ -932,12 +935,12 @@ export function findExcludedDocuments(
 
   const rows = db
     .prepare(
-      `SELECT source_ref AS ref, metadata_json AS meta
+      `SELECT id, source_ref AS ref, metadata_json AS meta
          FROM vector_document
         WHERE source_ref IS NOT NULL AND metadata_json IS NOT NULL`,
     )
-    .all() as { ref: string | null; meta: string | null }[];
-  const byFile = new Map<string, number>();
+    .all() as { id: string; ref: string | null; meta: string | null }[];
+  const byFile = new Map<string, string[]>();
   for (const r of rows) {
     if (!r.ref || !r.meta) continue;
     let root: unknown;
@@ -952,42 +955,30 @@ export function findExcludedDocuments(
     const rel = passagePathOf(r.ref);
     if (!matches(rel)) continue;
     const file = join(root, rel);
-    byFile.set(file, (byFile.get(file) ?? 0) + 1);
+    byFile.set(file, [...(byFile.get(file) ?? []), r.id]);
   }
+  // Ids, not files: a file path also names rows a bare `ingest <subdir>`
+  // wrote under another root, and deleting by path took those too — the dry
+  // run said 1 passage and --confirm deleted 2 (review, 2026-09-26).
   return [...byFile]
-    .map(([file, passages]) => ({ file, passages }))
+    .map(([file, ids]) => ({ file, passages: ids.length, ids }))
     .sort((a, b) => b.passages - a.passages);
 }
 
-/**
- * Delete the corpus rows of the given files — except any a belief still cites.
- * The one deletion path behind both gone and excluded files, so the pin
- * exception cannot hold for one and be forgotten for the other.
- */
-export function pruneFiles(
+/** Ids of every corpus row whose file (ingestRoot + path) is in `files`. */
+export function documentIdsOfFiles(
   db: DatabaseSync,
-  targets: ReadonlySet<string>,
-): { files: number; passages: number; pinnedSkipped: number } {
-  if (targets.size === 0) return { files: 0, passages: 0, pinnedSkipped: 0 };
-
-  const goneSet = targets;
+  files: ReadonlySet<string>,
+): Set<string> {
+  const ids = new Set<string>();
+  if (files.size === 0) return ids;
   const rows = db
     .prepare(
-      `SELECT d.id AS id, d.source_ref AS ref, d.metadata_json AS meta,
-              EXISTS (SELECT 1 FROM belief_source s WHERE s.ref_id = d.id) AS pinned
-         FROM vector_document d
-        WHERE d.source_ref IS NOT NULL AND d.metadata_json IS NOT NULL`,
+      `SELECT id, source_ref AS ref, metadata_json AS meta
+         FROM vector_document
+        WHERE source_ref IS NOT NULL AND metadata_json IS NOT NULL`,
     )
-    .all() as {
-    id: string;
-    ref: string | null;
-    meta: string | null;
-    pinned: number;
-  }[];
-
-  const doomed: string[] = [];
-  let pinnedSkipped = 0;
-  const files = new Set<string>();
+    .all() as { id: string; ref: string | null; meta: string | null }[];
   for (const r of rows) {
     if (!r.ref || !r.meta) continue;
     let root: unknown;
@@ -997,14 +988,54 @@ export function pruneFiles(
       continue;
     }
     if (typeof root !== "string" || root === "") continue;
-    const file = join(root, passagePathOf(r.ref));
-    if (!goneSet.has(file)) continue;
+    if (files.has(join(root, passagePathOf(r.ref)))) ids.add(r.id);
+  }
+  return ids;
+}
+
+/** How many of `ids` a belief cites — the rows pruneDocuments will keep. */
+export function countPinned(db: DatabaseSync, ids: Iterable<string>): number {
+  const q = db.prepare(`SELECT EXISTS (SELECT 1 FROM belief_source WHERE ref_id = ?) AS p`);
+  let n = 0;
+  for (const id of ids) if ((q.get(id) as { p: number }).p) n++;
+  return n;
+}
+
+/**
+ * Delete exactly these corpus rows — except any a belief still cites. The one
+ * deletion path behind both gone and excluded files, so the pin exception
+ * cannot hold for one and be forgotten for the other, and what is deleted is
+ * the set the caller listed rather than whatever a path happens to match.
+ */
+export function pruneDocuments(
+  db: DatabaseSync,
+  ids: ReadonlySet<string>,
+): { files: number; passages: number; pinnedSkipped: number } {
+  if (ids.size === 0) return { files: 0, passages: 0, pinnedSkipped: 0 };
+  const info = db.prepare(
+    `SELECT d.source_ref AS ref, d.metadata_json AS meta,
+            EXISTS (SELECT 1 FROM belief_source s WHERE s.ref_id = d.id) AS pinned
+       FROM vector_document d WHERE d.id = ?`,
+  );
+  const doomed: string[] = [];
+  let pinnedSkipped = 0;
+  const files = new Set<string>();
+  for (const id of ids) {
+    const r = info.get(id) as { ref: string | null; meta: string | null; pinned: number } | undefined;
+    if (!r) continue;
     if (r.pinned) {
       pinnedSkipped++;
       continue;
     }
-    doomed.push(r.id);
-    files.add(file);
+    doomed.push(id);
+    let root = "";
+    try {
+      const v = (JSON.parse(r.meta ?? "{}") as { ingestRoot?: unknown }).ingestRoot;
+      if (typeof v === "string") root = v;
+    } catch {
+      // counted under its id below
+    }
+    files.add(r.ref ? join(root, passagePathOf(r.ref)) : id);
   }
 
   // One transaction: a partial prune leaves a corpus that is neither the state

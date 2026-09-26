@@ -44,9 +44,21 @@ const DOMAIN = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|ae|net|org|io|co|a
  * split them into `0.84` and a stray `4` that no passage holds on its own —
  * measured on the vault eval, 2026-09-26.
  */
-const NUMBER = /\d[\d,]*(?:\.\d+)*/g;
-/** A capitalised word or acronym. Hyphens and apostrophes inside are kept. */
-const NAME = /\b[A-Z][A-Za-z0-9]*(?:['’-][A-Za-z0-9]+)*/g;
+//
+// Any script's digits (`\p{Nd}`): an ASCII-only `\d` never saw `٩٠٠`, and a
+// claim that wrote its number that way was checked for nothing. A scale word
+// or suffix stays attached, so `$9 billion` and `9k` are not satisfied by a
+// passage that says `$9` (review, 2026-09-26).
+const NUMBER =
+  /\p{Nd}[\p{Nd},]*(?:\.\p{Nd}+)*(?:\s?(?:k|bn|thousand|million|billion|trillion)(?![\p{L}\p{N}]))?/giu;
+/**
+ * A name: a capitalised word or acronym in any script (`Škoda`, `Möbius` —
+ * an ASCII class cut the latter to `M`), optionally led by digits (`9XFabs`,
+ * `3DPrintU`), or a lowercase-led word with an inner capital (`eBay`).
+ * Hyphens and apostrophes inside are kept.
+ */
+const NAME =
+  /(?<![\p{L}\p{N}])(?:\p{N}*\p{Lu}[\p{L}\p{N}]*|\p{Ll}+\p{Lu}[\p{L}\p{N}]*)(?:['’-][\p{L}\p{N}]+)*/gu;
 
 function stripMarkup(text: string): string {
   return text
@@ -67,21 +79,32 @@ function stripMarkup(text: string): string {
  * name ("Tesla makes it [1]") is not caught.
  */
 function atSentenceStart(text: string, index: number): boolean {
+  // Sentence ends only. A first version also counted `: ; — – ( -` as
+  // openers, which skipped every name after a label or a dash —
+  // "Manufacturer: Tesla [1]" and "Kingroon PLA (Tesla) [1]" were ALLOWED.
   const before = text.slice(0, index).trimEnd();
-  return before === "" || /[.!?:;—–(-]$/.test(before);
+  return before === "" || /[.!?]$/.test(before);
 }
 
 function looksLikeName(word: string): boolean {
-  return /[0-9]/.test(word) || /^.+[A-Z]/.test(word);
+  return /\p{N}/u.test(word) || /^.+\p{Lu}/u.test(word);
 }
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Digits only, so `1,210` in a claim matches `1210` in a passage and back. */
+/**
+ * Thousands separators dropped, so `1,210` in a claim matches `1210` in a
+ * passage and back. Only a comma followed by exactly three digits is one: a
+ * decimal comma (`1,5`) was collapsed too, and `15 EUR` then matched a
+ * passage saying `1,5 EUR` — a tenfold error certified (review, 2026-09-26).
+ */
+const THOUSANDS = /(\p{Nd}),(?=\p{Nd}{3}(?!\p{Nd}))/gu;
 function bareNumber(n: string): string {
-  return n.replace(/,/g, "").replace(/\.$/, "");
+  // A trailing comma is punctuation ("Tier 1, easily"), not part of the
+  // number — leaving it flagged "1," on the vault eval.
+  return n.replace(THOUSANDS, "$1").replace(/[.,]+$/, "");
 }
 
 /**
@@ -122,9 +145,9 @@ export function specificTerms(claim: string): string[] {
  */
 export function missingTerms(claim: string, passages: string[]): string[] {
   const haystack = passages.join("\n");
-  const numeric = haystack.replace(/(\d),(?=\d)/g, "$1");
+  const numeric = haystack.replace(THOUSANDS, "$1");
   return specificTerms(claim).filter((term) => {
-    if (/^[\d.]+$/.test(term)) {
+    if (/^[0-9.]+$/.test(term)) {
       return !new RegExp(`(?<![\\d.])${escapeRegex(term)}(?!\\.?\\d)`).test(numeric);
     }
     return !nameFound(haystack, term);
@@ -135,24 +158,27 @@ export function missingTerms(claim: string, passages: string[]): string[] {
  * A name is present if the passage has it whole, or has it without the
  * inflection prose adds to it, or — for a hyphenated join — has every part.
  *
- * "buy Kingroon's PLA", "two Kingroons" and "the AliExpress-Kingroon deal"
- * were each flagged against a passage that names Kingroon and AliExpress
- * plainly (reproduced after review, 2026-09-26). The fallbacks only ever strip
- * to something the claim already said: they cannot make a name the passage
- * lacks look present, because every part must still be found on its own.
+ * "buy Kingroon's PLA" and "the AliExpress-Kingroon deal" were each flagged
+ * against a passage that names Kingroon and AliExpress plainly (review,
+ * 2026-09-26). The fallbacks only ever strip to something the claim already
+ * said, and every part must still be found on its own. A plural fallback was
+ * tried and removed: it turned `Mars` into `Mar`, which a passage's "Mar 5"
+ * satisfied.
  */
 function nameFound(haystack: string, term: string): boolean {
   if (containsWord(haystack, term)) return true;
   const base = term.replace(/['’]s?$/i, "");
   if (base !== term && base !== "" && containsWord(haystack, base)) return true;
-  if (/[A-Za-z]{3,}s$/.test(base) && containsWord(haystack, base.slice(0, -1))) return true;
+  // An acronym's plural (`LLMs`, `APIs`) against its singular. Only for an
+  // all-caps stem: the general plural fallback turned `Mars` into `Mar`.
+  if (/^\p{Lu}{2,}s$/u.test(base) && containsWord(haystack, base.slice(0, -1))) return true;
   const parts = base.split("-").filter(Boolean);
   return parts.length > 1 && parts.every((p) => nameFound(haystack, p));
 }
 
-const isAlnum = (c: string | undefined): boolean => c !== undefined && /[A-Za-z0-9]/.test(c);
-const isLower = (c: string | undefined): boolean => c !== undefined && /[a-z]/.test(c);
-const isUpper = (c: string | undefined): boolean => c !== undefined && /[A-Z]/.test(c);
+const isAlnum = (c: string | undefined): boolean => c !== undefined && /[\p{L}\p{N}]/u.test(c);
+const isLower = (c: string | undefined): boolean => c !== undefined && /\p{Ll}/u.test(c);
+const isUpper = (c: string | undefined): boolean => c !== undefined && /\p{Lu}/u.test(c);
 
 /**
  * Case-insensitive whole-word search, where a lower-to-upper case change also

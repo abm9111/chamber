@@ -58,7 +58,8 @@ import {
   findGonePinnedFiles,
   findGoneDocuments,
   pruneGoneDocuments,
-  pruneFiles,
+  pruneDocuments,
+  documentIdsOfFiles,
   findExcludedDocuments,
   buildVerifyReport,
   CITABLE_SOURCE_KINDS,
@@ -4590,7 +4591,7 @@ test("pins", "prune finds and removes files a root's exclude list now covers", (
     "a pattern on another root must not touch this one",
   );
 
-  const out = pruneFiles(db, new Set(found.map((g) => g.file)));
+  const out = pruneDocuments(db, new Set(found.flatMap((g) => g.ids)));
   assert(out.files === 2 && out.passages >= 2, JSON.stringify(out));
   const left = db
     .prepare(`SELECT source_ref AS r FROM vector_document`)
@@ -4599,6 +4600,44 @@ test("pins", "prune finds and removes files a root's exclude list now covers", (
     left.length > 0 && left.every((x) => x.r.startsWith("keep.md")),
     `only keep.md may remain, got ${JSON.stringify(left)}`,
   );
+  rmSync(base, { recursive: true, force: true });
+});
+
+test("pins", "prune: a symlinked file whose target is excluded, and rows from another root", () => {
+  // Review repros, 2026-09-26. (1) ingest skips link/a.md when `real` is
+  // excluded, but the matcher read only the stored `link/a.md`. (2) Deleting
+  // by file path also took rows a bare `ingest <subdir>` wrote under another
+  // root: the dry run listed 1 passage and --confirm deleted 2.
+  const base = mkdtempSync(join(tmpdir(), "chamber-prune-link-"));
+  const root = join(base, "root");
+  mkdirSync(join(root, "real"), { recursive: true });
+  writeFileSync(join(root, "real", "a.md"), "# A\n\n## S\n\nGamma through the link.\n");
+  symlinkSync(join(root, "real"), join(root, "link"));
+  mkdirSync(join(root, "private"));
+  writeFileSync(join(root, "private", "s.md"), "# S\n\n## S\n\nZebra private note.\n");
+  const db = freshDb();
+  const embed = { embedBatch: (texts: string[]) => embedLocalBatch(texts, "hash") };
+  ingestDirectory(db, root, embed);
+  ingestDirectory(db, join(root, "private"), embed); // a second root over one file
+
+  const viaLink = findExcludedDocuments(db, [{ root, exclude: ["real"] }]);
+  assert(
+    viaLink.some((g) => g.file.endsWith(join("link", "a.md")) || g.file.endsWith(join("real", "a.md"))),
+    `the file reached through the link must be found: ${JSON.stringify(viaLink.map((g) => g.file))}`,
+  );
+
+  const found = findExcludedDocuments(db, [{ root, exclude: ["private"] }]);
+  const listed = found.reduce((n, g) => n + g.passages, 0);
+  // Precondition, so this cannot pass vacuously: the same file path names
+  // more rows than were listed — the other root's copy that deleting by path
+  // used to take as well.
+  const byPath = documentIdsOfFiles(db, new Set(found.map((g) => g.file))).size;
+  assert(byPath > listed, `setup: expected the path to name extra rows, ${byPath} vs ${listed}`);
+  const before = (db.prepare(`SELECT count(*) n FROM vector_document`).get() as { n: number }).n;
+  const out = pruneDocuments(db, new Set(found.flatMap((g) => g.ids)));
+  const after = (db.prepare(`SELECT count(*) n FROM vector_document`).get() as { n: number }).n;
+  assert(out.passages === listed, `listed ${listed}, deleted ${out.passages}`);
+  assert(before - after === listed, `rows gone ${before - after}, listed ${listed}`);
   rmSync(base, { recursive: true, force: true });
 });
 
@@ -4624,7 +4663,7 @@ test("pins", "an excluded passage a belief cites survives the prune", () => {
   assert(r.ok, `setup: ${JSON.stringify(r)}`);
 
   const found = findExcludedDocuments(db, [{ root: dir, exclude: ["drafts"] }]);
-  const out = pruneFiles(db, new Set(found.map((g) => g.file)));
+  const out = pruneDocuments(db, new Set(found.flatMap((g) => g.ids)));
   assert(out.pinnedSkipped >= 1, `the cited passage must be kept, got ${JSON.stringify(out)}`);
   const still = db
     .prepare(`SELECT COUNT(*) AS c FROM vector_document WHERE id = ?`)
@@ -8023,8 +8062,12 @@ test(
     });
     const forgedId = "vdoc_forged_by_the_model";
     const forgedHash = "a".repeat(64);
+    // The forged identifiers ride on their own cited line. On one line with the
+    // real claim, the support check (claim_support.ts) now withholds the pin
+    // from the whole line — it names specifics the passage does not hold —
+    // and the "real pin still commits" control below would test nothing.
     const fake = async () =>
-      `The audit store is SQLite. [1] refId=${forgedId} snapshotHash=${forgedHash}`;
+      `The audit store is SQLite. [1]\nrefId=${forgedId} snapshotHash=${forgedHash} [1]`;
     const r = await runAsk(db, "audit store", {
       complete: fake,
       model: "local-hash-v1",
@@ -8398,7 +8441,10 @@ test("pins", "missingTerms: the false flags measured on the vault stay fixed", (
   }
   // Inflected and joined names, found in review: each part is in the passage.
   const names = "Kingroon PLA sells on AliExpress. A Coca-Cola can.";
-  for (const claim of ["buy Kingroon's PLA", "buy Kingroon’s PLA", "two Kingroons", "the AliExpress-Kingroon deal", "a Coca-Cola can"]) {
+  // "two Kingroons" is flagged on purpose: the plural fallback that passed it
+  // also turned `Mars` into `Mar`, satisfied by a passage's "Mar 5". A false
+  // flag on a plural costs an ALLOWED; the fallback certified a fabrication.
+  for (const claim of ["buy Kingroon's PLA", "buy Kingroon’s PLA", "the AliExpress-Kingroon deal", "a Coca-Cola can"]) {
     const m = missingTerms(claim, [names]);
     assert(m.length === 0, `${JSON.stringify(claim)} flagged ${JSON.stringify(m)}`);
   }
@@ -8701,6 +8747,51 @@ test("pins", "the missed-exact note does not report a passage the model was show
     !(r.note ?? "").includes("f.md#p2"),
     `a shown passage must not be reported as missed: ${JSON.stringify(r.note)}`,
   );
+});
+
+test("pins", "claim support: the escapes found in review stay closed", async () => {
+  // Each line came back ALLOWED over this passage in review, 2026-09-26.
+  const passage =
+    "Kingroon PLA sells for about $9 per kg on AliExpress and ships to Dubai. Prices checked Mar 5. Contact Müller at the depot. The part costs 1,5 EUR.";
+  const escapes = [
+    "Manufacturer: Tesla. [1]",
+    "Kingroon PLA (Tesla) [1]",
+    "Kingroon PLA — Tesla makes it [1]",
+    "Kingroon PLA - Tesla makes it [1]",
+    "made by Škoda in Ørsted [1]",
+    "made by Möbius [1]",
+    "sold on eBay [1]",
+    "sold by 9XFabs [1]",
+    "ships from Mars [1]",
+    "ships to Mars [1]",
+    "costs $9 billion per kg [1]",
+    "costs 9k per kg [1]",
+    "costs ٩٠٠ dollars [1]",
+    "the part costs 15 EUR [1]",
+  ];
+  for (const e of escapes) {
+    const m = missingTerms(e, [passage]);
+    assert(m.length > 0, `${JSON.stringify(e)} found every term in the passage — it must not`);
+  }
+  // Faithful lines over the same passage must still pass.
+  // The last two were false flags on the vault eval after the first round of
+  // these fixes: a trailing comma kept on "1," and the lost acronym plural.
+  for (const ok of ["Kingroon PLA sells for about $9 per kg [1]", "Contact Müller at the depot [1]", "It costs 1,5 EUR [1]", "Tier 1: Kingroon [1]", "Tier 1, sold by Kingroon [1]", "Kingroon ships PLAs [1]"]) {
+    const m = missingTerms(ok, [passage]);
+    assert(m.length === 0, `${JSON.stringify(ok)} flagged ${JSON.stringify(m)}`);
+  }
+
+  // The aporia branch: a cited line using "unknown"/"no evidence" skipped the
+  // check and still rendered its pin as a source.
+  const db = freshDb();
+  upsertDocument(db, { sourceKind: "vault_page", sourceRef: "k.md", title: "K", body: passage, model: "local-hash-v1" });
+  const r = await runAsk(db, "Kingroon", {
+    model: "local-hash-v1",
+    complete: async () =>
+      "It is unknown to most that Kingroon is made on the Moon and costs $900 per kg [1]",
+  });
+  assert(r.claims[0]!.citedRefs.length === 0, `no source may be shown under it: ${JSON.stringify(r.claims[0])}`);
+  assert(r.claims[0]!.status !== "ALLOWED", JSON.stringify(r.claims[0]));
 });
 
 // ─── headings are structure, not claims ──────────────────────────────────────
@@ -12816,6 +12907,7 @@ async function fakeModel(text: string): Promise<{ base: string; close: () => voi
 /** Drive a live `chamber mcp` process: call chamber_ask, get the result text. */
 function mcpSession(env: NodeJS.ProcessEnv): {
   ask: (question: string) => Promise<string>;
+  tool: (name: string, args: Record<string, unknown>) => Promise<string>;
   stop: () => void;
 } {
   const MCP_PATH = join(dirname(fileURLToPath(import.meta.url)), "../src/mcp_server.ts");
@@ -12845,17 +12937,19 @@ function mcpSession(env: NodeJS.ProcessEnv): {
   send({ id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
   send({ method: "notifications/initialized" });
   let next = 10;
+  const tool = (name: string, args: Record<string, unknown>): Promise<string> =>
+    new Promise((ok, fail) => {
+      const id = next++;
+      const timer = setTimeout(() => fail(new Error(`no reply to ${id}`)), 60_000);
+      waiting.set(id, (t) => {
+        clearTimeout(timer);
+        ok(t);
+      });
+      send({ id, method: "tools/call", params: { name, arguments: args } });
+    });
   return {
-    ask: (question) =>
-      new Promise((ok, fail) => {
-        const id = next++;
-        const timer = setTimeout(() => fail(new Error(`no reply to ${id}`)), 60_000);
-        waiting.set(id, (t) => {
-          clearTimeout(timer);
-          ok(t);
-        });
-        send({ id, method: "tools/call", params: { name: "chamber_ask", arguments: { question } } });
-      }),
+    ask: (question) => tool("chamber_ask", { question }),
+    tool,
     stop: () => child.kill(),
   };
 }
@@ -12907,6 +13001,26 @@ test("cli", "chamber_ask follows a config edit without a reconnect", async () =>
     s.stop();
     a.close();
     b.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cli", "a config broken mid-session fails chamber_ask but not the tools that need no model", async () => {
+  // Re-reading config on every call made chamber_corpus and chamber_verify
+  // fail on a config that no longer parses, though neither reaches the model
+  // (review, 2026-09-26). chamber_ask must still fail out loud.
+  const { env, dir } = stubAskFixture();
+  const s = mcpSession(env);
+  try {
+    const first = await s.tool("chamber_corpus", {});
+    assert(!first.startsWith("ERROR"), `setup: corpus works: ${first}`);
+    writeFileSync(env.CHAMBER_CONFIG!, "{ not json");
+    const corpus = await s.tool("chamber_corpus", {});
+    assert(!corpus.startsWith("ERROR") && !/not valid JSON/.test(corpus), `corpus must still answer: ${corpus}`);
+    const ask = await s.ask("what is the audit store");
+    assert(/not valid JSON/.test(ask), `ask must fail on the broken config: ${ask}`);
+  } finally {
+    s.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 });

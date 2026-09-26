@@ -88,6 +88,10 @@ export function classifyClaims(reply: string): ClassifiedClaim[] {
   const out: ClassifiedClaim[] = [];
   for (const text of lines) {
     if (
+      // A cited line is a claim about its source, never an aporia: "It is
+      // unknown to most that X [1]" took this branch, skipped the support
+      // check, and still rendered its pin as a source (review, 2026-09-26).
+      !CITATION.test(text) &&
       /\b(i don't know|unknown|uncertain|cannot verify|aporia|no evidence)\b/i.test(
         text,
       )

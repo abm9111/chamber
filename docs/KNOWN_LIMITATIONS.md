@@ -108,6 +108,20 @@ deployment machine is the stated entry criterion for any capability level above 
 > shape says name (`UAE`, `AliExpress`, `3DPrintU`). Read `[ALLOWED]` as "the
 > source is real, unchanged, and contains this claim's specifics", never as
 > "this claim is true".
+>
+> A second review ran the real path and found ten more ways through; the
+> fixable ones are closed and pinned by a test (any-script digits and
+> letters, `eBay` and `9XFabs` shapes, names after `:` `(` and dashes, scale
+> words and suffixes, decimal commas, cited lines on the aporia branch). What
+> still passes, by design of a term check: numbers written as words ("nine
+> hundred"), a date whose parts each occur somewhere in the passage, a word
+> found inside a glued name (`Express` in `AliExpress` — the same rule that
+> reads scraped `FormingHandicraft` cells), and a currency symbol swapped
+> around a correct number (`€9` for `$9`). It also flags some faithful claims
+> — `$9` against `$9.00`, `.5` against `0.5`, `US` against `U.S.`, plurals of
+> non-acronym names — which costs those claims their `[ALLOWED]` and nothing
+> else. On the final 10-question vault run: 40 cited claims, 2 flagged, both
+> correctly (terms absent from every cited passage), 0 wrongly.
 
 This one is a stated non-goal, not a bug, and it is not solved.
 

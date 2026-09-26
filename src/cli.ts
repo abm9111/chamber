@@ -62,7 +62,9 @@ import {
   findExcludedDocuments,
   findGoneDocuments,
   ingestRootStatus,
-  pruneFiles,
+  countPinned,
+  documentIdsOfFiles,
+  pruneDocuments,
 } from "./pins.ts";
 import { runExpiryJob } from "./expiry.ts";
 import { indexCodeTree, searchCode } from "./code_index.ts";
@@ -1641,43 +1643,54 @@ async function main(): Promise<void> {
         }
         if (files.length > 10) console.log(`  … and ${files.length - 10} more file(s)`);
       };
-      const gonePassages = stale.reduce((n, g) => n + g.passages, 0);
-      const excludedPassages = excluded.reduce((n, g) => n + g.passages, 0);
+      // Row ids, fixed here, are what --confirm deletes: counting by file and
+      // deleting by path let the dry run say 1 and --confirm delete 2, because
+      // a path also names rows another root wrote (review, 2026-09-26).
+      const goneIds = documentIdsOfFiles(db, new Set(stale.map((g) => g.file)));
+      const excludedIds = new Set(
+        excluded.flatMap((g) => g.ids).filter((id) => !goneIds.has(id)),
+      );
+      const gonePinned = countPinned(db, goneIds);
+      const excludedPinned = countPinned(db, excludedIds);
       if (stale.length > 0) {
-        console.log(`${gonePassages} passage(s) in ${stale.length} file(s) no longer on disk:`);
+        console.log(`${goneIds.size} passage(s) in ${stale.length} file(s) no longer on disk:`);
         listFiles(stale);
       }
       if (excluded.length > 0) {
         console.log(
-          `${excludedPassages} passage(s) in ${excluded.length} file(s) now covered by an ingest root's exclude list:`,
+          `${excludedIds.size} passage(s) in ${excluded.length} file(s) now covered by an ingest root's exclude list:`,
         );
         listFiles(excluded);
       }
-      const passages = gonePassages + excludedPassages;
+      // Said before anything is deleted, so the count the operator confirms
+      // is the count that goes. A cited passage is kept whatever the reason
+      // it was listed — but "kept" means different things for the two.
+      if (gonePinned > 0) {
+        console.log(
+          `  ${gonePinned} of the gone passage(s) are cited by a belief and will be kept — ` +
+            `verify reports them as gone rather than losing the evidence`,
+        );
+      }
+      if (excludedPinned > 0) {
+        console.log(
+          `  ${excludedPinned} of the excluded passage(s) are cited by a belief and will be kept — ` +
+            `they still answer retrieval until that belief no longer cites them`,
+        );
+      }
+      const removable = goneIds.size + excludedIds.size - gonePinned - excludedPinned;
 
       if (!confirm) {
         console.log(
-          `dry run — nothing deleted. Re-run with --confirm to remove these ${passages} passage(s).`,
+          removable > 0
+            ? `dry run — nothing deleted. Re-run with --confirm to remove these ${removable} passage(s).`
+            : `dry run — nothing deleted, and nothing listed is removable.`,
         );
         break;
       }
-      // The files listed above, not a fresh sweep: what is deleted is exactly
-      // what this run showed, even if the disk or the config moved since.
-      const removed = pruneFiles(
-        db,
-        new Set([...stale, ...excluded].map((g) => g.file)),
-      );
-      console.log(
-        `pruned ${removed.passages} passage(s) from ${removed.files} file(s)`,
-      );
+      const removed = pruneDocuments(db, new Set([...goneIds, ...excludedIds]));
+      console.log(`pruned ${removed.passages} passage(s) from ${removed.files} file(s)`);
       if (removed.pinnedSkipped > 0) {
-        // Pins are evidence. A belief citing a passage whose file is gone
-        // still verifies against stored content, and deleting the row would
-        // turn a reported, recoverable state into an unrecoverable one.
-        console.log(
-          `kept ${removed.pinnedSkipped} passage(s) that a belief still cites — ` +
-            `verify reports them as gone rather than losing them`,
-        );
+        console.log(`kept ${removed.pinnedSkipped} passage(s) that a belief still cites`);
       }
       break;
     }

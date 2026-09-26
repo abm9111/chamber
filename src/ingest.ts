@@ -359,7 +359,23 @@ export function excludeMatcher(
   }
   return {
     root,
-    matches: (relPath) => matchExclude(patterns, toPosix(relPath)) !== undefined,
+    matches: (relPath) => {
+      const rel = toPosix(relPath);
+      if (matchExclude(patterns, rel) !== undefined) return true;
+      // The walk tests where a symlink points, not only its name: with
+      // `link -> real` and `exclude: ["real"]`, ingest skips link/a.md, and a
+      // matcher reading only the stored `link/a.md` never pruned what an
+      // earlier ingest had written through the link (review, 2026-09-26).
+      let real: string;
+      try {
+        real = realpathSync(join(root, rel));
+      } catch {
+        return false; // gone: findGoneDocuments' business, not this one's
+      }
+      if (!contained(root, real)) return false;
+      const target = relPosix(root, real);
+      return target !== rel && matchExclude(patterns, target) !== undefined;
+    },
   };
 }
 

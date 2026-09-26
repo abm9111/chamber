@@ -111,7 +111,7 @@ const operatorModelEnv = new Set(
 );
 let lastModel = "";
 
-function getDb(): DatabaseSync {
+function getDb(needsModel = true): DatabaseSync {
   // Re-read on every call, not once. A config file that no longer parses
   // throws here and fails this call out loud rather than serving the old
   // settings as if nothing had changed.
@@ -123,7 +123,20 @@ function getDb(): DatabaseSync {
   for (const k of MODEL_ENV) {
     if (!operatorModelEnv.has(k)) delete process.env[k];
   }
-  const config = loadConfig();
+  let config: ReturnType<typeof loadConfig>;
+  try {
+    config = loadConfig();
+  } catch (err) {
+    // A tool that never reaches the model keeps working on the database
+    // already open: re-reading config per call made chamber_corpus and
+    // chamber_verify fail on a broken file they do not need (review,
+    // 2026-09-26). chamber_ask, and any first call, still fail out loud.
+    if (!needsModel && db) {
+      console.error(`chamber mcp: config unreadable, using the open db — ${String(err)}`);
+      return db;
+    }
+    throw err;
+  }
   // Not optional, and not cosmetic: without it `complete()` reads its default
   // and every answer comes from the canned stub, in fluent prose, while the
   // config file says `"mode": "openai"`. Measured on this machine — the first
@@ -312,7 +325,7 @@ async function callTool(
         }
         since = parsed.toISOString();
       }
-      const report = verifyBeliefSources(getDb(), { since });
+      const report = verifyBeliefSources(getDb(false), { since });
       const broken = report.filter((b) => b.verified === 0);
       const degraded = report.filter((b) => b.verified > 0 && b.failures.length > 0);
       // Same rendering rule as the CLI: moved is info, never drift. A pin in
@@ -381,7 +394,7 @@ async function callTool(
     }
 
     case "chamber_corpus": {
-      const s = corpusStats(getDb());
+      const s = corpusStats(getDb(false));
       if (s.passages === 0) return "corpus is empty — run `chamber ingest`";
       const out = [
         `${s.passages.toLocaleString()} passages · ${s.files.toLocaleString()} files · ` +

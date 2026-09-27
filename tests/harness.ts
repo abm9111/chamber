@@ -9289,6 +9289,15 @@ test("pins", "claim support: file names and counts written as words are terms", 
   assert(miss("3 users agreed [1]", "three-quarters of users agreed").includes("3"), "three-quarters is not 3");
   assert(miss("Plan 2 added four entries [1]", "Plan 2 added two entries using Qwen3.5-2B-Q4_K_M").includes("four"), "the 4 in Q4_K_M is not a count of four");
   assert(miss("It rose 5 points [1]", "It fell -five points").includes("5"), "-five is not 5");
+  // Review D: only closed ordinal/fraction lists end a count — "five-month",
+  // "three-second" and "twenty-five-month" are counts.
+  assert(miss("a five-month period [1]", "a three-month period").includes("five"), "five-month is a count");
+  assert(miss("A three-second delay [1]", "A two-second delay").includes("three"), "three-second is a count");
+  assert(miss("a twenty-five-month warranty [1]", "a 20 month warranty").includes("twenty-five"), "twenty-five-month is 25");
+  assert(miss("It took 5 months [1]", "five-month cycles").length === 0, "five-month satisfies 5");
+  // A label carried on by a dash, and adverb openers, are ordinary.
+  assert(miss("1. **Pricing** — the plan costs $5 [1]", "the plan costs $5").length === 0, "a dash carries a label on");
+  assert(missingTerms("Currently the service uses port 80 [1]", ["the service uses port 80"], { openings: true }).length === 0, "an adverb opener is ordinary");
   // Review A: passages are joined so that no term spans two of them.
   assert(
     missingTerms("Revenue for Q3 was 5 million. [1]", ["Revenue for Q3 was 5", "million users joined the beta."]).includes("5 million"),
@@ -9446,13 +9455,36 @@ test("pins", "check: files that are not plain notes are never read", () => {
     rmSync(note);
     symlinkSync(join(dir, ".hidden", "s.md"), note);
     const linked = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [note] }])[0]!;
-    assert(linked.status === "STALE" && linked.problems.some((p) => p.includes("symbolic link")), `a link in a note's place: ${JSON.stringify(linked)}`);
+    assert(linked.status === "STALE" && linked.problems.some((p) => p.includes("hidden folder")), `a link into a hidden folder: ${JSON.stringify(linked)}`);
     rmSync(note);
     const fifo = spawnSync("mkfifo", [note]);
     assert(fifo.status === 0, `setup: mkfifo failed: ${fifo.stderr}`);
     const t = Date.now();
     const piped = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [note] }])[0]!;
     assert(Date.now() - t < 5000 && piped.status === "STALE" && piped.problems.some((p) => p.includes("regular file")), `a FIFO: ${JSON.stringify(piped)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: a linked note inside the root and a note with large frontmatter are judged", () => {
+  // Review D: refusing every link made an in-root linked note (indexed under
+  // the link's name) permanently STALE; a size cap relative to the indexed
+  // bodies did the same to a note whose frontmatter is large.
+  const db = freshDb();
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-link-")));
+  try {
+    mkdirSync(join(dir, "notes"));
+    writeFileSync(join(dir, "notes", "real.md"), "# Real\n\nThe service uses port 8080.\n");
+    symlinkSync(join(dir, "notes", "real.md"), join(dir, "a.md"));
+    writeFileSync(join(dir, "big.md"), `---\ntitle: Big\nblob: ${"x".repeat(1_200_000)}\n---\nThe service uses port 9090.\n`);
+    ingestDirectory(db, dir);
+    const [viaLink, big] = checkClaims(db, [
+      { text: "The service uses port 8080.", sources: ["a.md"] },
+      { text: "The service uses port 9090.", sources: [join(dir, "big.md")] },
+    ]);
+    assert(viaLink!.status === "SUPPORTED", `in-root linked note: ${JSON.stringify(viaLink)}`);
+    assert(big!.status === "SUPPORTED", `large frontmatter: ${JSON.stringify(big)}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -324,35 +324,40 @@ function staleness(
 
 /**
  * Compare the file on disk with its indexed passages, reading it only if it is
- * safe to. Opened without following a final symlink and without blocking, then
- * checked to be a regular file of plausible size before a byte is read:
+ * safe to. The path is resolved first and must stay inside the root and out of
+ * hidden folders; the resolved file is opened without blocking and checked to
+ * be a regular file of bounded size before a byte is read:
  * - a FIFO put in a note's place hung the whole MCP server in readFileSync;
- * - a note swapped for a link to a file ingest never indexed (a dot-folder,
- *   an excluded path) was read and compared;
+ * - a note swapped for a link into a dot-folder ingest never walks was read
+ *   and compared;
  * - a note grown to 100 MB cost 1.5 GB to decide it was stale
- * (review A, 2026-09-27). A link anywhere in the directory part must still
- * resolve inside the root, as ingest requires.
+ * (review A, 2026-09-27). Links inside the root are followed, since ingest
+ * indexes a linked note under the link's name: refusing every link made
+ * those notes permanently STALE (review D). The cap is absolute: one relative
+ * to the indexed bodies marked a note with large frontmatter STALE.
  * Returns a problem line, or null when the disk matches the index.
  */
+const MAX_COMPARE_BYTES = 32 * 1024 * 1024;
 function readAndCompare(full: string, root: string, file: string, rows: Row[]): string | null {
-  if (!inside(relative(nativeReal(root), nativeReal(full)))) {
-    return `${file}: now resolves outside its ingest root — not read, not judged`;
+  const real = nativeReal(full);
+  const rel = relative(nativeReal(root), real);
+  if (!inside(rel)) return `${file}: now resolves outside its ingest root — not read, not judged`;
+  if (rel.split(sep).some((seg) => seg.startsWith("."))) {
+    return `${file}: now resolves into a hidden folder — not read, not judged`;
   }
   let fd: number;
   try {
-    fd = openSync(full, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    fd = openSync(real, constants.O_RDONLY | constants.O_NONBLOCK);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return `${file}: indexed, but no longer on disk — run \`chamber prune\``;
-    if (code === "ELOOP") return `${file}: is now a symbolic link — not read, not judged`;
     return `${file}: indexed, but unreadable on disk (${code ?? "error"}) — not judged`;
   }
   try {
     const st = fstatSync(fd);
     if (!st.isFile()) return `${file}: is no longer a regular file — not read, not judged`;
-    const indexedBytes = rows.reduce((n, r) => n + Buffer.byteLength(r.body), 0);
-    if (st.size > indexedBytes * 8 + 1_000_000) {
-      return `${file}: changed on disk since the last ingest (far larger than the indexed copy) — run \`chamber ingest\``;
+    if (st.size > MAX_COMPARE_BYTES) {
+      return `${file}: over ${MAX_COMPARE_BYTES / 1024 / 1024} MB on disk — too large to compare, not judged`;
     }
     const disk = splitPassages(splitFrontmatter(readFileSync(fd, "utf8")).body);
     const indexed = new Map(rows.map((r) => [r.ref, r.body]));

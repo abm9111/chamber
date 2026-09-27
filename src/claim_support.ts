@@ -64,11 +64,15 @@ const TEENS = ["ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "si
 const TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
 /**
  * A hyphenated ordinal or fraction is not a count: "twenty-first" is not 20,
- * "two-thirds" not 2, "three-quarters" not 3 (review B, 2026-09-27).
+ * "two-thirds" not 2, "three-quarters" not 3 (review B, 2026-09-27). Closed
+ * lists, and an ordinal only after a tens word: a suffix pattern (-st, -nd,
+ * -th) also swallowed "five-month", "three-second", "two-hand" (review D).
  */
-const NOT_ORDINAL = "(?!-(?:\\p{L}+(?:st|nd|rd|th|ths)|halves|half|thirds?|quarters?)(?![\\p{L}\\p{N}_]))";
+const ORDINAL = "first|second|third|fourth|fifth|sixth|seventh|eighth|ninth";
+const FRACTION = "half|halves|thirds?|quarters?|fifths?|sixths?|sevenths?|eighths?|ninths?|tenths?";
+const WORD_END = "(?![\\p{L}\\p{N}_])";
 const NUMBER_WORD = new RegExp(
-  `(?<![\\p{L}\\p{N}_])(?:(${TENS.slice(2).join("|")})(?:[- ](${UNITS.slice(1).join("|")}))?|(${[...UNITS.slice(2), ...TEENS].join("|")}))(?![\\p{L}\\p{N}_])${NOT_ORDINAL}`,
+  `(?<![\\p{L}\\p{N}_])(?:(${TENS.slice(2).join("|")})(?:[- ](${UNITS.slice(1).join("|")}))?(?!-(?:${ORDINAL})${WORD_END})|(${[...UNITS.slice(2), ...TEENS].join("|")}))${WORD_END}(?!-(?:${FRACTION})${WORD_END})`,
   "giu",
 );
 function numberWordValue(word: string): number | undefined {
@@ -246,7 +250,7 @@ function afterLabel(text: string, index: number): boolean {
  * community corpus.
  */
 function continues(text: string, end: number): boolean {
-  return /^[\s\uE000/&"“”'‘’(),-]*(?:\p{L}|:)/u.test(text.slice(end));
+  return /^[\s\uE000/&"“”'‘’(),;|→—–-]*(?:\p{L}|:)/u.test(text.slice(end));
 }
 
 function looksLikeName(word: string): boolean {

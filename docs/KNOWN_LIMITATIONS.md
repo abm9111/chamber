@@ -194,6 +194,10 @@ deployment machine is the stated entry criterion for any capability level above 
 > - A count costs a false flag when the note lists the items without counting
 >   them ("the two tools" against a note naming both), and "two-factor" is
 >   flagged against "multi-factor".
+> - A bullet (`-`, `*`, `+`, `•`) opens a line like a sentence start, so in
+>   `ask` a plain name right after one ("+ Tesla makes it [1]") is the plain
+>   opener above and is not checked. A label closed by a full stop
+>   ("**Pricing**. The plan…") is read as a name and flagged.
 > - Meaning, as everywhere in this section: a negated or misattributed claim
 >   built from the note's own words is `SUPPORTED`.
 

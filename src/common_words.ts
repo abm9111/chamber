@@ -57,6 +57,11 @@ during per via despite unlike whereas upon toward towards beyond besides beside 
 once twice meanwhile otherwise therefore thus hence overall finally firstly secondly lastly additionally
 furthermore moreover instead rather regardless given following according based compared running setting
 getting putting using having making taking going coming looking asking building adding
+doing going being saying seeing currently typically usually clearly
+caveat caveats summary verdict pros cons tip tips warning warnings overview conclusion recommendation
+background pricing setup limitation limitations tradeoff tradeoffs downside downsides upside benefit
+bottom takeaway takeaways outcome status note
+faster slower larger smaller easier harder higher lower bigger newer older cheaper longer shorter safer
 `;
 
 export const COMMON_WORDS: ReadonlySet<string> = new Set(WORDS.split(/\s+/).filter(Boolean));
@@ -65,9 +70,9 @@ export const COMMON_WORDS: ReadonlySet<string> = new Set(WORDS.split(/\s+/).filt
 export function isCommonWord(word: string): boolean {
   const w = word.toLowerCase().replace(/['’]s$/, "");
   if (COMMON_WORDS.has(w)) return true;
-  // Plural, past and -ing only, each leaving a stem of 3+ letters. -er, -est
-  // and -ly turned names into listed words (Finder → find, Forest → for), and
-  // a 2-letter stem made Bing "be" (review B, 2026-09-27).
+  // Plural, past, -ing and -ly only, each leaving a stem of 3+ letters. -er
+  // and -est turned names into listed words (Finder → find, Forest → for),
+  // and a 2-letter stem made Bing "be" (review B, 2026-09-27).
   const stems = [
     w.replace(/ies$/, "y"),
     w.replace(/es$/, ""),
@@ -78,6 +83,7 @@ export function isCommonWord(word: string): boolean {
     w.replace(/ing$/, "e"),
     w.replace(/(\p{L})\1ing$/u, "$1"), // running → run
     w.replace(/(\p{L})\1ed$/u, "$1"), // stopped → stop
+    w.replace(/ly$/, ""), // currently → current (review D: no name collisions)
   ];
   return stems.some((s) => s !== w && s.length >= 3 && COMMON_WORDS.has(s));
 }

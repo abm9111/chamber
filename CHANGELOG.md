@@ -3,7 +3,7 @@
 All notable changes to Chamber. Versions before 0.1.6 are described in the git
 history and the GitHub releases.
 
-## Unreleased
+## 0.1.7 — 2026-09-28
 
 ### Added
 
@@ -14,15 +14,18 @@ history and the GitHub releases.
   changed on disk since it was indexed, so it is not judged), `NOT_FOUND` or
   `NO_SOURCE`. Unlike the check on model answers, it also checks the word that
   opens a claim, unless it is a common word ("Postgres was chosen in 2024").
-  A note held only by rows with no recorded folder (older ingests, code
-  indexes), or one replaced by a link out of its folder, is not judged. It
-  check uses no model. It is read-only unless `record: true`, which
+  It reads a note only when the note's real path is a note ingest indexed —
+  never through a link to an excluded, hidden or non-note file, and never a
+  FIFO or device — and anything else fails closed as `STALE` with the
+  reason. The check uses no model. It is read-only unless `record: true`, which
   commits only the supported claims through the gate, pinned to a small
   covering set of the passages that hold their terms.
 - The MCP server sends `instructions` on `initialize`, telling the host when to
   call `chamber_check` and what `SUPPORTED` does not mean.
 
 ### Fixed
+
+Upgrade if you rely on `[ALLOWED]`: the first fix below affects `ask`.
 
 - **A term split across two cited passages no longer counts as found.**
   Passages were joined with a newline, so "…was 5" ending one and "million

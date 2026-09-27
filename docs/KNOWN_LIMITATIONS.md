@@ -150,6 +150,19 @@ deployment machine is the stated entry criterion for any capability level above 
 > "roughly" — the cost of catching "Manufacturer: Tesla [1]"; and a number
 > restated in another form (`9 million` for `$9M`, `10 thousand` for
 > `10,000`, Indian digit grouping) is flagged rather than matched.
+>
+> **Revised 2026-09-27 — label colons.** Checking every word after a colon
+> was far costlier than the 0-in-50 vault eval suggested: models format
+> answers as "**Claude Code:** Users point…", and on answers over a
+> 279-thread community corpus 6 of 9 flags were such words ("Users",
+> "People", "Claiming", "Large"). After a label colon a word on a common-word
+> list (`src/common_words.ts`) is now skipped; anything else is still checked,
+> so "Manufacturer: Tesla" is caught. Re-run: 29 ALLOWED, 1 flag (correct) on
+> the corpus questions; 0 wrong of 41 on the vault eval. Sentence starts after
+> `. ! ?` keep the older rule, so "Tesla makes it [1]" stays unchecked —
+> extending the common-word test there flagged ordinary openers ("Sales",
+> "Shipping") that a hand-written list cannot cover; closing it needs a real
+> word list.
 
 This one is a stated non-goal, not a bug, and it is not solved.
 

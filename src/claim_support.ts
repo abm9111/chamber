@@ -37,6 +37,8 @@ const CONNECTIVES = new Set([
 ]);
 
 /** Domains end in a label a model might write bare: `3DPrintU.ae`, `amazon.com`. */
+import { isCommonWord } from "./common_words.ts";
+
 const DOMAIN = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|ae|net|org|io|co|ai|dev|app|store|shop|uk|us|de|sa)\b/gi;
 /**
  * A number, with its thousands separators and every dotted part, so a version
@@ -126,10 +128,8 @@ function stripMarkup(text: string): string {
  * name ("Tesla makes it [1]") is not caught.
  */
 function atSentenceStart(text: string, index: number): boolean {
-  // Sentence ends only. A first version also counted `: ; — – ( -` as
-  // openers, which skipped every name after a label or a dash —
-  // "Manufacturer: Tesla [1]" and "Kingroon PLA (Tesla) [1]" were ALLOWED.
-  const before = text.slice(0, index).trimEnd();
+  // Sentence ends only; label colons are handled in afterLabel().
+  const before = text.slice(0, index).replace(new RegExp(SEP, "g"), " ").trimEnd();
   if (before === "") return true;
   if (!/[.!?]$/.test(before)) return false;
   // A period after an abbreviation ends no sentence: "e.g. Tesla" and
@@ -151,6 +151,20 @@ function atSentenceStart(text: string, index: number): boolean {
 
 const ABBREVIATION =
   /(?:^|[\s(])(?:e\.g|i\.e|vs|etc|approx|ca|cf|incl|esp|Dr|Mr|Mrs|Ms|Prof|St|Inc|Ltd|Co|Corp|No|Fig|Vol|p|pp|Sgt|Gen|Rev|Bros|Dept|Ave|Univ|Col|Capt|Lt|Gov|Sen|Rep|Ft|Blvd|Rd|Est|Assn|Jr|Sr)\.$/i;
+
+/**
+ * Is the word at `index` the first word after a label colon ("**Access
+ * control:** People recommend…")? Models format answers this way constantly,
+ * and checking the ordinary word there produced 6 of 9 flags on the
+ * community-corpus answers (2026-09-27: "Users", "People", "Claiming",
+ * "Large"). Only a common word is skipped here, so "Manufacturer: Tesla" is
+ * still checked. Sentence starts after . ! ? keep their older rule: widening
+ * the common-word test to them flagged ordinary openers ("Sales", "Shipping")
+ * that a hand-written list cannot cover.
+ */
+function afterLabel(text: string, index: number): boolean {
+  return /:$/.test(text.slice(0, index).replace(new RegExp(SEP, "g"), " ").trimEnd());
+}
 
 function looksLikeName(word: string): boolean {
   return /\p{N}/u.test(word) || /^.+\p{Lu}/u.test(word);
@@ -196,6 +210,7 @@ export function specificTerms(claim: string): string[] {
   for (const m of text.matchAll(NAME)) {
     if (CONNECTIVES.has(m[0].toLowerCase())) continue;
     if (atSentenceStart(text, m.index) && !looksLikeName(m[0])) continue;
+    if (afterLabel(text, m.index) && !looksLikeName(m[0]) && isCommonWord(m[0])) continue;
     add(m[0]);
   }
   return out;

@@ -9201,6 +9201,31 @@ test("pins", "claim support: VIGIL on 4693bfb — markup after a letter, entitie
   assert(r.claims[0]!.status !== "ALLOWED", `end to end: ${JSON.stringify(r.claims[0])}`);
 });
 
+test("pins", "claim support: after a label colon only a common word is skipped", () => {
+  // Dogfooding on the community corpus, 2026-09-27: 6 of 9 flags were false —
+  // an ordinary word after a bold label ("**Claude Code:** Users point…" →
+  // terms_absent: Users). And a plain name opening a sentence was never
+  // checked at all ("Tesla makes it [1]", a documented escape). At any
+  // opening — start, after . ! ?, or after a label colon — only a common
+  // English word is skipped; anything else is checked wherever it stands.
+  const miss = (c: string, p: string): string[] => missingTerms(c, [p]);
+  const passage = "Some point Claude Code at the vault folder and keep it read-only until trusted.";
+  for (const ok of [
+    "**Claude Code / Claude desktop:** Users point Claude Code at the vault folder [1]",
+    "**Access control:** People recommend keeping it read-only until trusted [1]",
+    "**Privacy:** Claiming the vault folder stays read-only is disputed [1]",
+    "**Large vaults:** Users point Claude Code at the vault [1]",
+  ]) {
+    const m = miss(ok, passage);
+    assert(m.length === 0, `${JSON.stringify(ok)} flagged ${JSON.stringify(m)}`);
+  }
+  // A plain name opening a sentence ("Tesla makes it [1]") stays unchecked —
+  // documented in KNOWN_LIMITATIONS §2; closing it needs a real word list.
+  for (const bad of ["Manufacturer: Tesla. [1]", "**Maker:** Tesla keeps it read-only [1]", "Keep it read-only (Tesla) [1]"]) {
+    assert(miss(bad, passage).includes("Tesla"), `${JSON.stringify(bad)} must check Tesla: ${JSON.stringify(miss(bad, passage))}`);
+  }
+});
+
 test("pins", "debt payment does not write the same pin twice", () => {
   // Round-6 review: the duplicate-pin skip had no test.
   const db = freshDb();

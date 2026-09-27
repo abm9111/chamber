@@ -198,6 +198,15 @@ deployment machine is the stated entry criterion for any capability level above 
 >   `ask` a plain name right after one ("+ Tesla makes it [1]") is the plain
 >   opener above and is not checked. A label closed by a full stop
 >   ("**Pricing**. The plan…") is read as a name and flagged.
+> - `chamber_check` reads a note only when its real path is that indexed note
+>   or another note the same root indexed. A note inside a symlinked folder is
+>   indexed under the link's path while its real path is not, so it comes back
+>   `STALE` ("links to a file this root did not index") rather than judged.
+>   Following the link safely would mean re-deriving ingest's exclude and
+>   dot-folder rules in the check, and the two disagreeing is how a link to an
+>   excluded file came to be read (review E, 2026-09-27). A directory swapped
+>   for a link between resolving and opening leaves a small window; Node has no
+>   `openat`.
 > - Meaning, as everywhere in this section: a negated or misattributed claim
 >   built from the note's own words is `SUPPORTED`.
 

@@ -9455,7 +9455,7 @@ test("pins", "check: files that are not plain notes are never read", () => {
     rmSync(note);
     symlinkSync(join(dir, ".hidden", "s.md"), note);
     const linked = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [note] }])[0]!;
-    assert(linked.status === "STALE" && linked.problems.some((p) => p.includes("hidden folder")), `a link into a hidden folder: ${JSON.stringify(linked)}`);
+    assert(linked.status === "STALE" && linked.problems.some((p) => p.includes("did not index")), `a link into a hidden folder: ${JSON.stringify(linked)}`);
     rmSync(note);
     const fifo = spawnSync("mkfifo", [note]);
     assert(fifo.status === 0, `setup: mkfifo failed: ${fifo.stderr}`);
@@ -9485,28 +9485,45 @@ test("pins", "check: a linked note inside the root and a note with large frontma
     ]);
     assert(viaLink!.status === "SUPPORTED", `in-root linked note: ${JSON.stringify(viaLink)}`);
     assert(big!.status === "SUPPORTED", `large frontmatter: ${JSON.stringify(big)}`);
+    // Review E: a link is followed only to a note this root indexed — not to
+    // an excluded folder or a file ingest skips by type.
+    mkdirSync(join(dir, "Private"));
+    writeFileSync(join(dir, "Private", "secret.md"), "# Real\n\nThe service uses port 8080.\n");
+    writeFileSync(join(dir, "creds.env"), "# Real\n\nThe service uses port 8080.\n");
+    for (const target of [join(dir, "Private", "secret.md"), join(dir, "creds.env")]) {
+      rmSync(join(dir, "a.md"));
+      symlinkSync(target, join(dir, "a.md"));
+      const r = checkClaims(db, [{ text: "The service uses port 8080.", sources: ["a.md"] }])[0]!;
+      assert(r.status === "STALE" && r.problems.some((p) => p.includes("did not index")), `link to ${target}: ${JSON.stringify(r)}`);
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("pins", "check: a note is found through a symlinked folder and in any letter case", () => {
+test("pins", "check: letter case is free; a note under a linked folder fails closed", () => {
   const db = freshDb();
   const base = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-paths-")));
   try {
+    mkdirSync(join(base, "v", "plain"), { recursive: true });
     mkdirSync(join(base, "v", "real"), { recursive: true });
+    writeFileSync(join(base, "v", "plain", "y.md"), "# Y\n\nThe audit store is SQLite.\n");
     writeFileSync(join(base, "v", "real", "x.md"), "# X\n\nThe audit store is SQLite.\n");
     symlinkSync(join(base, "v", "real"), join(base, "v", "alink"));
     ingestDirectory(db, join(base, "v"));
-    const viaLink = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [join(base, "v", "alink", "x.md")] }])[0]!;
-    const viaReal = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [join(base, "v", "real", "x.md")] }])[0]!;
-    // Ingest walked the folder once, under the link's name; both paths name it.
-    assert(viaLink.status === "SUPPORTED" && viaReal.status === "SUPPORTED", `link: ${JSON.stringify(viaLink)} real: ${JSON.stringify(viaReal)}`);
     // On a case-insensitive filesystem the agent's casing need not match.
-    const upper = join(base, "v", "ALINK", "X.md");
+    const upper = join(base, "v", "PLAIN", "Y.MD");
     if (existsSync(upper)) {
       const cased = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [upper] }])[0]!;
       assert(cased.status === "SUPPORTED", `case-insensitive path: ${JSON.stringify(cased)}`);
+    }
+    // Ingest walked real/ once, through alink/, so the note is indexed only as
+    // alink/x.md and its real path is not an indexed note. Following the link
+    // would mean re-deriving ingest's exclude and dot-folder rules here; it is
+    // found, and refused with the reason, rather than read (review E).
+    for (const p of [join(base, "v", "alink", "x.md"), join(base, "v", "real", "x.md")]) {
+      const r = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [p] }])[0]!;
+      assert(r.status === "STALE" && r.problems.some((x) => x.includes("did not index")), `${p}: ${JSON.stringify(r)}`);
     }
   } finally {
     rmSync(base, { recursive: true, force: true });

@@ -21,7 +21,7 @@
  * and not judged.
  */
 
-import { closeSync, constants, fstatSync, openSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -316,53 +316,101 @@ function staleness(
   let problem: string | null = null;
   if (root !== null) {
     const rows = index.passagesOf(file).filter((r) => r.root === root);
-    problem = readAndCompare(resolve(root, file), root, file, rows);
+    problem = readAndCompare(index, resolve(root, file), root, file, rows);
   }
   cache.set(key, problem);
   return problem ?? undefined;
 }
 
 /**
- * Compare the file on disk with its indexed passages, reading it only if it is
- * safe to. The path is resolved first and must stay inside the root and out of
- * hidden folders; the resolved file is opened without blocking and checked to
- * be a regular file of bounded size before a byte is read:
- * - a FIFO put in a note's place hung the whole MCP server in readFileSync;
- * - a note swapped for a link into a dot-folder ingest never walks was read
- *   and compared;
- * - a note grown to 100 MB cost 1.5 GB to decide it was stale
- * (review A, 2026-09-27). Links inside the root are followed, since ingest
- * indexes a linked note under the link's name: refusing every link made
- * those notes permanently STALE (review D). The cap is absolute: one relative
- * to the indexed bodies marked a note with large frontmatter STALE.
+ * Compare the file on disk with its indexed passages, reading it only if the
+ * read is one ingest itself made. The rule: the note's real path must resolve
+ * (no fallback), and it must be the indexed note itself or another note the
+ * same root indexed. A link is followed only to an indexed note (review D:
+ * ingest indexes a linked note under the link's name, so refusing links made
+ * those notes permanently STALE), never to a file ingest skipped — an excluded
+ * folder, a dot-folder, a `.env` (review E, 2026-09-27). Asking the index
+ * rather than re-implementing ingest's rules is what keeps the two from
+ * disagreeing: a dot-rule here marked `--include-dotted` notes STALE forever.
+ *
+ * Then the resolved path is opened without following links and without
+ * blocking, re-resolved and compared by inode to narrow a swap between
+ * resolving and opening (review E measured 2,299 hits in 36,612 calls without
+ * this; a swapped directory mid-path keeps a small window — Node has no
+ * openat), checked to be a regular file, and read in a bounded loop: a file
+ * growing after fstat was read to EOF past the cap. A FIFO in a note's place
+ * once hung the MCP server in readFileSync (review A).
  * Returns a problem line, or null when the disk matches the index.
  */
 const MAX_COMPARE_BYTES = 32 * 1024 * 1024;
-function readAndCompare(full: string, root: string, file: string, rows: Row[]): string | null {
-  const real = nativeReal(full);
-  const rel = relative(nativeReal(root), real);
-  if (!inside(rel)) return `${file}: now resolves outside its ingest root — not read, not judged`;
-  if (rel.split(sep).some((seg) => seg.startsWith("."))) {
-    return `${file}: now resolves into a hidden folder — not read, not judged`;
+const notJudged = (file: string, why: string): string => `${file}: ${why} — not read, not judged`;
+
+function strictReal(p: string): { path: string } | { code: string } {
+  try {
+    return { path: realpathSync.native(p) };
+  } catch (err) {
+    return { code: (err as NodeJS.ErrnoException).code ?? "error" };
   }
+}
+
+function readAndCompare(index: Index, full: string, root: string, file: string, rows: Row[]): string | null {
+  const realRoot = strictReal(root);
+  if (!("path" in realRoot)) return notJudged(file, `its ingest root does not resolve (${realRoot.code})`);
+  const resolved = strictReal(full);
+  if (!("path" in resolved)) {
+    return resolved.code === "ENOENT"
+      ? `${file}: indexed, but no longer on disk — run \`chamber prune\``
+      : notJudged(file, `its path does not resolve (${resolved.code})`);
+  }
+  const real = resolved.path;
+  const rel = relative(realRoot.path, real);
+  if (!inside(rel)) return notJudged(file, "now resolves outside its ingest root");
+  const target = rel.split(sep).join("/");
+  // Case-insensitive, as the filesystems this runs on are: `rel` is in on-disk
+  // case, the indexed path in whatever case ingest walked.
+  const isSelf = target.toLowerCase() === file.toLowerCase();
+  if (!isSelf && !index.passagesOf(target).some((r) => r.root === root)) {
+    return notJudged(file, "now links to a file this root did not index");
+  }
+
   let fd: number;
   try {
-    fd = openSync(real, constants.O_RDONLY | constants.O_NONBLOCK);
+    fd = openSync(real, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return `${file}: indexed, but no longer on disk — run \`chamber prune\``;
-    return `${file}: indexed, but unreadable on disk (${code ?? "error"}) — not judged`;
+    return notJudged(file, `unreadable on disk (${code ?? "error"})`);
   }
   try {
     const st = fstatSync(fd);
-    if (!st.isFile()) return `${file}: is no longer a regular file — not read, not judged`;
-    if (st.size > MAX_COMPARE_BYTES) {
-      return `${file}: over ${MAX_COMPARE_BYTES / 1024 / 1024} MB on disk — too large to compare, not judged`;
+    if (!st.isFile()) return notJudged(file, "is no longer a regular file");
+    const again = strictReal(full);
+    let same: ReturnType<typeof statSync> | undefined;
+    try {
+      same = statSync(real);
+    } catch {
+      same = undefined;
     }
-    const disk = splitPassages(splitFrontmatter(readFileSync(fd, "utf8")).body);
+    if (!("path" in again) || again.path !== real || !same || same.ino !== st.ino || same.dev !== st.dev) {
+      return notJudged(file, "changed while being opened");
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const buf = Buffer.alloc(1024 * 1024);
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n === 0) break;
+      total += n;
+      if (total > MAX_COMPARE_BYTES) {
+        return notJudged(file, `over ${MAX_COMPARE_BYTES / 1024 / 1024} MB on disk — too large to compare`);
+      }
+      chunks.push(buf.subarray(0, n));
+    }
+    const text = Buffer.concat(chunks).toString("utf8");
+    const disk = splitPassages(splitFrontmatter(text).body);
     const indexed = new Map(rows.map((r) => [r.ref, r.body]));
-    const same = disk.length === indexed.size && disk.every((p) => indexed.get(`${file}#p${p.index}`) === p.body);
-    return same ? null : `${file}: changed on disk since the last ingest — run \`chamber ingest\``;
+    const matches = disk.length === indexed.size && disk.every((p) => indexed.get(`${file}#p${p.index}`) === p.body);
+    return matches ? null : `${file}: changed on disk since the last ingest — run \`chamber ingest\``;
   } finally {
     closeSync(fd);
   }

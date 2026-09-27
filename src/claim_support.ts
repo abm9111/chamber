@@ -51,7 +51,7 @@ const DOMAIN = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|ae|net|org|io|co|a
 const FILE =
   /(?<![\p{L}\p{N}_.~/-])(?:[\p{L}\p{N}_.~-]+\/)*([\p{L}\p{N}_-]+(?:\.[\p{L}\p{N}_-]+)*\.(?:json|jsonl|md|ts|tsx|js|jsx|mjs|cjs|py|rb|go|rs|java|kt|swift|sh|ya?ml|toml|ini|cfg|conf|txt|csv|tsv|sql|html|css|xml|lock|ipynb|pdf|sqlite|db))(?![\p{L}\p{N}_])/giu;
 /** "Node.js", "Next.js": a product name, left to the name rules. */
-const PRODUCT_JS = /^\p{Lu}\p{L}*\.js$/u;
+const PRODUCT_JS = /^\p{Lu}[\p{L}\p{N}]*\.js$/u;
 
 /**
  * Counts written as words. "Plan 2 added four entries" passed against a note
@@ -62,8 +62,13 @@ const PRODUCT_JS = /^\p{Lu}\p{L}*\.js$/u;
 const UNITS = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
 const TEENS = ["ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"];
 const TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+/**
+ * A hyphenated ordinal or fraction is not a count: "twenty-first" is not 20,
+ * "two-thirds" not 2, "three-quarters" not 3 (review B, 2026-09-27).
+ */
+const NOT_ORDINAL = "(?!-(?:\\p{L}+(?:st|nd|rd|th|ths)|halves|half|thirds?|quarters?)(?![\\p{L}\\p{N}_]))";
 const NUMBER_WORD = new RegExp(
-  `(?<![\\p{L}\\p{N}_])(?:(${TENS.slice(2).join("|")})(?:[- ](${UNITS.slice(1).join("|")}))?|(${[...UNITS.slice(2), ...TEENS].join("|")}))(?![\\p{L}\\p{N}_])`,
+  `(?<![\\p{L}\\p{N}_])(?:(${TENS.slice(2).join("|")})(?:[- ](${UNITS.slice(1).join("|")}))?|(${[...UNITS.slice(2), ...TEENS].join("|")}))(?![\\p{L}\\p{N}_])${NOT_ORDINAL}`,
   "giu",
 );
 function numberWordValue(word: string): number | undefined {
@@ -85,8 +90,20 @@ function numberWordValue(word: string): number | undefined {
  * satisfy "5" and "seventy-seven" satisfy "seventy" (self-review).
  */
 function spelledFound(haystack: string, n: number): boolean {
-  for (const m of haystack.matchAll(NUMBER_WORD)) if (numberWordValue(m[0]) === n) return true;
+  for (const m of haystack.matchAll(NUMBER_WORD)) {
+    // "-five" is minus five, as "-5" is: not a count of five.
+    if (haystack[m.index - 1] === "-" && !/[\p{L}\p{N}]/u.test(haystack[m.index - 2] ?? "")) continue;
+    if (numberWordValue(m[0]) === n) return true;
+  }
   return false;
+}
+/**
+ * A spelled count's digits, standing alone: "four" is not satisfied by the 4
+ * in `Qwen3.5-2B-Q4_K_M` (review C: the benchmark claim that motivated counts
+ * as terms was still passing that way).
+ */
+function countDigitsFound(numeric: string, n: number): boolean {
+  return new RegExp(`(?<![\\p{L}\\p{N}_.,-])${n}(?![\\p{L}\\p{N}_]|[.,]\\p{Nd})`, "u").test(numeric);
 }
 /**
  * A number, with its thousands separators and every dotted part, so a version
@@ -163,6 +180,10 @@ const NAME =
 function stripMarkup(text: string): string {
   return text
     .replace(/^\s*\d{1,3}[.)]\s+/, "") // list numbering is not a claimed number
+    // A bullet ("- ", "* " — already markup here — "+ ", "• ") opens a line
+    // as a sentence start does; left in, "- **Privacy:** …" made "Privacy" a
+    // mid-sentence word and it was flagged (community corpus, 2026-09-27).
+    .replace(/^\s*[-+•\uE000]\s+/u, "")
     .replace(/\[\d{1,2}\]/g, " ") // citations are not claims about the source
     .replace(/[#>]/g, " ");
 }
@@ -215,6 +236,17 @@ const ABBREVIATION =
  */
 function afterLabel(text: string, index: number): boolean {
   return /:$/.test(text.slice(0, index).replace(new RegExp(SEP, "g"), " ").trimEnd());
+}
+
+/**
+ * Does the phrase carry on after `end` — another word (past spaces, markup,
+ * slashes, quotes, brackets) or a label colon? A lone value does not: "Model:
+ * Claude [1]", "Released: May 5", "Price: Free [1]". Requiring a lowercase
+ * word flagged "**Privacy / “where…”:**" and "Pointing Claude Code at…" on the
+ * community corpus.
+ */
+function continues(text: string, end: number): boolean {
+  return /^[\s\uE000/&"“”'‘’(),-]*(?:\p{L}|:)/u.test(text.slice(end));
 }
 
 function looksLikeName(word: string): boolean {
@@ -278,8 +310,27 @@ export function specificTerms(claim: string, opts: TermOptions = {}): string[] {
   for (const m of text.matchAll(NAME)) {
     if (CONNECTIVES.has(m[0].toLowerCase())) continue;
     if (numberWordValue(m[0]) !== undefined) continue;
-    if (atSentenceStart(text, m.index) && !looksLikeName(m[0]) && !(opts.openings && !isCommonWord(m[0]))) continue;
-    if (afterLabel(text, m.index) && !looksLikeName(m[0]) && isCommonWord(m[0])) continue;
+    if (looksLikeName(m[0])) {
+      add(m[0]);
+      continue;
+    }
+    // An ordinary word in an opening position: on the common list, and the
+    // phrase carries on ("Users point…", "**Privacy:**"). A lone value after a
+    // label ("Model: Claude [1]", "Released: May 5") is checked.
+    const ordinary = isCommonWord(m[0]) && continues(text, m.index + m[0].length);
+    const wrapped = /\uE000[\s\uE000]*$/u.test(text.slice(0, m.index));
+    if (atSentenceStart(text, m.index)) {
+      // A plain opener keeps the older rule on model answers. Markup right
+      // before it — "**Tesla** makes it [1]", "- **Tesla:** makes…" — is the
+      // way models set a subject apart, and was checked until the label-colon
+      // change stripped markup here (review B, 2026-09-27); it stays checked.
+      // A plain opener under `openings` is skipped when common, whatever
+      // follows: "One NVIDIA A100…" and "Adding --live…" open sentences, not
+      // labels, and requiring the phrase to carry on flagged them.
+      if (wrapped ? ordinary : opts.openings ? isCommonWord(m[0]) : true) continue;
+    } else if (afterLabel(text, m.index) && ordinary) {
+      continue;
+    }
     add(m[0]);
   }
   return out;
@@ -294,12 +345,45 @@ export function specificTerms(claim: string, opts: TermOptions = {}): string[] {
  * found inside `Moonlight`.
  */
 export function missingTerms(claim: string, passages: string[], opts: TermOptions = {}): string[] {
-  const haystack = normalize(passages.join("\n"));
-  const numeric = haystack.replace(THOUSANDS, "$1");
-  return specificTerms(claim, opts).filter((term) => {
+  return missingTermsIn(claim, joinPrepared(passages.map(preparePassage)), opts);
+}
+
+/**
+ * Between passages: a private-use character no term pattern matches or treats
+ * as space. Joined with "\n", a spaced unit crossed the join — "…was 5" ending
+ * one passage and "million users…" opening the next satisfied "5 million",
+ * which neither passage says (review A, 2026-09-27).
+ */
+const BETWEEN = "\n\uE001\n";
+
+/** A passage normalised once, for callers that judge many claims against it. */
+export interface PreparedText {
+  haystack: string;
+  numeric: string;
+}
+export function preparePassage(body: string): PreparedText {
+  const haystack = normalize(body);
+  return { haystack, numeric: haystack.replace(THOUSANDS, "$1") };
+}
+export function joinPrepared(parts: PreparedText[]): PreparedText {
+  return {
+    haystack: parts.map((p) => p.haystack).join(BETWEEN),
+    numeric: parts.map((p) => p.numeric).join(BETWEEN),
+  };
+}
+
+/** `missingTerms` over passages already prepared (and joined). */
+export function missingTermsIn(claim: string, text: PreparedText, opts: TermOptions = {}): string[] {
+  return termsMissingIn(specificTerms(claim, opts), text);
+}
+
+/** Which of `terms` (from specificTerms) the prepared text does not hold. */
+export function termsMissingIn(terms: string[], text: PreparedText): string[] {
+  const { haystack, numeric } = text;
+  return terms.filter((term) => {
     const counted = numberWordValue(term);
     if (counted !== undefined) {
-      return !(numberFound(numeric, String(counted), "") || spelledFound(haystack, counted));
+      return !(countDigitsFound(numeric, counted) || spelledFound(haystack, counted));
     }
     const num = /^(-?[\p{Nd}][\p{Nd},.]*)(.*)$/u.exec(term);
     const suffix = num?.[2]!.trim() ?? "";

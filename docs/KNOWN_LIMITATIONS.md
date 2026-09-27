@@ -156,24 +156,46 @@ deployment machine is the stated entry criterion for any capability level above 
 > answers as "**Claude Code:** Users point…", and on answers over a
 > 279-thread community corpus 6 of 9 flags were such words ("Users",
 > "People", "Claiming", "Large"). After a label colon a word on a common-word
-> list (`src/common_words.ts`) is now skipped; anything else is still checked,
-> so "Manufacturer: Tesla" is caught. Re-run: 29 ALLOWED, 1 flag (correct) on
-> the corpus questions; 0 wrong of 41 on the vault eval. Sentence starts after
-> `. ! ?` keep the older rule, so "Tesla makes it [1]" stays unchecked —
+> list (`src/common_words.ts`) is now skipped when the phrase carries on;
+> anything else is still checked, so "Manufacturer: Tesla" and a lone value
+> ("Model: Claude [1]") are caught. Re-run on the source (an earlier re-run
+> went through a stale `dist/` build and is withdrawn): 28 ALLOWED and no
+> term flag on the corpus questions; on the vault eval 3 flags of 49 cited
+> claims, each verified against its cited passage as correct. A plain sentence start
+> after `. ! ?` keeps the older rule, so "Tesla makes it [1]" stays unchecked
+> in `ask` (a name set apart by markup, "**Tesla** makes it", is checked) —
 > extending the common-word test there flagged ordinary openers ("Sales",
 > "Shipping") that a hand-written list cannot cover; closing it needs a real
 > word list.
 >
 > **Measured 2026-09-27 — what the check catches.** 200 labelled claims over
 > 40 vault passages (80 supported, 120 not). The term check wrongly flagged 1
-> supported claim (a Spanish passage cited for "UAE") and caught 25 of 120
-> unsupported: most invented values (22/25), almost no negations (0/30), wrong
-> attributions (0/15), false comparisons (2/20) or values swapped within the
-> same passage (1/30). Those are entailment, and are what a model checker is
-> for (MiniCheck-DeBERTa scored AUC 0.89 on the same set). Since that run, file
-> names (`package.json`) and counts written as words (`four`) are terms, and
-> `’` and `'` are one apostrophe. A file is checked by its base name, so a
-> claim that puts it in the wrong directory is not caught.
+> supported claim (a Spanish passage cited for "UAE") and caught 22 of 120
+> unsupported (invented values 19/25). With file names (`package.json`) and
+> counts written as words (`four`) as terms it catches 26 of 120, with the
+> same 1 wrong flag: most invented values (23/25), almost no negations (0/30),
+> wrong attributions (0/15), false comparisons (2/20) or values swapped within
+> the same passage (1/30). Those are entailment, and are what a model checker
+> is for (MiniCheck-DeBERTa scored AUC 0.89 on the same set). `’` and `'` are
+> one apostrophe. A file is checked by its base name, so a claim that puts it
+> in the wrong directory is not caught.
+>
+> **`chamber_check` (2026-09-27).** The MCP check an agent runs on its own
+> claims uses the same term check, plus the word that opens each claim unless
+> it is a common word — so "Postgres was chosen in 2024" is flagged, where
+> `ask` lets a plain opener through. On the benchmark it catches 28 of 120
+> with the same 1 wrong flag of 80 (`ask`: 26 of 120). The common-word list
+> was extended after seeing its misses, so those figures are optimistic.
+> What it still does not catch:
+> - A product named after a common word at an opening ("Numbers", "Teams",
+>   "Notes", "Next" followed by more words) is read as the ordinary word.
+> - Counts are checked from two to ninety-nine; "one" (a pronoun as often as
+>   a number), "a hundred" and above are not.
+> - A count costs a false flag when the note lists the items without counting
+>   them ("the two tools" against a note naming both), and "two-factor" is
+>   flagged against "multi-factor".
+> - Meaning, as everywhere in this section: a negated or misattributed claim
+>   built from the note's own words is `SUPPORTED`.
 
 This one is a stated non-goal, not a bug, and it is not solved.
 

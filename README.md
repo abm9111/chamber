@@ -189,7 +189,7 @@ one-liner and the Obsidian Sync caveat: [`docs/OBSIDIAN.md`](docs/OBSIDIAN.md).
 
 An agent that reads your vault with its own tools can check what it is about
 to tell you. `chamber_check` takes the agent's claims and the notes it says
-they came from, and answers per claim:
+they came from, and answers per claim (abridged):
 
 ```
 [SUPPORTED] One NVIDIA A100 80GB or an L40S can serve about 1,000 users for code completion.
@@ -198,7 +198,7 @@ they came from, and answers per claim:
      the cited text does not contain: 2000
 ```
 
-It uses no model. It confirms the note is indexed, and unchanged on disk since
+The check uses no model. It confirms the note is indexed, and unchanged on disk since
 it was indexed (`STALE` otherwise: the agent read one text and the index holds
 another, so neither verdict would be about what was read). Then it checks that
 every number, capitalised name, domain, file name and count in the claim occurs
@@ -208,7 +208,8 @@ built from the note's own words — see
 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) §2 for what it was
 measured to catch. It writes nothing unless called with `record: true`. Then
 the supported claims are committed through the gate, pinned to the passages
-that hold them, and `chamber_verify` reports them if the note later changes.
+that hold them, and `chamber_verify` reports any whose pinned passage changes,
+once the note is re-ingested.
 The server tells the host this in its MCP `instructions`, which Claude Code
 puts in the agent's context.
 

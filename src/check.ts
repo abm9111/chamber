@@ -21,12 +21,12 @@
  * and not judged.
  */
 
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { passagePathOf, splitPassages } from "./chunk.ts";
-import { missingTerms, specificTerms } from "./claim_support.ts";
+import { joinPrepared, preparePassage, specificTerms, termsMissingIn, type PreparedText } from "./claim_support.ts";
 import { enforceClaimContract, type ContractSource } from "./contract.ts";
 import { splitFrontmatter } from "./ingest.ts";
 
@@ -59,8 +59,8 @@ export interface CheckResult {
   /** The indexed passages the claim was judged against, as `file#pN`. */
   checkedRefs: string[];
   /**
-   * The fewest of those that together hold every term the note has: what a
-   * reader should open, and what `record` pins.
+   * A small set of those that together hold every term the note has (greedy,
+   * not guaranteed minimal): what a reader should open, and what `record` pins.
    */
   foundIn: string[];
   /** One line per source that did not resolve or is stale, naming it. */
@@ -98,6 +98,17 @@ function realOrSelf(p: string): string {
     return resolve(p);
   }
 }
+
+/** The path with links resolved and each component in its on-disk case. */
+function nativeReal(p: string): string {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    return resolve(p);
+  }
+}
+
+const inside = (rel: string): boolean => rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 
 class Index {
   private readonly byFile = new Map<string, Row[]>();
@@ -139,6 +150,17 @@ class Index {
     return rows;
   }
 
+  private readonly prepared = new Map<string, PreparedText>();
+  /** Each passage is normalised once per call, however many claims cite it. */
+  prep(row: Row): PreparedText {
+    let p = this.prepared.get(row.id);
+    if (!p) {
+      p = preparePassage(row.body);
+      this.prepared.set(row.id, p);
+    }
+    return p;
+  }
+
   byId(id: string): Row | undefined {
     const r = this.db
       .prepare(
@@ -150,6 +172,30 @@ class Index {
       | undefined;
     if (!r || !r.source_ref) return undefined;
     return { id: r.id, ref: r.source_ref, body: r.body, hash: r.snapshot_hash, root: readRoot(r.metadata_json) };
+  }
+
+  /**
+   * The indexed note that is this file on disk, found by name then by real
+   * path. A folder reached through a link is indexed under the link's name
+   * and walked once, so the note's real path matched no row (review A).
+   */
+  sameFile(real: string): { r: string; rel: string } | undefined {
+    const name = real.split(sep).pop() ?? "";
+    const like = `%${name.replace(/[\\%_]/g, "\\$&")}#p%`;
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT source_ref, metadata_json FROM vector_document
+         WHERE source_kind = 'vault_page' AND source_ref LIKE ? ESCAPE '\\'`,
+      )
+      .all(like) as { source_ref: string; metadata_json: string | null }[];
+    for (const row of rows) {
+      const root = readRoot(row.metadata_json);
+      const rel = passagePathOf(row.source_ref);
+      if (root !== null && rel.split("/").pop() === name && nativeReal(resolve(root, rel)) === real) {
+        return { r: root, rel };
+      }
+    }
+    return undefined;
   }
 
   ingestRoots(): string[] {
@@ -199,19 +245,27 @@ function resolveSource(index: Index, raw: string, freshness: Map<string, string 
   let file: string;
   let root: string | null = null;
   if (isAbsolute(pathPart)) {
-    const real = realOrSelf(pathPart);
-    const hits = index
-      .ingestRoots()
-      .map((r) => ({ r, rel: relative(realOrSelf(r), real) }))
-      .filter(({ rel }) => rel !== "" && !rel.startsWith("..") && !isAbsolute(rel));
+    // Two readings of the path against each root, because ingest keys a note
+    // by the path it walked: as written (a note inside a symlinked folder is
+    // indexed under the link's name) and with links resolved (~/Vault → the
+    // real vault). Anything else — the target of a linked folder, a path in
+    // other letter case on macOS — is matched by real path in sameFile()
+    // (review A, 2026-09-27).
+    const hits = index.ingestRoots().flatMap((r) =>
+      [relative(r, resolve(pathPart)), relative(realOrSelf(r), realOrSelf(pathPart))]
+        .filter(inside)
+        .map((rel) => ({ r, rel: rel.split(sep).join("/") })),
+    );
     if (hits.length === 0) return { rows: [], problem: `${src}: not under any ingest root — not indexed` };
     // The deepest root that holds the file: a note under a nested root belongs
     // to it, unless that root excluded it and an outer root indexed it.
     hits.sort((a, b) => a.rel.length - b.rel.length);
     const holder =
-      hits.find((h) => index.passagesOf(h.rel.split(sep).join("/")).some((r) => r.root === h.r)) ?? hits[0]!;
+      hits.find((h) => index.passagesOf(h.rel).some((r) => r.root === h.r)) ??
+      index.sameFile(nativeReal(pathPart)) ??
+      hits[0]!;
     root = holder.r;
-    file = holder.rel.split(sep).join("/");
+    file = holder.rel;
   } else {
     file = pathPart.replace(/^\.\//, "");
   }
@@ -261,38 +315,52 @@ function staleness(
   if (cache.has(key)) return cache.get(key) ?? undefined;
   let problem: string | null = null;
   if (root !== null) {
-    const full = resolve(root, file);
-    const inside = relative(realOrSelf(root), realOrSelf(full));
-    if (existsSync(full) && (inside === "" || inside.startsWith("..") || isAbsolute(inside))) {
-      // Replaced by a link out of the root since ingest: read nothing, as
-      // ingest itself refuses a symlink escape.
-      problem = `${file}: now resolves outside its ingest root — not read, not judged`;
-    } else if (!existsSync(full)) {
-      problem = `${file}: indexed, but no longer on disk — run \`chamber prune\``;
-    } else {
-      let raw: string | undefined;
-      try {
-        raw = readFileSync(full, "utf8");
-      } catch (err) {
-        problem = `${file}: indexed, but unreadable on disk (${(err as Error).message}) — not judged`;
-      }
-      if (raw !== undefined) {
-        const disk = splitPassages(splitFrontmatter(raw).body);
-        const indexed = new Map(
-          index
-            .passagesOf(file)
-            .filter((r) => r.root === root)
-            .map((r) => [r.ref, r.body]),
-        );
-        const same =
-          disk.length === indexed.size &&
-          disk.every((p) => indexed.get(`${file}#p${p.index}`) === p.body);
-        if (!same) problem = `${file}: changed on disk since the last ingest — run \`chamber ingest\``;
-      }
-    }
+    const rows = index.passagesOf(file).filter((r) => r.root === root);
+    problem = readAndCompare(resolve(root, file), root, file, rows);
   }
   cache.set(key, problem);
   return problem ?? undefined;
+}
+
+/**
+ * Compare the file on disk with its indexed passages, reading it only if it is
+ * safe to. Opened without following a final symlink and without blocking, then
+ * checked to be a regular file of plausible size before a byte is read:
+ * - a FIFO put in a note's place hung the whole MCP server in readFileSync;
+ * - a note swapped for a link to a file ingest never indexed (a dot-folder,
+ *   an excluded path) was read and compared;
+ * - a note grown to 100 MB cost 1.5 GB to decide it was stale
+ * (review A, 2026-09-27). A link anywhere in the directory part must still
+ * resolve inside the root, as ingest requires.
+ * Returns a problem line, or null when the disk matches the index.
+ */
+function readAndCompare(full: string, root: string, file: string, rows: Row[]): string | null {
+  if (!inside(relative(nativeReal(root), nativeReal(full)))) {
+    return `${file}: now resolves outside its ingest root — not read, not judged`;
+  }
+  let fd: number;
+  try {
+    fd = openSync(full, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return `${file}: indexed, but no longer on disk — run \`chamber prune\``;
+    if (code === "ELOOP") return `${file}: is now a symbolic link — not read, not judged`;
+    return `${file}: indexed, but unreadable on disk (${code ?? "error"}) — not judged`;
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) return `${file}: is no longer a regular file — not read, not judged`;
+    const indexedBytes = rows.reduce((n, r) => n + Buffer.byteLength(r.body), 0);
+    if (st.size > indexedBytes * 8 + 1_000_000) {
+      return `${file}: changed on disk since the last ingest (far larger than the indexed copy) — run \`chamber ingest\``;
+    }
+    const disk = splitPassages(splitFrontmatter(readFileSync(fd, "utf8")).body);
+    const indexed = new Map(rows.map((r) => [r.ref, r.body]));
+    const same = disk.length === indexed.size && disk.every((p) => indexed.get(`${file}#p${p.index}`) === p.body);
+    return same ? null : `${file}: changed on disk since the last ingest — run \`chamber ingest\``;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**
@@ -301,9 +369,9 @@ function staleness(
  * real note because one term ("NVIDIA") ran through all of them; the passage
  * that states the claim holds every term at once and is taken first.
  */
-function cover(text: string, terms: string[], rows: Row[]): Row[] {
+function cover(index: Index, terms: string[], rows: Row[]): Row[] {
   const held = rows.map((r) => {
-    const miss = new Set(missingTerms(text, [r.body], OPENINGS));
+    const miss = new Set(termsMissingIn(terms, index.prep(r)));
     return { r, has: new Set(terms.filter((t) => !miss.has(t))) };
   });
   const left = new Set(terms);
@@ -376,9 +444,9 @@ export function checkClaims(
 
     const judged = [...rows.values()];
     base.checkedRefs = judged.map((r) => r.ref);
-    const holders = cover(text, terms, judged);
+    const missing = termsMissingIn(terms, joinPrepared(judged.map((r) => index.prep(r))));
+    const holders = cover(index, terms, judged);
     base.foundIn = holders.map((r) => r.ref);
-    const missing = missingTerms(text, judged.map((r) => r.body), OPENINGS);
     if (missing.length > 0) return { ...base, status: "TERMS_ABSENT", missing };
     // Nothing specific to check: the term check passes vacuously, and calling
     // that SUPPORTED would certify any sentence against any note.
@@ -409,8 +477,8 @@ const EXPLAIN: Record<CheckStatus, string> = {
   SUPPORTED: "every term Chamber recognises occurs in the cited text",
   TERMS_ABSENT: "the cited text does not contain",
   NO_TERMS: "nothing specific to check (no number, name, domain, file name or count) — only that the source exists",
-  STALE: "not judged — the note changed since it was indexed",
-  NOT_FOUND: "not judged — no cited source is in the index",
+  STALE: "not judged — the note on disk no longer matches the index, or could not be safely read",
+  NOT_FOUND: "not judged — no cited source could be resolved to an indexed note",
   NO_SOURCE: "not judged — cited nothing",
 };
 
@@ -455,7 +523,7 @@ export function formatCheck(results: CheckResult[], recorded: boolean): string {
     "SUPPORTED means the specifics are in the note, not that the sentence means what the note means: " +
       "a negated, reversed or misattributed claim built from the note's own words passes. " +
       (recorded
-        ? "Recorded claims are pinned; `chamber_verify` reports them if the note changes."
+        ? "Recorded claims are pinned to the passages found; after the next `chamber ingest`, `chamber_verify` reports any whose pinned passage changed."
         : "Nothing was recorded (pass `record: true` to pin supported claims for drift checks)."),
   );
   return out.join("\n");

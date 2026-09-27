@@ -16,14 +16,22 @@ history and the GitHub releases.
   opens a claim, unless it is a common word ("Postgres was chosen in 2024").
   A note held only by rows with no recorded folder (older ingests, code
   indexes), or one replaced by a link out of its folder, is not judged. It
-  uses no model. It is read-only unless `record: true`, which
-  commits only the supported claims through the gate, pinned to the fewest
-  passages that hold their terms.
+  check uses no model. It is read-only unless `record: true`, which
+  commits only the supported claims through the gate, pinned to a small
+  covering set of the passages that hold their terms.
 - The MCP server sends `instructions` on `initialize`, telling the host when to
   call `chamber_check` and what `SUPPORTED` does not mean.
 
 ### Fixed
 
+- **A term split across two cited passages no longer counts as found.**
+  Passages were joined with a newline, so "…was 5" ending one and "million
+  users…" opening the next satisfied "5 million", which neither says. This
+  affected `ask` and every path through the commit gate.
+- A name set apart by markup at the start of a claim (`**Tesla** makes it`,
+  `- **Tesla:** …`) is checked again; after a label colon, a common word is
+  skipped only when the phrase carries on, so a lone value (`Model: Claude`,
+  `Released: May 5`) is checked.
 - The claim-support term check now treats file names (`package.json`) and
   counts written as words (`four`, `twenty-five`) as terms, and reads `’`
   and `'` as one apostrophe. After a label colon it skips a common word

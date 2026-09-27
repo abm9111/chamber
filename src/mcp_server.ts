@@ -183,10 +183,12 @@ const INSTRUCTIONS =
   "it came from (the absolute path you read) before presenting it. Report " +
   "TERMS_ABSENT claims as not supported by that note instead of asserting them, and " +
   "say when a note was STALE or NOT_FOUND. SUPPORTED means every number, " +
-  "capitalised name, domain, file name and count in the claim occurs in the note; " +
+  "capitalised name, domain, file name and count (two to ninety-nine in words) in " +
+  "the claim occurs in the note; " +
   "lowercase names and ordinary words are not checked, nor is meaning, so a negated " +
   "or reversed claim can still pass. chamber_ask answers with Chamber's own " +
-  "configured model; chamber_verify reports recorded claims whose notes changed; " +
+  "configured model; chamber_verify reports recorded claims whose pinned passages " +
+  "changed, once the note is re-ingested; " +
   "chamber_corpus shows what is indexed.";
 
 const TOOLS = [
@@ -200,11 +202,12 @@ const TOOLS = [
       "name, domain, file name and count in the claim occurs in that note. Verdicts: SUPPORTED, " +
       "TERMS_ABSENT (names the missing terms), NO_TERMS (nothing specific to check), " +
       "STALE (the note changed since indexing — not judged), NOT_FOUND, NO_SOURCE. " +
-      "Uses no model: deterministic and offline. It does not check meaning — a negated " +
-      "claim built from the note's own words passes. Read-only unless `record` is true, " +
-      "which commits SUPPORTED claims through Chamber's gate with pinned sources so " +
-      "chamber_verify later reports them if the note changes; unsupported claims are " +
-      "never recorded.",
+      "The check uses no model and is deterministic. It does not check meaning — a " +
+      "negated claim built from the note's own words passes. Read-only unless `record` " +
+      "is true, which commits SUPPORTED claims through Chamber's gate (which may run the " +
+      "local embedder to compare against open citation debt), pinned to the passages " +
+      "that hold their terms, so chamber_verify reports them if a pinned passage changes " +
+      "once the note is re-ingested; unsupported claims are never recorded.",
     inputSchema: {
       type: "object",
       properties: {

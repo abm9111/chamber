@@ -9257,6 +9257,43 @@ test("pins", "claim support: file names and counts written as words are terms", 
   // Counts and file names must not leak into each other or into names.
   assert(miss("Seventeen files changed [1]", "17 files changed").length === 0, "17 satisfies seventeen");
   assert(miss("Seventeen files changed [1]", "7 files changed").includes("seventeen"), "7 must not satisfy seventeen");
+  // Review B, 2026-09-27: a name set apart by markup at an opening is checked;
+  // after a label only an ordinary word that carries the phrase on is skipped.
+  const shop = "Kingroon makes the PLA filament. Released June 5. Price: 5 dollars.";
+  for (const [c, t] of [
+    ["**Tesla** makes the PLA filament [1]", "Tesla"],
+    ["- **Tesla:** makes the PLA filament [1]", "Tesla"],
+    ["`Tesla` makes the PLA filament [1]", "Tesla"],
+    ["Released: May 5 [1]", "May"],
+    ["Price: Free [1]", "Free"],
+  ] as const) {
+    assert(miss(c, shop).includes(t), `${JSON.stringify(c)} must check ${t}: ${JSON.stringify(miss(c, shop))}`);
+  }
+  // Real answer lines from the community corpus run: a bullet opens a line,
+  // and a label's first word carries on past a slash, a quote or a name.
+  const vault = "Some point Claude Code at the vault folder; it sends data to Anthropic's API.";
+  for (const ok of [
+    "- **Privacy / “where data goes”:** Pointing Claude Code at the vault folder sends data to Anthropic’s API [1]",
+    "* **Large vaults / context:** Users point Claude Code at the vault folder [1]",
+  ]) {
+    assert(miss(ok, vault).length === 0, `${JSON.stringify(ok)} flagged ${JSON.stringify(miss(ok, vault))}`);
+  }
+  assert(miss("- **Tesla** points Claude Code at the vault [1]", vault).includes("Tesla"), "a bullet does not hide a name");
+  // Stems that turned names into listed words: Bing → "be", Finder → "find".
+  for (const [c, t] of [["Bing indexes the site [1]", "Bing"], ["Finder opens the vault [1]", "Finder"]] as const) {
+    assert(missingTerms(c, ["The site is indexed."], { openings: true }).includes(t), `${c} must check ${t}`);
+  }
+  // Ordinals and fractions are not counts; a count's digits must stand alone;
+  // a signed spelled number is not a count.
+  assert(miss("In the twenty-first century, two-thirds agreed [1]", "In the 21st century 66% agreed").length === 0, "ordinals and fractions are not counts");
+  assert(miss("3 users agreed [1]", "three-quarters of users agreed").includes("3"), "three-quarters is not 3");
+  assert(miss("Plan 2 added four entries [1]", "Plan 2 added two entries using Qwen3.5-2B-Q4_K_M").includes("four"), "the 4 in Q4_K_M is not a count of four");
+  assert(miss("It rose 5 points [1]", "It fell -five points").includes("5"), "-five is not 5");
+  // Review A: passages are joined so that no term spans two of them.
+  assert(
+    missingTerms("Revenue for Q3 was 5 million. [1]", ["Revenue for Q3 was 5", "million users joined the beta."]).includes("5 million"),
+    "a unit must not be read across the join of two passages",
+  );
   // A spelled number is read whole: "five" inside "fifty-five" is not 5.
   assert(miss("It costs 5 dollars [1]", "It costs fifty-five dollars").includes("5"), "fifty-five must not satisfy 5");
   assert(miss("It costs five dollars [1]", "It costs fifty five dollars").includes("five"), "fifty five must not satisfy five");
@@ -9282,7 +9319,11 @@ function checkFixture(): { db: DatabaseSync; dir: string; note: string } {
 test("pins", "check: an agent's claims are judged against the note it cites", () => {
   const { db, dir, note } = checkFixture();
   try {
-    const beliefsBefore = (db.prepare("SELECT count(*) AS n FROM belief").get() as { n: number }).n;
+    const rowsIn = (): string =>
+      ["belief", "belief_source", "citation_debt", "audit_event", "gate_event"]
+        .map((t) => `${t}=${(db.prepare(`SELECT count(*) AS n FROM ${t}`).get() as { n: number }).n}`)
+        .join(" ");
+    const before = rowsIn();
     const r = checkClaims(db, [
       { text: "The audit store is SQLite.", sources: [note] },
       { text: "The audit store is Postgres.", sources: [note] },
@@ -9307,8 +9348,7 @@ test("pins", "check: an agent's claims are judged against the note it cites", ()
     const stored = (db.prepare("SELECT source_ref FROM vector_document WHERE body LIKE '%audit store%'").get() as { source_ref: string }).source_ref;
     const onlyStore = checkClaims(db, [{ text: "The hosting budget is $900 per month.", sources: [stored] }]);
     assert(budget !== undefined && onlyStore[0]!.status === "TERMS_ABSENT", `a passage ref must not see the rest of the note: ${JSON.stringify(onlyStore)}`);
-    const beliefsAfter = (db.prepare("SELECT count(*) AS n FROM belief").get() as { n: number }).n;
-    assert(beliefsAfter === beliefsBefore, `a check without record must write nothing (${beliefsBefore} → ${beliefsAfter})`);
+    assert(rowsIn() === before, `a check without record must write nothing (${before} → ${rowsIn()})`);
     const text = formatCheck(r, false);
     assert(/\[TERMS_ABSENT\] The audit store is Postgres\.\n\s+the cited text does not contain: Postgres/.test(text), text);
     assert(text.includes("does not check") || text.includes("not that the sentence means"), "the output must say what SUPPORTED does not mean");
@@ -9379,6 +9419,68 @@ test("pins", "check: record commits only supported claims, pinned to the passage
   }
 });
 
+test("pins", "check: record pins the passage that states the claim, not every passage naming a common term", () => {
+  const db = freshDb();
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-cover-")));
+  try {
+    const sections = Array.from({ length: 6 }, (_, i) => `## Part ${i}\n\nNVIDIA hardware note ${i}.\n`);
+    sections.push("## Sizing\n\nOne NVIDIA A100 serves about 1,000 users.\n");
+    writeFileSync(join(dir, "gpu.md"), `# GPU\n\n${sections.join("\n")}`);
+    ingestDirectory(db, dir);
+    const [r] = checkClaims(db, [{ text: "One NVIDIA A100 serves about 1,000 users.", sources: [join(dir, "gpu.md")] }], { record: true });
+    assert(r!.status === "SUPPORTED" && r!.foundIn.length === 1, `one passage states it all: ${JSON.stringify(r)}`);
+    const pins = db.prepare("SELECT count(*) AS n FROM belief_source WHERE belief_id = ?").get(r!.recorded!.beliefId!) as { n: number };
+    assert(pins.n === 1, `must pin 1 passage, not every NVIDIA passage: pinned ${pins.n}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: files that are not plain notes are never read", () => {
+  // Review A, 2026-09-27: a FIFO in a note's place hung the MCP server in
+  // readFileSync; a note swapped for a link to a never-indexed file was read.
+  const { db, dir, note } = checkFixture();
+  try {
+    mkdirSync(join(dir, ".hidden"));
+    writeFileSync(join(dir, ".hidden", "s.md"), readFileSync(note, "utf8"));
+    rmSync(note);
+    symlinkSync(join(dir, ".hidden", "s.md"), note);
+    const linked = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [note] }])[0]!;
+    assert(linked.status === "STALE" && linked.problems.some((p) => p.includes("symbolic link")), `a link in a note's place: ${JSON.stringify(linked)}`);
+    rmSync(note);
+    const fifo = spawnSync("mkfifo", [note]);
+    assert(fifo.status === 0, `setup: mkfifo failed: ${fifo.stderr}`);
+    const t = Date.now();
+    const piped = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [note] }])[0]!;
+    assert(Date.now() - t < 5000 && piped.status === "STALE" && piped.problems.some((p) => p.includes("regular file")), `a FIFO: ${JSON.stringify(piped)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: a note is found through a symlinked folder and in any letter case", () => {
+  const db = freshDb();
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-paths-")));
+  try {
+    mkdirSync(join(base, "v", "real"), { recursive: true });
+    writeFileSync(join(base, "v", "real", "x.md"), "# X\n\nThe audit store is SQLite.\n");
+    symlinkSync(join(base, "v", "real"), join(base, "v", "alink"));
+    ingestDirectory(db, join(base, "v"));
+    const viaLink = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [join(base, "v", "alink", "x.md")] }])[0]!;
+    const viaReal = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [join(base, "v", "real", "x.md")] }])[0]!;
+    // Ingest walked the folder once, under the link's name; both paths name it.
+    assert(viaLink.status === "SUPPORTED" && viaReal.status === "SUPPORTED", `link: ${JSON.stringify(viaLink)} real: ${JSON.stringify(viaReal)}`);
+    // On a case-insensitive filesystem the agent's casing need not match.
+    const upper = join(base, "v", "ALINK", "X.md");
+    if (existsSync(upper)) {
+      const cased = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [upper] }])[0]!;
+      assert(cased.status === "SUPPORTED", `case-insensitive path: ${JSON.stringify(cased)}`);
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test("pins", "check: a note is judged in its own vault, not another holding the same path", () => {
   // Two ingest roots can each hold notes/ops.md. A claim cited to one must not
   // pass on the other's text.
@@ -9397,7 +9499,7 @@ test("pins", "check: a note is judged in its own vault, not another holding the 
     ]);
     assert(inA!.status === "TERMS_ABSENT", `vault a says SQLite: ${JSON.stringify(inA)}`);
     assert(inB!.status === "SUPPORTED", `vault b says Postgres: ${JSON.stringify(inB)}`);
-    assert(rel!.status === "NOT_FOUND" && rel!.problems.some((p) => p.includes("absolute path")), `an ambiguous relative path must not be judged: ${JSON.stringify(rel)}`);
+    assert(rel!.status === "NOT_FOUND" && rel!.problems.some((p) => p.includes("held by 2 ingest roots")), `an ambiguous relative path must not be judged: ${JSON.stringify(rel)}`);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -9431,8 +9533,8 @@ test("pins", "check: review findings on chamber_check stay closed", () => {
         { text: "The hosting budget is $900 per month.", sources: [note] },
         { text: "x".repeat(2001), sources: [note] },
       ], { record: true });
-    } catch {
-      threw = true;
+    } catch (err) {
+      threw = /claims\[1\] is over 2000 characters — nothing was checked/.test((err as Error).message);
     }
     const after = (db.prepare("SELECT count(*) AS n FROM belief").get() as { n: number }).n;
     assert(threw && after === before, `a refused call must write nothing: threw=${threw} beliefs ${before} → ${after}`);

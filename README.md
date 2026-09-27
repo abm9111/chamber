@@ -187,9 +187,34 @@ one-liner and the Obsidian Sync caveat: [`docs/OBSIDIAN.md`](docs/OBSIDIAN.md).
 
 ### Use it from an AI coding agent
 
-`src/mcp_server.ts` exposes three tools over MCP — `chamber_ask`,
-`chamber_verify`, `chamber_corpus` — so a host like Claude Code can query your
-corpus and see the per-claim citation verdicts rather than just the prose.
+An agent that reads your vault with its own tools can check what it is about
+to tell you. `chamber_check` takes the agent's claims and the notes it says
+they came from, and answers per claim:
+
+```
+[SUPPORTED] One NVIDIA A100 80GB or an L40S can serve about 1,000 users for code completion.
+     found in: ai-coding-setups-march-2026.md#p25
+[TERMS_ABSENT] One NVIDIA A100 80GB can serve about 2,000 users for code completion.
+     the cited text does not contain: 2000
+```
+
+It uses no model. It confirms the note is indexed, and unchanged on disk since
+it was indexed (`STALE` otherwise: the agent read one text and the index holds
+another, so neither verdict would be about what was read). Then it checks that
+every number, capitalised name, domain, file name and count in the claim occurs
+in the note. That catches invented values. It does not check lowercase names or
+ordinary words, and it does not catch a negated or reversed sentence
+built from the note's own words — see
+[`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) §2 for what it was
+measured to catch. It writes nothing unless called with `record: true`. Then
+the supported claims are committed through the gate, pinned to the passages
+that hold them, and `chamber_verify` reports them if the note later changes.
+The server tells the host this in its MCP `instructions`, which Claude Code
+puts in the agent's context.
+
+Three more tools cover the rest: `chamber_ask` (Chamber's own configured model
+answers, with the same per-claim verdicts), `chamber_verify` (drift in recorded
+claims) and `chamber_corpus` (what is indexed).
 
 From the npm package, the server is one subcommand:
 

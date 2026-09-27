@@ -3,6 +3,32 @@
 All notable changes to Chamber. Versions before 0.1.6 are described in the git
 history and the GitHub releases.
 
+## Unreleased
+
+### Added
+
+- **`chamber_check` (MCP): the check your AI agent runs on your notes.** An
+  agent passes its own claims with the notes they came from (absolute paths,
+  `file.md#pN` refs or passage ids). Each claim comes back `SUPPORTED`,
+  `TERMS_ABSENT` (naming the missing terms), `NO_TERMS`, `STALE` (the note
+  changed on disk since it was indexed, so it is not judged), `NOT_FOUND` or
+  `NO_SOURCE`. Unlike the check on model answers, it also checks the word that
+  opens a claim, unless it is a common word ("Postgres was chosen in 2024").
+  A note held only by rows with no recorded folder (older ingests, code
+  indexes), or one replaced by a link out of its folder, is not judged. It
+  uses no model. It is read-only unless `record: true`, which
+  commits only the supported claims through the gate, pinned to the fewest
+  passages that hold their terms.
+- The MCP server sends `instructions` on `initialize`, telling the host when to
+  call `chamber_check` and what `SUPPORTED` does not mean.
+
+### Fixed
+
+- The claim-support term check now treats file names (`package.json`) and
+  counts written as words (`four`, `twenty-five`) as terms, and reads `’`
+  and `'` as one apostrophe. After a label colon it skips a common word
+  instead of flagging it ("**Privacy:** Users…").
+
 ## 0.1.6 — 2026-09-27
 
 ### Security

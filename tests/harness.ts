@@ -66,6 +66,7 @@ import {
   CITABLE_SOURCE_KINDS,
 } from "../src/pins.ts";
 import { runAsk, citedIndices, stubDisclosure } from "../src/ask.ts";
+import { checkClaims, formatCheck } from "../src/check.ts";
 import { missingTerms, specificTerms } from "../src/claim_support.ts";
 import { withSiblings } from "../src/siblings.ts";
 import {
@@ -9263,6 +9264,244 @@ test("pins", "claim support: file names and counts written as words are terms", 
   assert(miss("It costs 55 dollars [1]", "It costs fifty five dollars").length === 0, "fifty five satisfies 55");
 });
 
+// ─── chamber_check: the agent's own claims against the note on disk ─────────
+
+function checkFixture(): { db: DatabaseSync; dir: string; note: string } {
+  const db = freshDb();
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-")));
+  mkdirSync(join(dir, "notes"));
+  const note = join(dir, "notes", "ops.md");
+  writeFileSync(
+    note,
+    "# Ops\n\n## Store\nThe audit store is SQLite, chosen in 2024.\n\n## Budget\nThe hosting budget is $900 per month.\n",
+  );
+  ingestDirectory(db, dir);
+  return { db, dir, note };
+}
+
+test("pins", "check: an agent's claims are judged against the note it cites", () => {
+  const { db, dir, note } = checkFixture();
+  try {
+    const beliefsBefore = (db.prepare("SELECT count(*) AS n FROM belief").get() as { n: number }).n;
+    const r = checkClaims(db, [
+      { text: "The audit store is SQLite.", sources: [note] },
+      { text: "The audit store is Postgres.", sources: [note] },
+      { text: "It was chosen carefully.", sources: [note] },
+      { text: "The hosting budget is $900 per month.", sources: ["notes/ops.md"] },
+      { text: "The audit store is SQLite.", sources: [] },
+      { text: "The audit store is SQLite.", sources: ["/etc/passwd"] },
+      { text: "The audit store is SQLite.", sources: [`${dir}/notes/../../../etc/passwd`] },
+    ]);
+    const st = r.map((x) => x.status);
+    assert(
+      JSON.stringify(st) ===
+        JSON.stringify(["SUPPORTED", "TERMS_ABSENT", "NO_TERMS", "SUPPORTED", "NO_SOURCE", "NOT_FOUND", "NOT_FOUND"]),
+      `statuses: ${JSON.stringify(st)}`,
+    );
+    assert(r[1]!.missing.includes("Postgres"), `must name Postgres: ${JSON.stringify(r[1])}`);
+    // A claim with nothing specific passes the term check vacuously; calling
+    // that SUPPORTED would certify any sentence against any note.
+    assert(r[2]!.terms.length === 0, "setup: the vacuous claim has no terms");
+    // A passage ref judges against that passage only.
+    const budget = r[3]!.checkedRefs.find((ref) => ref.startsWith("notes/ops.md#p"));
+    const stored = (db.prepare("SELECT source_ref FROM vector_document WHERE body LIKE '%audit store%'").get() as { source_ref: string }).source_ref;
+    const onlyStore = checkClaims(db, [{ text: "The hosting budget is $900 per month.", sources: [stored] }]);
+    assert(budget !== undefined && onlyStore[0]!.status === "TERMS_ABSENT", `a passage ref must not see the rest of the note: ${JSON.stringify(onlyStore)}`);
+    const beliefsAfter = (db.prepare("SELECT count(*) AS n FROM belief").get() as { n: number }).n;
+    assert(beliefsAfter === beliefsBefore, `a check without record must write nothing (${beliefsBefore} → ${beliefsAfter})`);
+    const text = formatCheck(r, false);
+    assert(/\[TERMS_ABSENT\] The audit store is Postgres\.\n\s+the cited text does not contain: Postgres/.test(text), text);
+    assert(text.includes("does not check") || text.includes("not that the sentence means"), "the output must say what SUPPORTED does not mean");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: a note edited or deleted since ingest is not judged", () => {
+  // The agent read the file on disk; the index holds the last ingest. Judged
+  // against the old copy, "Postgres" was TERMS_ABSENT for a note that now
+  // says it, and "SQLite" passed for a note that no longer does.
+  const { db, dir, note } = checkFixture();
+  try {
+    writeFileSync(note, "# Ops\n\n## Store\nThe audit store is Postgres, chosen in 2025.\n\n## Budget\nThe hosting budget is $900 per month.\n");
+    const edited = checkClaims(db, [
+      { text: "The audit store is Postgres.", sources: [note] },
+      { text: "The audit store is SQLite.", sources: [note] },
+    ]);
+    assert(edited.every((x) => x.status === "STALE"), `edited note must be STALE: ${JSON.stringify(edited.map((x) => x.status))}`);
+    assert(edited[0]!.problems.some((p) => p.includes("chamber ingest")), "must say how to fix it");
+    ingestDirectory(db, dir);
+    const fresh = checkClaims(db, [
+      { text: "The audit store is Postgres.", sources: [note] },
+      { text: "The audit store is SQLite.", sources: [note] },
+    ]);
+    assert(fresh[0]!.status === "SUPPORTED" && fresh[1]!.status === "TERMS_ABSENT", `after ingest: ${JSON.stringify(fresh.map((x) => x.status))}`);
+    // A file added after ingest is not in the index, whatever it says.
+    writeFileSync(join(dir, "notes", "new.md"), "The audit store is SQLite.\n");
+    assert(checkClaims(db, [{ text: "The audit store is SQLite.", sources: [join(dir, "notes", "new.md")] }])[0]!.status === "NOT_FOUND", "an unindexed file must be NOT_FOUND");
+    rmSync(note);
+    const gone = checkClaims(db, [{ text: "The audit store is Postgres.", sources: [note] }]);
+    assert(gone[0]!.status === "STALE" && gone[0]!.problems.some((p) => p.includes("chamber prune")), `deleted note: ${JSON.stringify(gone)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: record commits only supported claims, pinned to the passages that hold them", () => {
+  const { db, dir, note } = checkFixture();
+  try {
+    const r = checkClaims(
+      db,
+      [
+        { text: "The hosting budget is $900 per month.", sources: [note] },
+        { text: "The hosting budget is $1200 per month.", sources: [note] },
+        { text: "It was chosen carefully.", sources: [note] },
+      ],
+      { record: true },
+    );
+    assert(r[0]!.recorded?.status === "ALLOWED" && r[0]!.recorded.beliefId !== undefined, `supported claim must commit ALLOWED: ${JSON.stringify(r[0])}`);
+    assert(r[1]!.recorded === undefined && r[2]!.recorded === undefined, "unsupported and vacuous claims must never be recorded");
+    const beliefs = (db.prepare("SELECT count(*) AS n FROM belief").get() as { n: number }).n;
+    const debts = (db.prepare("SELECT count(*) AS n FROM citation_debt").get() as { n: number }).n;
+    assert(beliefs === 1 && debts === 0, `exactly one belief and no debt: beliefs=${beliefs} debts=${debts}`);
+    // A whole-note citation pins only the passage that holds the terms, so an
+    // edit to the other section is not reported as drift under this claim.
+    const pins = db.prepare("SELECT count(*) AS n FROM belief_source WHERE belief_id = ?").get(r[0]!.recorded!.beliefId!) as { n: number };
+    assert(pins.n === 1, `must pin one passage, pinned ${pins.n}`);
+    writeFileSync(note, "# Ops\n\n## Store\nThe audit store is Postgres now.\n\n## Budget\nThe hosting budget is $900 per month.\n");
+    ingestDirectory(db, dir);
+    assert(verifyBeliefSources(db).every((b) => b.failures.length === 0), "an edit elsewhere in the note is not drift for this claim");
+    writeFileSync(note, "# Ops\n\n## Store\nThe audit store is Postgres now.\n\n## Budget\nThe hosting budget is $1200 per month.\n");
+    ingestDirectory(db, dir);
+    assert(verifyBeliefSources(db).some((b) => b.failures.length > 0), "an edit to the pinned passage must be drift");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: a note is judged in its own vault, not another holding the same path", () => {
+  // Two ingest roots can each hold notes/ops.md. A claim cited to one must not
+  // pass on the other's text.
+  const db = freshDb();
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-roots-")));
+  try {
+    for (const [v, store] of [["a", "SQLite"], ["b", "Postgres"]] as const) {
+      mkdirSync(join(base, v, "notes"), { recursive: true });
+      writeFileSync(join(base, v, "notes", "ops.md"), `# Ops\n\nThe audit store is ${store}.\n`);
+      ingestDirectory(db, join(base, v));
+    }
+    const [inA, inB, rel] = checkClaims(db, [
+      { text: "The audit store is Postgres.", sources: [join(base, "a", "notes", "ops.md")] },
+      { text: "The audit store is Postgres.", sources: [join(base, "b", "notes", "ops.md")] },
+      { text: "The audit store is Postgres.", sources: ["notes/ops.md"] },
+    ]);
+    assert(inA!.status === "TERMS_ABSENT", `vault a says SQLite: ${JSON.stringify(inA)}`);
+    assert(inB!.status === "SUPPORTED", `vault b says Postgres: ${JSON.stringify(inB)}`);
+    assert(rel!.status === "NOT_FOUND" && rel!.problems.some((p) => p.includes("absolute path")), `an ambiguous relative path must not be judged: ${JSON.stringify(rel)}`);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: review findings on chamber_check stay closed", () => {
+  const { db, dir, note } = checkFixture();
+  try {
+    // 1. A claim opens with its subject; that word is checked here.
+    const [pg, oracle, running] = checkClaims(db, [
+      { text: "Postgres was chosen in 2024.", sources: [note] },
+      { text: "Oracle, not SQLite, was chosen in 2024.", sources: [note] },
+      { text: "Running the audit store on SQLite was chosen in 2024.", sources: [note] },
+    ]);
+    assert(pg!.status === "TERMS_ABSENT" && pg!.missing.includes("Postgres"), `opening name: ${JSON.stringify(pg)}`);
+    assert(oracle!.status === "TERMS_ABSENT" && oracle!.missing.includes("Oracle"), `opening name: ${JSON.stringify(oracle)}`);
+    assert(running!.status === "SUPPORTED", `an ordinary opening word is not a name: ${JSON.stringify(running)}`);
+
+    // 2. A row with no recorded root has no disk copy to compare: not judged.
+    const legacyId = upsertDocument(db, { sourceKind: "vault_page", sourceRef: "legacy.md#p0", title: "Legacy", body: "The audit store is Postgres.", model: "local-hash-v1" }).id;
+    for (const src of ["legacy.md", legacyId]) {
+      const legacy = checkClaims(db, [{ text: "The audit store is Postgres.", sources: [src] }])[0]!;
+      assert(legacy.status === "NOT_FOUND" && legacy.problems.some((p) => p.includes("without a recorded")), `rootless row via ${src}: ${JSON.stringify(legacy)}`);
+    }
+
+    // 3. Limits are checked before anything is recorded.
+    const before = (db.prepare("SELECT count(*) AS n FROM belief").get() as { n: number }).n;
+    let threw = false;
+    try {
+      checkClaims(db, [
+        { text: "The hosting budget is $900 per month.", sources: [note] },
+        { text: "x".repeat(2001), sources: [note] },
+      ], { record: true });
+    } catch {
+      threw = true;
+    }
+    const after = (db.prepare("SELECT count(*) AS n FROM belief").get() as { n: number }).n;
+    assert(threw && after === before, `a refused call must write nothing: threw=${threw} beliefs ${before} → ${after}`);
+
+    // 4. A note replaced by a link out of the root is not read.
+    const outside = join(dir, "..", `${basename(dir)}-outside.md`);
+    writeFileSync(outside, readFileSync(note, "utf8"));
+    rmSync(note);
+    symlinkSync(outside, note);
+    const linked = checkClaims(db, [{ text: "The audit store is SQLite.", sources: ["notes/ops.md"] }])[0]!;
+    rmSync(outside);
+    assert(linked.status === "STALE" && linked.problems.some((p) => p.includes("outside")), `symlink escape: ${JSON.stringify(linked)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: a nested root that excluded a note does not hide the outer root's copy", () => {
+  const db = freshDb();
+  const outer = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-nest-")));
+  try {
+    mkdirSync(join(outer, "inner"));
+    writeFileSync(join(outer, "inner", "x.md"), "# X\n\nThe audit store is SQLite.\n");
+    writeFileSync(join(outer, "inner", "y.md"), "# Y\n\nSomething else.\n");
+    ingestDirectory(db, outer);
+    ingestDirectory(db, join(outer, "inner"), { exclude: ["x.md"] });
+    const r = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [join(outer, "inner", "x.md")] }])[0]!;
+    assert(r.status === "SUPPORTED", `the outer root holds it: ${JSON.stringify(r)}`);
+  } finally {
+    rmSync(outer, { recursive: true, force: true });
+  }
+});
+
+test("oauth", "chamber_check over MCP: instructions in initialize, a check through the real server", async () => {
+  const MCP_PATH = join(dirname(fileURLToPath(import.meta.url)), "../src/mcp_server.ts");
+  const { env, dir } = stubAskFixture();
+  try {
+    const init = spawnSync(process.execPath, ["--experimental-strip-types", MCP_PATH], {
+      encoding: "utf8",
+      env,
+      input: `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "t", version: "0" } } })}\n`,
+      timeout: 30_000,
+    });
+    const reply = JSON.parse((init.stdout || "").split("\n").find((l) => l.includes('"id":1')) ?? "{}") as { result?: { instructions?: string } };
+    assert(/chamber_check/.test(reply.result?.instructions ?? ""), `initialize must carry instructions naming chamber_check: ${init.stdout}`);
+    const s = mcpSession(env);
+    try {
+      const note = join(realpathSync(dir), "docs", "ops.md");
+      const ok = await s.tool("chamber_check", { claims: [{ text: "The audit store is SQLite.", sources: [note] }, { text: "The audit store is Postgres.", sources: [note] }] });
+      assert(ok.includes("[SUPPORTED] The audit store is SQLite.") && ok.includes("[TERMS_ABSENT] The audit store is Postgres."), ok);
+      const bad = await s.tool("chamber_check", { claims: [{ text: "x" }] });
+      assert(/^(ERROR|Error)/.test(bad) && bad.includes("sources"), `a malformed claim must be refused, not skipped: ${bad}`);
+      // 5. Loose input is refused, not read as "don't record".
+      for (const [args, word] of [
+        [{ claims: [{ text: "The audit store is SQLite.", sources: [note] }], record: "true" }, "record"],
+        [{ claims: [{ text: "The audit store is SQLite.", sources: [note] }], recrod: true }, "recrod"],
+        [{ claims: [{ text: "The audit store is SQLite.", source: [note], sources: [note] }] }, "source"],
+      ] as const) {
+        const out = await s.tool("chamber_check", args as Record<string, unknown>);
+        assert(/^(ERROR|Error)/.test(out) && out.includes(word), `must refuse ${JSON.stringify(args)}: ${out}`);
+      }
+    } finally {
+      s.stop();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("pins", "debt payment does not write the same pin twice", () => {
   // Round-6 review: the duplicate-pin skip had no test.
   const db = freshDb();
@@ -9521,6 +9760,11 @@ test("oauth", "MCP tools carry honest annotations: two read-only, ask marked as 
       `${name} must declare readOnlyHint+idempotentHint: ${JSON.stringify(a)}`,
     );
   }
+  const check = byName.get("chamber_check");
+  assert(
+    check?.readOnlyHint === false && check?.destructiveHint === false,
+    `chamber_check can record, so it must not claim read-only: ${JSON.stringify(check)}`,
+  );
   const ask = byName.get("chamber_ask");
   assert(
     ask?.readOnlyHint === false && ask?.destructiveHint === false,

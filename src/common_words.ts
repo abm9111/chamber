@@ -7,8 +7,9 @@
  * "**Claude Code:** Users point…" — 6 of 9 flags on the community-corpus
  * answers were "Users", "People", "Claiming", "Large" (2026-09-27). A word on
  * this list is skipped there; any other word is checked, so "Manufacturer:
- * Tesla" is caught. Sentence starts after . ! ? do not use this list — see
- * atSentenceStart().
+ * Tesla" is caught. Sentence starts after . ! ? use it only in
+ * `chamber_check` (TermOptions.openings); for model answers a hand-written
+ * list flagged too many ordinary openers — see atSentenceStart().
  *
  * Hand-written, not derived from a licensed frequency list. Nouns that are
  * also brand names (apple, amazon, windows…) are deliberately left out:
@@ -51,6 +52,10 @@ power practical prefer price privacy private product prompt quality rank raise r
 remote reply request respond response rewrite safe scope secure security select sense server service setup
 simple skip slow smart sort speed stable standard strong structure style subscription summary switch sync tag
 theme third trust trusted typical unclear upload usage version voice warn weak web week whole wish worry
+during per via despite unlike whereas upon toward towards beyond besides beside onto per unless
+once twice meanwhile otherwise therefore thus hence overall finally firstly secondly lastly additionally
+furthermore moreover instead rather regardless given following according based compared running setting
+getting putting using having making taking going coming looking asking building adding
 `;
 
 export const COMMON_WORDS: ReadonlySet<string> = new Set(WORDS.split(/\s+/).filter(Boolean));
@@ -67,6 +72,8 @@ export function isCommonWord(word: string): boolean {
     w.replace(/ed$/, "e"),
     w.replace(/ing$/, ""),
     w.replace(/ing$/, "e"),
+    w.replace(/(\p{L})\1ing$/u, "$1"), // running → run
+    w.replace(/(\p{L})\1ed$/u, "$1"), // stopped → stop
     w.replace(/ly$/, ""),
     w.replace(/er$/, ""),
     w.replace(/est$/, ""),

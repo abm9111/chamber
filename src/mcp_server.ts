@@ -54,6 +54,7 @@ import { loadConfig, applyModelEnv } from "./config.ts";
 import { runAsk, stubDisclosure } from "./ask.ts";
 import { verifyBeliefSources } from "./pins.ts";
 import { corpusStats } from "./corpus.ts";
+import { checkClaims, formatCheck, type CheckInput } from "./check.ts";
 import { formatErrorChain } from "./error_chain.ts";
 
 // `console.error` already writes to stderr, so it is left alone and the rest
@@ -171,12 +172,85 @@ function send(msg: Record<string, unknown>): void {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...msg })}\n`);
 }
 
+/**
+ * Sent in `initialize`. Hosts that support it (Claude Code does) put this in
+ * the agent's context, which is the only place a tool can say *when* it should
+ * be called rather than what it does.
+ */
+const INSTRUCTIONS =
+  "Chamber checks claims against the user's indexed notes (their vault). When you " +
+  "answer from those notes, call chamber_check with each factual claim and the note " +
+  "it came from (the absolute path you read) before presenting it. Report " +
+  "TERMS_ABSENT claims as not supported by that note instead of asserting them, and " +
+  "say when a note was STALE or NOT_FOUND. SUPPORTED means every number, " +
+  "capitalised name, domain, file name and count in the claim occurs in the note; " +
+  "lowercase names and ordinary words are not checked, nor is meaning, so a negated " +
+  "or reversed claim can still pass. chamber_ask answers with Chamber's own " +
+  "configured model; chamber_verify reports recorded claims whose notes changed; " +
+  "chamber_corpus shows what is indexed.";
+
 const TOOLS = [
+  {
+    name: "chamber_check",
+    description:
+      "Check your own claims against the user's notes before you state them. For each " +
+      "claim, give the note(s) it came from — the absolute path you read, a `file.md#p3` " +
+      "ref from chamber_ask, or a passage id. Chamber confirms the note is indexed and " +
+      "unchanged on disk since indexing, then checks that every number, capitalised " +
+      "name, domain, file name and count in the claim occurs in that note. Verdicts: SUPPORTED, " +
+      "TERMS_ABSENT (names the missing terms), NO_TERMS (nothing specific to check), " +
+      "STALE (the note changed since indexing — not judged), NOT_FOUND, NO_SOURCE. " +
+      "Uses no model: deterministic and offline. It does not check meaning — a negated " +
+      "claim built from the note's own words passes. Read-only unless `record` is true, " +
+      "which commits SUPPORTED claims through Chamber's gate with pinned sources so " +
+      "chamber_verify later reports them if the note changes; unsupported claims are " +
+      "never recorded.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        claims: {
+          type: "array",
+          maxItems: 50,
+          description: "The claims to check, each with the notes it came from.",
+          items: {
+            type: "object",
+            properties: {
+              text: { type: "string", description: "One factual claim, as you would state it." },
+              sources: {
+                type: "array",
+                maxItems: 10,
+                items: { type: "string" },
+                description:
+                  "Where it came from: absolute note paths (a whole note is checked as one), " +
+                  "`file.md#pN` refs, or passage ids.",
+              },
+            },
+            required: ["text", "sources"],
+          },
+        },
+        record: {
+          type: "boolean",
+          description:
+            "Commit SUPPORTED claims as beliefs with pinned sources, for drift checks " +
+            "by chamber_verify. Default false: nothing is written.",
+        },
+      },
+      required: ["claims"],
+    },
+    // Not read-only: `record` writes beliefs and pins through the gate. Hosts
+    // that gate writes must treat the tool as writing, because it can.
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+    },
+  },
   {
     name: "chamber_ask",
     description:
-      "Ask a question of the local Chamber corpus and get an answer whose " +
-      "every claim is judged against its own citations. Each claim comes back " +
+      "Have Chamber's own configured model answer a question from the user's notes, " +
+      "with every claim judged against its own citations. To check an answer you " +
+      "wrote yourself, use chamber_check instead. Each claim comes back " +
       "ALLOWED (its cited passages verified against their stored hashes) or " +
       "UNSUPPORTED (no verified source — recorded, not load-bearing). Cited " +
       "sources are returned as file#passage references you can open. Answers " +
@@ -258,6 +332,33 @@ const TOOLS = [
   },
 ];
 
+/**
+ * `claims` as the schema describes it, or an error naming what is wrong. A
+ * malformed entry is refused rather than skipped: a check that quietly drops a
+ * claim reports on fewer claims than the caller made, and the summary line
+ * then reads as a verdict on all of them.
+ */
+function parseCheckClaims(raw: unknown): CheckInput[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new Error("chamber_check: `claims` must be a non-empty array of {text, sources}");
+  }
+  return raw.map((c: unknown, i: number): CheckInput => {
+    if (c === null || typeof c !== "object" || Array.isArray(c)) {
+      throw new Error(`chamber_check: claims[${i}] must be an object {text, sources}`);
+    }
+    const extra = Object.keys(c).filter((k) => k !== "text" && k !== "sources");
+    if (extra.length) throw new Error(`chamber_check: claims[${i}] has unknown key(s): ${extra.join(", ")}`);
+    const o = c as { text?: unknown; sources?: unknown };
+    if (typeof o.text !== "string" || o.text.trim() === "") {
+      throw new Error(`chamber_check: claims[${i}].text must be a non-empty string`);
+    }
+    if (!Array.isArray(o.sources) || o.sources.some((s: unknown) => typeof s !== "string")) {
+      throw new Error(`chamber_check: claims[${i}].sources must be an array of strings`);
+    }
+    return { text: o.text, sources: o.sources as string[] };
+  });
+}
+
 async function callTool(
   name: string,
   args: Record<string, unknown>,
@@ -308,6 +409,20 @@ async function callTool(
         if (c.debtIds.length) out.push(`     citation debt: ${c.debtIds.join(", ")}`);
       }
       return out.join("\n");
+    }
+
+    case "chamber_check": {
+      const unknown = Object.keys(args).filter((k) => k !== "claims" && k !== "record");
+      if (unknown.length) throw new Error(`chamber_check: unknown argument(s): ${unknown.join(", ")}`);
+      // Only a real boolean: "true" or 1 fell through as false, and a caller
+      // who asked to record was told nothing was recorded only in the footer.
+      if (args.record !== undefined && typeof args.record !== "boolean") {
+        throw new Error("chamber_check: `record` must be true or false");
+      }
+      const claims = parseCheckClaims(args.claims);
+      const record = args.record === true;
+      // No model: this check is the part of the gate that needs none.
+      return formatCheck(checkClaims(getDb(false), claims, { record }), record);
     }
 
     case "chamber_verify": {
@@ -453,6 +568,7 @@ async function handle(msg: JsonRpcRequest): Promise<void> {
           protocolVersion: typeof asked === "string" ? asked : DEFAULT_PROTOCOL,
           capabilities: { tools: {} },
           serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+          instructions: INSTRUCTIONS,
         },
       });
       return;

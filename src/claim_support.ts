@@ -242,7 +242,18 @@ function bareNumber(n: string): string {
  * The specific terms of a claim, in order of appearance, deduplicated
  * case-insensitively. Exported for tests and for the diagnostic reason string.
  */
-export function specificTerms(claim: string): string[] {
+export interface TermOptions {
+  /**
+   * Also check a capitalised word opening a sentence, unless it is a common
+   * word. Off for model answers, where it flagged ordinary openers ("Sales",
+   * "Shipping"); on for `chamber_check`, whose callers state one claim at a
+   * time and usually open it with its subject — "Postgres was chosen in 2024"
+   * passed against a note saying SQLite (review of chamber_check).
+   */
+  openings?: boolean;
+}
+
+export function specificTerms(claim: string, opts: TermOptions = {}): string[] {
   let text = stripMarkup(normalize(claim));
   const out: string[] = [];
   const seen = new Set<string>();
@@ -267,7 +278,7 @@ export function specificTerms(claim: string): string[] {
   for (const m of text.matchAll(NAME)) {
     if (CONNECTIVES.has(m[0].toLowerCase())) continue;
     if (numberWordValue(m[0]) !== undefined) continue;
-    if (atSentenceStart(text, m.index) && !looksLikeName(m[0])) continue;
+    if (atSentenceStart(text, m.index) && !looksLikeName(m[0]) && !(opts.openings && !isCommonWord(m[0]))) continue;
     if (afterLabel(text, m.index) && !looksLikeName(m[0]) && isCommonWord(m[0])) continue;
     add(m[0]);
   }
@@ -282,10 +293,10 @@ export function specificTerms(claim: string): string[] {
  * `2090`. Words match case-insensitively on word boundaries so `Moon` is not
  * found inside `Moonlight`.
  */
-export function missingTerms(claim: string, passages: string[]): string[] {
+export function missingTerms(claim: string, passages: string[], opts: TermOptions = {}): string[] {
   const haystack = normalize(passages.join("\n"));
   const numeric = haystack.replace(THOUSANDS, "$1");
-  return specificTerms(claim).filter((term) => {
+  return specificTerms(claim, opts).filter((term) => {
     const counted = numberWordValue(term);
     if (counted !== undefined) {
       return !(numberFound(numeric, String(counted), "") || spelledFound(haystack, counted));

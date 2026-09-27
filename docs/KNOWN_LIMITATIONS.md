@@ -136,7 +136,14 @@ deployment machine is the stated entry criterion for any capability level above 
 > is a range or an id (`19-25`, `2°–8°C`, `10%–20%`, `AGPL-3.0`); a first
 > version listed sign positions instead and missed markdown (`**-5%**`), a
 > second missed a minus opening a line. Accepted, fail-closed: `p.-5` and
-> `1.-5%` read the dash as a minus, `$9m` / `lakh` / `%` reducing to a bare number, and a
+> `1.-5%` read the dash as a minus. Open, fail-open, found by the final
+> pre-push audit (VIGIL AIML-008, 2026-09-27) and documented rather than
+> patched by owner decision — sign handling had reached the point where
+> each fix opened a new variant: HTML dash entities (`&ndash;`, `&mdash;`,
+> `&#45;`, `&#x2d;`, `&#8211;`, `&hyphen;`) are not read as minus signs, so
+> "Q3 sales &ndash;5%" still certifies "Q3 sales grew 5%" (only `&minus;`,
+> `&#8722;` and `&#x2212;` are). Likewise open: `Messrs.` hides the next
+> name, and a letter touching a dash reads as an id ("Q-5"), `$9m` / `lakh` / `%` reducing to a bare number, and a
 > passage's own `1,000 million` being flagged. Accepted, knowingly: a
 > capitalised ordinary word after a label or dash is now checked, so
 > "Delivery: Roughly 5 days [1]" is flagged when the passage lacks

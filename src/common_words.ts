@@ -1,15 +1,14 @@
 /**
  * Common English words, for one decision in claim_support.ts: whether a
- * capitalised word at an opening (a sentence start or right after a label
- * colon) is an ordinary word or a name.
+ * capitalised word right after a label colon is an ordinary word or a name.
  *
- * English capitalises an opening word whatever it is, so its capital says
- * nothing. Checking every opening word flagged answers formatted as
+ * A label is followed by a capital whatever comes next, so the capital says
+ * nothing. Checking every such word flagged answers formatted as
  * "**Claude Code:** Users point…" — 6 of 9 flags on the community-corpus
- * answers were "Users", "People", "Claiming", "Large" (2026-09-27). Skipping
- * every opening word let "Tesla makes it [1]" through unchecked. A word on
- * this list is skipped at an opening; any other word is checked, so a name
- * is caught wherever it stands.
+ * answers were "Users", "People", "Claiming", "Large" (2026-09-27). A word on
+ * this list is skipped there; any other word is checked, so "Manufacturer:
+ * Tesla" is caught. Sentence starts after . ! ? do not use this list — see
+ * atSentenceStart().
  *
  * Hand-written, not derived from a licensed frequency list. Nouns that are
  * also brand names (apple, amazon, windows…) are deliberately left out:

@@ -163,6 +163,17 @@ deployment machine is the stated entry criterion for any capability level above 
 > extending the common-word test there flagged ordinary openers ("Sales",
 > "Shipping") that a hand-written list cannot cover; closing it needs a real
 > word list.
+>
+> **Measured 2026-09-27 — what the check catches.** 200 labelled claims over
+> 40 vault passages (80 supported, 120 not). The term check wrongly flagged 1
+> supported claim (a Spanish passage cited for "UAE") and caught 25 of 120
+> unsupported: most invented values (22/25), almost no negations (0/30), wrong
+> attributions (0/15), false comparisons (2/20) or values swapped within the
+> same passage (1/30). Those are entailment, and are what a model checker is
+> for (MiniCheck-DeBERTa scored AUC 0.89 on the same set). Since that run, file
+> names (`package.json`) and counts written as words (`four`) are terms, and
+> `’` and `'` are one apostrophe. A file is checked by its base name, so a
+> claim that puts it in the wrong directory is not caught.
 
 This one is a stated non-goal, not a bug, and it is not solved.
 

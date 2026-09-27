@@ -9204,10 +9204,9 @@ test("pins", "claim support: VIGIL on 4693bfb — markup after a letter, entitie
 test("pins", "claim support: after a label colon only a common word is skipped", () => {
   // Dogfooding on the community corpus, 2026-09-27: 6 of 9 flags were false —
   // an ordinary word after a bold label ("**Claude Code:** Users point…" →
-  // terms_absent: Users). And a plain name opening a sentence was never
-  // checked at all ("Tesla makes it [1]", a documented escape). At any
-  // opening — start, after . ! ?, or after a label colon — only a common
-  // English word is skipped; anything else is checked wherever it stands.
+  // terms_absent: Users). After a label colon only a common English word is
+  // skipped; any other word is still checked. Sentence starts after . ! ?
+  // keep the older shape rule.
   const miss = (c: string, p: string): string[] => missingTerms(c, [p]);
   const passage = "Some point Claude Code at the vault folder and keep it read-only until trusted.";
   for (const ok of [
@@ -9224,6 +9223,44 @@ test("pins", "claim support: after a label colon only a common word is skipped",
   for (const bad of ["Manufacturer: Tesla. [1]", "**Maker:** Tesla keeps it read-only [1]", "Keep it read-only (Tesla) [1]"]) {
     assert(miss(bad, passage).includes("Tesla"), `${JSON.stringify(bad)} must check Tesla: ${JSON.stringify(miss(bad, passage))}`);
   }
+});
+
+test("pins", "claim support: file names and counts written as words are terms", () => {
+  // Checker benchmark, 2026-09-27: "Plan 2 added four entries" passed against a
+  // note saying two, and "modifies package.json" against a note that never
+  // names it — neither a lowercase file name nor a spelled count was a term.
+  const miss = (c: string, p: string): string[] => missingTerms(c, [p]);
+  const plan = "Plan 2 added two tokenizer entries to tools/vendor/manifest.json. Tests: ~/Projects/gate/rules.test.mjs";
+  assert(miss("Plan 2 added four tokenizer entries [1]", plan).includes("four"), "a wrong count in words must be flagged");
+  assert(miss("Plan 2 added 4 tokenizer entries [1]", plan).includes("4"), "a wrong count in digits must be flagged");
+  assert(miss("The task modifies package.json [1]", plan).includes("package.json"), "an unnamed file must be flagged");
+  assert(miss("Its tests live in prune.test.mjs [1]", plan).includes("prune.test.mjs"), "a wrong test file must be flagged");
+  for (const ok of [
+    "Plan 2 added two tokenizer entries to manifest.json [1]",
+    "Plan 2 added 2 entries to tools/vendor/manifest.json [1]",
+    "The tests live in rules.test.mjs [1]",
+    "Three tools were compared [1]",
+    "It supports twenty-five languages [1]",
+    "It supports 25 languages [1]",
+    "No one uses Node.js here, but one of them tried [1]",
+  ]) {
+    const passage = ok.startsWith("Plan") || ok.startsWith("The tests")
+      ? plan
+      : "We compared 3 tools. It supports twenty five languages. No one uses Node.js here, but one of them tried.";
+    const m = miss(ok, passage);
+    assert(m.length === 0, `${JSON.stringify(ok)} flagged ${JSON.stringify(m)}`);
+  }
+  // A curly apostrophe in the claim, a straight one in the passage.
+  assert(miss("the “You’re absolutely right!” loop [4]", "the \"You're absolutely right!\" loop").length === 0, "’ and ' are one apostrophe");
+  assert(miss("Kingroon’s PLA [1]", "Kingroon's PLA").length === 0, "possessive with either apostrophe");
+  // Counts and file names must not leak into each other or into names.
+  assert(miss("Seventeen files changed [1]", "17 files changed").length === 0, "17 satisfies seventeen");
+  assert(miss("Seventeen files changed [1]", "7 files changed").includes("seventeen"), "7 must not satisfy seventeen");
+  // A spelled number is read whole: "five" inside "fifty-five" is not 5.
+  assert(miss("It costs 5 dollars [1]", "It costs fifty-five dollars").includes("5"), "fifty-five must not satisfy 5");
+  assert(miss("It costs five dollars [1]", "It costs fifty five dollars").includes("five"), "fifty five must not satisfy five");
+  assert(miss("seventy users [1]", "seventy-seven users").includes("seventy"), "seventy-seven must not satisfy seventy");
+  assert(miss("It costs 55 dollars [1]", "It costs fifty five dollars").length === 0, "fifty five satisfies 55");
 });
 
 test("pins", "debt payment does not write the same pin twice", () => {

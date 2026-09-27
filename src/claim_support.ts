@@ -41,6 +41,54 @@ import { isCommonWord } from "./common_words.ts";
 
 const DOMAIN = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|ae|net|org|io|co|ai|dev|app|store|shop|uk|us|de|sa)\b/gi;
 /**
+ * A file name with a code or document extension, with any directory path in
+ * front of it; the term is the base name. Lowercase names were no term at
+ * all, so a claim that a plan "modifies package.json" passed against a note
+ * that never mentions it (checker benchmark, 2026-09-27: 2 of 25 invented
+ * values were file names). Checked by base name so "tests live in
+ * prune.test.mjs" is judged against a passage that gives the full path.
+ */
+const FILE =
+  /(?<![\p{L}\p{N}_.~/-])(?:[\p{L}\p{N}_.~-]+\/)*([\p{L}\p{N}_-]+(?:\.[\p{L}\p{N}_-]+)*\.(?:json|jsonl|md|ts|tsx|js|jsx|mjs|cjs|py|rb|go|rs|java|kt|swift|sh|ya?ml|toml|ini|cfg|conf|txt|csv|tsv|sql|html|css|xml|lock|ipynb|pdf|sqlite|db))(?![\p{L}\p{N}_])/giu;
+/** "Node.js", "Next.js": a product name, left to the name rules. */
+const PRODUCT_JS = /^\p{Lu}\p{L}*\.js$/u;
+
+/**
+ * Counts written as words. "Plan 2 added four entries" passed against a note
+ * saying two (checker benchmark, 2026-09-27): only digits were terms. "one"
+ * is left out — it is a pronoun at least as often ("no one", "one of").
+ * A count is found as the word or as its digits, either way round.
+ */
+const UNITS = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"];
+const TEENS = ["ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"];
+const TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+const NUMBER_WORD = new RegExp(
+  `(?<![\\p{L}\\p{N}_])(?:(${TENS.slice(2).join("|")})(?:[- ](${UNITS.slice(1).join("|")}))?|(${[...UNITS.slice(2), ...TEENS].join("|")}))(?![\\p{L}\\p{N}_])`,
+  "giu",
+);
+function numberWordValue(word: string): number | undefined {
+  const w = word.toLowerCase().split(/[- ]/);
+  if (w.length === 1) {
+    const u = UNITS.indexOf(w[0]!);
+    if (u >= 2) return u;
+    const t = TEENS.indexOf(w[0]!);
+    if (t >= 0) return 10 + t;
+    const d = TENS.indexOf(w[0]!);
+    return d >= 2 ? d * 10 : undefined;
+  }
+  const d = TENS.indexOf(w[0]!), u = UNITS.indexOf(w[1]!);
+  return d >= 2 && u >= 1 ? d * 10 + u : undefined;
+}
+/**
+ * Does the passage spell out the count `n`? Each spelled number is read whole,
+ * so "five" inside "fifty-five" is 55, not 5 — a word search let "fifty-five"
+ * satisfy "5" and "seventy-seven" satisfy "seventy" (self-review).
+ */
+function spelledFound(haystack: string, n: number): boolean {
+  for (const m of haystack.matchAll(NUMBER_WORD)) if (numberWordValue(m[0]) === n) return true;
+  return false;
+}
+/**
  * A number, with its thousands separators and every dotted part, so a version
  * (`0.84.4`) or an address (`127.0.0.1`) is one term. Taking one decimal part
  * split them into `0.84` and a stray `4` that no passage holds on its own —
@@ -94,6 +142,9 @@ function normalize(text: string): string {
     .replace(/(?<![\p{L}\p{N}])_+|_+(?![\p{L}\p{N}])/gu, SEP)
     .replace(/[*`]/g, SEP)
     .replace(/[‐‑‒–−﹣－]/g, "-")
+    // One apostrophe: models write ’, scraped notes keep ' — "You’re" was
+    // flagged against a passage quoting "You're" (community corpus, 2026-09-27).
+    .replace(/[’‘ʼ]/g, "'")
     // Spaced forms too ("J. R. R.", "U. S."), without eating the space after
     // the last dot — round-6 review flagged "J.R.R." against "J. R. R.".
     .replace(/(?<![\p{L}\p{N}])(?:\p{Lu}\.(?:\s(?=\p{Lu}\.))?){2,}/gu, (m) =>
@@ -206,9 +257,16 @@ export function specificTerms(claim: string): string[] {
   // term, not as the name `Amazon` plus nothing.
   for (const m of text.matchAll(DOMAIN)) add(m[0]);
   text = text.replace(DOMAIN, " ");
+  text = text.replace(FILE, (whole: string, base: string) => {
+    if (PRODUCT_JS.test(whole)) return whole;
+    add(base);
+    return " ";
+  });
+  for (const m of text.matchAll(NUMBER_WORD)) add(m[0].toLowerCase().replace(" ", "-"));
   for (const m of text.matchAll(NUMBER)) add(bareNumber(m[0]));
   for (const m of text.matchAll(NAME)) {
     if (CONNECTIVES.has(m[0].toLowerCase())) continue;
+    if (numberWordValue(m[0]) !== undefined) continue;
     if (atSentenceStart(text, m.index) && !looksLikeName(m[0])) continue;
     if (afterLabel(text, m.index) && !looksLikeName(m[0]) && isCommonWord(m[0])) continue;
     add(m[0]);
@@ -228,6 +286,10 @@ export function missingTerms(claim: string, passages: string[]): string[] {
   const haystack = normalize(passages.join("\n"));
   const numeric = haystack.replace(THOUSANDS, "$1");
   return specificTerms(claim).filter((term) => {
+    const counted = numberWordValue(term);
+    if (counted !== undefined) {
+      return !(numberFound(numeric, String(counted), "") || spelledFound(haystack, counted));
+    }
     const num = /^(-?[\p{Nd}][\p{Nd},.]*)(.*)$/u.exec(term);
     const suffix = num?.[2]!.trim() ?? "";
     // Only a bare number or a number with a unit takes the number path. A
@@ -235,7 +297,9 @@ export function missingTerms(claim: string, passages: string[]): string[] {
     // ("Buy3DPrintU" satisfied it) and its possessive/hyphen handling
     // (round-4 review); names keep the name rules.
     if (num && (suffix === "" || UNIT.test(suffix))) {
-      return !numberFound(numeric, num[1]!, suffix);
+      if (numberFound(numeric, num[1]!, suffix)) return false;
+      // "3 tools" against a note that says "three tools".
+      return !(suffix === "" && /^\p{Nd}{1,2}$/u.test(num[1]!) && spelledFound(haystack, Number(num[1])));
     }
     return !nameFound(haystack, term);
   });

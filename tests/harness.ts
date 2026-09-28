@@ -992,6 +992,7 @@ test("pins", "ingest applies the dotted and extension rules to where a symlink l
     symlinkSync(join(dir, ".obsidian"), join(dir, "notes"));
     symlinkSync(join(dir, ".obsidian", "x.md"), join(dir, "y.md"));
     symlinkSync(join(dir, "data.json"), join(dir, "z.md"));
+    symlinkSync(join(dir, "real.md"), join(dir, "c.txt"));
     const db = freshDb();
     ingestDirectory(db, dir);
     const refs = (db.prepare("SELECT source_ref FROM vector_document").all() as { source_ref: string }[]).map((r) => r.source_ref).sort();

@@ -559,9 +559,12 @@ function walk(ctx: WalkContext, dir: string): void {
       continue;
     }
 
-    // The target's extension, not the link's: "z.md → data.json" is JSON.
-    const ext = extname(isLink ? realFull : entry).toLowerCase();
-    if (!MARKDOWN_EXTENSIONS.includes(ext)) {
+    // Both the name and, for a link, its target must be notes: "z.md →
+    // data.json" is JSON, and "c.txt → c.md" would store a note a second time
+    // under a name that is not one (review F).
+    const ext = extname(entry).toLowerCase();
+    const targetExt = extname(realFull).toLowerCase();
+    if (!MARKDOWN_EXTENSIONS.includes(ext) || !MARKDOWN_EXTENSIONS.includes(targetExt)) {
       ctx.skipped.push({
         path: rel,
         kind: "unsupported_extension",

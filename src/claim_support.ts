@@ -207,7 +207,10 @@ function atSentenceStart(text: string, index: number): boolean {
   // Sentence ends only; label colons are handled in afterLabel().
   const before = text.slice(0, index).replace(new RegExp(SEP, "g"), " ").trimEnd();
   if (before === "") return true;
-  if (!/[.!?]$/.test(before)) return false;
+  // A closing quote or bracket after the stop still ends the sentence:
+  // '…the same cliff.” [2] Models can…' flagged "Models" on a real answer
+  // (the citation is blanked, leaving .” before the word).
+  if (!/[.!?]["'”’)\]]*$/.test(before)) return false;
   // A period after an abbreviation ends no sentence: "e.g. Tesla" and
   // "Dr. Tesla" left the name unchecked (round-2 review, VIGIL AIML-001).
   // By list, and by shape: the list alone was a blocklist, and "a.k.a.",

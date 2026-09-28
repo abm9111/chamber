@@ -9305,6 +9305,8 @@ test("pins", "claim support: file names and counts written as words are terms", 
     assert(miss(ok, vault).length === 0, `${JSON.stringify(ok)} flagged ${JSON.stringify(miss(ok, vault))}`);
   }
   assert(miss("- **Tesla** points Claude Code at the vault [1]", vault).includes("Tesla"), "a bullet does not hide a name");
+  // A sentence end hidden by a closing quote and a citation (real answer).
+  assert(miss("They “high-five over the same cliff.” [2] Models can also chase a score [3]", "they high-five over the same cliff and chase a score").length === 0, "a quote after the stop still ends the sentence");
   // Stems that turned names into listed words: Bing → "be", Finder → "find".
   for (const [c, t] of [["Bing indexes the site [1]", "Bing"], ["Finder opens the vault [1]", "Finder"]] as const) {
     assert(missingTerms(c, ["The site is indexed."], { openings: true }).includes(t), `${c} must check ${t}`);

@@ -161,7 +161,12 @@ deployment machine is the stated entry criterion for any capability level above 
 > ("Model: Claude [1]") are caught. Re-run on the source (an earlier re-run
 > went through a stale `dist/` build and is withdrawn): 28 ALLOWED and no
 > term flag on the corpus questions; on the vault eval 3 flags of 49 cited
-> claims, each verified against its cited passage as correct. A plain sentence start
+> claims. **Corrected 2026-09-28:** only one of those was right ("AI" against a
+> passage saying "AIP"). The other two ("Silversmith", "School") were scraped
+> table cells glued to the next cell's text ("Silversmithtechnical"); the
+> replay that "verified" them used a word-boundary search with the same blind
+> spot. Lowercase-to-lowercase glue is indistinguishable from "Moon" inside
+> "Moonlight", so it stays a known false flag on scraped tables. A plain sentence start
 > after `. ! ?` keeps the older rule, so "Tesla makes it [1]" stays unchecked
 > in `ask` (a name set apart by markup, "**Tesla** makes it", is checked) —
 > extending the common-word test there flagged ordinary openers ("Sales",

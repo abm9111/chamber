@@ -3,6 +3,39 @@
 All notable changes to Chamber. Versions before 0.1.6 are described in the git
 history and the GitHub releases.
 
+## 0.1.8 — 2026-09-28
+
+### Fixed
+
+- **Ingest no longer reads hidden folders or non-notes through links.** A
+  symlink into a dotted folder (`notes → .obsidian`, `y.md → .obsidian/x.md`)
+  was walked and indexed without `--include-dotted`, and a `.md` link to a
+  non-note file took the link's extension. The dotted and extension rules now
+  apply to where a link lands, and a linked note needs a note name as well as
+  a note target. Existing rows indexed that way are removed by `chamber
+  prune`.
+- **The claim check reads what a citation shows.** The model is shown each
+  passage's title and path; a name found only there (a company in its page's
+  file name) is now found, from the file's own name and title only — never
+  folder names, never numbers of any kind.
+- Quantities match across scales by value: `1M AED` / `1 million AED`,
+  `11k` / `11,000`. A glued `m`, `M` or `K` counts as a scale only next to a
+  currency, so `9m yacht` and `3M tape` vouch for no millions. A bare number
+  is no longer satisfied by a scaled one (`9 users` against `9 million users`
+  passed before).
+- A family name before its version counts (`Qwen` in `Qwen3.5-122B`); a
+  capital before a digit does not (`GPT` in `GPT4`, `B` in `B2B`).
+- A closing quote or bracket after a full stop still ends the sentence, and
+  abbreviations before one (`Dr.”`, `(Gen.)`) still hide no name.
+
+Measured on a held-out set of 200 claims and 74 real answer claims judged
+blind: see `docs/KNOWN_LIMITATIONS.md` §2.
+
+### Changed
+
+- The README leads with `chamber_check`: the check your AI agent runs on your
+  notes.
+
 ## 0.1.7 — 2026-09-28
 
 ### Added

@@ -211,6 +211,9 @@ function atSentenceStart(text: string, index: number): boolean {
   // '…the same cliff.” [2] Models can…' flagged "Models" on a real answer
   // (the citation is blanked, leaving .” before the word).
   if (!/[.!?]["'”’)\]]*$/.test(before)) return false;
+  // The abbreviation tests read the text up to the stop: "Dr.” Tesla" and
+  // "(see U.S.) Tesla" still leave the name checked.
+  const stop = before.replace(/["'”’)\]]+$/, "");
   // A period after an abbreviation ends no sentence: "e.g. Tesla" and
   // "Dr. Tesla" left the name unchecked (round-2 review, VIGIL AIML-001).
   // By list, and by shape: the list alone was a blocklist, and "a.k.a.",
@@ -218,18 +221,18 @@ function atSentenceStart(text: string, index: number): boolean {
   // one- or two-letter words before a period are read as abbreviations. Being
   // wrong here only means the next word is checked — the safe direction.
   return !(
-    ABBREVIATION.test(before) ||
-    /(?:^|[\s(])(?:\p{L}{1,3}\.){2,}$/u.test(before) ||
+    ABBREVIATION.test(stop) ||
+    /(?:^|[\s(“‘"'])(?:\p{L}{1,3}\.){2,}$/u.test(stop) ||
     // A capitalised one- or two-letter word (Jr., Sr., Mt.); longer titles
     // are listed. Round 5 widened this to any capitalised word of up to five
     // letters, and "Paris.", "China.", "Sony." then hid nothing but flagged
     // the next sentence's ordinary opening word (round-6 review).
-    /(?:^|[\s(])\p{Lu}\p{Ll}?\.$/u.test(before)
+    /(?:^|[\s(“‘"'])\p{Lu}\p{Ll}?\.$/u.test(stop)
   );
 }
 
 const ABBREVIATION =
-  /(?:^|[\s(])(?:e\.g|i\.e|vs|etc|approx|ca|cf|incl|esp|Dr|Mr|Mrs|Ms|Prof|St|Inc|Ltd|Co|Corp|No|Fig|Vol|p|pp|Sgt|Gen|Rev|Bros|Dept|Ave|Univ|Col|Capt|Lt|Gov|Sen|Rep|Ft|Blvd|Rd|Est|Assn|Jr|Sr)\.$/i;
+  /(?:^|[\s(“‘"'])(?:e\.g|i\.e|vs|etc|approx|ca|cf|incl|esp|Dr|Mr|Mrs|Ms|Prof|St|Inc|Ltd|Co|Corp|No|Fig|Vol|p|pp|Sgt|Gen|Rev|Bros|Dept|Ave|Univ|Col|Capt|Lt|Gov|Sen|Rep|Ft|Blvd|Rd|Est|Assn|Jr|Sr)\.$/i;
 
 /**
  * Is the word at `index` the first word after a label colon ("**Access

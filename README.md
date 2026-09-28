@@ -1,8 +1,13 @@
 # Chamber
 
-Ask questions about your own notes. Get answers that cite their sources — and a
-daily check that tells you when a source has changed underneath a conclusion you
-already trusted.
+The check your AI agent runs on your notes. When Claude Code or any MCP host
+answers from your vault, `chamber_check` confirms the numbers, names and file
+names it quotes are really in the note it cites — and says so when they are
+not, or when the note changed since it was indexed. [How it works](#use-it-from-an-ai-coding-agent).
+
+You can also ask questions yourself and get answers that cite their sources,
+plus a daily check that tells you when a source has changed underneath a
+conclusion you already trusted.
 
 Zero runtime dependencies. Everything is `node:sqlite` and files on your disk.
 No account, no cloud call unless you point it at one.

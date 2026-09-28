@@ -496,6 +496,17 @@ function walk(ctx: WalkContext, dir: string): void {
         });
         continue;
       }
+      // The dotted rule applies to where a link lands, not only to its name:
+      // "notes → .obsidian" and "y.md → .obsidian/x.md" were walked and
+      // indexed without --include-dotted (review E, 2026-09-27).
+      if (!ctx.includeDotted && relPosix(ctx.root, realFull).split("/").some((seg) => seg.startsWith(".") && seg !== "." && seg !== "..")) {
+        ctx.skipped.push({
+          path: rel,
+          kind: "dotted",
+          reason: "symlink target is a dotted entry (pass --include-dotted to ingest it)",
+        });
+        continue;
+      }
       const targetHit = matchExclude(ctx.patterns, relPosix(ctx.root, realFull));
       if (targetHit) {
         targetHit.matched += 1;
@@ -548,7 +559,8 @@ function walk(ctx: WalkContext, dir: string): void {
       continue;
     }
 
-    const ext = extname(entry).toLowerCase();
+    // The target's extension, not the link's: "z.md → data.json" is JSON.
+    const ext = extname(isLink ? realFull : entry).toLowerCase();
     if (!MARKDOWN_EXTENSIONS.includes(ext)) {
       ctx.skipped.push({
         path: rel,

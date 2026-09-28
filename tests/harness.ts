@@ -980,6 +980,31 @@ test("pins", "a moved pin is never rescued by another file's identical text", ()
  * Uses the real ingest path rather than hand-written rows, because the orphan
  * sweep that deletes the tail is part of what is being tested.
  */
+test("pins", "ingest applies the dotted and extension rules to where a symlink lands", () => {
+  // Review E, 2026-09-27: links into .obsidian were indexed without
+  // --include-dotted, and a .md link to a .json file took the link's extension.
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-ingest-links-")));
+  try {
+    mkdirSync(join(dir, ".obsidian"));
+    writeFileSync(join(dir, ".obsidian", "x.md"), "# Hidden\n\nPlugin settings.\n");
+    writeFileSync(join(dir, "data.json"), "{\"a\": 1}\n");
+    writeFileSync(join(dir, "real.md"), "# Real\n\nA note.\n");
+    symlinkSync(join(dir, ".obsidian"), join(dir, "notes"));
+    symlinkSync(join(dir, ".obsidian", "x.md"), join(dir, "y.md"));
+    symlinkSync(join(dir, "data.json"), join(dir, "z.md"));
+    const db = freshDb();
+    ingestDirectory(db, dir);
+    const refs = (db.prepare("SELECT source_ref FROM vector_document").all() as { source_ref: string }[]).map((r) => r.source_ref).sort();
+    assert(JSON.stringify(refs) === JSON.stringify(["real.md#p0"]), `only the plain note: ${JSON.stringify(refs)}`);
+    const opted = freshDb();
+    ingestDirectory(opted, dir, { includeDotted: true });
+    const withDots = (opted.prepare("SELECT source_ref FROM vector_document").all() as { source_ref: string }[]).map((r) => r.source_ref);
+    assert(withDots.includes("y.md#p0") && !withDots.some((r) => r.startsWith("z.md")), `opted in: ${JSON.stringify(withDots)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("pins", "a pin whose row was swept by a shrinking note is found where the text moved", () => {
   const db = freshDb();
   const dir = mkdtempSync(join(tmpdir(), "chamber-shrink-"));

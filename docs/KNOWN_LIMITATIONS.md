@@ -212,6 +212,12 @@ deployment machine is the stated entry criterion for any capability level above 
 >   (`CA` / `California`), scraped glue (`Serna BioW21Ontario`,
 >   `Silversmithtechnical`), and claims that add a term the note lacks.
 >   Real answers (74 claims, judged blind): 2 wrong flags of 69, both glue.
+>   Accepted costs of that revision (review H): a file's own name counts, so a
+>   note named `stripe-vs-adyen` vouches for "Stripe"; a family name matches
+>   its versioned form ("Falcon" in "Falcon9", "Pixel" in "Pixel8") when the
+>   letter before the digit is lowercase; a glued lowercase `k` is thousands,
+>   so "10 km" against "10k run" is flagged; a glued `m`/`M`/`K` is a scale
+>   only after a currency, so "9 users" is satisfied by "9m users".
 > - A bullet (`-`, `*`, `+`, `•`) opens a line like a sentence start, so in
 >   `ask` a plain name right after one ("+ Tesla makes it [1]") is the plain
 >   opener above and is not checked. A label closed by a full stop

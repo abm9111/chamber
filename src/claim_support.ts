@@ -376,8 +376,19 @@ const BETWEEN = "\n\uE001\n";
  * are covered by the passage's pin hash.
  */
 export function citedPassage(body: string, title: string | null, sourceRef: string | null): PreparedText {
-  const path = (sourceRef ?? "").replace(/#p\d+$/, "").replace(/\.(?:md|markdown)$/i, "").replace(/[_/.#]+/g, " ");
-  const names = `${title ?? ""}\n${path}`.replace(/\p{Nd}+/gu, " ");
+  // The file's own name, not its folders: a folder ("05 - UAE Peptide Lab/")
+  // vouched for every note under it (review H). A title that is a path (the
+  // fallback when a note has none) is cut the same way, segment by segment.
+  const lastPart = (p: string): string => p.split("/").pop() ?? "";
+  const file = lastPart((sourceRef ?? "").replace(/#p\d+$/, "")).replace(/\.(?:md|markdown)$/i, "");
+  const heads = (title ?? "").split(" › ").map(lastPart).join(" › ");
+  // No numbers of any kind: digits, and counts spelled out ("Five lessons…",
+  // "top-ten-tools") supplied claimed numbers (review H).
+  const names = `${heads}\n${file.replace(/[_.#]+/g, " ")}`
+    .replace(NUMBER_WORD, " ")
+    // A whole word with a digit in it goes, not just the digits: stripping
+    // them turned "Q3" into "Q" and "GPT4" into "GPT" (review H).
+    .replace(/[\p{L}\p{N}_-]*\p{Nd}[\p{L}\p{N}_-]*/gu, " ");
   return joinPrepared([preparePassage(body), preparePassage(names)]);
 }
 
@@ -449,8 +460,29 @@ const SCALE: Readonly<Record<string, number>> = {
 function scaledValue(digits: string, suffix: string): number | undefined {
   const scale = SCALE[suffix.toLowerCase()];
   if (scale === undefined) return undefined;
-  const n = Number(digits.replace(/,/g, ""));
+  // Thousands separators are already gone (THOUSANDS); a comma left is a
+  // decimal comma, which Number() refuses — "1,5 million" is not 15 million
+  // (review H). Stripping every comma, as this once did, made it one.
+  const n = Number(digits);
   return Number.isFinite(n) ? n * scale : undefined;
+}
+
+/**
+ * Is a glued suffix a scale here? A lowercase "k", "mn" and "bn" are. A glued
+ * "m", "M" or "K" is one only after a currency: "$9m", "AED 2.4M". Without
+ * one it is as often metres, minutes, a model size or a brand — "9m yacht",
+ * "timeout: 10m", "3M tape", "4K monitor" all vouched for millions and
+ * thousands (review H).
+ */
+const CURRENCY_BEFORE = /(?:[$€£¥₹]|\b(?:AED|USD|EUR|GBP|INR|SAR|Rs)\.?)\s?$/i;
+const CURRENCY_AFTER = /^\s?(?:AED|USD|EUR|GBP|INR|SAR|dollars?|dirhams?|euros?|pounds?|rupees?)(?![\p{L}\p{N}])/iu;
+function gluedIsScale(text: string, numberStart: number, suffix: string, suffixEnd: number): boolean {
+  if (suffix === "k" || /^(?:mn|bn)$/i.test(suffix)) return true;
+  const clean = (t: string): string => t.replace(/\uE000/g, "");
+  return (
+    CURRENCY_BEFORE.test(clean(text.slice(Math.max(0, numberStart - 8), numberStart))) ||
+    CURRENCY_AFTER.test(clean(text.slice(suffixEnd, suffixEnd + 12)))
+  );
 }
 function scaledValueFound(numeric: string, digits: string, suffix: string): boolean {
   const want = scaledValue(digits, suffix.trim());
@@ -461,9 +493,13 @@ function scaledValueFound(numeric: string, digits: string, suffix: string): bool
     const parts = /^(-?[\p{Nd}][\p{Nd},.]*)(.*)$/u.exec(term);
     if (!parts) continue;
     const suf = parts[2]!.trim();
+    const glued = suf !== "" && !/\s/.test(parts[2]!);
+    if (glued && !gluedIsScale(numeric, m.index, suf, m.index + m[0].length)) continue;
     const have = scaledValue(parts[1]!, suf);
     if (have === undefined) continue;
     if (!claimScaled && SCALE[suf.toLowerCase()] === 1) continue;
+    // A year is not "2k": "2k stars" was satisfied by "Founded in 2000".
+    if (claimScaled && suf === "" && /^(?:1[89]|20)\p{Nd}{2}$/u.test(parts[1]!)) continue;
     if (Math.abs(have - want) <= Math.abs(want) * 1e-9) return true;
   }
   return false;
@@ -482,10 +518,11 @@ function numberFound(numeric: string, digits: string, suffix: string): boolean {
   const space = SPACED_UNIT.test(suffix) ? "\\s?" : "";
   const tail =
     suffix === ""
-      ? // A bare number is not found in one that carries a scale: "9 users"
-        // was satisfied by "9 million users" and "11 stores" by "11k stores"
-        // (found 2026-09-28). A spaced "m" is metres, not a scale.
-        "(?![\\p{Nd}]|[.,]\\p{Nd})(?!(?:k|m|mn|bn)(?![\\p{L}\\p{N}])|\\s?(?:thousand|million|billion|trillion|lakh|crore)(?![\\p{L}\\p{N}]))"
+      ? // A bare number is not found in one that carries a scale word: "9
+        // users" was satisfied by "9 million users" (found 2026-09-28). A glued
+        // suffix is judged per match below — "11k" is a scale, "9m yacht" is
+        // not (review H).
+        "(?![\\p{Nd}]|[.,]\\p{Nd})(?!\\s?(?:thousand|million|billion|trillion|lakh|crore)(?![\\p{L}\\p{N}]))"
       : `${space}${escapeRegex(suffix)}(?![\\p{L}\\p{N}])`;
   // A dash is a sign when nothing alphanumeric stands before it — after a
   // space, `(`, `|`, `=`, `:`, a quote, a comma... (round-5 review: "|-5%|"
@@ -512,7 +549,15 @@ function numberFound(numeric: string, digits: string, suffix: string): boolean {
   const before = signed
     ? `(?<!${quantity}${sep})(?<![\\p{L}_.,])`
     : `(?<![\\p{Nd}.,])(?<!(?<!${quantity}${sep})(?<![\\p{L}_])-${sep})`;
-  return new RegExp(`${before}${body}${tail}`, "iu").test(numeric);
+  const re = new RegExp(`${before}${body}${tail}`, "giu");
+  if (suffix !== "") return re.test(numeric);
+  for (const m of numeric.matchAll(re)) {
+    const end = m.index + m[0].length;
+    const glued = /^(k|mn|bn|m)(?![\p{L}\p{N}])/iu.exec(numeric.slice(end));
+    if (glued && gluedIsScale(numeric, m.index, glued[1]!, end + glued[1]!.length)) continue;
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -556,12 +601,14 @@ function containsWord(haystack: string, term: string): boolean {
     const end = i + needle.length;
     const left =
       !isAlnum(haystack[i - 1]) || (isLower(haystack[i - 1]) && isUpper(haystack[i]));
-    // A letter followed by a digit is an edge too: a family name before its
-    // version ("Qwen" in "Qwen3.5-122B") was flagged on a faithful claim.
+    // A lowercase letter followed by a digit is an edge too: a family name
+    // before its version ("Qwen" in "Qwen3.5-122B") was flagged on a faithful
+    // claim. Not after a capital: "GPT" in "GPT4", "B" in "B2B", "X" in "X86"
+    // are codes, not names (review H).
     const right =
       !isAlnum(haystack[end]) ||
       (isLower(haystack[end - 1]) && isUpper(haystack[end])) ||
-      (/\p{L}/u.test(haystack[end - 1] ?? "") && /\p{Nd}/u.test(haystack[end] ?? ""));
+      (isLower(haystack[end - 1]) && /\p{Nd}/u.test(haystack[end] ?? ""));
     if (left && right) return true;
   }
   return false;

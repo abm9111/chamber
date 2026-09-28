@@ -9700,6 +9700,23 @@ test("pins", "claim support: a citation's title and path names count; numbers ma
   assert(missingTerms("Fine-tuning local LLMs (e.g. Qwen models) on Apple hardware [1]", ["fine-tuning local LLMs (Qwen3.5-122B) on Apple hardware"]).length === 0, "Qwen in Qwen3.5");
   assert(missingTerms("The Moon was bright [1]", ["the Moonlight was bright"]).includes("Moon"), "a letter-letter join is still no edge");
   assert(missingTerms("**Group-level catalogue** includes: Mining (13) [1]", ["Mining (13)"]).length === 0, "Group-level is ordinary");
+  // Review H: what title, path and glued suffixes must not supply.
+  const cited = (claim: string, body: string, title: string, ref: string): string[] =>
+    missingTermsIn(claim, citedPassage(body, title, ref));
+  assert(cited("Revenue grew for 5 years [1]", "Revenue grew steadily.", "Five lessons from scaling", "notes/a.md").includes("5"), "a spelled count in the title is not a number");
+  assert(cited("The Q team led [1]", "The team led.", "Q3 results", "notes/q3.md").includes("Q"), "Q3 in a title does not supply Q");
+  assert(cited("Imports into the UAE were banned [1]", "Imports were banned.", "Reta", "05 - UAE Peptide Lab/reta.md#p0").includes("UAE"), "a folder name vouches for nothing");
+  for (const [c, p, t] of [
+    ["It has 15 million users [1]", "It has 1,5 million users", "15 million"],
+    ["It has 10 million users [1]", "timeout: 10m", "10 million"],
+    ["It sold 3 million units [1]", "3M tape", "3 million"],
+    ["It has 2k stars [1]", "Founded in 2000", "2k"],
+    ["The Series B closed [1]", "a B2B product", "B"],
+  ] as const) assert(missingTerms(c, [p]).includes(t), `${c} vs ${p} must flag ${t}: ${JSON.stringify(missingTerms(c, [p]))}`);
+  assert(missingTerms("Awards under 1 million AED [1]", ["| **<1M AED** | SaaS"]).length === 0, "a currency after the number makes M a scale");
+  for (const [c, p] of [["A 9 metre yacht [1]", "A 9m yacht"], ["A 30 minute timeout [1]", "a 30m timeout"], ["It raised $9M [1]", "raised $9m"], ["It has 11,000 stores [1]", "11k stores"]] as const) {
+    assert(missingTerms(c, [p]).length === 0, `${c} vs ${p}: ${JSON.stringify(missingTerms(c, [p]))}`);
+  }
   // Scales: by value, both ways; a bare number never matches a scaled one.
   const miss = (c: string, p: string): string[] => missingTerms(c, [p]);
   for (const [c, p] of [

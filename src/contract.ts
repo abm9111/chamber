@@ -11,7 +11,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import { commitBelief } from "./commit_belief.ts";
-import { missingTerms } from "./claim_support.ts";
+import { citedPassage, joinPrepared, missingTermsIn, type PreparedText } from "./claim_support.ts";
 import { verifyPin } from "./pins.ts";
 import type { RejectedSource, SourceRef } from "./types.ts";
 
@@ -138,20 +138,20 @@ function withholdUnsupported(
   cited: SourceRef[],
 ): { kept: SourceRef[]; rejected: RejectedSource[] } {
   const read = db.prepare(
-    `SELECT body FROM vector_document WHERE id = ? AND source_kind = 'vault_page'`,
+    `SELECT body, title, source_ref FROM vector_document WHERE id = ? AND source_kind = 'vault_page'`,
   );
   // Only pins that verify are judged here. A row that is missing, or whose
   // content drifted from the pinned hash, is left for commitBelief to reject
   // with its true reason (not_found, hash_mismatch); checking a drifted body
   // would report terms_absent against text the claim never cited.
-  const bodyOf = new Map<SourceRef, string>();
+  const bodyOf = new Map<SourceRef, PreparedText>();
   for (const s of cited) {
     if (s.kind !== "vault_page" || !verifyPin(db, s).ok) continue;
-    const row = read.get(s.refId) as { body: string } | undefined;
-    if (row) bodyOf.set(s, row.body);
+    const row = read.get(s.refId) as { body: string; title: string | null; source_ref: string | null } | undefined;
+    if (row) bodyOf.set(s, citedPassage(row.body, row.title, row.source_ref));
   }
   if (bodyOf.size === 0) return { kept: cited, rejected: [] };
-  const missing = missingTerms(text, [...bodyOf.values()]);
+  const missing = missingTermsIn(text, joinPrepared([...bodyOf.values()]));
   if (missing.length === 0) return { kept: cited, rejected: [] };
   const reason = `terms_absent: ${missing.join(", ")}`;
   return {

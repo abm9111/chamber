@@ -199,6 +199,19 @@ deployment machine is the stated entry criterion for any capability level above 
 > - A count costs a false flag when the note lists the items without counting
 >   them ("the two tools" against a note naming both), and "two-factor" is
 >   flagged against "multi-factor".
+> - **Revised 2026-09-28 (held-out set and real answers).** The check reads
+>   what a citation shows: the body, plus the names in its title and file
+>   path (never their digits, so a path's date cannot supply a claimed
+>   number). A quantity matches across scales by value (`1M` / `1 million`,
+>   `11k` / `11,000`), so the "restated number" case above now matches for
+>   scale words; a bare number no longer matches a scaled one (`9 users`
+>   against `9 million users`, which it did before). A glued `m` is read as
+>   million, so `5m long` (metres) satisfies "5 million". On a held-out
+>   set of 200 claims written by a different model, wrong flags fell from 10
+>   to 7 of 80 in check mode. The rest are an abbreviation expanded
+>   (`CA` / `California`), scraped glue (`Serna BioW21Ontario`,
+>   `Silversmithtechnical`), and claims that add a term the note lacks.
+>   Real answers (74 claims, judged blind): 2 wrong flags of 69, both glue.
 > - A bullet (`-`, `*`, `+`, `•`) opens a line like a sentence start, so in
 >   `ask` a plain name right after one ("+ Tesla makes it [1]") is the plain
 >   opener above and is not checked. A label closed by a full stop

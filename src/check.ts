@@ -26,7 +26,7 @@ import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { passagePathOf, splitPassages } from "./chunk.ts";
-import { joinPrepared, preparePassage, specificTerms, termsMissingIn, type PreparedText } from "./claim_support.ts";
+import { citedPassage, joinPrepared, specificTerms, termsMissingIn, type PreparedText } from "./claim_support.ts";
 import { enforceClaimContract, type ContractSource } from "./contract.ts";
 import { splitFrontmatter } from "./ingest.ts";
 
@@ -73,6 +73,7 @@ interface Row {
   id: string;
   ref: string;
   body: string;
+  title: string | null;
   hash: string;
   root: string | null;
 }
@@ -126,13 +127,14 @@ class Index {
     const rows = (
       this.db
         .prepare(
-          `SELECT id, source_ref, body, snapshot_hash, metadata_json FROM vector_document
+          `SELECT id, source_ref, body, title, snapshot_hash, metadata_json FROM vector_document
            WHERE source_kind = 'vault_page' AND (source_ref LIKE ? ESCAPE '\\' OR source_ref = ?)`,
         )
         .all(like, file) as {
         id: string;
         source_ref: string;
         body: string;
+        title: string | null;
         snapshot_hash: string;
         metadata_json: string | null;
       }[]
@@ -143,6 +145,7 @@ class Index {
         id: r.id,
         ref: r.source_ref,
         body: r.body,
+        title: r.title,
         hash: r.snapshot_hash,
         root: readRoot(r.metadata_json),
       }));
@@ -155,7 +158,7 @@ class Index {
   prep(row: Row): PreparedText {
     let p = this.prepared.get(row.id);
     if (!p) {
-      p = preparePassage(row.body);
+      p = citedPassage(row.body, row.title, row.ref);
       this.prepared.set(row.id, p);
     }
     return p;
@@ -164,14 +167,14 @@ class Index {
   byId(id: string): Row | undefined {
     const r = this.db
       .prepare(
-        `SELECT id, source_ref, body, snapshot_hash, metadata_json FROM vector_document
+        `SELECT id, source_ref, body, title, snapshot_hash, metadata_json FROM vector_document
          WHERE id = ? AND source_kind = 'vault_page'`,
       )
       .get(id) as
-      | { id: string; source_ref: string | null; body: string; snapshot_hash: string; metadata_json: string | null }
+      | { id: string; source_ref: string | null; body: string; title: string | null; snapshot_hash: string; metadata_json: string | null }
       | undefined;
     if (!r || !r.source_ref) return undefined;
-    return { id: r.id, ref: r.source_ref, body: r.body, hash: r.snapshot_hash, root: readRoot(r.metadata_json) };
+    return { id: r.id, ref: r.source_ref, body: r.body, title: r.title, hash: r.snapshot_hash, root: readRoot(r.metadata_json) };
   }
 
   /**

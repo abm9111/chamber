@@ -67,7 +67,7 @@ import {
 } from "../src/pins.ts";
 import { runAsk, citedIndices, stubDisclosure } from "../src/ask.ts";
 import { checkClaims, formatCheck } from "../src/check.ts";
-import { missingTerms, specificTerms } from "../src/claim_support.ts";
+import { citedPassage, missingTerms, missingTermsIn, specificTerms } from "../src/claim_support.ts";
 import { withSiblings } from "../src/siblings.ts";
 import {
   minilmAvailable,
@@ -9682,6 +9682,47 @@ test("oauth", "chamber_check over MCP: instructions in initialize, a check throu
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("pins", "claim support: a citation's title and path names count; numbers match across scales", () => {
+  // Held-out benchmark, 2026-09-28: the model is shown "[n] title (path)" above
+  // each passage, and a company named only in its page's path was flagged; and
+  // "1 million" / "1M", "11,000" / "11k" were flagged as different numbers.
+  const page = (claim: string, body: string, title: string, ref: string): string[] =>
+    missingTermsIn(claim, citedPassage(body, title, ref));
+  const ref = "2026-09-27__intel/raw/www_ycombinator_com_companies_flexengage.md#p3";
+  assert(page("FlexEngage reports $2.4m ARR [1]", "It reports $2.4m ARR.", "Dynamic text", ref).length === 0, "a name from the path counts");
+  assert(page("Growth came from Tesla [1]", "Growth came.", "Dynamic text", ref).includes("Tesla"), "a name in neither is still flagged");
+  // Digits from a title or path are not evidence: the path's date is not "27".
+  assert(page("It grew 27 times [1]", "It grew.", "Report 27", ref).includes("27"), "a number from title/path must not count");
+  // A family name before its version number is the name; a compound of
+  // common words opening a bold label is ordinary (live vault eval).
+  assert(missingTerms("Fine-tuning local LLMs (e.g. Qwen models) on Apple hardware [1]", ["fine-tuning local LLMs (Qwen3.5-122B) on Apple hardware"]).length === 0, "Qwen in Qwen3.5");
+  assert(missingTerms("The Moon was bright [1]", ["the Moonlight was bright"]).includes("Moon"), "a letter-letter join is still no edge");
+  assert(missingTerms("**Group-level catalogue** includes: Mining (13) [1]", ["Mining (13)"]).length === 0, "Group-level is ordinary");
+  // Scales: by value, both ways; a bare number never matches a scaled one.
+  const miss = (c: string, p: string): string[] => missingTerms(c, [p]);
+  for (const [c, p] of [
+    ["Awards under 1 million AED [1]", "awards < AED 1M"],
+    ["Deployed in 11,000 stores [1]", "Deployed in 11k stores"],
+    ["It has $2.4 million ARR [1]", "at $2.4m ARR"],
+    ["It raised $9M [1]", "raised 9 million dollars"],
+  ] as const) assert(miss(c, p).length === 0, `${c} vs ${p}: ${JSON.stringify(miss(c, p))}`);
+  for (const [c, p, t] of [
+    ["It has 9 users [1]", "9 million users", "9"],
+    ["It has 11 stores [1]", "11k stores", "11"],
+    ["It fell 5 million [1]", "it fell -5M", "5 million"],
+    ["It raised $9M [1]", "raised 90 million", "9M"],
+  ] as const) assert(miss(c, p).includes(t), `${c} vs ${p} must flag ${t}: ${JSON.stringify(miss(c, p))}`);
+});
+
+test("pins", "claim support: the commit gate reads the citation's title and path", () => {
+  const db = freshDb();
+  const src = seedPinnedDoc(db, "It reports $2.4m in ARR.", "intel/companies_flexengage.md#p0");
+  const r = enforceClaimContract(db, { kind: "assertion", text: "FlexEngage reports $2.4 million in ARR [1]" }, { sources: [src] });
+  assert(r.status === "ALLOWED", `a path-named company with a scaled number must commit: ${JSON.stringify(r)}`);
+  const bad = enforceClaimContract(db, { kind: "assertion", text: "The company Tesla reports $2.4 million in ARR [1]" }, { sources: [src] });
+  assert(bad.status !== "ALLOWED" && (bad.rejectedSources ?? []).some((x) => x.reason.includes("Tesla")), `an unnamed company must not: ${JSON.stringify(bad)}`);
 });
 
 test("pins", "debt payment does not write the same pin twice", () => {

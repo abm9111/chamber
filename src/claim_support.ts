@@ -366,6 +366,21 @@ export function missingTerms(claim: string, passages: string[], opts: TermOption
  */
 const BETWEEN = "\n\uE001\n";
 
+/**
+ * The text a citation shows: the passage body, plus the names in its title
+ * and file path. The model is shown "[n] title (path)" above each body, so a
+ * company named only in its page's path ("…companies_flexengage") was flagged
+ * on a claim that quoted it (held-out benchmark, 2026-09-28: 3 of 10 wrong
+ * flags). Only names come from title and path — their digits are dropped, so
+ * a date in a path ("2026-09-27__…") cannot supply a claimed "27". All three
+ * are covered by the passage's pin hash.
+ */
+export function citedPassage(body: string, title: string | null, sourceRef: string | null): PreparedText {
+  const path = (sourceRef ?? "").replace(/#p\d+$/, "").replace(/\.(?:md|markdown)$/i, "").replace(/[_/.#]+/g, " ");
+  const names = `${title ?? ""}\n${path}`.replace(/\p{Nd}+/gu, " ");
+  return joinPrepared([preparePassage(body), preparePassage(names)]);
+}
+
 /** A passage normalised once, for callers that judge many claims against it. */
 export interface PreparedText {
   haystack: string;
@@ -403,6 +418,7 @@ export function termsMissingIn(terms: string[], text: PreparedText): string[] {
     // (round-4 review); names keep the name rules.
     if (num && (suffix === "" || UNIT.test(suffix))) {
       if (numberFound(numeric, num[1]!, suffix)) return false;
+      if (scaledValueFound(numeric, num[1]!, suffix)) return false;
       // "3 tools" against a note that says "three tools".
       return !(suffix === "" && /^\p{Nd}{1,2}$/u.test(num[1]!) && spelledFound(haystack, Number(num[1])));
     }
@@ -419,6 +435,40 @@ export function termsMissingIn(terms: string[], text: PreparedText): string[] {
  * (round-3 review). One optional space between number and suffix, so "9%"
  * and "9 %" are the same claim.
  */
+/**
+ * A quantity written at another scale: "1 million" for "1M", "11,000" for
+ * "11k", "$2.4m" for "2.4 million" (held-out benchmark, 2026-09-28: 3 of 10
+ * wrong flags). Compared by value, and only when one side carries a scale
+ * word — two bare numbers keep the digit-boundary rules above. A sign must
+ * agree. `m` is read as million, as in "$5m"; the spaced "5 m" (metres) was
+ * never a scale here and still is not.
+ */
+const SCALE: Readonly<Record<string, number>> = {
+  "": 1, k: 1e3, thousand: 1e3, lakh: 1e5, m: 1e6, mn: 1e6, million: 1e6, crore: 1e7, bn: 1e9, billion: 1e9, trillion: 1e12,
+};
+function scaledValue(digits: string, suffix: string): number | undefined {
+  const scale = SCALE[suffix.toLowerCase()];
+  if (scale === undefined) return undefined;
+  const n = Number(digits.replace(/,/g, ""));
+  return Number.isFinite(n) ? n * scale : undefined;
+}
+function scaledValueFound(numeric: string, digits: string, suffix: string): boolean {
+  const want = scaledValue(digits, suffix.trim());
+  if (want === undefined) return false;
+  const claimScaled = SCALE[suffix.trim().toLowerCase()] !== 1;
+  for (const m of numeric.matchAll(NUMBER)) {
+    const term = bareNumber(m[0]);
+    const parts = /^(-?[\p{Nd}][\p{Nd},.]*)(.*)$/u.exec(term);
+    if (!parts) continue;
+    const suf = parts[2]!.trim();
+    const have = scaledValue(parts[1]!, suf);
+    if (have === undefined) continue;
+    if (!claimScaled && SCALE[suf.toLowerCase()] === 1) continue;
+    if (Math.abs(have - want) <= Math.abs(want) * 1e-9) return true;
+  }
+  return false;
+}
+
 /** The units a number-led term may carry; anything else makes it a name. */
 const UNIT = /^(?:%|k|m|mn|bn|thousand|million|billion|trillion|lakh|crore)$/i;
 /**
@@ -432,7 +482,10 @@ function numberFound(numeric: string, digits: string, suffix: string): boolean {
   const space = SPACED_UNIT.test(suffix) ? "\\s?" : "";
   const tail =
     suffix === ""
-      ? "(?![\\p{Nd}]|[.,]\\p{Nd})"
+      ? // A bare number is not found in one that carries a scale: "9 users"
+        // was satisfied by "9 million users" and "11 stores" by "11k stores"
+        // (found 2026-09-28). A spaced "m" is metres, not a scale.
+        "(?![\\p{Nd}]|[.,]\\p{Nd})(?!(?:k|m|mn|bn)(?![\\p{L}\\p{N}])|\\s?(?:thousand|million|billion|trillion|lakh|crore)(?![\\p{L}\\p{N}]))"
       : `${space}${escapeRegex(suffix)}(?![\\p{L}\\p{N}])`;
   // A dash is a sign when nothing alphanumeric stands before it — after a
   // space, `(`, `|`, `=`, `:`, a quote, a comma... (round-5 review: "|-5%|"
@@ -503,8 +556,12 @@ function containsWord(haystack: string, term: string): boolean {
     const end = i + needle.length;
     const left =
       !isAlnum(haystack[i - 1]) || (isLower(haystack[i - 1]) && isUpper(haystack[i]));
+    // A letter followed by a digit is an edge too: a family name before its
+    // version ("Qwen" in "Qwen3.5-122B") was flagged on a faithful claim.
     const right =
-      !isAlnum(haystack[end]) || (isLower(haystack[end - 1]) && isUpper(haystack[end]));
+      !isAlnum(haystack[end]) ||
+      (isLower(haystack[end - 1]) && isUpper(haystack[end])) ||
+      (/\p{L}/u.test(haystack[end - 1] ?? "") && /\p{Nd}/u.test(haystack[end] ?? ""));
     if (left && right) return true;
   }
   return false;

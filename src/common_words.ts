@@ -70,6 +70,8 @@ export const COMMON_WORDS: ReadonlySet<string> = new Set(WORDS.split(/\s+/).filt
 export function isCommonWord(word: string): boolean {
   const w = word.toLowerCase().replace(/['’]s$/, "");
   if (COMMON_WORDS.has(w)) return true;
+  // A compound of common words is common: "Group-level", "Read-only".
+  if (w.includes("-")) return w.split("-").every((part) => part !== "" && isCommonWord(part));
   // Plural, past, -ing and -ly only, each leaving a stem of 3+ letters. -er
   // and -est turned names into listed words (Finder → find, Forest → for),
   // and a 2-letter stem made Bing "be" (review B, 2026-09-27).

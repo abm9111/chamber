@@ -2,7 +2,7 @@
   "name": "@bu7umaid/chamber",
   "version": "0.1.8",
   "type": "module",
-  "description": "Ask questions about your own notes and get answers that cite their sources \u2014 then get told when a source changed underneath a conclusion. Local-first CLI + MCP server, zero runtime dependencies.",
+  "description": "The check your AI agent runs on your notes: an MCP server that confirms the numbers, names and files a claim quotes are really in the note it cites. Local CLI + MCP server, zero runtime dependencies.",
   "license": "MIT",
   "mcpName": "io.github.abm9111/chamber",
   "repository": {
@@ -24,7 +24,14 @@
     "rag",
     "sqlite",
     "knowledge-management",
-    "drift-detection"
+    "drift-detection",
+    "claude",
+    "claude-code",
+    "ai-agents",
+    "hallucination",
+    "fact-checking",
+    "grounding",
+    "verification"
   ],
   "bin": {
     "chamber": "bin/chamber.js"

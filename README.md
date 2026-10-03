@@ -12,12 +12,33 @@ conclusion you already trusted.
 Zero runtime dependencies. Everything is `node:sqlite` and files on your disk.
 No account, no cloud call unless you point it at one.
 
+## What people actually do
+
+There is no public trail of Chamber users yet. These are the adjacent failures
+on X, which are the reason the check exists.
+
+- Pointing Claude Code at an Obsidian folder reads files. It does not check the
+  sentence. [Richard Kovacs, 28 Sep 2026](https://x.com/rchardkovacs/status/2104469882527973411):
+  Claude returns a list of sources and he checks them. The remaining failure he
+  names is confirmation bias, and he treats that as discipline.
+- A tool the agent must remember to call is not a gate.
+  [Saksham Arora, 2 Oct 2026](https://x.com/nerfsaksham/status/2106056221879124381):
+  a shared-memory MCP only recalled a session if the other agent decided to
+  search, so he put a hook before every message. `chamber_check` is the same
+  shape. MCP `instructions` ask Claude to call it. Nothing blocks the turn if
+  it skips. A Stop hook that requires a receipt is the missing piece; it is not
+  in this repo yet.
+- Viral vault posts (99.7% recall, thousands of links in minutes) are not
+  measurements. The number in this repo is the 200-claim set in
+  [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) §2: invented values
+  mostly caught, negations not.
+
 ## See it in two minutes
 
 Requires Node **23.6+** — Chamber runs TypeScript directly, with no build step.
 
 ```bash
-git clone <this repo> chamber && cd chamber
+git clone https://github.com/abm9111/chamber.git chamber && cd chamber
 npm ci && node --experimental-strip-types src/cli.ts try
 ```
 
@@ -160,6 +181,9 @@ chamber corpus           # what is actually in the index
 Pointed at a folder of exported chat logs, Chamber will happily index all of
 them and answer from them — see `chamber corpus` and
 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) entry 11.
+If the root is an Obsidian vault, exclude `.obsidian`, `.trash`, and
+`*sync-conflict*` before that first ingest. A symlinked folder is indexed under
+the link path and comes back `STALE` under the real path.
 
 ### Use it as a CI drift gate
 
@@ -216,32 +240,34 @@ the supported claims are committed through the gate, pinned to the passages
 that hold them, and `chamber_verify` reports any whose pinned passage changes,
 once the note is re-ingested.
 The server tells the host this in its MCP `instructions`, which Claude Code
-puts in the agent's context.
+puts in the agent's context. That is a prompt contract, not a runtime gate.
 
-Three more tools cover the rest: `chamber_ask` (Chamber's own configured model
-answers, with the same per-claim verdicts), `chamber_verify` (drift in recorded
-claims) and `chamber_corpus` (what is indexed).
+Four tools, not three. `chamber_check` is the one above. The other three cover
+the rest: `chamber_ask` (Chamber's own configured model answers, with the same
+per-claim verdicts), `chamber_verify` (drift in recorded claims) and
+`chamber_corpus` (what is indexed). Ingest stays on the CLI so the model cannot
+re-index its own evidence.
 
-From the npm package, the server is one subcommand:
+From the npm package, the server is one subcommand. `CHAMBER_PYTHON` is only
+for the embedder used by `chamber_ask`. `chamber_check` does not need it.
 
 ```bash
 claude mcp add -s user chamber \
-  -e CHAMBER_PYTHON=/path/to/python-with-onnxruntime \
   -- npx -y @bu7umaid/chamber mcp
 ```
 
 That form works when the host's spawn environment can resolve a Node 23.6+
 `npx`. When it cannot — and MCP hosts often spawn with a minimal `PATH` — name
-the interpreters absolutely:
+the interpreter absolutely:
 
 ```bash
 claude mcp add -s user chamber \
-  -e CHAMBER_PYTHON=/path/to/python-with-onnxruntime \
   -- /absolute/path/to/node --experimental-strip-types /path/to/chamber/src/mcp_server.ts
 ```
 
-Both absolute paths are deliberate. A spawned MCP server does not inherit your
-interactive shell's `PATH`: `node` may resolve to a version below the 23.6
+Add `-e CHAMBER_PYTHON=/path/to/python-with-onnxruntime` only if you use
+`chamber_ask` and want semantic retrieval. A spawned MCP server does not inherit
+your interactive shell's `PATH`: `node` may resolve to a version below the 23.6
 floor, and `python3` to one without `onnxruntime` — which makes the embedder
 fall back to non-semantic hash vectors and every question answer "nothing in
 the corpus matches." Naming the interpreters is the only reliable fix. See
@@ -277,15 +303,16 @@ non-goal, it has been observed happening, and it is not solved.
 
 Read [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) before trusting
 any output. Eighteen limitations are documented there, including the two least
-flattering. The sandbox confines only where bubblewrap works — Linux with
-unprivileged user namespaces — and refuses to run anything anywhere else, which
-is safe but is not the same as working. And citation debt blocks a verbatim
-repeat reliably, while the paraphrase leg over it is a heuristic: calibration
-found no cosine threshold that separates a restatement from a contradiction. A
-numeric and negation check now removes the worst of that — an operator
-correcting an indebted claim is no longer refused for restating it — but two of
-five true paraphrases still slip through, and a contradiction that is neither
-numeric nor negated still reads as a repeat.
+flattering. The sandbox does not isolate: a docker detection can relabel to a
+subprocess, `CHAMBER_SANDBOX_REQUIRED=1` does not fail closed, and a probed run
+read `$HOME` and resolved DNS (`docs/KNOWN_LIMITATIONS.md` §1). That path is off
+`chamber_check`. Do not read "sandbox" as containment. Citation debt blocks a
+verbatim repeat reliably, while the paraphrase leg over it is a heuristic:
+calibration found no cosine threshold that separates a restatement from a
+contradiction. A numeric and negation check now removes the worst of that — an
+operator correcting an indebted claim is no longer refused for restating it —
+but two of five true paraphrases still slip through, and a contradiction that
+is neither numeric nor negated still reads as a repeat.
 
 ## The invariant
 
@@ -325,7 +352,7 @@ again. A gate that cannot fail reports safety it never checked.
 
 ```text
 src/ask.ts              retrieval → prompt → per-claim citation gate
-src/mcp_server.ts       the read side over MCP: ask, verify, corpus
+src/mcp_server.ts       MCP surface: ask, check, verify, corpus
 src/commit_belief.ts    the belief gate; check and write in one transaction
 src/pins.ts             content pins and drift verification
 src/audit.ts            hash-chained log + incremental Merkle
@@ -334,6 +361,7 @@ src/db.ts               opens the database, loads every schema
 probes/                 adversarial probes, run by npm run probes
 demos/                  the four scenarios above, run in CI so they cannot rot
 docs/KNOWN_LIMITATIONS.md   what does not work, and what it costs
+docs/NEXT_LEVEL_PLAN.md     historical plan; several items already shipped
 ```
 
 MIT.

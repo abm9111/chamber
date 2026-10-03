@@ -1,9 +1,10 @@
 # Chamber
 
 The check your AI agent runs on your notes. When Claude Code or any MCP host
-answers from your vault, `chamber_check` confirms the numbers, names and file
-names it quotes are really in the note it cites — and says so when they are
-not, or when the note changed since it was indexed. [How it works](#use-it-from-an-ai-coding-agent).
+answers from your vault, `chamber_check` confirms the numbers, capitalised
+names and file names it quotes are really in the note it cites — and says so
+when they are not, or when the note changed since it was indexed.
+[How it works](#use-it-from-an-ai-coding-agent).
 
 You can also ask questions yourself and get answers that cite their sources,
 plus a daily check that tells you when a source has changed underneath a
@@ -11,6 +12,40 @@ conclusion you already trusted.
 
 Zero runtime dependencies. Everything is `node:sqlite` and files on your disk.
 No account, no cloud call unless you point it at one.
+
+## Run the check
+
+Checkout and the published package are different runtimes. Config is a third
+path, for [ingest and chamber_ask](#for-ingest-and-chamber_ask-not-for-the-check).
+
+```bash
+claude mcp add -s user chamber -- npx -y @bu7umaid/chamber mcp
+```
+
+**Checkout — Node 23.6+.** TypeScript runs directly from the repo, with no
+build step. `--experimental-strip-types` has been the default since 23.6.0, so
+the flag is defensive. No config, no model, no network.
+
+```bash
+git clone https://github.com/abm9111/chamber.git && cd chamber && npm ci && node --experimental-strip-types src/cli.ts try
+```
+
+**Agent.** The command above runs the published bin (`dist/`), not `src/`.
+If `/mcp` does not list `chamber_check`, the host spawned with a minimal
+`PATH`. Take the interpreter from `command -v node` in the shell you actually
+use, and point it at the published bin or at a checkout's `src/mcp_server.ts`.
+Those are different files.
+
+```bash
+# published bin: bin/chamber.js loads dist/. This is not src/mcp_server.ts.
+claude mcp add -s user chamber -- "$(command -v node)" /path/to/node_modules/@bu7umaid/chamber/bin/chamber.js mcp
+
+# checkout only. src/mcp_server.ts is not in the npm install.
+claude mcp add -s user chamber -- "$(command -v node)" --experimental-strip-types /path/to/chamber/src/mcp_server.ts
+```
+
+A number the note does not contain returns `TERMS_ABSENT` and names the term.
+`SUPPORTED` is term presence, not entailment.
 
 ## What people actually do
 
@@ -35,22 +70,16 @@ on X, which are the reason the check exists.
 
 ## See it in two minutes
 
-Requires Node **23.6+** — Chamber runs TypeScript directly, with no build step.
-
-```bash
-git clone https://github.com/abm9111/chamber.git chamber && cd chamber
-npm ci && node --experimental-strip-types src/cli.ts try
-```
-
-No config, no database, no model, no network. It builds a throwaway workspace,
-runs the real code paths against it, and deletes it (`--keep` to look around).
+The checkout command above builds a throwaway workspace, runs the real code
+paths against it, and deletes it (`--keep` to look around). It does not open
+a database.
 
 ![chamber try](https://raw.githubusercontent.com/abm9111/chamber/main/assets/chamber-try.gif)
 
 That recording is scripted from [`assets/demo.tape`](assets/demo.tape) rather
 than hand-captured, so it is regenerated when the output changes instead of
 quietly showing a version of Chamber that no longer exists. Everything below is
-the same command's actual output, trimmed:
+that checkout command's actual output, trimmed:
 
 ```
 $ chamber believe belief "Customers may return any purchase within 30 days of delivery."
@@ -149,7 +178,7 @@ I don't know
 Both notes are in the index and both are relevant. Neither answers the
 question, so nothing is composed from the pieces.
 
-## Pointing it at your own notes
+## For ingest and chamber_ask, not for the check
 
 ```bash
 npm link                 # puts `chamber` on your PATH
@@ -185,7 +214,7 @@ If the root is an Obsidian vault, exclude `.obsidian`, `.trash`, and
 `*sync-conflict*` before that first ingest. A symlinked folder is indexed under
 the link path and comes back `STALE` under the real path.
 
-### Use it as a CI drift gate
+## Use it as a CI drift gate
 
 The same verify loop works on a repo: claims in docs pinned to passages of
 code or policy, `chamber verify --json` failing the build when the ground
@@ -199,14 +228,14 @@ moves. One line in a workflow — this repo ships the action:
 [`demos/06_ci_drift_gate.ts`](demos/06_ci_drift_gate.ts) is the runnable
 transcript.
 
-### Run it daily
+## Run it daily
 
 `deploy/launchd/com.chamber.verify.plist` (macOS) and `deploy/systemd/`
 (Linux) run ingest and verify on a schedule, and raise a notification only when
 something drifted. A check that correctly reports nothing on most days is a
 check you stop reading, so it stays quiet until it isn't.
 
-### Render it in Obsidian
+## Render it in Obsidian
 
 The companion plugin [Chamber Drift](https://github.com/abm9111/chamber-obsidian)
 renders `verify --json`'s report as a vault sidebar panel and a per-note
@@ -214,7 +243,7 @@ banner — nothing more. It never verifies and never writes; Chamber does both,
 on its own schedule, outside Obsidian. Setup, including the report-writing
 one-liner and the Obsidian Sync caveat: [`docs/OBSIDIAN.md`](docs/OBSIDIAN.md).
 
-### Use it from an AI coding agent
+## Use it from an AI coding agent
 
 An agent that reads your vault with its own tools can check what it is about
 to tell you. `chamber_check` takes the agent's claims and the notes it says
@@ -245,33 +274,12 @@ puts in the agent's context. That is a prompt contract, not a runtime gate.
 Four tools, not three. `chamber_check` is the one above. The other three cover
 the rest: `chamber_ask` (Chamber's own configured model answers, with the same
 per-claim verdicts), `chamber_verify` (drift in recorded claims) and
-`chamber_corpus` (what is indexed). Ingest stays on the CLI so the model cannot
-re-index its own evidence.
+`chamber_corpus` (what is indexed). `CHAMBER_PYTHON` is optional, and only for
+`chamber_ask`'s semantic retrieval; a missing onnxruntime falls back to hash
+vectors. Ingest stays on the CLI so the model cannot re-index its own evidence.
 
-From the npm package, the server is one subcommand. `CHAMBER_PYTHON` is only
-for the embedder used by `chamber_ask`. `chamber_check` does not need it.
-
-```bash
-claude mcp add -s user chamber \
-  -- npx -y @bu7umaid/chamber mcp
-```
-
-That form works when the host's spawn environment can resolve a Node 23.6+
-`npx`. When it cannot — and MCP hosts often spawn with a minimal `PATH` — name
-the interpreter absolutely:
-
-```bash
-claude mcp add -s user chamber \
-  -- /absolute/path/to/node --experimental-strip-types /path/to/chamber/src/mcp_server.ts
-```
-
-Add `-e CHAMBER_PYTHON=/path/to/python-with-onnxruntime` only if you use
-`chamber_ask` and want semantic retrieval. A spawned MCP server does not inherit
-your interactive shell's `PATH`: `node` may resolve to a version below the 23.6
-floor, and `python3` to one without `onnxruntime` — which makes the embedder
-fall back to non-semantic hash vectors and every question answer "nothing in
-the corpus matches." Naming the interpreters is the only reliable fix. See
-[`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) entry 15.
+Register the server with the [command above](#run-the-check). That `npx` runs
+the published bin (`dist/`).
 
 The server re-reads config on every tool call, so an edit to `model` takes
 effect on the next call without a reconnect; a `CHAMBER_*` variable set in the

@@ -1,12 +1,12 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.abm9111/chamber",
-  "description": "The check your AI agent runs on your notes: claims vs the cited note, locally, no model.",
+  "description": "Indexed note: numbers, capitalised names, file names. Local, no model, no meaning check.",
   "repository": {
     "url": "https://github.com/abm9111/chamber",
     "source": "github"
   },
-  "version": "0.1.8",
+  "version": "0.1.9",
   "packages": [
     {
       "registryType": "npm",

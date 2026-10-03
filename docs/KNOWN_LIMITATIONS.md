@@ -985,41 +985,38 @@ Two smaller findings from the same run, both now handled in code:
 
 ## 18. `npx` could not run this package at all before 0.1.3
 
-> **Correction, 2026-08-14 (same day, hours later).** The entry below was
-> wrong twice within hours of being written, in ways worth recording. First:
-> it claimed Node 26 lifts the node_modules type-stripping restriction — a
-> clean-cache test on 26.5 refuted that; the restriction is effectively
-> universal on current Node. Second and worse: the "every local verification
-> had quietly run on Node 26" line understated the failure. The local npx
-> verifications were green because npm resolved the LOCAL repository package
-> (matching name@version at the working directory) and never executed the
-> registry tarball at all — the verified-cold claims made after 0.1.1 and
-> 0.1.2 were false, and the tarball additionally never shipped
-> `fixtures/demo`, so `try` would have failed even without the stripping
-> error. Green checks that never tested the real path, on the project that
-> exists to catch exactly that. Fixed in 0.1.3: the tarball ships compiled
-> JavaScript (`prepack` → `dist/`; the bin shim prefers it) plus the demo
-> fixtures, and the release checklist now requires the clean-cache,
-> neutral-cwd tarball test before any publish.
+> **Correction, 2026-08-14 (same day, hours later).** The original entry was
+> wrong twice within hours of being written. A clean-cache test on Node 26.5
+> showed the `node_modules` type-stripping restriction still holds; a newer
+> Node does not remove it. Second, and worse: local `npx` verifications were
+> green because npm resolved the local repository package (matching
+> name@version at the working directory) and never executed the registry
+> tarball. The verified-cold claims made after 0.1.1 and 0.1.2 were false, and
+> the tarball additionally never shipped `fixtures/demo`, so `try` would have
+> failed even without the stripping error. Green checks that never tested the
+> real path, on the project that exists to catch exactly that. Fixed in 0.1.3:
+> the tarball ships compiled JavaScript (`prepack` → `dist/`; the bin shim
+> prefers it) plus the demo fixtures, and the release checklist now requires
+> the clean-cache, neutral-cwd tarball test before any publish.
 
-Node refuses to strip TypeScript types for files under `node_modules`
-(`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`) on Node 24, and `node_modules`
-is exactly where `npx` installs `@bu7umaid/chamber`. So `npx -y
-@bu7umaid/chamber try` — the README's own npm one-liner — dies on the current
-LTS. Node 26 lifts the restriction; the git-clone path runs TypeScript from a
-regular directory and needs only the documented 23.6 floor. Found by the
-GitHub Action's self-test on a stock `ubuntu-latest` runner (Node 24.19) after
-every local verification had quietly run on Node 26.
+Since 0.1.3, `npx` runs that compiled JavaScript. `bin/chamber.js` loads
+`dist/cli.js` when the file is present, and the 23.6 check does not run on
+that path. Node still refuses to strip TypeScript under `node_modules`
+(`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`), including on Node 26. The
+checkout is the path that runs TypeScript, from a normal directory, and it
+needs Node 23.6+.
 
-**What it costs.** The lowest-friction install path silently excludes the
-default Node of most CI images and many machines, with a raw stack trace as
-the only explanation. The bin shim's version guard checks the 23.6 floor and
-passes 24 — correct by its own rule, wrong about this case.
+**If `dist/` is missing.** The shim checks a version only on that branch, and
+the check is the 23.6 floor alone. Below 23.6 it prints `chamber requires Node
+23.6 or newer (you are running <version>).` and `Chamber runs TypeScript
+directly via Node's built-in type stripping, which shipped in 23.6.`, then
+exits 1. On 23.6 or newer it imports `src/cli.ts`. Under `node_modules` that
+import throws `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`. On a checkout,
+outside `node_modules`, the same import runs.
 
-**What would fix it.** Ship compiled JavaScript in the npm tarball (a
-`prepack` build; the repository itself stays TypeScript-direct), or teach the
-bin shim to catch this specific error and say "Node 26+, or clone" instead of
-stack-tracing. Until one of those lands, the action and docs pin Node 26.
+Before 0.1.3 the tarball had no `dist/`, so `npx` hit that import and died with
+the raw exception. The floor check could not name it: 24 is above 23.6, so the
+guard passed and the stripping error followed.
 
 ## 19. `ask` on the stub answered in a real model's voice, unlabelled
 

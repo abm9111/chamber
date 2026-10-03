@@ -86,9 +86,8 @@ Without the action, the same gate by hand:
 
 ```yaml
       - uses: actions/setup-node@v4
-        with: { node-version: 26 }   # 26+, not 24: Node 24 refuses type
-                                     # stripping under node_modules, which is
-                                     # where npx puts the package (KL 18)
+        with: { node-version: 24 }   # npx runs dist/, compiled JS since
+                                     # 0.1.3 (KL 18).
       - run: npx -y @bu7umaid/chamber@0.1.8 ingest ./docs
       - run: npx -y @bu7umaid/chamber@0.1.8 index-code ./src
       - run: npx -y @bu7umaid/chamber@0.1.8 verify --json

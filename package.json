@@ -2,7 +2,7 @@
   "name": "@bu7umaid/chamber",
   "version": "0.1.8",
   "type": "module",
-  "description": "The check your AI agent runs on your notes: an MCP server that confirms the numbers, names and files a claim quotes are really in the note it cites. Local CLI + MCP server, zero runtime dependencies.",
+  "description": "Checks that the numbers, capitalised names, and file names in a claim occur in the indexed note. Local, no model. It does not judge meaning. Zero runtime dependencies.",
   "license": "MIT",
   "mcpName": "io.github.abm9111/chamber",
   "repository": {

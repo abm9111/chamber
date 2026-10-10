@@ -9684,6 +9684,35 @@ test("oauth", "chamber_check over MCP: instructions in initialize, a check throu
   }
 });
 
+test("pins", "claim support: the digits after a decimal point are not a second term", () => {
+  // "$4.2M" was checked as 4.2M and also as "2M": NAME (digits then a capital) began again right after the
+  // decimal point. chamber_check then reported "does not contain: 4.2M, 2M" against a note saying $2.4M.
+  for (const [claim, want] of [
+    ["Q3 revenue was $4.2M.", ["4.2M", "Q3"]],
+    ["It holds 9.99M rows", ["9.99M"]],
+    ["A 1.5GB file", ["1.5", "1.5GB"]],
+    ["A 1.2B parameter model", ["1.2", "1.2B"]],
+    ["Costs 1,5M EUR", ["1,5M", "EUR"]],
+  ] as const) {
+    const got = specificTerms(claim, { openings: true }).filter((t) => t !== "3")
+    assert(JSON.stringify(got) === JSON.stringify(want), `${claim}: ${JSON.stringify(got)}`);
+  }
+  assert(JSON.stringify(missingTerms("Q3 revenue was $4.2M [1]", ["Q3 revenue was $2.4M."])) === JSON.stringify(["4.2M"]), "only the real number is reported");
+  // The unit stays part of the term: dropping "5GB" must not let a different unit through.
+  assert(missingTerms("A 1.5GB file [1]", ["A 1.5TB file"]).includes("1.5GB"), "1.5GB vs 1.5TB is flagged");
+  assert(missingTerms("A 1.5GB file [1]", ["A 1.5GB file"]).length === 0, "1.5GB vs 1.5GB passes");
+  // A number glued to a letter or `_` cannot match whole, so its tail stays a term, as before: dropping it
+  // certified v1.2B against a note saying v1.2C (review of this fix).
+  for (const [c, p, t] of [
+    ["The v1.2B build [1]", "The v1.2C build", "2B"],
+    ["Runs iOS17.4Beta [1]", "Runs iOS17.4Alpha", "4Beta"],
+    ["Uses GPT4.5Turbo [1]", "Uses GPT4.5Mini", "5Turbo"],
+    ["Ships ver_2.0RC [1]", "Ships ver_2.0GA", "0RC"],
+  ] as const) assert(missingTerms(c, [p]).includes(t), `${c} vs ${p} must flag ${t}: ${JSON.stringify(missingTerms(c, [p]))}`);
+  // A name right after a full stop between sentences is still a name.
+  assert(specificTerms("It shipped in 2024.Tesla bought it", { openings: true }).includes("Tesla"), "a name after a year and a full stop");
+});
+
 test("pins", "claim support: a citation's title and path names count; numbers match across scales", () => {
   // Held-out benchmark, 2026-09-28: the model is shown "[n] title (path)" above
   // each passage, and a company named only in its page's path was flagged; and

@@ -176,10 +176,16 @@ function normalize(text: string): string {
  * A name: a capitalised word or acronym in any script (`Škoda`, `Möbius` —
  * an ASCII class cut the latter to `M`), optionally led by digits (`9XFabs`,
  * `3DPrintU`), or a lowercase-led word with an inner capital (`eBay`).
- * Hyphens and apostrophes inside are kept.
+ * Hyphens and apostrophes inside are kept. A digit-led name takes a decimal
+ * whole (`1.5GB`, `1.2B`), and does not start again inside a number that
+ * already matched whole: `$4.2M` was checked as `4.2M` and again as `2M`,
+ * which chamber_check reported missing against a note saying `$2.4M`. A
+ * number glued to a letter or `_` (`v1.2B`, `GPT4.5Turbo`) cannot match
+ * whole, so its tail (`2B`, `5Turbo`) stays a term: dropping it certified
+ * `v1.2B` against a note saying `v1.2C`.
  */
 const NAME =
-  /(?<![\p{L}\p{N}_])(?:\p{N}*\p{Lu}[\p{L}\p{N}_]*|\p{Ll}+\p{Lu}[\p{L}\p{N}_]*)(?:['’-][\p{L}\p{N}_]+)*/gu;
+  /(?<![\p{L}\p{N}_])(?:(?<!(?<![\p{L}\p{N}_])\p{N}+(?:[.,]\p{N}+)*[.,])\p{N}+(?:[.,]\p{N}+)*\p{Lu}[\p{L}\p{N}_]*|\p{Lu}[\p{L}\p{N}_]*|\p{Ll}+\p{Lu}[\p{L}\p{N}_]*)(?:['’-][\p{L}\p{N}_]+)*/gu;
 
 function stripMarkup(text: string): string {
   return text

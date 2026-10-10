@@ -1,40 +1,53 @@
 # Chamber
 
-The check your AI agent runs on your notes. When Claude Code or any MCP host
-answers from your vault, `chamber_check` confirms the numbers, capitalised
-names and file names it quotes are really in the note it cites — and says so
-when they are not, or when the note changed since it was indexed.
-[How it works](#use-it-from-an-ai-coding-agent).
+Catches your AI agent quoting a number or a name that isn't in the note it
+cites. When Claude Code (or any MCP host) answers from your notes, it is told
+to run each claim through `chamber_check` first. Real output, trimmed:
 
-You can also ask questions yourself and get answers that cite their sources,
-plus a daily check that tells you when a source has changed underneath a
-conclusion you already trusted.
+```
+2 claim(s): 1 supported · 1 terms absent · 0 nothing to check · 0 not judged
 
-Zero runtime dependencies. Everything is `node:sqlite` and files on your disk.
-No account, no cloud call unless you point it at one.
+[TERMS_ABSENT] Q3 revenue was $420k, up 18% on Q2.
+     the cited text does not contain: 420k
+     checked: q3-review.md#p0
+[SUPPORTED] Enterprise renewals moved to Dana Ortiz in August.
+     every term Chamber recognises occurs in the cited text
+     checked: q3-review.md#p0
+```
 
-## Run the check
-
-Checkout and the published package are different runtimes. Config is a third
-path, for [ingest and chamber_ask](#for-ingest-and-chamber_ask-not-for-the-check).
+The note says `$240k`. The agent wrote `$420k`. Edit the note afterwards and
+the same check returns `STALE` instead of a verdict, because what it is checking
+against has changed.
 
 ```bash
 claude mcp add -s user chamber -- npx -y @bu7umaid/chamber mcp
 ```
 
-**Checkout — Node 23.6+.** TypeScript runs directly from the repo, with no
-build step. `--experimental-strip-types` has been the default since 23.6.0, so
-the flag is defensive. No config, no model, no network.
+No model, no account, no network: the check is deterministic string matching
+over `node:sqlite` and files on your disk. It checks numbers, capitalised
+names, domains, file names and counts. It does not check meaning, so a negated
+or reversed sentence built from the note's own words still passes. See
+[what a verified citation does and does not prove](#what-a-verified-citation-does-and-does-not-prove).
+
+Beyond the check: answers that cite their sources, and a daily job that tells
+you when a source changed underneath a conclusion you already trusted.
+
+## Run the check
+
+The `npx` line above is all most people need. Two other ways in:
+
+**From a checkout (Node 23.6+).** TypeScript runs straight from the repo, with
+no build step, config, model or network. `try` builds a throwaway workspace,
+runs the real code paths and deletes it.
 
 ```bash
 git clone https://github.com/abm9111/chamber.git && cd chamber && npm ci && node --experimental-strip-types src/cli.ts try
 ```
 
-**Agent.** The command above runs the published bin (`dist/`), not `src/`.
-If `/mcp` does not list `chamber_check`, the host spawned with a minimal
-`PATH`. Take the interpreter from `command -v node` in the shell you actually
-use, and point it at the published bin or at a checkout's `src/mcp_server.ts`.
-Those are different files.
+**If `/mcp` does not list `chamber_check`,** the host started the server with a
+minimal `PATH`. Take the interpreter from `command -v node` in your own shell
+and point it at the published bin or at a checkout's `src/mcp_server.ts`. Those
+are different files:
 
 ```bash
 # published bin: bin/chamber.js loads dist/. This is not src/mcp_server.ts.
@@ -44,8 +57,8 @@ claude mcp add -s user chamber -- "$(command -v node)" /path/to/node_modules/@bu
 claude mcp add -s user chamber -- "$(command -v node)" --experimental-strip-types /path/to/chamber/src/mcp_server.ts
 ```
 
-A number the note does not contain returns `TERMS_ABSENT` and names the term.
-`SUPPORTED` is term presence, not entailment.
+Ingest and `chamber_ask` need config; the check does not. See
+[for ingest and chamber_ask](#for-ingest-and-chamber_ask-not-for-the-check).
 
 ## What people actually do
 

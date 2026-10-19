@@ -9931,6 +9931,56 @@ test("pins", "check: an exclude that matches nothing poisons only that folder", 
   }
 });
 
+test("pins", "check: a poisoned folder refuses an indexed absolute passage before any open", () => {
+  const db = freshDb();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-poison-idx-")));
+  const POISON = '--exclude matched nothing: "no-such" — nothing in this folder was checked';
+  try {
+    const note = join(root, "n.md");
+    writeFileSync(note, "The audit store is SQLite.\n");
+    ingestDirectory(db, root);
+    const folders = [{ root, exclude: ["no-such"] }];
+    const claim = { text: "The audit store is SQLite.", sources: [`${note}#p0`] };
+    // The index holds this passage: resolveSource takes the indexed branch.
+    const first = checkClaims(db, [claim], { folders })[0]!;
+    assert(first.status === "NOT_FOUND", `indexed #p0 under a poisoned folder: ${JSON.stringify(first)}`);
+    assert(first.problems.some((p) => p === POISON), JSON.stringify(first.problems));
+    // Not opened: with a fifo in the note's place any open hangs or reports "regular file".
+    rmSync(note);
+    const fifo = spawnSync("mkfifo", [note]);
+    assert(fifo.status === 0, `setup: mkfifo failed: ${fifo.stderr}`);
+    const t = Date.now();
+    const piped = checkClaims(db, [claim], { folders })[0]!;
+    assert(Date.now() - t < 5000, "the call must return, not hang on the fifo");
+    assert(piped.status === "NOT_FOUND" && piped.problems.some((p) => p === POISON), JSON.stringify(piped));
+    assert(!piped.problems.some((p) => p.includes("regular file")), `the file was opened: ${JSON.stringify(piped.problems)}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: the poison cache is keyed by the exclude list, not the root", () => {
+  const db = freshDb();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-poison-key-")));
+  const POISON = '--exclude matched nothing: "no-such" — nothing in this folder was checked';
+  try {
+    mkdirSync(join(root, "skip"));
+    writeFileSync(join(root, "skip", "x.md"), "Skipped.\n");
+    writeFileSync(join(root, "n.md"), "The audit store is SQLite.\n");
+    const claim = { text: "The audit store is SQLite.", sources: [join(root, "n.md")] };
+    const poisoned = [{ root, exclude: ["no-such"] }];
+    for (const round of [1, 2]) {
+      const r = checkClaims(db, [claim], { folders: poisoned })[0]!;
+      assert(r.status === "NOT_FOUND" && r.problems.some((p) => p === POISON), `round ${round}: ${JSON.stringify(r)}`);
+    }
+    // Same root, a list that matches something: a root-only key would stay poisoned.
+    const real = checkClaims(db, [claim], { folders: [{ root, exclude: ["skip"] }] })[0]!;
+    assert(real.status === "SUPPORTED", `a matching exclude list must give a real verdict: ${JSON.stringify(real)}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("oauth", "chamber_check over MCP: instructions in initialize, a check through the real server", async () => {
   const MCP_PATH = join(dirname(fileURLToPath(import.meta.url)), "../src/mcp_server.ts");
   const { env, dir } = stubAskFixture();

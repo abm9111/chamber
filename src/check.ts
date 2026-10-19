@@ -301,6 +301,11 @@ function resolveSource(
     // An absolute path with no passage is the file the agent read: judged from
     // disk, and compared with whatever the index holds for it.
     if (!passage) return resolveFromDisk(index, src, pathPart, null, folders, poisoned);
+    // The indexed branch below reads the file too (staleness). A path under a
+    // declared folder whose --exclude matched nothing is refused before that,
+    // exactly as resolveFromDisk refuses it.
+    const poison = poisonOf(declaredHolders(pathPart, folders), poisoned);
+    if (poison) return { rows: [], problem: poison, refused: true };
     const hits = rootHits(index, pathPart);
     if (hits.length === 0) return resolveFromDisk(index, src, pathPart, Number(passage[1]), folders, poisoned);
     const holder = indexedHolder(index, pathPart, hits) ?? hits[0]!;
@@ -339,6 +344,45 @@ function resolveSource(
   if (!row) return { rows: [], problem: `${src}: the note has no passage p${passage[1]} in the index` };
   const stale = staleness(index, file, rows[0]!.root, freshness);
   return stale ? { rows: [row], notes: [PASSAGE_MOVED], unpinnable: true } : { rows: [row] };
+}
+
+type Holder = { folder: DeclaredFolder; realRoot: string; path: string; rel: string };
+
+/**
+ * Every declared folder that contains `pathPart`, outermost first. The path is
+ * judged as written; only when its directory is an alias of the folder's real
+ * path is the parent resolved. The leaf is never resolved here.
+ */
+function declaredHolders(pathPart: string, folders: readonly DeclaredFolder[]): Holder[] {
+  const abs = resolve(pathPart);
+  let parentReal: string | undefined;
+  try {
+    parentReal = join(realpathSync.native(dirname(abs)), basename(abs));
+  } catch {
+    parentReal = undefined;
+  }
+  const holders: Holder[] = [];
+  for (const folder of folders) {
+    const realRoot = realOrSelf(folder.root);
+    for (const cand of parentReal === undefined || parentReal === abs ? [abs] : [abs, parentReal]) {
+      const rel = relative(realRoot, cand);
+      if (inside(rel)) {
+        holders.push({ folder, realRoot, path: cand, rel: rel.split(sep).join("/") });
+        break;
+      }
+    }
+  }
+  // Outermost first: it names the file in the output, and its refusal is read first.
+  return holders.sort((a, b) => a.realRoot.length - b.realRoot.length);
+}
+
+/** The first poison message among the folders holding a path; checked before any open. */
+function poisonOf(holders: readonly Holder[], poisoned: ReadonlyMap<string, string>): string | undefined {
+  for (const h of holders) {
+    const poison = poisoned.get(h.folder.root);
+    if (poison) return poison;
+  }
+  return undefined;
 }
 
 /** Every ingest root that holds `pathPart`, by the path as written and with links resolved. */
@@ -385,31 +429,10 @@ function resolveFromDisk(
   if (folders.length === 0) {
     return refuse("no notes folder declared — chamber mcp --notes <folder>");
   }
-  const abs = resolve(pathPart);
-  let parentReal: string | undefined;
-  try {
-    parentReal = join(realpathSync.native(dirname(abs)), basename(abs));
-  } catch {
-    parentReal = undefined;
-  }
-  const holders: { folder: DeclaredFolder; realRoot: string; path: string; rel: string }[] = [];
-  for (const folder of folders) {
-    const realRoot = realOrSelf(folder.root);
-    for (const cand of parentReal === undefined || parentReal === abs ? [abs] : [abs, parentReal]) {
-      const rel = relative(realRoot, cand);
-      if (inside(rel)) {
-        holders.push({ folder, realRoot, path: cand, rel: rel.split(sep).join("/") });
-        break;
-      }
-    }
-  }
+  const holders = declaredHolders(pathPart, folders);
   if (holders.length === 0) return refuse(`${src}: not under any declared folder`);
-  // Outermost first: it names the file in the output, and its refusal is read first.
-  holders.sort((a, b) => a.realRoot.length - b.realRoot.length);
-  for (const h of holders) {
-    const poison = poisoned.get(h.folder.root);
-    if (poison) return refuse(poison);
-  }
+  const poison = poisonOf(holders, poisoned);
+  if (poison) return refuse(poison);
   for (const h of holders) {
     const refusal = pathRefusal(h.folder.root, h.folder.exclude, h.path);
     if (refusal) {

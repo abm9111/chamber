@@ -19,12 +19,26 @@ Checkout and the published package are different runtimes. Config is a third
 path, for [ingest and chamber_ask](#for-ingest-and-chamber_ask-not-for-the-check).
 
 ```bash
-claude mcp add -s user chamber -- npx -y @bu7umaid/chamber mcp
+claude mcp add -s user chamber -- npx -y @bu7umaid/chamber mcp --notes ~/Notes
+```
+
+```json
+{
+  "mcpServers": {
+    "chamber": {
+      "command": "npx",
+      "args": ["-y", "@bu7umaid/chamber", "mcp", "--notes", "/absolute/path/to/Notes"]
+    }
+  }
+}
 ```
 
 **Checkout — Node 23.6+.** TypeScript runs directly from the repo, with no
 build step. `--experimental-strip-types` has been the default since 23.6.0, so
-the flag is defensive. No config, no model, no network.
+the flag is defensive. No config, no model, no network. The published package
+runs on Node 22 (measured 22.23.1, which prints Node's experimental-SQLite
+warning). Node 20.20.2 exits with `ERR_UNKNOWN_BUILTIN_MODULE` because
+`node:sqlite` is absent. Node 23.6 remains the floor for a checkout.
 
 ```bash
 git clone https://github.com/abm9111/chamber.git && cd chamber && npm ci && node --experimental-strip-types src/cli.ts try
@@ -212,7 +226,8 @@ them and answer from them — see `chamber corpus` and
 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) entry 11.
 If the root is an Obsidian vault, exclude `.obsidian`, `.trash`, and
 `*sync-conflict*` before that first ingest. A symlinked folder is indexed under
-the link path and comes back `STALE` under the real path.
+the link path. The check reads the real path too, because it uses the same
+per-entry rules as ingest. A link that leaves the declared folder is not read.
 
 ## Use it as a CI drift gate
 
@@ -256,11 +271,13 @@ they came from, and answers per claim (abridged):
      the cited text does not contain: 2000
 ```
 
-The check uses no model. It confirms the note is indexed, and unchanged on disk since
-it was indexed (`STALE` otherwise: the agent read one text and the index holds
-another, so neither verdict would be about what was read). Then it checks that
-every number, capitalised name, domain, file name and count in the claim occurs
-in the note. That catches invented values. It does not check lowercase names or
+The check uses no model. It reads the file on disk when the path is
+absolute and the file sits in a declared folder. An indexed note that has since
+changed is still judged, from the disk text, and the result adds `index is behind
+this file`. A passage ref is judged from the indexed text. `SUPPORTED` means the
+recognised terms occur in that text. It does not mean the sentence follows.
+Then it checks that every number, capitalised name, domain, file name and count
+in the claim occurs in the note. That catches invented values. It does not check lowercase names or
 ordinary words, and it does not catch a negated or reversed sentence
 built from the note's own words — see
 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) §2 for what it was

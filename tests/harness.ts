@@ -209,8 +209,11 @@ import { scanForSecrets, skillSecretScanRefuse } from "../src/secret_scan.ts";
 import { formatErrorChain } from "../src/error_chain.ts";
 import { assertSpendBudget } from "../src/spend.ts";
 import {
+  classifyEntry,
+  countExcludeMatches,
   ingestDirectory,
   parseIngestArgs,
+  pathRefusal,
   splitFrontmatter,
   type IngestReport,
 } from "../src/ingest.ts";
@@ -227,7 +230,7 @@ import {
   loadConfig,
   explainConfig,
 } from "../src/config.ts";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync, spawn, execFileSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
@@ -4164,6 +4167,61 @@ test("pins", "ingestDirectory honours exclude patterns", () => {
 
   const r = ingestDirectory(db, dir, { exclude: ["private"] });
   assert(r.ingested === 1, `expected 1 ingested, got ${r.ingested}`);
+});
+
+test("pins", "check: the path walk and the ingest walk classify the same entries", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "chamber-classify-")));
+  try {
+    mkdirSync(join(root, "notes"));
+    mkdirSync(join(root, ".hidden"));
+    writeFileSync(join(root, "notes", "ok.md"), "The audit store is SQLite.\n");
+    writeFileSync(join(root, ".hidden", "s.md"), "The audit store is SQLite.\n");
+    writeFileSync(join(root, "data.json"), "{}\n");
+    symlinkSync(join(root, ".hidden", "s.md"), join(root, "notes", "dotted.md"));
+    symlinkSync(join(root, "data.json"), join(root, "notes", "via.md"));
+    const outside = join(root, "..", `${basename(root)}-out.md`);
+    writeFileSync(outside, "The audit store is SQLite.\n");
+    symlinkSync(outside, join(root, "notes", "leave.md"));
+    const fifo = spawnSync("mkfifo", [join(root, "notes", "pipe.md")]);
+    assert(fifo.status === 0, `mkfifo failed: ${fifo.stderr}`);
+    mkdirSync(join(root, "Private"));
+    writeFileSync(join(root, "Private", "secret.md"), "The audit store is SQLite.\n");
+
+    const planted = [
+      join(root, "notes", "ok.md"),
+      join(root, "notes", "dotted.md"),
+      join(root, "notes", "via.md"),
+      join(root, "notes", "leave.md"),
+      join(root, "notes", "pipe.md"),
+      join(root, "Private", "secret.md"),
+    ];
+    for (const abs of planted) {
+      const refused = pathRefusal(root, ["Private"], abs);
+      const ingested = ingestDirectory(freshDb(), root, { exclude: ["Private"] });
+      const rel = relative(root, abs).split(sep).join("/");
+      const skipped =
+        ingested.skipped.find((s) => s.path === rel) ??
+        (refused !== null
+          ? ingested.skipped.find(
+              (s) => s.kind === refused.kind && s.reason === refused.reason,
+            )
+          : undefined);
+      if (abs.endsWith("ok.md")) {
+        assert(refused === null, `ok.md must be readable: ${JSON.stringify(refused)}`);
+        assert(skipped === undefined, `ok.md must be ingested: ${JSON.stringify(ingested.skipped)}`);
+      } else {
+        assert(refused !== null && skipped !== undefined, `${rel} must be refused by both`);
+        assert(refused!.kind === skipped!.kind && refused!.reason === skipped!.reason, `${rel}: walk ${JSON.stringify(skipped)} path ${JSON.stringify(refused)}`);
+      }
+    }
+    const counts = countExcludeMatches(root, ["Private", "no-such"]);
+    assert(counts.find((c) => c.raw === "Private")!.matched > 0, JSON.stringify(counts));
+    assert(counts.find((c) => c.raw === "no-such")!.matched === 0, JSON.stringify(counts));
+    assert(typeof classifyEntry === "function", "classifyEntry is exported");
+    rmSync(outside);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test(

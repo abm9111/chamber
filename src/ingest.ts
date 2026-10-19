@@ -393,24 +393,48 @@ interface WalkContext {
 export interface EntryDecision {
   action: "skip" | "descend" | "file";
   skip?: IngestSkip;
+  /**
+   * Set on a `kind: "excluded"` skip only. "name": the entry's own path matched
+   * a pattern, so anything beneath it is matched again on its own path.
+   * "target": a symlink's *target* matched; the walk never descends the link,
+   * so a path beneath it is refused as a whole, not re-matched.
+   */
+  excludedBy?: "name" | "target";
 }
 
-function buildWalkPatterns(root: string, exclude: readonly string[]): ExcludePattern[] {
+/**
+ * `owners[i]` is the pattern input `i` is counted on, or undefined when it was
+ * rejected or merged into an earlier equal pattern. One slot per input, so a
+ * caller can tell "matched nothing" from "was discarded".
+ */
+function buildWalkPatternsIndexed(
+  root: string,
+  exclude: readonly string[],
+): { patterns: ExcludePattern[]; owners: (ExcludePattern | undefined)[] } {
   const patterns: ExcludePattern[] = [];
+  const owners: (ExcludePattern | undefined)[] = [];
   const seen = new Set<string>();
   for (const raw of exclude) {
     const norm = normalizeExclude(raw, root);
-    if (!norm.ok) continue;
-    if (seen.has(norm.pattern)) continue;
+    if (!norm.ok || seen.has(norm.pattern)) {
+      owners.push(undefined);
+      continue;
+    }
     seen.add(norm.pattern);
-    patterns.push({
+    const p: ExcludePattern = {
       raw,
       pattern: norm.pattern,
       segmented: norm.segmented,
       matched: 0,
-    });
+    };
+    patterns.push(p);
+    owners.push(p);
   }
-  return patterns;
+  return { patterns, owners };
+}
+
+function buildWalkPatterns(root: string, exclude: readonly string[]): ExcludePattern[] {
+  return buildWalkPatternsIndexed(root, exclude).patterns;
 }
 
 function errText(err: unknown): string {
@@ -474,6 +498,7 @@ export function classifyEntry(ctx: WalkContext, dir: string, entry: string): Ent
         kind: "excluded",
         reason: `excluded by --exclude ${hit.raw}`,
       },
+      excludedBy: "name",
     };
   }
 
@@ -539,6 +564,7 @@ export function classifyEntry(ctx: WalkContext, dir: string, entry: string): Ent
           kind: "excluded",
           reason: `symlink target excluded by --exclude ${targetHit.raw}`,
         },
+        excludedBy: "target",
       };
     }
   }
@@ -669,7 +695,14 @@ export function pathRefusal(
     const entry = segments[i]!;
     const decision = classifyEntry(ctx, dir, entry);
     if (decision.action === "skip") {
-      if (decision.skip!.kind === "excluded" && i < segments.length - 1) {
+      // Only a name-excluded entry is walked through: its children are matched
+      // again on their own paths. A link whose target is excluded is never
+      // descended by ingest, so what lies beneath it is refused here too.
+      if (
+        decision.skip!.kind === "excluded" &&
+        decision.excludedBy === "name" &&
+        i < segments.length - 1
+      ) {
         dir = join(dir, entry);
         continue;
       }
@@ -702,7 +735,7 @@ export function countExcludeMatches(
   } catch {
     return exclude.map((raw) => ({ raw, matched: 0 }));
   }
-  const patterns = buildWalkPatterns(root, exclude);
+  const { patterns, owners } = buildWalkPatternsIndexed(root, exclude);
   const ctx: WalkContext = {
     root,
     patterns,
@@ -712,7 +745,8 @@ export function countExcludeMatches(
     visited: new Set([root]),
   };
   walk(ctx, root);
-  return patterns.map((p) => ({ raw: p.raw, matched: p.matched }));
+  // One row per input, in input order. A rejected or merged pattern is 0.
+  return exclude.map((raw, i) => ({ raw, matched: owners[i]?.matched ?? 0 }));
 }
 
 // ─── identity ────────────────────────────────────────────────────────────────

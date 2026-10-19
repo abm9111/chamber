@@ -4186,6 +4186,8 @@ test("pins", "check: the path walk and the ingest walk classify the same entries
     assert(fifo.status === 0, `mkfifo failed: ${fifo.stderr}`);
     mkdirSync(join(root, "Private"));
     writeFileSync(join(root, "Private", "secret.md"), "The audit store is SQLite.\n");
+    // A link whose *target* is excluded: ingest skips `link` and never descends.
+    symlinkSync(join(root, "Private"), join(root, "link"));
 
     const planted = [
       join(root, "notes", "ok.md"),
@@ -4194,6 +4196,8 @@ test("pins", "check: the path walk and the ingest walk classify the same entries
       join(root, "notes", "leave.md"),
       join(root, "notes", "pipe.md"),
       join(root, "Private", "secret.md"),
+      join(root, "link"),
+      join(root, "link", "secret.md"),
     ];
     for (const abs of planted) {
       const refused = pathRefusal(root, ["Private"], abs);
@@ -4217,6 +4221,12 @@ test("pins", "check: the path walk and the ingest walk classify the same entries
     const counts = countExcludeMatches(root, ["Private", "no-such"]);
     assert(counts.find((c) => c.raw === "Private")!.matched > 0, JSON.stringify(counts));
     assert(counts.find((c) => c.raw === "no-such")!.matched === 0, JSON.stringify(counts));
+    const rows = countExcludeMatches(root, ["Private", "private/", "../bad", "Private"]);
+    assert(
+      rows.length === 4 && rows.map((r) => r.raw).join("|") === "Private|private/|../bad|Private",
+      `one row per input pattern: ${JSON.stringify(rows)}`,
+    );
+    assert(rows[0]!.matched > 0 && rows[2]!.matched === 0 && rows[3]!.matched === 0, JSON.stringify(rows));
     assert(typeof classifyEntry === "function", "classifyEntry is exported");
     rmSync(outside);
   } finally {

@@ -222,8 +222,8 @@ deployment machine is the stated entry criterion for any capability level above 
 >   `ask` a plain name right after one ("+ Tesla makes it [1]") is the plain
 >   opener above and is not checked. A label closed by a full stop
 >   ("**Pricing**. The plan…") is read as a name and flagged.
-> - `chamber_check` reads a note only when its real path is that indexed note
->   or another note the same root indexed.
+> - Before 2026-10-19, `chamber_check` read a note only when its real path was
+>   that indexed note or another note the same root indexed.
 >   **Correction, 2026-10-19.** As of this change the check and the walk share
 >   one classifier, so the real path of a note inside a declared folder is
 >   judged from disk, and an edited file is no longer returned as `STALE`. A

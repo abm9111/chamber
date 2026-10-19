@@ -334,11 +334,17 @@ function resolveSource(
   if (roots.size > 1) {
     return { rows: [], problem: `${src}: held by ${roots.size} ingest roots — pass the absolute path` };
   }
+  const located = resolve(rows[0]!.root!, file);
   if (!passage) {
     // A relative path the index maps to exactly one file is that file's
     // absolute path, so it and the absolute path cannot disagree about an edit.
-    return resolveFromDisk(index, src, resolve(rows[0]!.root!, file), null, folders, poisoned);
+    return resolveFromDisk(index, src, located, null, folders, poisoned);
   }
+  // A relative `file.md#pN` is the same file. The poison check has to run
+  // before staleness, which opens it: an exclude that matched nothing must
+  // refuse this citation too, not only the absolute spelling.
+  const poison = poisonOf(declaredHolders(located, folders), poisoned);
+  if (poison) return { rows: [], problem: poison, refused: true };
   const want = `${file}#p${passage[1]}`;
   const row = rows.find((r) => r.ref === want);
   if (!row) return { rows: [], problem: `${src}: the note has no passage p${passage[1]} in the index` };

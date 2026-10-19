@@ -12,6 +12,9 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { openChamberDb } from "../src/db.ts";
+import { checkClaims } from "../src/check.ts";
+import { ingestDirectory } from "../src/ingest.ts";
 
 const root = mkdtempSync(join(tmpdir(), "chamber-probe-notes-"));
 const db = join(root, "missing.sqlite");
@@ -67,6 +70,40 @@ try {
   });
   if (bad.status !== 1) fail(`bad flag exited ${bad.status}`);
   if ((bad.stdout || "").trim().startsWith("{")) fail(`bad flag wrote JSON: ${bad.stdout}`);
+
+  // A relative file.md#pN is the same file as the absolute path. An exclude
+  // that matched nothing must refuse it before the freshness read opens it.
+  const relRoot = join(root, "rel");
+  mkdirSync(relRoot);
+  const relNote = join(relRoot, "n.md");
+  writeFileSync(relNote, "The audit store is SQLite.\n");
+  const relDb = openChamberDb(join(root, "rel.sqlite"));
+  const savedEmbedder = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_EMBEDDER = "hash";
+  try {
+    ingestDirectory(relDb, relRoot);
+    const folders = [{ root: relRoot, exclude: ["no-such"] }];
+    const poison = '--exclude matched nothing: "no-such" — nothing in this folder was checked';
+    const cited = checkClaims(relDb, [{ text: "The audit store is SQLite.", sources: ["n.md#p0"] }], { folders })[0];
+    if (!cited || cited.status !== "NOT_FOUND" || !cited.problems.some((p) => p === poison)) {
+      fail(`relative #p0 was not refused: ${JSON.stringify(cited)}`);
+    }
+    rmSync(relNote);
+    const fifo = spawnSync("mkfifo", [relNote]);
+    if (fifo.status !== 0) fail(`mkfifo failed: ${fifo.stderr}`);
+    const started = Date.now();
+    const piped = checkClaims(relDb, [{ text: "The audit store is SQLite.", sources: ["n.md#p0"] }], { folders })[0];
+    if (Date.now() - started >= 5000) fail("relative #p0 hung on the fifo");
+    if (!piped || piped.status !== "NOT_FOUND" || !piped.problems.some((p) => p === poison)) {
+      fail(`relative #p0 opened the fifo: ${JSON.stringify(piped)}`);
+    } else if (piped.problems.some((p) => p.includes("regular file"))) {
+      fail(`the file was opened: ${JSON.stringify(piped.problems)}`);
+    }
+  } finally {
+    if (savedEmbedder === undefined) delete process.env.CHAMBER_EMBEDDER;
+    else process.env.CHAMBER_EMBEDDER = savedEmbedder;
+    relDb.close();
+  }
 } finally {
   rmSync(root, { recursive: true, force: true });
 }

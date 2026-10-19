@@ -9737,7 +9737,7 @@ test("pins", "check: an unindexed note in a declared folder is judged from disk"
     const text = formatCheck([r!], false);
     assert(text.includes("not judged — a cited source could not be read") === false, text);
     const none = checkClaims(db, [{ text: "One NVIDIA A100 serves 1,000 users.", sources: [note] }]);
-    assert(none[0]!.status === "NOT_FOUND" && none[0]!.problems.some((p) => p.includes("no notes folder declared — chamber mcp --notes <folder>")), JSON.stringify(none[0]));
+    assert(none[0]!.status === "NOT_FOUND" && none[0]!.problems.some((p) => p === "no notes folder declared — chamber mcp --notes <folder>"), JSON.stringify(none[0]));
     assert(formatCheck(none, false).includes("not judged — a cited source could not be read"), formatCheck(none, false));
     const mixed = checkClaims(
       db,
@@ -9752,6 +9752,28 @@ test("pins", "check: an unindexed note in a declared folder is judged from disk"
       { folders: [{ root: dir, exclude: [] }] },
     );
     assert(empty[0]!.status === "NOT_FOUND" && empty[0]!.problems.some((p) => p.includes("empty")), JSON.stringify(empty[0]));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: a disk reading is never recorded", () => {
+  const db = freshDb();
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-diskrec-")));
+  try {
+    const note = join(dir, "gpu.md");
+    writeFileSync(note, "# GPU\n\nOne NVIDIA A100 80GB can serve about 1,000 users.\n");
+    const count = (t: string): number => (db.prepare(`SELECT count(*) AS n FROM ${t}`).get() as { n: number }).n;
+    const before = ["belief", "belief_source", "citation_debt"].map(count).join(",");
+    const [r] = checkClaims(
+      db,
+      [{ text: "One NVIDIA A100 80GB can serve about 1,000 users.", sources: [note] }],
+      { record: true, folders: [{ root: dir, exclude: [] }] },
+    );
+    assert(r!.status === "SUPPORTED" && r!.problems.includes("not indexed yet"), JSON.stringify(r));
+    assert(r!.recorded === undefined, `a disk reading has no row to pin: ${JSON.stringify(r!.recorded)}`);
+    const after = ["belief", "belief_source", "citation_debt"].map(count).join(",");
+    assert(after === before, `nothing may be written (${before} → ${after})`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

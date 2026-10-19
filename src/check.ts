@@ -333,7 +333,7 @@ function resolveFromDisk(
 ): Resolved {
   const refuse = (problem: string): Resolved => ({ rows: [], problem, refused: true });
   if (folders.length === 0) {
-    return refuse(`${src}: no notes folder declared — chamber mcp --notes <folder>`);
+    return refuse("no notes folder declared — chamber mcp --notes <folder>");
   }
   const abs = resolve(pathPart);
   let parentReal: string | undefined;

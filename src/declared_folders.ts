@@ -9,7 +9,8 @@ export interface DeclaredFolder {
 }
 
 function expand(p: string): string {
-  const full = p.startsWith("~/") ? `${homedir()}${p.slice(1)}` : p;
+  const full =
+    p === "~" ? homedir() : p.startsWith("~/") ? `${homedir()}${p.slice(1)}` : p;
   const abs = isAbsolute(full) ? full : resolve(full);
   try {
     return realpathSync.native(abs);
@@ -28,7 +29,7 @@ export function parseNotesArgs(
     const arg = args[i]!;
     if (arg === "--notes") {
       const value = args[i + 1];
-      if (value === undefined || value.startsWith("-")) {
+      if (value === undefined || value === "" || value.startsWith("-")) {
         return { ok: false, error: "--notes requires a path" };
       }
       current = { root: expand(value), exclude: [] };

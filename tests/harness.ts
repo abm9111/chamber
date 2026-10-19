@@ -9725,6 +9725,14 @@ test("pins", "check: --notes binds the excludes that follow it", () => {
   assert(!unknown.ok && unknown.error.includes("--include-dotted"), JSON.stringify(unknown));
   const missing = parseNotesArgs(["--notes"]);
   assert(!missing.ok, JSON.stringify(missing));
+  const emptyNotes = parseNotesArgs(["--notes", ""]);
+  assert(!emptyNotes.ok && emptyNotes.error.includes("--notes requires a path"), JSON.stringify(emptyNotes));
+  const bareHome = parseNotesArgs(["--notes", "~"]);
+  assert(bareHome.ok, JSON.stringify(bareHome));
+  if (bareHome.ok) {
+    const homeRoot = realpathSync.native(homedir());
+    assert(bareHome.folders[0]!.root === homeRoot, bareHome.folders[0]!.root);
+  }
   const ok = parseNotesArgs([
     "mcp",
     "--notes", "~/Vault",

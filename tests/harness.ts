@@ -217,6 +217,7 @@ import {
   splitFrontmatter,
   type IngestReport,
 } from "../src/ingest.ts";
+import { mergeDeclaredFolders, parseNotesArgs } from "../src/declared_folders.ts";
 import {
   PASSAGE_MAX_TOKENS,
   estimateTokens,
@@ -9714,6 +9715,34 @@ test("pins", "check: a nested root that excluded a note does not hide the outer 
   } finally {
     rmSync(outer, { recursive: true, force: true });
   }
+});
+
+
+test("pins", "check: --notes binds the excludes that follow it", () => {
+  const bad = parseNotesArgs(["--exclude", "transcripts"]);
+  assert(!bad.ok && bad.error.includes("--exclude"), JSON.stringify(bad));
+  const unknown = parseNotesArgs(["--notes", "/tmp/v", "--include-dotted"]);
+  assert(!unknown.ok && unknown.error.includes("--include-dotted"), JSON.stringify(unknown));
+  const missing = parseNotesArgs(["--notes"]);
+  assert(!missing.ok, JSON.stringify(missing));
+  const ok = parseNotesArgs([
+    "mcp",
+    "--notes", "~/Vault",
+    "--exclude", "transcripts",
+    "--notes", "~/Vault/research",
+    "--exclude", "raw",
+  ]);
+  assert(ok.ok, JSON.stringify(ok));
+  if (!ok.ok) return;
+  assert(ok.folders.length === 2, JSON.stringify(ok.folders));
+  assert(ok.folders[0]!.exclude.join() === "transcripts", JSON.stringify(ok.folders[0]));
+  assert(ok.folders[1]!.exclude.join() === "raw", JSON.stringify(ok.folders[1]));
+  assert(!ok.folders[0]!.root.includes("~"), ok.folders[0]!.root);
+  const twice = parseNotesArgs(["--notes", "/tmp/v", "--exclude", "a", "--notes", "/tmp/v", "--exclude", "b"]);
+  assert(twice.ok, JSON.stringify(twice));
+  if (!twice.ok) return;
+  const merged = mergeDeclaredFolders(twice.folders);
+  assert(merged.length === 1 && merged[0]!.exclude.slice().sort().join() === "a,b", JSON.stringify(merged));
 });
 
 test("oauth", "chamber_check over MCP: instructions in initialize, a check through the real server", async () => {

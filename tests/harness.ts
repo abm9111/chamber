@@ -9898,6 +9898,39 @@ test("pins", "check: --notes binds the excludes that follow it", () => {
   assert(merged.length === 1 && merged[0]!.exclude.slice().sort().join() === "a,b", JSON.stringify(merged));
 });
 
+test("pins", "check: an exclude that matches nothing poisons only that folder", () => {
+  const db = freshDb();
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-poison-")));
+  try {
+    const a = join(base, "a");
+    const b = join(base, "b");
+    mkdirSync(a);
+    mkdirSync(b);
+    writeFileSync(join(a, "n.md"), "The audit store is SQLite.\n");
+    writeFileSync(join(b, "n.md"), "The audit store is SQLite.\n");
+    const folders = [
+      { root: a, exclude: ["no-such"] },
+      { root: b, exclude: [] },
+    ];
+    const [bad, good] = checkClaims(
+      db,
+      [
+        { text: "The audit store is SQLite.", sources: [join(a, "n.md")] },
+        { text: "The audit store is SQLite.", sources: [join(b, "n.md")] },
+      ],
+      { folders },
+    );
+    assert(bad!.status === "NOT_FOUND", JSON.stringify(bad));
+    assert(
+      bad!.problems.some((p) => p === '--exclude matched nothing: "no-such" — nothing in this folder was checked'),
+      JSON.stringify(bad!.problems),
+    );
+    assert(good!.status === "SUPPORTED", JSON.stringify(good));
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test("oauth", "chamber_check over MCP: instructions in initialize, a check through the real server", async () => {
   const MCP_PATH = join(dirname(fileURLToPath(import.meta.url)), "../src/mcp_server.ts");
   const { env, dir } = stubAskFixture();

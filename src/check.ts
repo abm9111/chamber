@@ -30,7 +30,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { passagePathOf, splitPassages } from "./chunk.ts";
 import { citedPassage, joinPrepared, specificTerms, termsMissingIn, type PreparedText } from "./claim_support.ts";
 import { enforceClaimContract, type ContractSource } from "./contract.ts";
-import { passageTitle, pathRefusal, splitFrontmatter } from "./ingest.ts";
+import { countExcludeMatches, passageTitle, pathRefusal, splitFrontmatter } from "./ingest.ts";
 import { mergeDeclaredFolders, type DeclaredFolder } from "./declared_folders.ts";
 
 /** One claim per call, usually opening with its subject: check that word too. */
@@ -115,6 +115,30 @@ function nativeReal(p: string): string {
 }
 
 const inside = (rel: string): boolean => rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+
+/** Cached per `${root}\0${exclude.join("\0")}` — null means the folder is not poisoned. */
+const excludePoisonCache = new Map<string, string | null>();
+
+function buildPoisonedRoots(folders: readonly DeclaredFolder[]): Map<string, string> {
+  const poisoned = new Map<string, string>();
+  for (const folder of folders) {
+    if (folder.exclude.length === 0) continue;
+    const key = `${folder.root}\0${folder.exclude.join("\0")}`;
+    let message = excludePoisonCache.get(key);
+    if (message === undefined) {
+      message = null;
+      for (const count of countExcludeMatches(folder.root, folder.exclude)) {
+        if (count.matched === 0) {
+          message = `--exclude matched nothing: ${JSON.stringify(count.raw)} — nothing in this folder was checked`;
+          break;
+        }
+      }
+      excludePoisonCache.set(key, message);
+    }
+    if (message) poisoned.set(folder.root, message);
+  }
+  return poisoned;
+}
 
 class Index {
   private readonly byFile = new Map<string, Row[]>();
@@ -249,6 +273,7 @@ function resolveSource(
   raw: string,
   freshness: Map<string, string | null>,
   folders: readonly DeclaredFolder[],
+  poisoned: ReadonlyMap<string, string>,
 ): Resolved {
   const src = raw.trim();
   if (src === "") return { rows: [], problem: "empty source" };
@@ -275,9 +300,9 @@ function resolveSource(
     // (review A, 2026-09-27).
     // An absolute path with no passage is the file the agent read: judged from
     // disk, and compared with whatever the index holds for it.
-    if (!passage) return resolveFromDisk(index, src, pathPart, null, folders);
+    if (!passage) return resolveFromDisk(index, src, pathPart, null, folders, poisoned);
     const hits = rootHits(index, pathPart);
-    if (hits.length === 0) return resolveFromDisk(index, src, pathPart, Number(passage[1]), folders);
+    if (hits.length === 0) return resolveFromDisk(index, src, pathPart, Number(passage[1]), folders, poisoned);
     const holder = indexedHolder(index, pathPart, hits) ?? hits[0]!;
     root = holder.r;
     file = holder.rel;
@@ -296,7 +321,7 @@ function resolveSource(
   rows = rows.filter((r) => r.root !== null);
   if (rows.length === 0) {
     if (isAbsolute(pathPart)) {
-      return resolveFromDisk(index, src, pathPart, passage ? Number(passage[1]) : null, folders);
+      return resolveFromDisk(index, src, pathPart, passage ? Number(passage[1]) : null, folders, poisoned);
     }
     return { rows: [], problem: `${src}: not in the index — pass the absolute path` };
   }
@@ -307,7 +332,7 @@ function resolveSource(
   if (!passage) {
     // A relative path the index maps to exactly one file is that file's
     // absolute path, so it and the absolute path cannot disagree about an edit.
-    return resolveFromDisk(index, src, resolve(rows[0]!.root!, file), null, folders);
+    return resolveFromDisk(index, src, resolve(rows[0]!.root!, file), null, folders, poisoned);
   }
   const want = `${file}#p${passage[1]}`;
   const row = rows.find((r) => r.ref === want);
@@ -354,6 +379,7 @@ function resolveFromDisk(
   pathPart: string,
   passageNo: number | null,
   folders: readonly DeclaredFolder[],
+  poisoned: ReadonlyMap<string, string>,
 ): Resolved {
   const refuse = (problem: string): Resolved => ({ rows: [], problem, refused: true });
   if (folders.length === 0) {
@@ -380,6 +406,10 @@ function resolveFromDisk(
   if (holders.length === 0) return refuse(`${src}: not under any declared folder`);
   // Outermost first: it names the file in the output, and its refusal is read first.
   holders.sort((a, b) => a.realRoot.length - b.realRoot.length);
+  for (const h of holders) {
+    const poison = poisoned.get(h.folder.root);
+    if (poison) return refuse(poison);
+  }
   for (const h of holders) {
     const refusal = pathRefusal(h.folder.root, h.folder.exclude, h.path);
     if (refusal) {
@@ -658,6 +688,7 @@ export function checkClaims(
     ...(opts.folders ?? []),
     ...index.ingestRoots().map((root) => ({ root, exclude: [] as string[] })),
   ]);
+  const poisoned = buildPoisonedRoots(folders);
   const freshness = new Map<string, string | null>();
   return claims.map((c) => {
     const text = c.text.trim();
@@ -676,7 +707,7 @@ export function checkClaims(
     let refused = false;
     let unpinnable = false;
     for (const s of c.sources) {
-      const r = resolveSource(index, s, freshness, folders);
+      const r = resolveSource(index, s, freshness, folders, poisoned);
       if (r.problem) base.problems.push(r.problem);
       if (r.notes) base.problems.push(...r.notes);
       if (r.refused) refused = true;

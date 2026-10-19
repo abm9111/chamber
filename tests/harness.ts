@@ -9981,6 +9981,36 @@ test("pins", "check: the poison cache is keyed by the exclude list, not the root
   }
 });
 
+test("pins", "check: a link to a folder in the same root does not bypass a multi-segment exclude", () => {
+  const db = freshDb();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-zlink-")));
+  const WHY = "excluded by --exclude work/clients";
+  try {
+    mkdirSync(join(root, "work", "clients"), { recursive: true });
+    mkdirSync(join(root, "work", "public"), { recursive: true });
+    writeFileSync(join(root, "work", "clients", "acme.md"), "The audit store is SQLite.\n");
+    writeFileSync(join(root, "work", "public", "open.md"), "The audit store is SQLite.\n");
+    symlinkSync(join(root, "work"), join(root, "zlink"));
+    const folders = [{ root, exclude: ["work/clients"] }];
+    const claimOf = (p: string) => ({ text: "The audit store is SQLite.", sources: [p] });
+    // Control: the real spelling is refused.
+    const direct = checkClaims(db, [claimOf(join(root, "work", "clients", "acme.md"))], { folders })[0]!;
+    assert(direct.status === "NOT_FOUND" && direct.problems.some((p) => p.includes(WHY)), `direct: ${JSON.stringify(direct)}`);
+    // The bypass: the same file through an in-root link to its folder.
+    const viaLink = checkClaims(db, [claimOf(join(root, "zlink", "clients", "acme.md"))], { folders })[0]!;
+    assert(viaLink.status === "NOT_FOUND" && viaLink.problems.some((p) => p.includes(WHY)), `via link: ${JSON.stringify(viaLink)}`);
+    // A note not under the exclude, reached through the link, stays judged.
+    const open = checkClaims(db, [claimOf(join(root, "zlink", "public", "open.md"))], { folders })[0]!;
+    assert(open.status === "SUPPORTED", `a non-excluded note via the link: ${JSON.stringify(open)}`);
+    // An in-root link to a single note is still readable.
+    symlinkSync(join(root, "work", "public", "open.md"), join(root, "a.md"));
+    const leaf = checkClaims(db, [claimOf(join(root, "a.md"))], { folders })[0]!;
+    assert(leaf.status === "SUPPORTED", `an in-root link to a note: ${JSON.stringify(leaf)}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("oauth", "chamber_check over MCP: instructions in initialize, a check through the real server", async () => {
   const MCP_PATH = join(dirname(fileURLToPath(import.meta.url)), "../src/mcp_server.ts");
   const { env, dir } = stubAskFixture();
@@ -14455,6 +14485,39 @@ test("cli", "a config broken mid-session fails chamber_ask but not the tools tha
     assert(!corpus.startsWith("ERROR") && !/not valid JSON/.test(corpus), `corpus must still answer: ${corpus}`);
     const ask = await s.ask("what is the audit store");
     assert(/not valid JSON/.test(ask), `ask must fail on the broken config: ${ask}`);
+  } finally {
+    s.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cli", "a config broken mid-session fails chamber_check instead of dropping the config roots excludes", async () => {
+  // The check declared folders include the config ingest roots and their
+  // excludes. With the database already open, a config that no longer parses
+  // used to fall through to no folders at all; it must fail the check out loud.
+  const { env, dir } = stubAskFixture();
+  const vault = join(dir, "vault");
+  mkdirSync(join(vault, "private"), { recursive: true });
+  writeFileSync(join(vault, "notes.md"), "The audit store is SQLite.\n");
+  writeFileSync(join(vault, "private", "secret.md"), "The audit store is SQLite.\n");
+  writeFileSync(
+    env.CHAMBER_CONFIG!,
+    `${JSON.stringify({ database: env.CHAMBER_DB, ingest: [{ root: vault, exclude: ["private"] }] })}\n`,
+  );
+  const s = mcpSession(env);
+  const claim = (p: string) => ({ claims: [{ text: "The audit store is SQLite.", sources: [p] }] });
+  try {
+    const open = await s.tool("chamber_corpus", {});
+    assert(!open.startsWith("ERROR"), `setup: the database is open: ${open}`);
+    const ok = await s.tool("chamber_check", claim(join(vault, "notes.md")));
+    assert(!ok.startsWith("ERROR") && /SUPPORTED/.test(ok), `setup: a config root is a declared folder: ${ok}`);
+    const refused = await s.tool("chamber_check", claim(join(vault, "private", "secret.md")));
+    assert(/excluded by --exclude private/.test(refused), `setup: the config exclude applies: ${refused}`);
+    writeFileSync(env.CHAMBER_CONFIG!, "{ not json");
+    const broken = await s.tool("chamber_check", claim(join(vault, "notes.md")));
+    assert(/not valid JSON/.test(broken) && !/SUPPORTED|NOT_FOUND/.test(broken), `a broken config must fail the check: ${broken}`);
+    const brokenExcluded = await s.tool("chamber_check", claim(join(vault, "private", "secret.md")));
+    assert(/not valid JSON/.test(brokenExcluded) && !/SUPPORTED/.test(brokenExcluded), `an excluded note must not be judged: ${brokenExcluded}`);
   } finally {
     s.stop();
     rmSync(dir, { recursive: true, force: true });

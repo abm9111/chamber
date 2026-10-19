@@ -224,7 +224,7 @@ const INSTRUCTIONS =
   "answer from those notes, call chamber_check with each factual claim and the note " +
   "it came from (the absolute path you read) before presenting it. Report " +
   "TERMS_ABSENT claims as not supported by that note instead of asserting them, and " +
-  "say when a note was STALE or NOT_FOUND. The check reads notes from folders " +
+  "say when a note was NOT_FOUND. The check reads notes from folders " +
   "declared with --notes or the config's ingest roots; an absolute path is the file " +
   "on disk; a passage ref is the indexed text; `SUPPORTED` means the recognised terms " +
   "occur in the judged text and a negated or reversed sentence built from the note's " +
@@ -248,7 +248,7 @@ const TOOLS = [
       "judged text and a negated or reversed sentence built from the note's own words " +
       "still passes. Verdicts: SUPPORTED, " +
       "TERMS_ABSENT (names the missing terms), NO_TERMS (nothing specific to check), " +
-      "STALE (the note changed since indexing — not judged), NOT_FOUND, NO_SOURCE. " +
+      "NOT_FOUND, NO_SOURCE. " +
       "The check uses no model and is deterministic. Read-only unless `record` " +
       "is true, which commits SUPPORTED claims through Chamber's gate (which may run the " +
       "local embedder to compare against open citation debt), pinned to the passages " +
@@ -470,11 +470,16 @@ async function callTool(
       }
       const claims = parseCheckClaims(args.claims);
       const record = args.record === true;
-      // No model: this check is the part of the gate that needs none.
-      const config = refreshConfig(false);
+      // No model: this check is the part of the gate that needs none. But it
+      // does need the config, because the config's ingest roots and their
+      // excludes are declared folders: a config that no longer parses fails the
+      // check out loud (`true`), rather than falling through to the open
+      // database's row roots, which carry no excludes.
+      const config = refreshConfig(true);
+      if (config === null) throw new Error("chamber_check: config could not be loaded");
       const folders = mergeDeclaredFolders([
         ...declaredFolders,
-        ...(config?.ingest ?? []).map((i) => ({ root: i.root, exclude: [...i.exclude] })),
+        ...config.ingest.map((i) => ({ root: i.root, exclude: [...i.exclude] })),
       ]);
       // The database file is opened only when something needs it: it already
       // exists, a database is already pinned, or a source is a passage id or
@@ -483,8 +488,7 @@ async function callTool(
       // nobody asked for.
       const needsIndex = claims.some((c) => c.sources.some((s) => !isDiskOnlySource(s)));
       let index: DatabaseSync;
-      if (config === null) index = db!;
-      else if (db !== null || needsIndex || existsSync(config.database)) index = openPinned(config);
+      if (db !== null || needsIndex || existsSync(config.database)) index = openPinned(config);
       else index = emptyIndex ??= openChamberDb(":memory:");
       return formatCheck(checkClaims(index, claims, { record, folders }), record);
     }

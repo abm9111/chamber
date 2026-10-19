@@ -16,7 +16,7 @@ No account, no cloud call unless you point it at one.
 ## Run the check
 
 Checkout and the published package are different runtimes. Config is a third
-path, for [ingest and chamber_ask](#for-ingest-and-chamber_ask-not-for-the-check).
+path, for [ingest, chamber_ask and the check's config roots](#config-ingest-chamber_ask-and-the-checks-config-roots).
 
 ```bash
 claude mcp add -s user chamber -- npx -y @bu7umaid/chamber mcp --notes ~/Notes
@@ -192,7 +192,7 @@ I don't know
 Both notes are in the index and both are relevant. Neither answers the
 question, so nothing is composed from the pieces.
 
-## For ingest and chamber_ask, not for the check
+## Config: ingest, chamber_ask, and the check's config roots
 
 ```bash
 npm link                 # puts `chamber` on your PATH
@@ -208,6 +208,10 @@ Then edit that config to add a notes folder and a model:
   "ingest": [{ "root": "~/Notes", "exclude": ["transcripts", "attachments"] }]
 }
 ```
+
+`--exclude <pattern>` repeats after `--notes`; config ingest roots and their
+excludes also count as declared folders for the check, and an exclude that
+matches nothing refuses that folder.
 
 `model.base` may name any OpenAI-compatible endpoint. A loopback address needs
 no API key; anything else reads `CHAMBER_API_KEY` from the environment, never

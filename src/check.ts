@@ -460,6 +460,16 @@ function resolveFromDisk(
       return refuse(`${src}: resolves outside its notes folder — not read, not judged`);
     }
   }
+  // Classify the file that will be opened, not only the spelling that was cited:
+  // a link to a folder in the same root (`zlink` -> `work`) walks past a
+  // multi-segment exclude (`work/clients`) when only the cited spelling is
+  // judged, while ingest skips that link as a cycle and never reads the file.
+  // Every declared folder whose real root holds the real path must allow it.
+  for (const folder of folders) {
+    if (!inside(relative(realOrSelf(folder.root), real))) continue;
+    const refusal = pathRefusal(folder.root, folder.exclude, real);
+    if (refusal) return refuse(`${src}: ${refusal.reason}`);
+  }
 
   const read = readBounded(outer.path, real);
   if ("problem" in read) return refuse(`${src}: ${read.problem} — not read, not judged`);

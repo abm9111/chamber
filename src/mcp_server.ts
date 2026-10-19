@@ -196,14 +196,15 @@ function getDb(needsModel = true): DatabaseSync {
 }
 
 /**
- * True for a source `checkClaims` judges from disk without the index: an
- * absolute path (after `~/`) with no `#pN` suffix. A passage ref, a passage id
- * and a relative path are resolved against the index.
+ * True for a source `checkClaims` can judge from disk without the index: an
+ * absolute path (after `~/`), with or without a `#pN` suffix — a path is still
+ * absolute when it names a passage. A relative path and a `vdoc_` id are
+ * resolved against the index.
  */
 function isDiskOnlySource(raw: string): boolean {
   const src = raw.trim();
   const expanded = src.startsWith("~/") ? `${homedir()}${src.slice(1)}` : src;
-  return isAbsolute(expanded) && !/#p\d+$/.test(expanded);
+  return isAbsolute(expanded);
 }
 
 /** An empty, schema-complete index held in memory: no file is created for it. */
@@ -476,9 +477,10 @@ async function callTool(
         ...(config?.ingest ?? []).map((i) => ({ root: i.root, exclude: [...i.exclude] })),
       ]);
       // The database file is opened only when something needs it: it already
-      // exists, a database is already pinned, or a source is a passage ref or
-      // a relative path. Otherwise every source is an absolute path judged from
-      // disk, and opening would create a file nobody asked for.
+      // exists, a database is already pinned, or a source is a passage id or
+      // a relative path. Otherwise every source is an absolute path (a passage
+      // ref included) judged from disk, and opening would create a file
+      // nobody asked for.
       const needsIndex = claims.some((c) => c.sources.some((s) => !isDiskOnlySource(s)));
       let index: DatabaseSync;
       if (config === null) index = db!;

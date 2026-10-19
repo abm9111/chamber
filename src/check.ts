@@ -23,12 +23,13 @@
 
 import { closeSync, constants, fstatSync, openSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { passagePathOf, splitPassages } from "./chunk.ts";
 import { citedPassage, joinPrepared, specificTerms, termsMissingIn, type PreparedText } from "./claim_support.ts";
 import { enforceClaimContract, type ContractSource } from "./contract.ts";
-import { splitFrontmatter } from "./ingest.ts";
+import { passageTitle, pathRefusal, splitFrontmatter } from "./ingest.ts";
+import { mergeDeclaredFolders, type DeclaredFolder } from "./declared_folders.ts";
 
 /** One claim per call, usually opening with its subject: check that word too. */
 const OPENINGS = { openings: true } as const;
@@ -76,6 +77,8 @@ interface Row {
   title: string | null;
   hash: string;
   root: string | null;
+  /** Read from disk for this call, not from the index: it has no row to pin. */
+  disk?: true;
 }
 
 function readRoot(json: string | null): string | null {
@@ -222,7 +225,11 @@ const NO_ROOT = (src: string): string =>
 interface Resolved {
   rows: Row[];
   problem?: string;
+  /** Further problem lines that do not stop the rows being judged. */
+  notes?: string[];
   stale?: boolean;
+  /** A path that was refused or could not be read from disk: the claim is not judged. */
+  refused?: boolean;
 }
 
 /**
@@ -230,7 +237,12 @@ interface Resolved {
  * mapped through the ingest roots recorded on the rows; only a file that is
  * indexed is ever read from disk, so a path outside the corpus reads nothing.
  */
-function resolveSource(index: Index, raw: string, freshness: Map<string, string | null>): Resolved {
+function resolveSource(
+  index: Index,
+  raw: string,
+  freshness: Map<string, string | null>,
+  folders: readonly DeclaredFolder[],
+): Resolved {
   const src = raw.trim();
   if (src === "") return { rows: [], problem: "empty source" };
   if (/^vdoc_[0-9a-f]+$/.test(src)) {
@@ -259,7 +271,7 @@ function resolveSource(index: Index, raw: string, freshness: Map<string, string 
         .filter(inside)
         .map((rel) => ({ r, rel: rel.split(sep).join("/") })),
     );
-    if (hits.length === 0) return { rows: [], problem: `${src}: not under any ingest root — not indexed` };
+    if (hits.length === 0) return resolveFromDisk(index, src, pathPart, passage ? Number(passage[1]) : null, folders);
     // The deepest root that holds the file: a note under a nested root belongs
     // to it, unless that root excluded it and an outer root indexed it.
     hits.sort((a, b) => a.rel.length - b.rel.length);
@@ -283,10 +295,10 @@ function resolveSource(index: Index, raw: string, freshness: Map<string, string 
   if (rows.length > 0 && rows.every((r) => r.root === null)) return { rows: [], problem: NO_ROOT(src) };
   rows = rows.filter((r) => r.root !== null);
   if (rows.length === 0) {
-    return {
-      rows: [],
-      problem: `${src}: not in the index${isAbsolute(pathPart) ? " (excluded, or never ingested)" : " — pass the absolute path"}`,
-    };
+    if (isAbsolute(pathPart)) {
+      return resolveFromDisk(index, src, pathPart, passage ? Number(passage[1]) : null, folders);
+    }
+    return { rows: [], problem: `${src}: not in the index — pass the absolute path` };
   }
   const roots = new Set(rows.map((r) => r.root));
   if (roots.size > 1) {
@@ -300,6 +312,123 @@ function resolveSource(index: Index, raw: string, freshness: Map<string, string 
     return row ? { rows: [row] } : { rows: [], problem: `${src}: the note has no passage p${passage[1]} in the index` };
   }
   return { rows };
+}
+
+/**
+ * An absolute path no index row answers for, judged from the file itself when
+ * a declared notes folder holds it. Nothing is written: no embedding, no row.
+ *
+ * Every folder that contains the path must allow it (`pathRefusal`, the walk's
+ * own decision), and the first refusal wins before the file is opened. The path
+ * is judged as written; only when its directory is an alias of the folder's
+ * real path (/tmp for /private/tmp) is the parent resolved, and the leaf never
+ * is before the classifier has seen it.
+ */
+function resolveFromDisk(
+  index: Index,
+  src: string,
+  pathPart: string,
+  passageNo: number | null,
+  folders: readonly DeclaredFolder[],
+): Resolved {
+  const refuse = (problem: string): Resolved => ({ rows: [], problem, refused: true });
+  if (folders.length === 0) {
+    return refuse(`${src}: no notes folder declared — chamber mcp --notes <folder>`);
+  }
+  const abs = resolve(pathPart);
+  let parentReal: string | undefined;
+  try {
+    parentReal = join(realpathSync.native(dirname(abs)), basename(abs));
+  } catch {
+    parentReal = undefined;
+  }
+  const holders: { folder: DeclaredFolder; realRoot: string; path: string; rel: string }[] = [];
+  for (const folder of folders) {
+    const realRoot = realOrSelf(folder.root);
+    for (const cand of parentReal === undefined || parentReal === abs ? [abs] : [abs, parentReal]) {
+      const rel = relative(realRoot, cand);
+      if (inside(rel)) {
+        holders.push({ folder, realRoot, path: cand, rel: rel.split(sep).join("/") });
+        break;
+      }
+    }
+  }
+  if (holders.length === 0) return refuse(`${src}: not under any declared folder`);
+  // Outermost first: it names the file in the output, and its refusal is read first.
+  holders.sort((a, b) => a.realRoot.length - b.realRoot.length);
+  for (const h of holders) {
+    const refusal = pathRefusal(h.folder.root, h.folder.exclude, h.path);
+    if (refusal) return refuse(`${src}: ${refusal.reason}`);
+  }
+  const outer = holders[0]!;
+  const target = strictReal(outer.path);
+  if (!("path" in target)) return refuse(`${src}: its path does not resolve (${target.code}) — not read, not judged`);
+  const real = target.path;
+  for (const h of holders) {
+    if (!inside(relative(realOrSelf(h.folder.root), real))) {
+      return refuse(`${src}: resolves outside its notes folder — not read, not judged`);
+    }
+  }
+
+  const read = readBounded(outer.path, real);
+  if ("problem" in read) return refuse(`${src}: ${read.problem} — not read, not judged`);
+  const { title, body } = splitFrontmatter(read.text);
+  const passages = read.text.trim() === "" || body.trim() === "" ? [] : splitPassages(body);
+  if (passages.length === 0) return refuse(`${src}: empty body — nothing to judge`);
+
+  const docTitle = title ?? outer.rel.replace(/\.(?:md|markdown)$/i, "");
+  const all: Row[] = passages.map((p) => ({
+    id: `disk:${real}#p${p.index}`,
+    ref: `${outer.rel}#p${p.index}`,
+    body: p.body,
+    title: passageTitle(docTitle, p.headings),
+    hash: "",
+    root: outer.realRoot,
+    disk: true,
+  }));
+  const notes = index.sameFile(real) ? [] : ["not indexed yet"];
+  if (passageNo === null) return { rows: all, notes };
+  const one = all.find((r) => r.ref === `${outer.rel}#p${passageNo}`);
+  return one
+    ? { rows: [one], notes }
+    : refuse(`${src}: the note has no passage p${passageNo}`);
+}
+
+/** Open an allowed path as ingest would be read: no links, no blocking, a regular file, bounded. */
+function readBounded(full: string, real: string): { text: string } | { problem: string } {
+  let fd: number;
+  try {
+    fd = openSync(real, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (err) {
+    return { problem: `unreadable on disk (${(err as NodeJS.ErrnoException).code ?? "error"})` };
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) return { problem: "is not a regular file" };
+    const again = strictReal(full);
+    let same: ReturnType<typeof statSync> | undefined;
+    try {
+      same = statSync(real);
+    } catch {
+      same = undefined;
+    }
+    if (!("path" in again) || again.path !== real || !same || same.ino !== st.ino || same.dev !== st.dev) {
+      return { problem: "changed while being opened" };
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const buf = Buffer.alloc(1024 * 1024);
+      const n = readSync(fd, buf, 0, buf.length, null);
+      if (n === 0) break;
+      total += n;
+      if (total > MAX_COMPARE_BYTES) return { problem: `over ${MAX_COMPARE_BYTES / 1024 / 1024} MB — too large to read` };
+      chunks.push(buf.subarray(0, n));
+    }
+    return { text: Buffer.concat(chunks).toString("utf8") };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**
@@ -453,7 +582,7 @@ function cover(index: Index, terms: string[], rows: Row[]): Row[] {
 export function checkClaims(
   db: DatabaseSync,
   claims: CheckInput[],
-  opts: { record?: boolean } = {},
+  opts: { record?: boolean; folders?: readonly DeclaredFolder[] } = {},
 ): CheckResult[] {
   if (claims.length > MAX_CHECK_CLAIMS) {
     throw new Error(`chamber_check: at most ${MAX_CHECK_CLAIMS} claims per call (got ${claims.length}) — nothing was checked`);
@@ -470,6 +599,12 @@ export function checkClaims(
     }
   });
   const index = new Index(db);
+  // Declared folders plus every root the index recorded (no excludes: the index
+  // does not keep what its ingest excluded).
+  const folders = mergeDeclaredFolders([
+    ...(opts.folders ?? []),
+    ...index.ingestRoots().map((root) => ({ root, exclude: [] as string[] })),
+  ]);
   const freshness = new Map<string, string | null>();
   return claims.map((c) => {
     const text = c.text.trim();
@@ -486,15 +621,21 @@ export function checkClaims(
 
     const rows = new Map<string, Row>();
     let stale = false;
+    let refused = false;
     for (const s of c.sources) {
-      const r = resolveSource(index, s, freshness);
+      const r = resolveSource(index, s, freshness, folders);
       if (r.problem) base.problems.push(r.problem);
+      if (r.notes) base.problems.push(...r.notes);
       if (r.stale) stale = true;
+      if (r.refused) refused = true;
       for (const row of r.rows) rows.set(row.id, row);
     }
     // Any stale source leaves the claim unjudged: the agent's reading of that
     // note and the index's copy of it disagree, and either verdict would be
     // about text one of them never saw.
+    // A source that was refused or unreadable leaves the claim unjudged: the
+    // sources that did resolve would answer for a citation that was not read.
+    if (refused) return { ...base, status: "NOT_FOUND" };
     if (stale) return { ...base, status: "STALE" };
     if (rows.size === 0) return { ...base, status: "NOT_FOUND" };
 
@@ -509,7 +650,9 @@ export function checkClaims(
     if (terms.length === 0) return { ...base, status: "NO_TERMS" };
 
     const result: CheckResult = { ...base, status: "SUPPORTED" };
-    if (opts.record) {
+    // A reading taken from disk has no row to pin; writing one would mint a
+    // belief source that points at nothing. Task 4 owns the refusal line.
+    if (opts.record && !holders.some((r) => r.disk)) {
       // Pin only the covering passages: a whole-note citation pinned to every
       // passage — or to every passage naming a common term — would report
       // drift for an edit anywhere in the note.
@@ -534,7 +677,7 @@ const EXPLAIN: Record<CheckStatus, string> = {
   TERMS_ABSENT: "the cited text does not contain",
   NO_TERMS: "nothing specific to check (no number, name, domain, file name or count) — only that the source exists",
   STALE: "not judged — the note on disk no longer matches the index, or could not be safely read",
-  NOT_FOUND: "not judged — no cited source could be resolved to an indexed note",
+  NOT_FOUND: "not judged — a cited source could not be read",
   NO_SOURCE: "not judged — cited nothing",
 };
 

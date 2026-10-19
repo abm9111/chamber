@@ -9487,7 +9487,8 @@ test("pins", "check: a note edited or deleted since ingest is not judged", () =>
     assert(fresh[0]!.status === "SUPPORTED" && fresh[1]!.status === "TERMS_ABSENT", `after ingest: ${JSON.stringify(fresh.map((x) => x.status))}`);
     // A file added after ingest is not in the index, whatever it says.
     writeFileSync(join(dir, "notes", "new.md"), "The audit store is SQLite.\n");
-    assert(checkClaims(db, [{ text: "The audit store is SQLite.", sources: [join(dir, "notes", "new.md")] }])[0]!.status === "NOT_FOUND", "an unindexed file must be NOT_FOUND");
+    const unindexed = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [join(dir, "notes", "new.md")] }])[0]!;
+    assert(unindexed.status === "SUPPORTED" && unindexed.problems.includes("not indexed yet"), `an unindexed file in a declared folder is judged from disk: ${JSON.stringify(unindexed)}`);
     rmSync(note);
     const gone = checkClaims(db, [{ text: "The audit store is Postgres.", sources: [note] }]);
     assert(gone[0]!.status === "STALE" && gone[0]!.problems.some((p) => p.includes("chamber prune")), `deleted note: ${JSON.stringify(gone)}`);
@@ -9717,6 +9718,44 @@ test("pins", "check: a nested root that excluded a note does not hide the outer 
   }
 });
 
+
+test("pins", "check: an unindexed note in a declared folder is judged from disk", () => {
+  const db = freshDb();
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-disk-")));
+  try {
+    mkdirSync(join(dir, "notes"));
+    const note = join(dir, "notes", "gpu.md");
+    writeFileSync(note, "# GPU\n\nOne NVIDIA A100 80GB can serve about 1,000 users.\n");
+    const [r] = checkClaims(
+      db,
+      [{ text: "One NVIDIA A100 80GB can serve about 2,000 users.", sources: [note] }],
+      { folders: [{ root: dir, exclude: [] }] },
+    );
+    assert(r!.status === "TERMS_ABSENT" && r!.missing.includes("2000"), JSON.stringify(r));
+    assert(r!.problems.some((p) => p === "not indexed yet"), JSON.stringify(r!.problems));
+    assert(r!.checkedRefs.some((ref) => ref === "notes/gpu.md#p0"), JSON.stringify(r!.checkedRefs));
+    const text = formatCheck([r!], false);
+    assert(text.includes("not judged — a cited source could not be read") === false, text);
+    const none = checkClaims(db, [{ text: "One NVIDIA A100 serves 1,000 users.", sources: [note] }]);
+    assert(none[0]!.status === "NOT_FOUND" && none[0]!.problems.some((p) => p.includes("no notes folder declared — chamber mcp --notes <folder>")), JSON.stringify(none[0]));
+    assert(formatCheck(none, false).includes("not judged — a cited source could not be read"), formatCheck(none, false));
+    const mixed = checkClaims(
+      db,
+      [{ text: "One NVIDIA A100 80GB can serve about 1,000 users.", sources: [note, join(dir, "..", "outside.md")] }],
+      { folders: [{ root: dir, exclude: [] }] },
+    );
+    assert(mixed[0]!.status === "NOT_FOUND" && mixed[0]!.checkedRefs.length === 0, JSON.stringify(mixed[0]));
+    writeFileSync(join(dir, "notes", "empty.md"), "");
+    const empty = checkClaims(
+      db,
+      [{ text: "One NVIDIA A100 serves 1,000 users.", sources: [join(dir, "notes", "empty.md")] }],
+      { folders: [{ root: dir, exclude: [] }] },
+    );
+    assert(empty[0]!.status === "NOT_FOUND" && empty[0]!.problems.some((p) => p.includes("empty")), JSON.stringify(empty[0]));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("pins", "check: --notes binds the excludes that follow it", () => {
   const bad = parseNotesArgs(["--exclude", "transcripts"]);

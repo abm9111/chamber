@@ -238,6 +238,10 @@ function pythonBin(): string {
   return raw && raw.trim() !== "" ? raw.trim() : "python3";
 }
 
+export function minilmServeCommand(): string[] {
+  return [pythonBin(), SCRIPT, "--serve"];
+}
+
 /** UTF-8 bytes of JSON on one stdin write. Under the pipe buffer spawnSync fills in one write. */
 export const STDIN_CAP_BYTES = 12_288;
 
@@ -414,6 +418,10 @@ function noteTruncation(stderr: string): void {
       // Not our line, or malformed. Diagnostics do not get to break embedding.
     }
   }
+}
+
+export function noteMinilmStderr(stderr: string): void {
+  noteTruncation(stderr);
 }
 
 /** Truncation seen in this process, or null if nothing was truncated. */

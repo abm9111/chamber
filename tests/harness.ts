@@ -36,6 +36,7 @@ import {
   buildMerkleLayers,
 } from "../src/merkle.ts";
 import { embedMinilmBatch } from "../src/embedder.ts";
+import { createMinilmSession } from "../src/minilm_session.ts";
 import {
   localHashEmbed,
   cosineSimilarity,
@@ -82,6 +83,7 @@ import {
   STDIN_CAP_BYTES,
   chunkJsonStdin,
   embedMinilm,
+  noteMinilmStderr,
 } from "../src/embedder.ts";
 import { CALIBRATED_THRESHOLDS } from "../src/commit_belief.ts";
 import {
@@ -15605,6 +15607,251 @@ test("embedder", "embedMinilmBatch spawns once per stdin group and drops a parti
     short = e instanceof Error ? e.message : String(e);
   }
   assert(short.includes("returned 1 vectors for 2 texts"), short);
+});
+
+function writeMinilmStub(dir: string): string {
+  const file = join(dir, "minilm-stub.cjs");
+  writeFileSync(
+    file,
+    [
+      "const fs = require('fs');",
+      "const log = process.argv[2];",
+      "const mode = process.argv[3] || 'stay';",
+      "fs.appendFileSync(log, 'start ' + process.pid + '\\n');",
+      "let buf = '';",
+      "let replies = 0;",
+      "const trunc = JSON.stringify({ chamber_truncation: { limit: 256, passages: 1, of: 1, tokens_dropped: 4, longest: 260 } });",
+      "function reply(group) {",
+      "  replies += 1;",
+      "  if (mode === 'crash-first' || (mode === 'crash-second' && replies === 2)) {",
+      "    process.stderr.write(mode + '\\n');",
+      "    process.exit(9);",
+      "  }",
+      "  if (mode === 'truncate') process.stderr.write(trunc + '\\n');",
+      "  const vecs = group.map((_, i) => [replies, i, 1]);",
+      "  process.stdout.write(JSON.stringify(vecs) + '\\n');",
+      "  if (mode === 'exit-after-reply') process.exit(0);",
+      "}",
+      "process.stdin.on('data', (chunk) => {",
+      "  buf += chunk.toString('utf8');",
+      "  let nl;",
+      "  while ((nl = buf.indexOf('\\n')) >= 0) {",
+      "    const line = buf.slice(0, nl);",
+      "    buf = buf.slice(nl + 1);",
+      "    if (line === '') continue;",
+      "    let group;",
+      "    try { group = JSON.parse(line); } catch (e) { process.stderr.write('not-json\\n'); process.exit(2); }",
+      "    reply(group);",
+      "  }",
+      "});",
+      "if (mode === 'ignore-eof') setInterval(() => {}, 500);",
+      "process.stdin.on('end', () => {",
+      "  if (mode === 'ignore-eof') return;",
+      "  if (mode === 'truncate-on-end') process.stderr.write(trunc + '\\n');",
+      "  process.exit(0);",
+      "});",
+    ].join("\n"),
+  );
+  return file;
+}
+
+function stubCommand(dir: string, mode: string): { command: string[]; log: string } {
+  const log = join(dir, `log-${mode}`);
+  return { command: [process.execPath, writeMinilmStub(dir), log, mode], log };
+}
+
+function startLines(log: string): string[] {
+  try {
+    return readFileSync(log, "utf8").split("\n").filter((ln) => ln.startsWith("start "));
+  } catch {
+    return [];
+  }
+}
+
+test("embedder", "one session serves two stdin groups from one process", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  const { command, log } = stubCommand(dir, "stay");
+  const session = createMinilmSession({ command });
+  const piece = "p".repeat(4500);
+  const texts = [piece + "A", piece + "B", piece + "C"];
+  const expected = chunkJsonStdin(texts, STDIN_CAP_BYTES);
+  assert(expected.length === 2, `setup: expected two groups, got ${expected.length}`);
+  try {
+    const vectors = embedMinilmBatch(texts, (payload) => {
+      assert(Buffer.byteLength(payload, "utf8") <= STDIN_CAP_BYTES, payload.length.toString());
+      return session.send(payload);
+    });
+    assert(vectors.length === 3, String(vectors.length));
+    assert(vectors[0]![0] === 1, JSON.stringify(vectors[0]));
+    assert(vectors[2]![0] === 2, JSON.stringify(vectors[2]));
+    assert(startLines(log).length === 1, readFileSync(log, "utf8"));
+  } finally {
+    session.close();
+  }
+});
+
+test("embedder", "a child that dies on the second group discards the first reply", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  const { command } = stubCommand(dir, "crash-second");
+  const session = createMinilmSession({ command });
+  const piece = "p".repeat(4500);
+  const texts = [piece + "A", piece + "B", piece + "C"];
+  let thrown = "";
+  try {
+    embedMinilmBatch(texts, (payload) => session.send(payload));
+  } catch (err) {
+    thrown = err instanceof Error ? err.message : String(err);
+  } finally {
+    session.close();
+  }
+  assert(thrown.includes("embed_minilm failed (9):"), thrown);
+  assert(thrown.includes("crash-second"), thrown);
+});
+
+test("embedder", "a child that never replies is not started again", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  const { command, log } = stubCommand(dir, "crash-first");
+  const session = createMinilmSession({ command });
+  let first = "";
+  let second = "";
+  try {
+    try {
+      session.send(JSON.stringify(["a"]));
+    } catch (err) {
+      first = err instanceof Error ? err.message : String(err);
+    }
+    try {
+      session.send(JSON.stringify(["b"]));
+    } catch (err) {
+      second = err instanceof Error ? err.message : String(err);
+    }
+  } finally {
+    session.close();
+  }
+  assert(first.includes("embed_minilm failed (9):"), first);
+  assert(first.includes("crash-first"), first);
+  assert(second.includes("embed_minilm: session is dead"), second);
+  assert(startLines(log).length === 1, readFileSync(log, "utf8"));
+});
+
+test("embedder", "a child that has replied may be replaced once", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  const { command, log } = stubCommand(dir, "exit-after-reply");
+  const session = createMinilmSession({ command });
+  let third = "";
+  try {
+    const first = session.send(JSON.stringify(["a"]));
+    const second = session.send(JSON.stringify(["b"]));
+    assert(first.length === 1 && second.length === 1, "both replies must return");
+    try {
+      session.send(JSON.stringify(["c"]));
+    } catch (err) {
+      third = err instanceof Error ? err.message : String(err);
+    }
+  } finally {
+    session.close();
+  }
+  assert(third.includes("embed_minilm: session is dead"), third);
+  assert(startLines(log).length === 2, readFileSync(log, "utf8"));
+});
+
+test("embedder", "stop kills the child and close refuses a later send", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  const { command, log } = stubCommand(dir, "stay");
+  const session = createMinilmSession({ command });
+  session.send(JSON.stringify(["a"]));
+  session.stop();
+  session.send(JSON.stringify(["b"]));
+  session.stop();
+  let third = "";
+  try {
+    session.send(JSON.stringify(["c"]));
+  } catch (err) {
+    third = err instanceof Error ? err.message : String(err);
+  }
+  const pid = Number(startLines(log)[0]!.split(" ")[1]);
+  session.close();
+  session.close();
+  let alive = true;
+  try {
+    process.kill(pid, 0);
+  } catch {
+    alive = false;
+  }
+  let after = "";
+  try {
+    session.send(JSON.stringify(["d"]));
+  } catch (err) {
+    after = err instanceof Error ? err.message : String(err);
+  }
+  assert(third.includes("embed_minilm: session is dead"), third);
+  assert(startLines(log).length === 2, readFileSync(log, "utf8"));
+  assert(alive === false, `pid ${pid} still running`);
+  assert(after.includes("embed_minilm: session is closed"), after);
+  assert(session.cleanupError === undefined, String(session.cleanupError));
+});
+
+test("embedder", "close waits out a child that ignores stdin end, then SIGKILL", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  const { command, log } = stubCommand(dir, "ignore-eof");
+  const session = createMinilmSession({ command });
+  session.send(JSON.stringify(["a"]));
+  const pid = Number(startLines(log)[0]!.split(" ")[1]);
+  const t0 = Date.now();
+  session.close();
+  const dt = Date.now() - t0;
+  let alive = true;
+  try {
+    process.kill(pid, 0);
+  } catch {
+    alive = false;
+  }
+  assert(dt >= 1000, `close returned in ${dt}ms`);
+  assert(dt < 8000, `close took ${dt}ms`);
+  assert(alive === false, `pid ${pid} still running`);
+  assert(session.cleanupError === undefined, String(session.cleanupError));
+});
+
+test("embedder", "a session that never sends does not spawn", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  const { command, log } = stubCommand(dir, "stay");
+  const session = createMinilmSession({ command });
+  session.close();
+  session.close();
+  let thrown = "";
+  try {
+    session.send(JSON.stringify(["a"]));
+  } catch (err) {
+    thrown = err instanceof Error ? err.message : String(err);
+  }
+  assert(thrown.includes("embed_minilm: session is closed"), thrown);
+  assert(startLines(log).length === 0, startLines(log).join(","));
+});
+
+assert(typeof noteMinilmStderr === "function");
+
+test("embedder", "truncation on stderr is counted once, including a line that arrives at close", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  resetMinilmProbe();
+  const early = stubCommand(dir, "truncate");
+  const earlySession = createMinilmSession({ command: early.command });
+  try {
+    earlySession.send(JSON.stringify(["a"]));
+    const seen = minilmTruncationSeen();
+    assert(seen?.passages === 1 && seen.tokensDropped === 4, JSON.stringify(seen));
+  } finally {
+    earlySession.close();
+  }
+  assert(minilmTruncationSeen()?.passages === 1, JSON.stringify(minilmTruncationSeen()));
+
+  resetMinilmProbe();
+  const late = stubCommand(dir, "truncate-on-end");
+  const lateSession = createMinilmSession({ command: late.command });
+  lateSession.send(JSON.stringify(["a"]));
+  assert(minilmTruncationSeen() === null, JSON.stringify(minilmTruncationSeen()));
+  lateSession.close();
+  assert(minilmTruncationSeen()?.passages === 1, JSON.stringify(minilmTruncationSeen()));
+  resetMinilmProbe();
 });
 
 reportingStarted = true;

@@ -140,6 +140,24 @@ export interface IngestReport {
   truncated?: MinilmTruncation;
 }
 
+/**
+ * One place prints the written/kept split, so no caller reports `passages`
+ * (rows written this run) as the size of the corpus.
+ */
+export function formatIngestLine(
+  report: Pick<IngestReport, "ingested" | "passages" | "unchanged">,
+  from?: string,
+): string {
+  const tail = from === undefined ? "" : ` from ${from}`;
+  if (report.unchanged === 0) {
+    return `ingested ${report.ingested} file(s) as ${report.passages} passage(s)${tail}`;
+  }
+  return (
+    `ingested ${report.ingested} file(s): wrote ${report.passages} passage(s), ` +
+    `kept ${report.unchanged} unchanged${tail}`
+  );
+}
+
 export interface IngestOptions {
   exclude?: string[];
   /** Ingest dotted entries (`.trash`, `.obsidian`, …). Default false. */

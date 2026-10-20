@@ -212,6 +212,7 @@ import { assertSpendBudget } from "../src/spend.ts";
 import {
   ingestDirectory,
   parseIngestArgs,
+  formatIngestLine,
   splitFrontmatter,
   type IngestReport,
 } from "../src/ingest.ts";
@@ -5152,6 +5153,29 @@ test("pins", "a hash vector of unchanged text is embedded again", () => {
   assert(second.unchanged === 0 && second.passages === 3, JSON.stringify(second));
   const models = db.prepare(`SELECT DISTINCT model FROM vector_embedding`).all() as { model: string }[];
   assert(models.length === 1 && models[0]!.model === MINILM_MODEL, JSON.stringify(models));
+});
+
+test("pins", "the ingest line names kept passages only when there are some", () => {
+  assert(
+    formatIngestLine({ ingested: 2, passages: 4, unchanged: 0 }, "/vault") ===
+      "ingested 2 file(s) as 4 passage(s) from /vault",
+    "a run that kept nothing must keep the old line",
+  );
+  assert(
+    formatIngestLine({ ingested: 2, passages: 1, unchanged: 3 }, "/vault") ===
+      "ingested 2 file(s): wrote 1 passage(s), kept 3 unchanged from /vault",
+    "a run that kept passages must say wrote and kept",
+  );
+  assert(
+    formatIngestLine({ ingested: 2, passages: 4, unchanged: 0 }) ===
+      "ingested 2 file(s) as 4 passage(s)",
+    "the demo line has no path",
+  );
+  assert(
+    formatIngestLine({ ingested: 2, passages: 1, unchanged: 3 }) ===
+      "ingested 2 file(s): wrote 1 passage(s), kept 3 unchanged",
+    "the demo split has no path",
+  );
 });
 
 test("pins", "shrinking a file keeps the first id and deletes the other two", () => {

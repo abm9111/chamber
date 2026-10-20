@@ -69,6 +69,20 @@ function finishRequest(message) {
   reply(message);
 }
 
+function detachChild(target) {
+  if (child === target) {
+    child = null;
+    Atomics.store(pidSlot, 0, 0);
+  }
+}
+
+function killChild(target) {
+  try {
+    target.kill("SIGKILL");
+  } catch (err) {}
+  detachChild(target);
+}
+
 function bind(target) {
   child = target;
   Atomics.store(pidSlot, 0, target.pid || 0);
@@ -77,7 +91,7 @@ function bind(target) {
   target.stdin.on("error", () => {});
   target.stdout.on("data", (chunk) => {
     if (stdout.length + chunk.length > REPLY_LIMIT) {
-      try { target.kill("SIGKILL"); } catch (err) {}
+      killChild(target);
       stderrPending += "reply longer than 64 MiB";
       finishRequest({ ok: false, status: null });
       return;
@@ -91,13 +105,13 @@ function bind(target) {
     try {
       vectors = JSON.parse(line);
     } catch (err) {
-      try { target.kill("SIGKILL"); } catch (killErr) {}
+      killChild(target);
       stderrPending += "embed_minilm: expected a JSON array of vectors";
       finishRequest({ ok: false, status: null });
       return;
     }
     if (!Array.isArray(vectors)) {
-      try { target.kill("SIGKILL"); } catch (killErr) {}
+      killChild(target);
       stderrPending += "embed_minilm: expected a JSON array of vectors";
       finishRequest({ ok: false, status: null });
       return;
@@ -113,10 +127,7 @@ function bind(target) {
     stderrPending += chunk;
   });
   target.on("exit", (code) => {
-    if (child === target) {
-      child = null;
-      Atomics.store(pidSlot, 0, 0);
-    }
+    detachChild(target);
     setImmediate(() => {
       if (!requestOpen || settled) return;
       if (pendingVectors) {
@@ -127,20 +138,10 @@ function bind(target) {
     });
   });
   target.on("error", (err) => {
-    if (child === target) child = null;
+    detachChild(target);
     stderrPending += String(err);
     if (requestOpen) finishRequest({ ok: false, status: null });
-    else reply({ ok: false, status: null });
   });
-}
-
-function start(command) {
-  stdout = "";
-  settled = false;
-  pendingVectors = null;
-  requestOpen = false;
-  const target = spawn(command[0], command.slice(1), { stdio: ["pipe", "pipe", "pipe"] });
-  bind(target);
 }
 
 async function stopChild() {
@@ -186,15 +187,43 @@ parentPort.on("message", (msg) => {
   if (msg.op === "start") {
     try {
       if (child) {
-        reply({ ok: true, alive: true });
-        return;
+        if (
+          !child.killed &&
+          child.exitCode === null &&
+          child.signalCode === null
+        ) {
+          reply({ ok: true, alive: true });
+          return;
+        }
+        detachChild(child);
       }
-      start(msg.command);
-      if (!child || !child.pid) {
-        reply({ ok: false, status: null });
-        return;
+      stdout = "";
+      settled = false;
+      pendingVectors = null;
+      requestOpen = false;
+      let startReplied = false;
+      const replyStart = (message) => {
+        if (startReplied) return;
+        startReplied = true;
+        reply(message);
+      };
+      const target = spawn(msg.command[0], msg.command.slice(1), {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      const onSpawn = () => {
+        bind(target);
+        replyStart({ ok: true, alive: true });
+      };
+      target.once("error", (err) => {
+        stderrPending += String(err);
+        detachChild(target);
+        replyStart({ ok: false, status: null });
+      });
+      if (target.pid !== undefined) {
+        onSpawn();
+      } else {
+        target.once("spawn", onSpawn);
       }
-      reply({ ok: true, alive: true });
     } catch (err) {
       stderrPending += String(err);
       reply({ ok: false, status: null });

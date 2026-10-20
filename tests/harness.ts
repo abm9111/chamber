@@ -15628,8 +15628,13 @@ function writeMinilmStub(dir: string): string {
       "    process.exit(9);",
       "  }",
       "  if (mode === 'truncate') process.stderr.write(trunc + '\\n');",
+      "  if (mode === 'bad-second-line' && replies === 2) {",
+      "    process.stdout.write('not-json\\n');",
+      "    return;",
+      "  }",
       "  const vecs = group.map((_, i) => [replies, i, 1]);",
       "  process.stdout.write(JSON.stringify(vecs) + '\\n');",
+      
       "  if (mode === 'exit-after-reply') process.exit(0);",
       "}",
       "process.stdin.on('data', (chunk) => {",
@@ -15852,6 +15857,55 @@ test("embedder", "truncation on stderr is counted once, including a line that ar
   lateSession.close();
   assert(minilmTruncationSeen()?.passages === 1, JSON.stringify(minilmTruncationSeen()));
   resetMinilmProbe();
+});
+
+
+test("embedder", "a bad reply kills the child so the session may spawn once more", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  const { command, log } = stubCommand(dir, "bad-second-line");
+  const session = createMinilmSession({ command });
+  let second = "";
+  let third: number[][];
+  try {
+    session.send(JSON.stringify(["a"]));
+    try {
+      session.send(JSON.stringify(["b"]));
+    } catch (err) {
+      second = err instanceof Error ? err.message : String(err);
+    }
+    third = session.send(JSON.stringify(["c"]));
+  } finally {
+    session.close();
+  }
+  assert(second.includes("embed_minilm: expected a JSON array of vectors"), second);
+  assert(third.length === 1 && third[0]![0] === 1, JSON.stringify(third));
+  assert(startLines(log).length === 2, readFileSync(log, "utf8"));
+});
+
+test("embedder", "a missing interpreter reports spawn error and close stays safe", () => {
+  const session = createMinilmSession({
+    command: ["/nonexistent/python3", "embed_minilm.py", "--serve"],
+  });
+  let thrown = "";
+  try {
+    session.send(JSON.stringify(["a"]));
+  } catch (err) {
+    thrown = err instanceof Error ? err.message : String(err);
+  }
+  assert(thrown.includes("embed_minilm failed (null):"), thrown);
+  assert(
+    thrown.includes("ENOENT") || thrown.toLowerCase().includes("nonexistent"),
+    thrown,
+  );
+  session.close();
+  session.close();
+  let after = "";
+  try {
+    session.send(JSON.stringify(["b"]));
+  } catch (err) {
+    after = err instanceof Error ? err.message : String(err);
+  }
+  assert(after.includes("embed_minilm: session is closed"), after);
 });
 
 reportingStarted = true;

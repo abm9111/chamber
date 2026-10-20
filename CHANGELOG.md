@@ -3,6 +3,16 @@
 All notable changes to Chamber. Versions before 0.1.6 are described in the git
 history and the GitHub releases.
 
+## 0.1.9 — 2026-10-03
+
+### Changed
+
+- The published description names the check: numbers, capitalised names, and
+  file names in the indexed note. Local, no model. It does not judge meaning.
+- The README that ships with the package separates checkout, the npx install,
+  and config. Checkout is Node 23.6+ from this repo. npx runs the published
+  bin. Config is for ingest and chamber_ask.
+
 ## 0.1.8 — 2026-09-28
 
 ### Fixed

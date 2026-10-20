@@ -1,40 +1,69 @@
 # Chamber
 
-The check your AI agent runs on your notes. When Claude Code or any MCP host
-answers from your vault, `chamber_check` confirms the numbers, capitalised
-names and file names it quotes are really in the note it cites — and says so
-when they are not, or when the note changed since it was indexed.
-[How it works](#use-it-from-an-ai-coding-agent).
+Catches your AI agent quoting a number or a name that isn't in the note it
+cites. When Claude Code (or any MCP host) answers from your notes, it is told
+to run each claim through `chamber_check` first. Real output, trimmed:
 
-You can also ask questions yourself and get answers that cite their sources,
-plus a daily check that tells you when a source has changed underneath a
-conclusion you already trusted.
+```
+2 claim(s): 1 supported · 1 terms absent · 0 nothing to check · 0 not judged
 
-Zero runtime dependencies. Everything is `node:sqlite` and files on your disk.
-No account, no cloud call unless you point it at one.
+[TERMS_ABSENT] Q3 revenue was $420k, up 18% on Q2.
+     the cited text does not contain: 420k
+     checked: q3-review.md#p0
+[SUPPORTED] Enterprise renewals moved to Dana Ortiz in August.
+     every term Chamber recognises occurs in the cited text
+     checked: q3-review.md#p0
+```
+
+The note says `$240k`. The agent wrote `$420k`. Edit the note afterwards and
+the same check judges the new text, and the result adds `index is behind this
+file`, because the index still holds the old copy.
+
+```bash
+claude mcp add -s user chamber -- npx -y @bu7umaid/chamber mcp --notes ~/Notes
+```
+
+```json
+{
+  "mcpServers": {
+    "chamber": {
+      "command": "npx",
+      "args": ["-y", "@bu7umaid/chamber", "mcp", "--notes", "/absolute/path/to/Notes"]
+    }
+  }
+}
+```
+
+No model, no account, no network: the check is deterministic string matching
+over `node:sqlite` and files on your disk. It checks numbers, capitalised
+names, domains, file names and counts. It does not check meaning, so a negated
+or reversed sentence built from the note's own words still passes. See
+[what a verified citation does and does not prove](#what-a-verified-citation-does-and-does-not-prove).
+
+Beyond the check: answers that cite their sources, and a daily job that tells
+you when a source changed underneath a conclusion you already trusted.
 
 ## Run the check
 
-Checkout and the published package are different runtimes. Config is a third
-path, for [ingest and chamber_ask](#for-ingest-and-chamber_ask-not-for-the-check).
+The `npx` line above is all most people need. `--exclude <pattern>` repeats
+after `--notes`. Config ingest roots and their excludes count too. Two other
+ways in:
 
-```bash
-claude mcp add -s user chamber -- npx -y @bu7umaid/chamber mcp
-```
-
-**Checkout — Node 23.6+.** TypeScript runs directly from the repo, with no
-build step. `--experimental-strip-types` has been the default since 23.6.0, so
-the flag is defensive. No config, no model, no network.
+**From a checkout (Node 23.6+).** TypeScript runs straight from the repo, with
+no build step. `try` builds a throwaway workspace, runs the real code paths
+and deletes it. The published package runs on Node 22 (measured 22.23.1, which
+prints Node's experimental-SQLite warning). Node 20.20.2 exits with
+`ERR_UNKNOWN_BUILTIN_MODULE` because `node:sqlite` is absent. Node 23.6
+remains the floor for a checkout.
 
 ```bash
 git clone https://github.com/abm9111/chamber.git && cd chamber && npm ci && node --experimental-strip-types src/cli.ts try
 ```
 
-**Agent.** The command above runs the published bin (`dist/`), not `src/`.
-If `/mcp` does not list `chamber_check`, the host spawned with a minimal
-`PATH`. Take the interpreter from `command -v node` in the shell you actually
-use, and point it at the published bin or at a checkout's `src/mcp_server.ts`.
-Those are different files.
+**If `/mcp` does not list `chamber_check`,** the host started the server with a
+minimal `PATH`. Take the interpreter from `command -v node` in your own shell
+and point it at the published bin or at a checkout's `src/mcp_server.ts`. Those
+are different files:
 
 ```bash
 # published bin: bin/chamber.js loads dist/. This is not src/mcp_server.ts.
@@ -44,8 +73,9 @@ claude mcp add -s user chamber -- "$(command -v node)" /path/to/node_modules/@bu
 claude mcp add -s user chamber -- "$(command -v node)" --experimental-strip-types /path/to/chamber/src/mcp_server.ts
 ```
 
-A number the note does not contain returns `TERMS_ABSENT` and names the term.
-`SUPPORTED` is term presence, not entailment.
+Ingest and `chamber_ask` need config. The check also reads config ingest roots
+when they are set. See
+[config: ingest, chamber_ask, and the check](#config-ingest-chamber_ask-and-the-checks-config-roots).
 
 ## What people actually do
 
@@ -178,7 +208,7 @@ I don't know
 Both notes are in the index and both are relevant. Neither answers the
 question, so nothing is composed from the pieces.
 
-## For ingest and chamber_ask, not for the check
+## Config: ingest, chamber_ask, and the check's config roots
 
 ```bash
 npm link                 # puts `chamber` on your PATH
@@ -194,6 +224,10 @@ Then edit that config to add a notes folder and a model:
   "ingest": [{ "root": "~/Notes", "exclude": ["transcripts", "attachments"] }]
 }
 ```
+
+`--exclude <pattern>` repeats after `--notes`; config ingest roots and their
+excludes also count as declared folders for the check, and an exclude that
+matches nothing refuses that folder.
 
 `model.base` may name any OpenAI-compatible endpoint. A loopback address needs
 no API key; anything else reads `CHAMBER_API_KEY` from the environment, never
@@ -212,7 +246,8 @@ them and answer from them — see `chamber corpus` and
 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) entry 11.
 If the root is an Obsidian vault, exclude `.obsidian`, `.trash`, and
 `*sync-conflict*` before that first ingest. A symlinked folder is indexed under
-the link path and comes back `STALE` under the real path.
+the link path. The check reads the real path too, because it uses the same
+per-entry rules as ingest. A link that leaves the declared folder is not read.
 
 ## Use it as a CI drift gate
 
@@ -221,7 +256,7 @@ code or policy, `chamber verify --json` failing the build when the ground
 moves. One line in a workflow — this repo ships the action:
 
 ```yaml
-- uses: abm9111/chamber@v0.1.8
+- uses: abm9111/chamber@v0.1.9
 ```
 
 [`docs/CI_DRIFT_GATE.md`](docs/CI_DRIFT_GATE.md) is the one-page recipe;
@@ -256,11 +291,13 @@ they came from, and answers per claim (abridged):
      the cited text does not contain: 2000
 ```
 
-The check uses no model. It confirms the note is indexed, and unchanged on disk since
-it was indexed (`STALE` otherwise: the agent read one text and the index holds
-another, so neither verdict would be about what was read). Then it checks that
-every number, capitalised name, domain, file name and count in the claim occurs
-in the note. That catches invented values. It does not check lowercase names or
+The check uses no model. It reads the file on disk when the path is
+absolute and the file sits in a declared folder. An indexed note that has since
+changed is still judged, from the disk text, and the result adds `index is behind
+this file`. A passage ref is judged from the indexed text. `SUPPORTED` means the
+recognised terms occur in that text. It does not mean the sentence follows.
+Then it checks that every number, capitalised name, domain, file name and count
+in the claim occurs in the note. That catches invented values. It does not check lowercase names or
 ordinary words, and it does not catch a negated or reversed sentence
 built from the note's own words — see
 [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) §2 for what it was

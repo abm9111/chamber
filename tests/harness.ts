@@ -210,12 +210,16 @@ import { scanForSecrets, skillSecretScanRefuse } from "../src/secret_scan.ts";
 import { formatErrorChain } from "../src/error_chain.ts";
 import { assertSpendBudget } from "../src/spend.ts";
 import {
+  classifyEntry,
+  countExcludeMatches,
   ingestDirectory,
   parseIngestArgs,
   formatIngestLine,
+  pathRefusal,
   splitFrontmatter,
   type IngestReport,
 } from "../src/ingest.ts";
+import { mergeDeclaredFolders, parseNotesArgs } from "../src/declared_folders.ts";
 import {
   PASSAGE_MAX_TOKENS,
   estimateTokens,
@@ -229,7 +233,7 @@ import {
   loadConfig,
   explainConfig,
 } from "../src/config.ts";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync, spawn, execFileSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
@@ -4197,6 +4201,71 @@ test("pins", "ingestDirectory honours exclude patterns", () => {
 
   const r = ingestDirectory(db, dir, { exclude: ["private"] });
   assert(r.ingested === 1, `expected 1 ingested, got ${r.ingested}`);
+});
+
+test("pins", "check: the path walk and the ingest walk classify the same entries", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "chamber-classify-")));
+  try {
+    mkdirSync(join(root, "notes"));
+    mkdirSync(join(root, ".hidden"));
+    writeFileSync(join(root, "notes", "ok.md"), "The audit store is SQLite.\n");
+    writeFileSync(join(root, ".hidden", "s.md"), "The audit store is SQLite.\n");
+    writeFileSync(join(root, "data.json"), "{}\n");
+    symlinkSync(join(root, ".hidden", "s.md"), join(root, "notes", "dotted.md"));
+    symlinkSync(join(root, "data.json"), join(root, "notes", "via.md"));
+    const outside = join(root, "..", `${basename(root)}-out.md`);
+    writeFileSync(outside, "The audit store is SQLite.\n");
+    symlinkSync(outside, join(root, "notes", "leave.md"));
+    const fifo = spawnSync("mkfifo", [join(root, "notes", "pipe.md")]);
+    assert(fifo.status === 0, `mkfifo failed: ${fifo.stderr}`);
+    mkdirSync(join(root, "Private"));
+    writeFileSync(join(root, "Private", "secret.md"), "The audit store is SQLite.\n");
+    // A link whose *target* is excluded: ingest skips `link` and never descends.
+    symlinkSync(join(root, "Private"), join(root, "link"));
+
+    const planted = [
+      join(root, "notes", "ok.md"),
+      join(root, "notes", "dotted.md"),
+      join(root, "notes", "via.md"),
+      join(root, "notes", "leave.md"),
+      join(root, "notes", "pipe.md"),
+      join(root, "Private", "secret.md"),
+      join(root, "link"),
+      join(root, "link", "secret.md"),
+    ];
+    for (const abs of planted) {
+      const refused = pathRefusal(root, ["Private"], abs);
+      const ingested = ingestDirectory(freshDb(), root, { exclude: ["Private"] });
+      const rel = relative(root, abs).split(sep).join("/");
+      const skipped =
+        ingested.skipped.find((s) => s.path === rel) ??
+        (refused !== null
+          ? ingested.skipped.find(
+              (s) => s.kind === refused.kind && s.reason === refused.reason,
+            )
+          : undefined);
+      if (abs.endsWith("ok.md")) {
+        assert(refused === null, `ok.md must be readable: ${JSON.stringify(refused)}`);
+        assert(skipped === undefined, `ok.md must be ingested: ${JSON.stringify(ingested.skipped)}`);
+      } else {
+        assert(refused !== null && skipped !== undefined, `${rel} must be refused by both`);
+        assert(refused!.kind === skipped!.kind && refused!.reason === skipped!.reason, `${rel}: walk ${JSON.stringify(skipped)} path ${JSON.stringify(refused)}`);
+      }
+    }
+    const counts = countExcludeMatches(root, ["Private", "no-such"]);
+    assert(counts.find((c) => c.raw === "Private")!.matched > 0, JSON.stringify(counts));
+    assert(counts.find((c) => c.raw === "no-such")!.matched === 0, JSON.stringify(counts));
+    const rows = countExcludeMatches(root, ["Private", "private/", "../bad", "Private"]);
+    assert(
+      rows.length === 4 && rows.map((r) => r.raw).join("|") === "Private|private/|../bad|Private",
+      `one row per input pattern: ${JSON.stringify(rows)}`,
+    );
+    assert(rows[0]!.matched > 0 && rows[2]!.matched === 0 && rows[3]!.matched === 0, JSON.stringify(rows));
+    assert(typeof classifyEntry === "function", "classifyEntry is exported");
+    rmSync(outside);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test(
@@ -9676,10 +9745,11 @@ test("pins", "check: an agent's claims are judged against the note it cites", ()
   }
 });
 
-test("pins", "check: a note edited or deleted since ingest is not judged", () => {
+test("pins", "check: an edited note is judged from disk, a deleted path is not", () => {
   // The agent read the file on disk; the index holds the last ingest. Judged
   // against the old copy, "Postgres" was TERMS_ABSENT for a note that now
-  // says it, and "SQLite" passed for a note that no longer does.
+  // says it, and "SQLite" passed for a note that no longer does. The verdict is
+  // about the text on disk, and says the index is behind it.
   const { db, dir, note } = checkFixture();
   try {
     writeFileSync(note, "# Ops\n\n## Store\nThe audit store is Postgres, chosen in 2025.\n\n## Budget\nThe hosting budget is $900 per month.\n");
@@ -9687,8 +9757,20 @@ test("pins", "check: a note edited or deleted since ingest is not judged", () =>
       { text: "The audit store is Postgres.", sources: [note] },
       { text: "The audit store is SQLite.", sources: [note] },
     ]);
-    assert(edited.every((x) => x.status === "STALE"), `edited note must be STALE: ${JSON.stringify(edited.map((x) => x.status))}`);
-    assert(edited[0]!.problems.some((p) => p.includes("chamber ingest")), "must say how to fix it");
+    assert(
+      edited[0]!.status === "SUPPORTED" && edited[1]!.status === "TERMS_ABSENT",
+      `edited note is judged from disk: ${JSON.stringify(edited.map((x) => x.status))}`,
+    );
+    assert(edited.every((x) => (x.status as string) !== "STALE"), "an edited note is never STALE");
+    assert(
+      edited.every((x) => x.problems.some((p) => p.includes("index is behind this file"))),
+      `both must say the index is behind: ${JSON.stringify(edited.map((x) => x.problems))}`,
+    );
+    const relEdited = checkClaims(db, [{ text: "The audit store is Postgres.", sources: ["notes/ops.md"] }])[0]!;
+    assert(
+      relEdited.status === edited[0]!.status && relEdited.problems.some((p) => p === "index is behind this file"),
+      `a relative path judges the same file: ${JSON.stringify(relEdited)}`,
+    );
     ingestDirectory(db, dir);
     const fresh = checkClaims(db, [
       { text: "The audit store is Postgres.", sources: [note] },
@@ -9697,10 +9779,11 @@ test("pins", "check: a note edited or deleted since ingest is not judged", () =>
     assert(fresh[0]!.status === "SUPPORTED" && fresh[1]!.status === "TERMS_ABSENT", `after ingest: ${JSON.stringify(fresh.map((x) => x.status))}`);
     // A file added after ingest is not in the index, whatever it says.
     writeFileSync(join(dir, "notes", "new.md"), "The audit store is SQLite.\n");
-    assert(checkClaims(db, [{ text: "The audit store is SQLite.", sources: [join(dir, "notes", "new.md")] }])[0]!.status === "NOT_FOUND", "an unindexed file must be NOT_FOUND");
+    const added = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [join(dir, "notes", "new.md")] }])[0]!;
+    assert(added.status === "SUPPORTED" && added.problems.some((p) => p === "not indexed yet"), JSON.stringify(added));
     rmSync(note);
     const gone = checkClaims(db, [{ text: "The audit store is Postgres.", sources: [note] }]);
-    assert(gone[0]!.status === "STALE" && gone[0]!.problems.some((p) => p.includes("chamber prune")), `deleted note: ${JSON.stringify(gone)}`);
+    assert(gone[0]!.status === "NOT_FOUND" && gone[0]!.problems.some((p) => p.includes("chamber prune")), `deleted note: ${JSON.stringify(gone)}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -9765,13 +9848,13 @@ test("pins", "check: files that are not plain notes are never read", () => {
     rmSync(note);
     symlinkSync(join(dir, ".hidden", "s.md"), note);
     const linked = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [note] }])[0]!;
-    assert(linked.status === "STALE" && linked.problems.some((p) => p.includes("did not index")), `a link into a hidden folder: ${JSON.stringify(linked)}`);
+    assert(linked.status === "NOT_FOUND" && linked.problems.some((p) => p.includes("dotted entry")), `a link into a hidden folder: ${JSON.stringify(linked)}`);
     rmSync(note);
     const fifo = spawnSync("mkfifo", [note]);
     assert(fifo.status === 0, `setup: mkfifo failed: ${fifo.stderr}`);
     const t = Date.now();
     const piped = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [note] }])[0]!;
-    assert(Date.now() - t < 5000 && piped.status === "STALE" && piped.problems.some((p) => p.includes("regular file")), `a FIFO: ${JSON.stringify(piped)}`);
+    assert(Date.now() - t < 5000 && piped.status === "NOT_FOUND" && piped.problems.some((p) => p.includes("regular file")), `a FIFO: ${JSON.stringify(piped)}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -9800,11 +9883,18 @@ test("pins", "check: a linked note inside the root and a note with large frontma
     mkdirSync(join(dir, "Private"));
     writeFileSync(join(dir, "Private", "secret.md"), "# Real\n\nThe service uses port 8080.\n");
     writeFileSync(join(dir, "creds.env"), "# Real\n\nThe service uses port 8080.\n");
-    for (const target of [join(dir, "Private", "secret.md"), join(dir, "creds.env")]) {
+    for (const [target, why] of [
+      [join(dir, "Private", "secret.md"), "excluded by --exclude Private"],
+      [join(dir, "creds.env"), "unsupported extension"],
+    ] as const) {
       rmSync(join(dir, "a.md"));
       symlinkSync(target, join(dir, "a.md"));
-      const r = checkClaims(db, [{ text: "The service uses port 8080.", sources: ["a.md"] }])[0]!;
-      assert(r.status === "STALE" && r.problems.some((p) => p.includes("did not index")), `link to ${target}: ${JSON.stringify(r)}`);
+      const r = checkClaims(
+        db,
+        [{ text: "The service uses port 8080.", sources: ["a.md"] }],
+        { folders: [{ root: dir, exclude: ["Private"] }] },
+      )[0]!;
+      assert(r.status === "NOT_FOUND" && r.problems.some((p) => p.includes(why)), `link to ${target}: ${JSON.stringify(r)}`);
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -9828,12 +9918,11 @@ test("pins", "check: letter case is free; a note under a linked folder fails clo
       assert(cased.status === "SUPPORTED", `case-insensitive path: ${JSON.stringify(cased)}`);
     }
     // Ingest walked real/ once, through alink/, so the note is indexed only as
-    // alink/x.md and its real path is not an indexed note. Following the link
-    // would mean re-deriving ingest's exclude and dot-folder rules here; it is
-    // found, and refused with the reason, rather than read (review E).
+    // alink/x.md. Both spellings are the same file; each is judged from disk by
+    // the walk's own rules, which is the re-derivation review E said was missing.
     for (const p of [join(base, "v", "alink", "x.md"), join(base, "v", "real", "x.md")]) {
       const r = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [p] }])[0]!;
-      assert(r.status === "STALE" && r.problems.some((x) => x.includes("did not index")), `${p}: ${JSON.stringify(r)}`);
+      assert(r.status === "SUPPORTED", `${p}: ${JSON.stringify(r)}`);
     }
   } finally {
     rmSync(base, { recursive: true, force: true });
@@ -9905,7 +9994,72 @@ test("pins", "check: review findings on chamber_check stay closed", () => {
     symlinkSync(outside, note);
     const linked = checkClaims(db, [{ text: "The audit store is SQLite.", sources: ["notes/ops.md"] }])[0]!;
     rmSync(outside);
-    assert(linked.status === "STALE" && linked.problems.some((p) => p.includes("outside")), `symlink escape: ${JSON.stringify(linked)}`);
+    assert(linked.status === "NOT_FOUND" && linked.problems.some((p) => p.includes("escapes the ingest root")), `symlink escape: ${JSON.stringify(linked)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: a passage ref stays on the index when the file changes", () => {
+  const { db, dir, note } = checkFixture();
+  try {
+    const ref = (db.prepare(
+      "SELECT source_ref FROM vector_document WHERE source_ref LIKE '%ops.md#p%' AND body LIKE '%SQLite%'",
+    ).get() as { source_ref: string }).source_ref;
+    writeFileSync(note, "# Ops\n\nThe audit store is Postgres, chosen in 2025.\n");
+    const [fromRef] = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [ref] }]);
+    assert(fromRef!.status === "SUPPORTED", JSON.stringify(fromRef));
+    assert(
+      fromRef!.problems.some((p) => p === "file on disk has changed since this passage was indexed"),
+      JSON.stringify(fromRef!.problems),
+    );
+    const [recorded] = checkClaims(
+      db,
+      [{ text: "The audit store is SQLite.", sources: [note] }],
+      { record: true },
+    );
+    assert(recorded!.status === "TERMS_ABSENT", JSON.stringify(recorded));
+    const [supportedOld] = checkClaims(
+      db,
+      [{ text: "The audit store is SQLite.", sources: [ref] }],
+      { record: true },
+    );
+    assert(supportedOld!.recorded === undefined, JSON.stringify(supportedOld));
+    assert(
+      supportedOld!.problems.some((p) => p === "not recorded: the index does not hold this text"),
+      JSON.stringify(supportedOld!.problems),
+    );
+    const beliefs = (db.prepare("SELECT count(*) AS n FROM belief").get() as { n: number }).n;
+    assert(beliefs === 0, `record must not write when disk and index disagree: ${beliefs}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: one source the index does not hold stops record, even beside a row cover would pin", () => {
+  const { db, dir, note } = checkFixture();
+  try {
+    const extra = join(dir, "notes", "extra.md");
+    writeFileSync(extra, "The audit store is SQLite.\n");
+    const count = (): number => (db.prepare("SELECT count(*) AS n FROM belief").get() as { n: number }).n;
+    const claim = { text: "The audit store is SQLite.", sources: [note, extra] };
+    const [mixed] = checkClaims(db, [claim], { record: true });
+    assert(mixed!.status === "SUPPORTED" && mixed!.problems.includes("not indexed yet"), JSON.stringify(mixed));
+    assert(
+      mixed!.foundIn.every((r) => !r.startsWith("notes/extra.md")),
+      `setup: cover must pick the indexed row alone: ${JSON.stringify(mixed!.foundIn)}`,
+    );
+    assert(mixed!.recorded === undefined && count() === 0, `nothing may be recorded: ${JSON.stringify(mixed)}`);
+    assert(
+      mixed!.problems.some((p) => p === "not recorded: the index does not hold this text"),
+      JSON.stringify(mixed!.problems),
+    );
+    // The control: the indexed note alone is pinned, so the refusal above is the unindexed source's doing.
+    const [alone] = checkClaims(db, [{ text: claim.text, sources: [note] }], { record: true });
+    assert(alone!.recorded?.status === "ALLOWED" && count() === 1, JSON.stringify(alone));
+    // A claim that is not SUPPORTED does not gain the line.
+    const [absent] = checkClaims(db, [{ text: "The audit store is Postgres.", sources: [note, extra] }], { record: true });
+    assert(absent!.status === "TERMS_ABSENT" && !absent!.problems.some((p) => p.startsWith("not recorded")), JSON.stringify(absent));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -9924,6 +10078,215 @@ test("pins", "check: a nested root that excluded a note does not hide the outer 
     assert(r.status === "SUPPORTED", `the outer root holds it: ${JSON.stringify(r)}`);
   } finally {
     rmSync(outer, { recursive: true, force: true });
+  }
+});
+
+
+test("pins", "check: an unindexed note in a declared folder is judged from disk", () => {
+  const db = freshDb();
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-disk-")));
+  try {
+    mkdirSync(join(dir, "notes"));
+    const note = join(dir, "notes", "gpu.md");
+    writeFileSync(note, "# GPU\n\nOne NVIDIA A100 80GB can serve about 1,000 users.\n");
+    const [r] = checkClaims(
+      db,
+      [{ text: "One NVIDIA A100 80GB can serve about 2,000 users.", sources: [note] }],
+      { folders: [{ root: dir, exclude: [] }] },
+    );
+    assert(r!.status === "TERMS_ABSENT" && r!.missing.includes("2000"), JSON.stringify(r));
+    assert(r!.problems.some((p) => p === "not indexed yet"), JSON.stringify(r!.problems));
+    assert(r!.checkedRefs.some((ref) => ref === "notes/gpu.md#p0"), JSON.stringify(r!.checkedRefs));
+    const text = formatCheck([r!], false);
+    assert(text.includes("not judged — a cited source could not be read") === false, text);
+    const none = checkClaims(db, [{ text: "One NVIDIA A100 serves 1,000 users.", sources: [note] }]);
+    assert(none[0]!.status === "NOT_FOUND" && none[0]!.problems.some((p) => p === "no notes folder declared — chamber mcp --notes <folder>"), JSON.stringify(none[0]));
+    assert(formatCheck(none, false).includes("not judged — a cited source could not be read"), formatCheck(none, false));
+    const mixed = checkClaims(
+      db,
+      [{ text: "One NVIDIA A100 80GB can serve about 1,000 users.", sources: [note, join(dir, "..", "outside.md")] }],
+      { folders: [{ root: dir, exclude: [] }] },
+    );
+    assert(mixed[0]!.status === "NOT_FOUND" && mixed[0]!.checkedRefs.length === 0, JSON.stringify(mixed[0]));
+    writeFileSync(join(dir, "notes", "empty.md"), "");
+    const empty = checkClaims(
+      db,
+      [{ text: "One NVIDIA A100 serves 1,000 users.", sources: [join(dir, "notes", "empty.md")] }],
+      { folders: [{ root: dir, exclude: [] }] },
+    );
+    assert(empty[0]!.status === "NOT_FOUND" && empty[0]!.problems.some((p) => p.includes("empty")), JSON.stringify(empty[0]));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: a disk reading is never recorded", () => {
+  const db = freshDb();
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-diskrec-")));
+  try {
+    const note = join(dir, "gpu.md");
+    writeFileSync(note, "# GPU\n\nOne NVIDIA A100 80GB can serve about 1,000 users.\n");
+    const count = (t: string): number => (db.prepare(`SELECT count(*) AS n FROM ${t}`).get() as { n: number }).n;
+    const before = ["belief", "belief_source", "citation_debt"].map(count).join(",");
+    const [r] = checkClaims(
+      db,
+      [{ text: "One NVIDIA A100 80GB can serve about 1,000 users.", sources: [note] }],
+      { record: true, folders: [{ root: dir, exclude: [] }] },
+    );
+    assert(r!.status === "SUPPORTED" && r!.problems.includes("not indexed yet"), JSON.stringify(r));
+    assert(r!.recorded === undefined, `a disk reading has no row to pin: ${JSON.stringify(r!.recorded)}`);
+    const after = ["belief", "belief_source", "citation_debt"].map(count).join(",");
+    assert(after === before, `nothing may be written (${before} → ${after})`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: --notes binds the excludes that follow it", () => {
+  const bad = parseNotesArgs(["--exclude", "transcripts"]);
+  assert(!bad.ok && bad.error.includes("--exclude"), JSON.stringify(bad));
+  const unknown = parseNotesArgs(["--notes", "/tmp/v", "--include-dotted"]);
+  assert(!unknown.ok && unknown.error.includes("--include-dotted"), JSON.stringify(unknown));
+  const missing = parseNotesArgs(["--notes"]);
+  assert(!missing.ok, JSON.stringify(missing));
+  const emptyNotes = parseNotesArgs(["--notes", ""]);
+  assert(!emptyNotes.ok && emptyNotes.error.includes("--notes requires a path"), JSON.stringify(emptyNotes));
+  const bareHome = parseNotesArgs(["--notes", "~"]);
+  assert(bareHome.ok, JSON.stringify(bareHome));
+  if (bareHome.ok) {
+    const homeRoot = realpathSync.native(homedir());
+    assert(bareHome.folders[0]!.root === homeRoot, bareHome.folders[0]!.root);
+  }
+  const ok = parseNotesArgs([
+    "mcp",
+    "--notes", "~/Vault",
+    "--exclude", "transcripts",
+    "--notes", "~/Vault/research",
+    "--exclude", "raw",
+  ]);
+  assert(ok.ok, JSON.stringify(ok));
+  if (!ok.ok) return;
+  assert(ok.folders.length === 2, JSON.stringify(ok.folders));
+  assert(ok.folders[0]!.exclude.join() === "transcripts", JSON.stringify(ok.folders[0]));
+  assert(ok.folders[1]!.exclude.join() === "raw", JSON.stringify(ok.folders[1]));
+  assert(!ok.folders[0]!.root.includes("~"), ok.folders[0]!.root);
+  const twice = parseNotesArgs(["--notes", "/tmp/v", "--exclude", "a", "--notes", "/tmp/v", "--exclude", "b"]);
+  assert(twice.ok, JSON.stringify(twice));
+  if (!twice.ok) return;
+  const merged = mergeDeclaredFolders(twice.folders);
+  assert(merged.length === 1 && merged[0]!.exclude.slice().sort().join() === "a,b", JSON.stringify(merged));
+});
+
+test("pins", "check: an exclude that matches nothing poisons only that folder", () => {
+  const db = freshDb();
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-poison-")));
+  try {
+    const a = join(base, "a");
+    const b = join(base, "b");
+    mkdirSync(a);
+    mkdirSync(b);
+    writeFileSync(join(a, "n.md"), "The audit store is SQLite.\n");
+    writeFileSync(join(b, "n.md"), "The audit store is SQLite.\n");
+    const folders = [
+      { root: a, exclude: ["no-such"] },
+      { root: b, exclude: [] },
+    ];
+    const [bad, good] = checkClaims(
+      db,
+      [
+        { text: "The audit store is SQLite.", sources: [join(a, "n.md")] },
+        { text: "The audit store is SQLite.", sources: [join(b, "n.md")] },
+      ],
+      { folders },
+    );
+    assert(bad!.status === "NOT_FOUND", JSON.stringify(bad));
+    assert(
+      bad!.problems.some((p) => p === '--exclude matched nothing: "no-such" — nothing in this folder was checked'),
+      JSON.stringify(bad!.problems),
+    );
+    assert(good!.status === "SUPPORTED", JSON.stringify(good));
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: a poisoned folder refuses an indexed absolute passage before any open", () => {
+  const db = freshDb();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-poison-idx-")));
+  const POISON = '--exclude matched nothing: "no-such" — nothing in this folder was checked';
+  try {
+    const note = join(root, "n.md");
+    writeFileSync(note, "The audit store is SQLite.\n");
+    ingestDirectory(db, root);
+    const folders = [{ root, exclude: ["no-such"] }];
+    const claim = { text: "The audit store is SQLite.", sources: [`${note}#p0`] };
+    // The index holds this passage: resolveSource takes the indexed branch.
+    const first = checkClaims(db, [claim], { folders })[0]!;
+    assert(first.status === "NOT_FOUND", `indexed #p0 under a poisoned folder: ${JSON.stringify(first)}`);
+    assert(first.problems.some((p) => p === POISON), JSON.stringify(first.problems));
+    // Not opened: with a fifo in the note's place any open hangs or reports "regular file".
+    rmSync(note);
+    const fifo = spawnSync("mkfifo", [note]);
+    assert(fifo.status === 0, `setup: mkfifo failed: ${fifo.stderr}`);
+    const t = Date.now();
+    const piped = checkClaims(db, [claim], { folders })[0]!;
+    assert(Date.now() - t < 5000, "the call must return, not hang on the fifo");
+    assert(piped.status === "NOT_FOUND" && piped.problems.some((p) => p === POISON), JSON.stringify(piped));
+    assert(!piped.problems.some((p) => p.includes("regular file")), `the file was opened: ${JSON.stringify(piped.problems)}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: the poison cache is keyed by the exclude list, not the root", () => {
+  const db = freshDb();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-poison-key-")));
+  const POISON = '--exclude matched nothing: "no-such" — nothing in this folder was checked';
+  try {
+    mkdirSync(join(root, "skip"));
+    writeFileSync(join(root, "skip", "x.md"), "Skipped.\n");
+    writeFileSync(join(root, "n.md"), "The audit store is SQLite.\n");
+    const claim = { text: "The audit store is SQLite.", sources: [join(root, "n.md")] };
+    const poisoned = [{ root, exclude: ["no-such"] }];
+    for (const round of [1, 2]) {
+      const r = checkClaims(db, [claim], { folders: poisoned })[0]!;
+      assert(r.status === "NOT_FOUND" && r.problems.some((p) => p === POISON), `round ${round}: ${JSON.stringify(r)}`);
+    }
+    // Same root, a list that matches something: a root-only key would stay poisoned.
+    const real = checkClaims(db, [claim], { folders: [{ root, exclude: ["skip"] }] })[0]!;
+    assert(real.status === "SUPPORTED", `a matching exclude list must give a real verdict: ${JSON.stringify(real)}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pins", "check: a link to a folder in the same root does not bypass a multi-segment exclude", () => {
+  const db = freshDb();
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "chamber-check-zlink-")));
+  const WHY = "excluded by --exclude work/clients";
+  try {
+    mkdirSync(join(root, "work", "clients"), { recursive: true });
+    mkdirSync(join(root, "work", "public"), { recursive: true });
+    writeFileSync(join(root, "work", "clients", "acme.md"), "The audit store is SQLite.\n");
+    writeFileSync(join(root, "work", "public", "open.md"), "The audit store is SQLite.\n");
+    symlinkSync(join(root, "work"), join(root, "zlink"));
+    const folders = [{ root, exclude: ["work/clients"] }];
+    const claimOf = (p: string) => ({ text: "The audit store is SQLite.", sources: [p] });
+    // Control: the real spelling is refused.
+    const direct = checkClaims(db, [claimOf(join(root, "work", "clients", "acme.md"))], { folders })[0]!;
+    assert(direct.status === "NOT_FOUND" && direct.problems.some((p) => p.includes(WHY)), `direct: ${JSON.stringify(direct)}`);
+    // The bypass: the same file through an in-root link to its folder.
+    const viaLink = checkClaims(db, [claimOf(join(root, "zlink", "clients", "acme.md"))], { folders })[0]!;
+    assert(viaLink.status === "NOT_FOUND" && viaLink.problems.some((p) => p.includes(WHY)), `via link: ${JSON.stringify(viaLink)}`);
+    // A note not under the exclude, reached through the link, stays judged.
+    const open = checkClaims(db, [claimOf(join(root, "zlink", "public", "open.md"))], { folders })[0]!;
+    assert(open.status === "SUPPORTED", `a non-excluded note via the link: ${JSON.stringify(open)}`);
+    // An in-root link to a single note is still readable.
+    symlinkSync(join(root, "work", "public", "open.md"), join(root, "a.md"));
+    const leaf = checkClaims(db, [claimOf(join(root, "a.md"))], { folders })[0]!;
+    assert(leaf.status === "SUPPORTED", `an in-root link to a note: ${JSON.stringify(leaf)}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -9961,6 +10324,35 @@ test("oauth", "chamber_check over MCP: instructions in initialize, a check throu
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("pins", "claim support: the digits after a decimal point are not a second term", () => {
+  // "$4.2M" was checked as 4.2M and also as "2M": NAME (digits then a capital) began again right after the
+  // decimal point. chamber_check then reported "does not contain: 4.2M, 2M" against a note saying $2.4M.
+  for (const [claim, want] of [
+    ["Q3 revenue was $4.2M.", ["4.2M", "Q3"]],
+    ["It holds 9.99M rows", ["9.99M"]],
+    ["A 1.5GB file", ["1.5", "1.5GB"]],
+    ["A 1.2B parameter model", ["1.2", "1.2B"]],
+    ["Costs 1,5M EUR", ["1,5M", "EUR"]],
+  ] as const) {
+    const got = specificTerms(claim, { openings: true }).filter((t) => t !== "3")
+    assert(JSON.stringify(got) === JSON.stringify(want), `${claim}: ${JSON.stringify(got)}`);
+  }
+  assert(JSON.stringify(missingTerms("Q3 revenue was $4.2M [1]", ["Q3 revenue was $2.4M."])) === JSON.stringify(["4.2M"]), "only the real number is reported");
+  // The unit stays part of the term: dropping "5GB" must not let a different unit through.
+  assert(missingTerms("A 1.5GB file [1]", ["A 1.5TB file"]).includes("1.5GB"), "1.5GB vs 1.5TB is flagged");
+  assert(missingTerms("A 1.5GB file [1]", ["A 1.5GB file"]).length === 0, "1.5GB vs 1.5GB passes");
+  // A number glued to a letter or `_` cannot match whole, so its tail stays a term, as before: dropping it
+  // certified v1.2B against a note saying v1.2C (review of this fix).
+  for (const [c, p, t] of [
+    ["The v1.2B build [1]", "The v1.2C build", "2B"],
+    ["Runs iOS17.4Beta [1]", "Runs iOS17.4Alpha", "4Beta"],
+    ["Uses GPT4.5Turbo [1]", "Uses GPT4.5Mini", "5Turbo"],
+    ["Ships ver_2.0RC [1]", "Ships ver_2.0GA", "0RC"],
+  ] as const) assert(missingTerms(c, [p]).includes(t), `${c} vs ${p} must flag ${t}: ${JSON.stringify(missingTerms(c, [p]))}`);
+  // A name right after a full stop between sentences is still a name.
+  assert(specificTerms("It shipped in 2024.Tesla bought it", { openings: true }).includes("Tesla"), "a name after a year and a full stop");
 });
 
 test("pins", "claim support: a citation's title and path names count; numbers match across scales", () => {
@@ -14401,6 +14793,39 @@ test("cli", "a config broken mid-session fails chamber_ask but not the tools tha
     assert(!corpus.startsWith("ERROR") && !/not valid JSON/.test(corpus), `corpus must still answer: ${corpus}`);
     const ask = await s.ask("what is the audit store");
     assert(/not valid JSON/.test(ask), `ask must fail on the broken config: ${ask}`);
+  } finally {
+    s.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cli", "a config broken mid-session fails chamber_check instead of dropping the config roots excludes", async () => {
+  // The check declared folders include the config ingest roots and their
+  // excludes. With the database already open, a config that no longer parses
+  // used to fall through to no folders at all; it must fail the check out loud.
+  const { env, dir } = stubAskFixture();
+  const vault = join(dir, "vault");
+  mkdirSync(join(vault, "private"), { recursive: true });
+  writeFileSync(join(vault, "notes.md"), "The audit store is SQLite.\n");
+  writeFileSync(join(vault, "private", "secret.md"), "The audit store is SQLite.\n");
+  writeFileSync(
+    env.CHAMBER_CONFIG!,
+    `${JSON.stringify({ database: env.CHAMBER_DB, ingest: [{ root: vault, exclude: ["private"] }] })}\n`,
+  );
+  const s = mcpSession(env);
+  const claim = (p: string) => ({ claims: [{ text: "The audit store is SQLite.", sources: [p] }] });
+  try {
+    const open = await s.tool("chamber_corpus", {});
+    assert(!open.startsWith("ERROR"), `setup: the database is open: ${open}`);
+    const ok = await s.tool("chamber_check", claim(join(vault, "notes.md")));
+    assert(!ok.startsWith("ERROR") && /SUPPORTED/.test(ok), `setup: a config root is a declared folder: ${ok}`);
+    const refused = await s.tool("chamber_check", claim(join(vault, "private", "secret.md")));
+    assert(/excluded by --exclude private/.test(refused), `setup: the config exclude applies: ${refused}`);
+    writeFileSync(env.CHAMBER_CONFIG!, "{ not json");
+    const broken = await s.tool("chamber_check", claim(join(vault, "notes.md")));
+    assert(/not valid JSON/.test(broken) && !/SUPPORTED|NOT_FOUND/.test(broken), `a broken config must fail the check: ${broken}`);
+    const brokenExcluded = await s.tool("chamber_check", claim(join(vault, "private", "secret.md")));
+    assert(/not valid JSON/.test(brokenExcluded) && !/SUPPORTED/.test(brokenExcluded), `an excluded note must not be judged: ${brokenExcluded}`);
   } finally {
     s.stop();
     rmSync(dir, { recursive: true, force: true });

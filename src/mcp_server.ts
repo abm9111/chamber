@@ -48,9 +48,13 @@
  * see below.
  */
 
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { openChamberDb } from "./db.ts";
 import { loadConfig, applyModelEnv } from "./config.ts";
+import { mergeDeclaredFolders, parseNotesArgs } from "./declared_folders.ts";
 import { runAsk, stubDisclosure } from "./ask.ts";
 import { verifyBeliefSources } from "./pins.ts";
 import { corpusStats } from "./corpus.ts";
@@ -70,6 +74,15 @@ import { formatErrorChain } from "./error_chain.ts";
 console.log = console.error;
 console.info = console.error;
 console.debug = console.error;
+
+// A bad flag is refused before any JSON-RPC frame is written. An empty argv is
+// valid: the folders then come from the config's ingest roots alone.
+const notes = parseNotesArgs(process.argv.slice(2));
+if (!notes.ok) {
+  console.error(notes.error);
+  process.exit(1);
+}
+const declaredFolders = notes.folders;
 
 const SERVER_NAME = "chamber";
 const SERVER_VERSION = "0.1.9";
@@ -112,7 +125,12 @@ const operatorModelEnv = new Set(
 );
 let lastModel = "";
 
-function getDb(needsModel = true): DatabaseSync {
+/**
+ * Re-reads config and re-seeds the model environment. Returns null only when
+ * the config no longer parses, the tool does not need a model, and a database
+ * is already open: that call keeps working on the open database.
+ */
+function refreshConfig(needsModel: boolean): ReturnType<typeof loadConfig> | null {
   // Re-read on every call, not once. A config file that no longer parses
   // throws here and fails this call out loud rather than serving the old
   // settings as if nothing had changed.
@@ -134,7 +152,7 @@ function getDb(needsModel = true): DatabaseSync {
     // 2026-09-26). chamber_ask, and any first call, still fail out loud.
     if (!needsModel && db) {
       console.error(`chamber mcp: config unreadable, using the open db — ${String(err)}`);
-      return db;
+      return null;
     }
     throw err;
   }
@@ -151,7 +169,11 @@ function getDb(needsModel = true): DatabaseSync {
     console.error(`chamber mcp: ${lastModel === "" ? "" : "config changed — "}${model}`);
     lastModel = model;
   }
+  return config;
+}
 
+/** The pinned database for this process, opened on first use. */
+function openPinned(config: NonNullable<ReturnType<typeof refreshConfig>>): DatabaseSync {
   if (!db) {
     db = openChamberDb(config.database);
     openedDatabase = config.database;
@@ -168,6 +190,26 @@ function getDb(needsModel = true): DatabaseSync {
   return db;
 }
 
+function getDb(needsModel = true): DatabaseSync {
+  const config = refreshConfig(needsModel);
+  return config === null ? db! : openPinned(config);
+}
+
+/**
+ * True for a source `checkClaims` can judge from disk without the index: an
+ * absolute path (after `~/`), with or without a `#pN` suffix — a path is still
+ * absolute when it names a passage. A relative path and a `vdoc_` id are
+ * resolved against the index.
+ */
+function isDiskOnlySource(raw: string): boolean {
+  const src = raw.trim();
+  const expanded = src.startsWith("~/") ? `${homedir()}${src.slice(1)}` : src;
+  return isAbsolute(expanded);
+}
+
+/** An empty, schema-complete index held in memory: no file is created for it. */
+let emptyIndex: DatabaseSync | null = null;
+
 function send(msg: Record<string, unknown>): void {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...msg })}\n`);
 }
@@ -182,11 +224,14 @@ const INSTRUCTIONS =
   "answer from those notes, call chamber_check with each factual claim and the note " +
   "it came from (the absolute path you read) before presenting it. Report " +
   "TERMS_ABSENT claims as not supported by that note instead of asserting them, and " +
-  "say when a note was STALE or NOT_FOUND. SUPPORTED means every number, " +
-  "capitalised name, domain, file name and count (two to ninety-nine in words) in " +
-  "the claim occurs in the note; " +
-  "lowercase names and ordinary words are not checked, nor is meaning, so a negated " +
-  "or reversed claim can still pass. chamber_ask answers with Chamber's own " +
+  "say when a note was NOT_FOUND. The check reads notes from folders " +
+  "declared with --notes or the config's ingest roots; an absolute path is the file " +
+  "on disk; a passage ref is the indexed text; `SUPPORTED` means the recognised terms " +
+  "occur in the judged text and a negated or reversed sentence built from the note's " +
+  "own words still passes. The recognised terms are every number, capitalised name, " +
+  "domain, file name and count (two to ninety-nine in words); " +
+  "lowercase names and ordinary words are not checked, nor is meaning. " +
+  "chamber_ask answers with Chamber's own " +
   "configured model; chamber_verify reports recorded claims whose pinned passages " +
   "changed, once the note is re-ingested; " +
   "chamber_corpus shows what is indexed.";
@@ -197,13 +242,14 @@ const TOOLS = [
     description:
       "Check your own claims against the user's notes before you state them. For each " +
       "claim, give the note(s) it came from — the absolute path you read, a `file.md#p3` " +
-      "ref from chamber_ask, or a passage id. Chamber confirms the note is indexed and " +
-      "unchanged on disk since indexing, then checks that every number, capitalised " +
-      "name, domain, file name and count in the claim occurs in that note. Verdicts: SUPPORTED, " +
+      "ref from chamber_ask, or a passage id. The check reads notes from folders declared " +
+      "with --notes or the config's ingest roots; an absolute path is the file on disk; a " +
+      "passage ref is the indexed text; `SUPPORTED` means the recognised terms occur in the " +
+      "judged text and a negated or reversed sentence built from the note's own words " +
+      "still passes. Verdicts: SUPPORTED, " +
       "TERMS_ABSENT (names the missing terms), NO_TERMS (nothing specific to check), " +
-      "STALE (the note changed since indexing — not judged), NOT_FOUND, NO_SOURCE. " +
-      "The check uses no model and is deterministic. It does not check meaning — a " +
-      "negated claim built from the note's own words passes. Read-only unless `record` " +
+      "NOT_FOUND, NO_SOURCE. " +
+      "The check uses no model and is deterministic. Read-only unless `record` " +
       "is true, which commits SUPPORTED claims through Chamber's gate (which may run the " +
       "local embedder to compare against open citation debt), pinned to the passages " +
       "that hold their terms, so chamber_verify reports them if a pinned passage changes " +
@@ -424,8 +470,27 @@ async function callTool(
       }
       const claims = parseCheckClaims(args.claims);
       const record = args.record === true;
-      // No model: this check is the part of the gate that needs none.
-      return formatCheck(checkClaims(getDb(false), claims, { record }), record);
+      // No model: this check is the part of the gate that needs none. But it
+      // does need the config, because the config's ingest roots and their
+      // excludes are declared folders: a config that no longer parses fails the
+      // check out loud (`true`), rather than falling through to the open
+      // database's row roots, which carry no excludes.
+      const config = refreshConfig(true);
+      if (config === null) throw new Error("chamber_check: config could not be loaded");
+      const folders = mergeDeclaredFolders([
+        ...declaredFolders,
+        ...config.ingest.map((i) => ({ root: i.root, exclude: [...i.exclude] })),
+      ]);
+      // The database file is opened only when something needs it: it already
+      // exists, a database is already pinned, or a source is a passage id or
+      // a relative path. Otherwise every source is an absolute path (a passage
+      // ref included) judged from disk, and opening would create a file
+      // nobody asked for.
+      const needsIndex = claims.some((c) => c.sources.some((s) => !isDiskOnlySource(s)));
+      let index: DatabaseSync;
+      if (db !== null || needsIndex || existsSync(config.database)) index = openPinned(config);
+      else index = emptyIndex ??= openChamberDb(":memory:");
+      return formatCheck(checkClaims(index, claims, { record, folders }), record);
     }
 
     case "chamber_verify": {

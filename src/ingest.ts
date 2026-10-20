@@ -390,6 +390,53 @@ interface WalkContext {
   visited: Set<string>;
 }
 
+export interface EntryDecision {
+  action: "skip" | "descend" | "file";
+  skip?: IngestSkip;
+  /**
+   * Set on a `kind: "excluded"` skip only. "name": the entry's own path matched
+   * a pattern, so anything beneath it is matched again on its own path.
+   * "target": a symlink's *target* matched; the walk never descends the link,
+   * so a path beneath it is refused as a whole, not re-matched.
+   */
+  excludedBy?: "name" | "target";
+}
+
+/**
+ * `owners[i]` is the pattern input `i` is counted on, or undefined when it was
+ * rejected or merged into an earlier equal pattern. One slot per input, so a
+ * caller can tell "matched nothing" from "was discarded".
+ */
+function buildWalkPatternsIndexed(
+  root: string,
+  exclude: readonly string[],
+): { patterns: ExcludePattern[]; owners: (ExcludePattern | undefined)[] } {
+  const patterns: ExcludePattern[] = [];
+  const owners: (ExcludePattern | undefined)[] = [];
+  const seen = new Set<string>();
+  for (const raw of exclude) {
+    const norm = normalizeExclude(raw, root);
+    if (!norm.ok || seen.has(norm.pattern)) {
+      owners.push(undefined);
+      continue;
+    }
+    seen.add(norm.pattern);
+    const p: ExcludePattern = {
+      raw,
+      pattern: norm.pattern,
+      segmented: norm.segmented,
+      matched: 0,
+    };
+    patterns.push(p);
+    owners.push(p);
+  }
+  return { patterns, owners };
+}
+
+function buildWalkPatterns(root: string, exclude: readonly string[]): ExcludePattern[] {
+  return buildWalkPatternsIndexed(root, exclude).patterns;
+}
+
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -424,6 +471,167 @@ function contained(root: string, candidate: string): boolean {
  * `link -> Private/` cannot launder a deny-listed folder past a pattern that
  * only sees the link's own name.
  */
+export function classifyEntry(ctx: WalkContext, dir: string, entry: string): EntryDecision {
+  const full = join(dir, entry);
+  const rel = relPosix(ctx.root, full);
+
+  // Dotted entries are opt-in. `.trash` holds notes the operator *deleted*;
+  // ingesting it resurrects deleted content into a queryable corpus.
+  if (!ctx.includeDotted && entry.startsWith(".")) {
+    return {
+      action: "skip",
+      skip: {
+        path: rel,
+        kind: "dotted",
+        reason: "dotted entry (pass --include-dotted to ingest it)",
+      },
+    };
+  }
+
+  const hit = matchExclude(ctx.patterns, rel);
+  if (hit) {
+    hit.matched += 1;
+    return {
+      action: "skip",
+      skip: {
+        path: rel,
+        kind: "excluded",
+        reason: `excluded by --exclude ${hit.raw}`,
+      },
+      excludedBy: "name",
+    };
+  }
+
+  let isLink: boolean;
+  try {
+    isLink = lstatSync(full).isSymbolicLink();
+  } catch (err) {
+    return {
+      action: "skip",
+      skip: {
+        path: rel,
+        kind: "unreadable",
+        reason: `unreadable entry: ${errText(err)}`,
+      },
+    };
+  }
+
+  let realFull = full;
+  if (isLink) {
+    try {
+      realFull = realpathSync(full);
+    } catch (err) {
+      // Dangling link, or a loop (ELOOP). Report and keep walking.
+      return {
+        action: "skip",
+        skip: {
+          path: rel,
+          kind: "unreadable",
+          reason: `unresolvable symlink: ${errText(err)}`,
+        },
+      };
+    }
+    if (!contained(ctx.root, realFull)) {
+      return {
+        action: "skip",
+        skip: {
+          path: rel,
+          kind: "symlink_escape",
+          reason: `symlink escapes the ingest root (points at ${realFull})`,
+        },
+      };
+    }
+    // The dotted rule applies to where a link lands, not only to its name:
+    // "notes → .obsidian" and "y.md → .obsidian/x.md" were walked and
+    // indexed without --include-dotted (review E, 2026-09-27).
+    if (!ctx.includeDotted && relPosix(ctx.root, realFull).split("/").some((seg) => seg.startsWith(".") && seg !== "." && seg !== "..")) {
+      return {
+        action: "skip",
+        skip: {
+          path: rel,
+          kind: "dotted",
+          reason: "symlink target is a dotted entry (pass --include-dotted to ingest it)",
+        },
+      };
+    }
+    const targetHit = matchExclude(ctx.patterns, relPosix(ctx.root, realFull));
+    if (targetHit) {
+      targetHit.matched += 1;
+      return {
+        action: "skip",
+        skip: {
+          path: rel,
+          kind: "excluded",
+          reason: `symlink target excluded by --exclude ${targetHit.raw}`,
+        },
+        excludedBy: "target",
+      };
+    }
+  }
+
+  let isDir: boolean;
+  let isFile: boolean;
+  try {
+    const st = statSync(realFull);
+    isDir = st.isDirectory();
+    isFile = st.isFile();
+  } catch (err) {
+    return {
+      action: "skip",
+      skip: {
+        path: rel,
+        kind: "unreadable",
+        reason: `unstattable entry: ${errText(err)}`,
+      },
+    };
+  }
+
+  if (isDir) {
+    let key: string;
+    try {
+      key = realpathSync(realFull);
+    } catch {
+      key = realFull;
+    }
+    if (ctx.visited.has(key)) {
+      return {
+        action: "skip",
+        skip: {
+          path: rel,
+          kind: "cycle",
+          reason: "directory already visited (symlink cycle or duplicate link)",
+        },
+      };
+    }
+    ctx.visited.add(key);
+    return { action: "descend" };
+  }
+
+  if (!isFile) {
+    return {
+      action: "skip",
+      skip: { path: rel, kind: "not_regular_file", reason: "not a regular file" },
+    };
+  }
+
+  // Both the name and, for a link, its target must be notes: "z.md →
+  // data.json" is JSON, and "c.txt → c.md" would store a note a second time
+  // under a name that is not one (review F).
+  const ext = extname(entry).toLowerCase();
+  const targetExt = extname(realFull).toLowerCase();
+  if (!MARKDOWN_EXTENSIONS.includes(ext) || !MARKDOWN_EXTENSIONS.includes(targetExt)) {
+    return {
+      action: "skip",
+      skip: {
+        path: rel,
+        kind: "unsupported_extension",
+        reason: `unsupported extension ${ext || "(none)"} (ingesting ${MARKDOWN_EXTENSIONS.join(", ")})`,
+      },
+    };
+  }
+  return { action: "file" };
+}
+
 function walk(ctx: WalkContext, dir: string): void {
   let entries: string[];
   try {
@@ -436,144 +644,109 @@ function walk(ctx: WalkContext, dir: string): void {
     });
     return;
   }
-
   for (const entry of entries) {
-    const full = join(dir, entry);
-    const rel = relPosix(ctx.root, full);
-
-    // Dotted entries are opt-in. `.trash` holds notes the operator *deleted*;
-    // ingesting it resurrects deleted content into a queryable corpus.
-    if (!ctx.includeDotted && entry.startsWith(".")) {
-      ctx.skipped.push({
-        path: rel,
-        kind: "dotted",
-        reason: "dotted entry (pass --include-dotted to ingest it)",
-      });
+    const decision = classifyEntry(ctx, dir, entry);
+    if (decision.action === "skip") {
+      ctx.skipped.push(decision.skip!);
       continue;
     }
-
-    const hit = matchExclude(ctx.patterns, rel);
-    if (hit) {
-      hit.matched += 1;
-      ctx.skipped.push({
-        path: rel,
-        kind: "excluded",
-        reason: `excluded by --exclude ${hit.raw}`,
-      });
+    if (decision.action === "descend") {
+      walk(ctx, join(dir, entry));
       continue;
     }
-
-    let isLink: boolean;
-    try {
-      isLink = lstatSync(full).isSymbolicLink();
-    } catch (err) {
-      ctx.skipped.push({
-        path: rel,
-        kind: "unreadable",
-        reason: `unreadable entry: ${errText(err)}`,
-      });
-      continue;
-    }
-
-    let realFull = full;
-    if (isLink) {
-      try {
-        realFull = realpathSync(full);
-      } catch (err) {
-        // Dangling link, or a loop (ELOOP). Report and keep walking.
-        ctx.skipped.push({
-          path: rel,
-          kind: "unreadable",
-          reason: `unresolvable symlink: ${errText(err)}`,
-        });
-        continue;
-      }
-      if (!contained(ctx.root, realFull)) {
-        ctx.skipped.push({
-          path: rel,
-          kind: "symlink_escape",
-          reason: `symlink escapes the ingest root (points at ${realFull})`,
-        });
-        continue;
-      }
-      // The dotted rule applies to where a link lands, not only to its name:
-      // "notes → .obsidian" and "y.md → .obsidian/x.md" were walked and
-      // indexed without --include-dotted (review E, 2026-09-27).
-      if (!ctx.includeDotted && relPosix(ctx.root, realFull).split("/").some((seg) => seg.startsWith(".") && seg !== "." && seg !== "..")) {
-        ctx.skipped.push({
-          path: rel,
-          kind: "dotted",
-          reason: "symlink target is a dotted entry (pass --include-dotted to ingest it)",
-        });
-        continue;
-      }
-      const targetHit = matchExclude(ctx.patterns, relPosix(ctx.root, realFull));
-      if (targetHit) {
-        targetHit.matched += 1;
-        ctx.skipped.push({
-          path: rel,
-          kind: "excluded",
-          reason: `symlink target excluded by --exclude ${targetHit.raw}`,
-        });
-        continue;
-      }
-    }
-
-    let isDir: boolean;
-    let isFile: boolean;
-    try {
-      const st = statSync(realFull);
-      isDir = st.isDirectory();
-      isFile = st.isFile();
-    } catch (err) {
-      ctx.skipped.push({
-        path: rel,
-        kind: "unreadable",
-        reason: `unstattable entry: ${errText(err)}`,
-      });
-      continue;
-    }
-
-    if (isDir) {
-      let key: string;
-      try {
-        key = realpathSync(realFull);
-      } catch {
-        key = realFull;
-      }
-      if (ctx.visited.has(key)) {
-        ctx.skipped.push({
-          path: rel,
-          kind: "cycle",
-          reason: "directory already visited (symlink cycle or duplicate link)",
-        });
-        continue;
-      }
-      ctx.visited.add(key);
-      walk(ctx, full);
-      continue;
-    }
-
-    if (!isFile) {
-      ctx.skipped.push({ path: rel, kind: "not_regular_file", reason: "not a regular file" });
-      continue;
-    }
-
-    // Both the name and, for a link, its target must be notes: "z.md →
-    // data.json" is JSON, and "c.txt → c.md" would store a note a second time
-    // under a name that is not one (review F).
-    const ext = extname(entry).toLowerCase();
-    const targetExt = extname(realFull).toLowerCase();
-    if (!MARKDOWN_EXTENSIONS.includes(ext) || !MARKDOWN_EXTENSIONS.includes(targetExt)) {
-      ctx.skipped.push({
-        path: rel,
-        kind: "unsupported_extension",
-        reason: `unsupported extension ${ext || "(none)"} (ingesting ${MARKDOWN_EXTENSIONS.join(", ")})`,
-      });
-      continue;
-    }
-    ctx.files.push(full);
+    ctx.files.push(join(dir, entry));
   }
+}
+
+export function pathRefusal(
+  rootInput: string,
+  exclude: readonly string[],
+  absPath: string,
+): IngestSkip | null {
+  let root: string;
+  try {
+    root = realpathSync(resolve(rootInput));
+  } catch (err) {
+    return {
+      path: ".",
+      kind: "unreadable",
+      reason: `ingest root is unreadable: ${rootInput} — ${errText(err)}`,
+    };
+  }
+  const rel = relative(root, absPath);
+  if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+    return {
+      path: relPosix(root, absPath),
+      kind: "symlink_escape",
+      reason: `symlink escapes the ingest root (points at ${absPath})`,
+    };
+  }
+  const ctx: WalkContext = {
+    root,
+    patterns: buildWalkPatterns(root, exclude),
+    includeDotted: false,
+    files: [],
+    skipped: [],
+    visited: new Set([root]),
+  };
+  const segments = rel.split(sep).filter((s) => s !== "" && s !== ".");
+  let dir = root;
+  for (let i = 0; i < segments.length; i++) {
+    const entry = segments[i]!;
+    const decision = classifyEntry(ctx, dir, entry);
+    if (decision.action === "skip") {
+      // Only a name-excluded entry is walked through: its children are matched
+      // again on their own paths. A link whose target is excluded is never
+      // descended by ingest, so what lies beneath it is refused here too.
+      if (
+        decision.skip!.kind === "excluded" &&
+        decision.excludedBy === "name" &&
+        i < segments.length - 1
+      ) {
+        dir = join(dir, entry);
+        continue;
+      }
+      return decision.skip!;
+    }
+    if (decision.action === "file") {
+      if (i === segments.length - 1) return null;
+      return {
+        path: relPosix(root, join(dir, entry)),
+        kind: "not_regular_file",
+        reason: "not a regular file",
+      };
+    }
+    dir = join(dir, entry);
+  }
+  return {
+    path: relPosix(root, absPath),
+    kind: "not_regular_file",
+    reason: "not a regular file",
+  };
+}
+
+export function countExcludeMatches(
+  rootInput: string,
+  exclude: readonly string[],
+): { raw: string; matched: number }[] {
+  let root: string;
+  try {
+    root = realpathSync(resolve(rootInput));
+  } catch {
+    return exclude.map((raw) => ({ raw, matched: 0 }));
+  }
+  const { patterns, owners } = buildWalkPatternsIndexed(root, exclude);
+  const ctx: WalkContext = {
+    root,
+    patterns,
+    includeDotted: false,
+    files: [],
+    skipped: [],
+    visited: new Set([root]),
+  };
+  walk(ctx, root);
+  // One row per input, in input order. A rejected or merged pattern is 0.
+  return exclude.map((raw, i) => ({ raw, matched: owners[i]?.matched ?? 0 }));
 }
 
 // ─── identity ────────────────────────────────────────────────────────────────

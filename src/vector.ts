@@ -12,6 +12,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { newId, sha256 } from "./hash.ts";
+import { vaultPageHash } from "./vault_page_hash.ts";
 import { embedLocal, MINILM_MODEL } from "./embedder.ts";
 
 export type VectorSourceKind =
@@ -191,23 +192,14 @@ export function upsertDocument(
     input.id ??
     stableDocumentId(input.sourceKind, input.sourceRef, input.metadata?.ingestRoot);
   const body = input.body;
-  // JSON.stringify of a fixed 3-element array, NOT [...].join("\n"): joining is
-  // not injective across its own separator, so {title:"X", body:"Y\nZ"} and
-  // {title:"X\nY", body:"Z"} minted one identical pin. Moving a newline from the
-  // end of a title to the start of a body was therefore undetectable drift —
-  // precisely what a content pin exists to catch, and vault notes are multi-line
-  // markdown. JSON escapes separators inside each field, so the array framing
-  // is unambiguous about where fields end — but that alone does not make the
-  // formula injective: title/sourceRef are nullable, and defaulting to "" —
-  // `input.title ?? ""` — *before* building the array collapsed NULL and ""
-  // to the same element, reopening the identical undetectable-drift bug one
-  // level up. `?? null` below keeps NULL and "" distinct and only normalizes
-  // `undefined` (which JSON.stringify would otherwise also render as `null`
-  // inside the array) — see vaultPageHash in src/pins.ts for the full
-  // account. Must stay byte-identical to it.
-  const snapshot = sha256(
-    JSON.stringify([input.title ?? null, body, input.sourceRef ?? null]),
-  );
+  // The only vault-page formula. A second copy re-embeds the corpus or skips
+  // a passage whose text changed. src/vault_page_hash.ts says why null and ""
+  // stay distinct.
+  const snapshot = vaultPageHash({
+    title: input.title ?? null,
+    body,
+    source_ref: input.sourceRef ?? null,
+  });
   let model: string;
   let vec: Float32Array;
   if (input.embedding) {

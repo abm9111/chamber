@@ -64,6 +64,7 @@ import {
   findExcludedDocuments,
   buildVerifyReport,
   CITABLE_SOURCE_KINDS,
+  vaultPageHash,
 } from "../src/pins.ts";
 import { runAsk, citedIndices, stubDisclosure } from "../src/ask.ts";
 import { checkClaims, formatCheck } from "../src/check.ts";
@@ -670,6 +671,37 @@ test("pins", "the same passage keeps its id across a rebuilt index", () => {
     model: LOCAL_HASH_MODEL,
   });
   assert(other.id !== a.id, "different passages must not collide");
+});
+
+test("pins", "upsertDocument stores the hash vaultPageHash returns", () => {
+  const db = freshDb();
+  const body = "the body";
+  const nullHash = vaultPageHash({ title: null, body, source_ref: "n.md#p0" });
+  const emptyHash = vaultPageHash({ title: "", body, source_ref: "n.md#p1" });
+  assert(nullHash !== emptyHash, "a null title and an empty title must hash differently");
+
+  const injected = {
+    embedding: new Float32Array(8),
+    model: "test-hash",
+  };
+  const missing = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "n.md#p0",
+    body,
+    ...injected,
+  });
+  const empty = upsertDocument(db, {
+    sourceKind: "vault_page",
+    sourceRef: "n.md#p1",
+    title: "",
+    body,
+    ...injected,
+  });
+  const stored = (id: string): string =>
+    (db.prepare(`SELECT snapshot_hash FROM vector_document WHERE id = ?`).get(id) as { snapshot_hash: string })
+      .snapshot_hash;
+  assert(stored(missing.id) === nullHash, "omitted title must store the null-title hash");
+  assert(stored(empty.id) === emptyHash, "empty title must store the empty-title hash");
 });
 
 /**

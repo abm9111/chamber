@@ -46,10 +46,23 @@ delete process.env.CHAMBER_DB;
 resetMinilmProbe();
 
 const db = openChamberDb(join(root, "chamber.sqlite"));
-ingestDirectory(db, root, {});
+const report = ingestDirectory(db, root, {});
 
 const lines = readFileSync(log, "utf8").split("\n").filter(Boolean);
-const serve = lines.filter((ln: string) => (JSON.parse(ln) as string[]).includes("--serve"));
+const argvs = lines.map((ln) => JSON.parse(ln) as string[]);
+
+if (report.embedFallback) {
+  console.error(`embedFallback: ${report.embedFallback}`);
+  process.exit(1);
+}
+
+const jsonRuns = argvs.filter((argv) => argv.includes("--json"));
+if (jsonRuns.length > 0) {
+  console.error(`unexpected --json during ingest (${jsonRuns.length})\n${lines.join("\n")}`);
+  process.exit(1);
+}
+
+const serve = argvs.filter((argv) => argv.includes("--serve"));
 if (serve.length !== 1) {
   console.error(`expected one --serve start, got ${serve.length}\n${lines.join("\n")}`);
   process.exit(1);

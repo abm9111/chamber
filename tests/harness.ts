@@ -79,6 +79,9 @@ import {
   embedLocalBatch,
   HASH_MODEL,
   MINILM_MODEL,
+  STDIN_CAP_BYTES,
+  chunkJsonStdin,
+  embedMinilm,
 } from "../src/embedder.ts";
 import { CALIBRATED_THRESHOLDS } from "../src/commit_belief.ts";
 import {
@@ -15488,6 +15491,101 @@ test("pins", "a failed vector write leaves no hash that a later ingest would ski
 
 // From here the tally is fixed: `registered` and `results` are read below, so
 // a test declared past this line cannot appear on either side of the summary.
+
+test("embedder", "stdin groups stay in order and an oversized text throws before spawn", () => {
+  const one = chunkJsonStdin(["aa", "bb", "cc"], 1000);
+  assert(one.length === 1 && one[0]!.join() === "aa,bb,cc", JSON.stringify(one));
+  const pair = Buffer.byteLength(JSON.stringify(["aa", "bb"]), "utf8");
+  const tight = chunkJsonStdin(["aa", "bb", "cc"], pair);
+  assert(tight.length === 2 && tight.flat().join("") === "aabbcc", JSON.stringify(tight));
+
+  const huge = "x".repeat(STDIN_CAP_BYTES);
+  for (const texts of [[huge], ["ok", huge]]) {
+    let msg = "";
+    try {
+      chunkJsonStdin(texts, STDIN_CAP_BYTES);
+    } catch (e) {
+      msg = e instanceof Error ? e.message : String(e);
+    }
+    const n = Buffer.byteLength(JSON.stringify([huge]), "utf8");
+    assert(msg === `stdin cap exceeded (${n} > ${STDIN_CAP_BYTES} bytes)`, msg);
+  }
+
+  const wide = "\u4e00".repeat(5000);
+  assert(wide.length < STDIN_CAP_BYTES, "setup: javascript length is under the cap");
+  let wideMsg = "";
+  try {
+    chunkJsonStdin([wide], STDIN_CAP_BYTES);
+  } catch (e) {
+    wideMsg = e instanceof Error ? e.message : String(e);
+  }
+  assert(wideMsg.includes(String(STDIN_CAP_BYTES)) && wideMsg.startsWith("stdin cap exceeded"), wideMsg);
+
+  for (const run of [() => embedMinilm(huge), () => embedMinilmBatch([huge])]) {
+    let msg = "";
+    try {
+      run();
+    } catch (e) {
+      msg = e instanceof Error ? e.message : String(e);
+    }
+    assert(msg.startsWith("stdin cap exceeded"), msg);
+    assert(!/spawn|ENOENT|python/i.test(msg), msg);
+  }
+});
+
+test("embedder", "a long embedder argument is refused before the model is imported", () => {
+  const script = fileURLToPath(new URL("../scripts/embed_minilm.py", import.meta.url));
+  const run = spawnSync("python3", [script, "x".repeat(2049)], { encoding: "utf8" });
+  assert(run.status === 2, `status ${run.status} stderr ${run.stderr}`);
+  assert(
+    (run.stderr || "").trim() ===
+      "refusing an argument longer than 2048 characters; pass the JSON array on stdin: --json -",
+    run.stderr,
+  );
+});
+
+test("embedder", "embedMinilmBatch spawns once per stdin group and drops a partial result", () => {
+  const piece = "p".repeat(4500);
+  const texts = [piece + "A", piece + "B", piece + "C"];
+  const expected = chunkJsonStdin(texts, STDIN_CAP_BYTES);
+  assert(expected.length === 2, `setup: expected two groups, got ${expected.length}`);
+  const calls: string[] = [];
+  const vectors = embedMinilmBatch(texts, (payload) => {
+    calls.push(payload);
+    assert(Buffer.byteLength(payload, "utf8") <= STDIN_CAP_BYTES, String(Buffer.byteLength(payload, "utf8")));
+    const group = JSON.parse(payload) as string[];
+    return group.map(() => [0.25]);
+  });
+  assert(calls.length === expected.length, JSON.stringify(calls.map((c) => c.length)));
+  assert(
+    calls.flatMap((p) => JSON.parse(p) as string[]).join("|") === texts.join("|"),
+    "payloads reordered the texts",
+  );
+  assert(vectors.length === 3, String(vectors.length));
+
+  let thrown = "";
+  try {
+    embedMinilmBatch(texts, (payload) => {
+      const group = JSON.parse(payload) as string[];
+      if (group.length === expected[1]!.length && group[0] === expected[1]![0]) {
+        throw new Error("second spawn failed");
+      }
+      return group.map(() => [0.5]);
+    });
+  } catch (e) {
+    thrown = e instanceof Error ? e.message : String(e);
+  }
+  assert(thrown === "second spawn failed", thrown);
+
+  let short = "";
+  try {
+    embedMinilmBatch(["one", "two"], () => [[0.5]]);
+  } catch (e) {
+    short = e instanceof Error ? e.message : String(e);
+  }
+  assert(short.includes("returned 1 vectors for 2 texts"), short);
+});
+
 reportingStarted = true;
 
 const passed = results.filter((r) => r.ok).length;

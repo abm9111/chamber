@@ -15544,6 +15544,27 @@ test("embedder", "a long embedder argument is refused before the model is import
   );
 });
 
+test("embedder", "--serve refuses a long argument before importing the model", () => {
+  const script = fileURLToPath(new URL("../scripts/embed_minilm.py", import.meta.url));
+  const bare = spawnSync("python3", [script], { encoding: "utf8" });
+  assert(bare.status === 2, `status ${bare.status} stderr ${bare.stderr}`);
+  assert((bare.stderr || "").includes("--serve"), bare.stderr);
+
+  const run = spawnSync(
+    "python3",
+    ["-X", "importtime", script, "--serve", "x".repeat(2049)],
+    { encoding: "utf8" },
+  );
+  assert(run.status === 2, `status ${run.status} stderr ${run.stderr}`);
+  assert(
+    (run.stderr || "").includes(
+      "refusing an argument longer than 2048 characters; pass the JSON array on stdin: --json -",
+    ),
+    run.stderr,
+  );
+  assert(!(run.stderr || "").includes("numpy"), run.stderr);
+});
+
 test("embedder", "embedMinilmBatch spawns once per stdin group and drops a partial result", () => {
   const piece = "p".repeat(4500);
   const texts = [piece + "A", piece + "B", piece + "C"];

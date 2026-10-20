@@ -5,6 +5,7 @@ Usage:
   python3 embed_minilm.py "single text"
   python3 embed_minilm.py --json '["a","b"]'     # JSON array of strings → JSON array of vectors
   python3 embed_minilm.py --json -                # same, JSON array on stdin
+  python3 embed_minilm.py --serve                 # one JSON array per stdin line
 
 Arguments longer than 2048 characters are refused before the model is imported.
 Page text must not sit on the process command line, where `pgrep -f` copies it
@@ -108,7 +109,7 @@ def report_truncation(texts: list[str], enc: list) -> None:
     invisible until counted.
 
     Stderr because stdout is the vector protocol. One summary line per
-    process, not one per passage: an ingest of 43k passages must not emit
+    embed_texts call, not one per passage: an ingest of 43k passages must not emit
     43k lines, and the count is what an operator acts on.
     """
     filled = [i for i, e in enumerate(enc) if sum(e.attention_mask) >= MAX_TOKENS]
@@ -136,6 +137,7 @@ def report_truncation(texts: list[str], enc: list) -> None:
         ),
         file=sys.stderr,
     )
+    sys.stderr.flush()
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
@@ -179,16 +181,41 @@ def _import_stack() -> None:
     Tokenizer = _Tokenizer
 
 
+def serve() -> None:
+    """One model load, then one JSON reply per stdin line."""
+    _import_stack()
+    while True:
+        raw = sys.stdin.buffer.readline()
+        if raw == b"":
+            return
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
+        try:
+            texts = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise SystemExit("expected JSON array")
+        if not isinstance(texts, list):
+            raise SystemExit("expected JSON array")
+        vecs = embed_texts([str(t) for t in texts])
+        sys.stderr.flush()
+        json.dump(vecs, sys.stdout)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print(
-            "usage: embed_minilm.py <text> | --json '[\"a\",\"b\"]' | --json -",
+            "usage: embed_minilm.py <text> | --json '[\"a\",\"b\"]' | --json - | --serve",
             file=sys.stderr,
         )
         sys.exit(2)
     if any(len(a) > ARGV_LIMIT for a in sys.argv[1:]):
         print(ARGV_REFUSAL, file=sys.stderr)
         sys.exit(2)
+    if sys.argv[1] == "--serve":
+        serve()
+        return
     _import_stack()
     if sys.argv[1] == "--json":
         if len(sys.argv) < 3:

@@ -649,7 +649,7 @@ try {
     pinsInUntouchedFiles: untouchedCells.length,
     falseAlarmsInUntouchedFiles: untouchedCells.filter((c) => isAlarm(c) && !isChanged(c)).length,
     corpusPassagesBefore: before.passages,
-    corpusPassagesAfter: after.passages,
+    corpusPassagesAfter: countDocuments(db),
     pins: pins.length,
     scored: scored.length,
     selfTest: Number(selfTest.toFixed(4)),

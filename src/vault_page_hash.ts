@@ -2,10 +2,10 @@ import { sha256 } from "./hash.ts";
 
 /**
  * Recompute a vault_page pin from the stored row.
- * Must stay byte-identical to the snapshot formula in upsertDocument
- * (src/vector.ts) — a pin minted there is only checkable if the framing is
- * reproduced exactly here. The round-trip tests in the `pins` suite mint via
- * upsertDocument and verify here, so drift between the two fails the suite.
+ * This is the only vault-page formula. `upsertDocument` (src/vector.ts) calls
+ * this function to mint the stored hash, so there is no second copy to keep
+ * byte-identical. The contract test is
+ * `pins/upsertDocument stores the hash vaultPageHash returns`.
  *
  * The framing is JSON.stringify of a fixed 3-element array, NOT
  * [...].join("\n"): joining is not injective across its own separator, so

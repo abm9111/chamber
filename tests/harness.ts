@@ -15015,6 +15015,52 @@ test("audit", "a skill refusal survives the rollback that refuses it", () => {
   assert(verifyAuditChain(db).ok, "the chain must still verify");
 });
 
+test("pins", "a failed vector write leaves no hash that a later ingest would skip", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-skip-atomic-"));
+  const file = join(dir, "note.md");
+  const TWO = "# Note\n\nalpha body one\n\n## Two\n\nbeta body two\n";
+  writeFileSync(file, TWO);
+  const first = ingestDirectory(db, dir, { embedBatch: minilmVectors });
+  assert(first.passages === 2, `setup: expected 2 passages, got ${first.passages}`);
+  writeFileSync(file, TWO.replace("beta body two", "beta body edited"));
+  db.exec(
+    `CREATE TRIGGER fail_embed BEFORE INSERT ON vector_embedding
+     BEGIN SELECT RAISE(ABORT, 'boom'); END`,
+  );
+  let threw = false;
+  try {
+    try {
+      ingestDirectory(db, dir, { embedBatch: minilmVectors });
+    } catch {
+      threw = true;
+    }
+  } finally {
+    db.exec(`DROP TRIGGER IF EXISTS fail_embed`);
+  }
+  assert(threw, "the re-ingest must throw while the vector write is refused");
+  const bodies: string[] = [];
+  ingestDirectory(db, dir, {
+    embedBatch: (texts) => {
+      bodies.push(...texts);
+      return minilmVectors(texts);
+    },
+  });
+  assert(
+    bodies.length === 1 && bodies[0]!.includes("beta body edited"),
+    `the edited passage was skipped: embedder saw ${JSON.stringify(bodies)}`,
+  );
+  const row = db
+    .prepare(
+      `SELECT d.body, e.model FROM vector_document d
+       JOIN vector_embedding e ON e.document_id = d.id
+       WHERE d.body LIKE '%beta body%'`,
+    )
+    .get() as { body: string; model: string };
+  assert(row.body.includes("beta body edited"), `stored body: ${row.body}`);
+  assert(row.model === MINILM_MODEL, `stored model: ${row.model}`);
+});
+
 // From here the tally is fixed: `registered` and `results` are read below, so
 // a test declared past this line cannot appear on either side of the summary.
 reportingStarted = true;

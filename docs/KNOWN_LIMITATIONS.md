@@ -854,6 +854,12 @@ used — but any *other* consumer of that tokenizer file gets 128 silently. A
 measurement script written against it reported "0 passages over 256" for this
 corpus, which was the instrument capping, not the data.
 
+**What invalidates a stored vector.** Ingest leaves a passage in place when its
+text is unchanged and its model is exactly `minilm-l6-v2-q`. A change to the
+vector itself — `scripts/embed_minilm.py`, the ONNX file, the pooling — does not
+reach those passages until that model string changes. Until then they keep the
+vectors the old code wrote.
+
 ## The paraphrase gate softens when its embedder is unavailable — deliberately
 
 The semantic half of the citation-debt gate needs a real embedder. When one is

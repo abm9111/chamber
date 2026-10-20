@@ -227,47 +227,59 @@ export function upsertDocument(
   // relies on exactly this overwrite, so the fix is to report it, not block it.
   const replaced = !!existing;
 
-  if (existing) {
-    db.prepare(
-      `UPDATE vector_document
-       SET source_kind = ?, source_ref = ?, title = ?, body = ?,
-           snapshot_hash = ?, metadata_json = ?,
-           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-       WHERE id = ?`,
-    ).run(
-      input.sourceKind,
-      input.sourceRef ?? null,
-      input.title ?? null,
-      body,
-      snapshot,
-      input.metadata ? JSON.stringify(input.metadata) : null,
-      id,
-    );
-  } else {
-    db.prepare(
-      `INSERT INTO vector_document (
-         id, source_kind, source_ref, title, body, snapshot_hash, metadata_json
-       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      id,
-      input.sourceKind,
-      input.sourceRef ?? null,
-      input.title ?? null,
-      body,
-      snapshot,
-      input.metadata ? JSON.stringify(input.metadata) : null,
-    );
-  }
+  // The document row and its vector are one unit. Ingest skips a passage whose
+  // hash and model match, so a new hash left beside an old MiniLM vector would
+  // be treated as current forever. A SAVEPOINT, not BEGIN: the caller may
+  // already hold a transaction.
+  db.exec("SAVEPOINT upsert_document");
+  try {
+    if (existing) {
+      db.prepare(
+        `UPDATE vector_document
+         SET source_kind = ?, source_ref = ?, title = ?, body = ?,
+             snapshot_hash = ?, metadata_json = ?,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE id = ?`,
+      ).run(
+        input.sourceKind,
+        input.sourceRef ?? null,
+        input.title ?? null,
+        body,
+        snapshot,
+        input.metadata ? JSON.stringify(input.metadata) : null,
+        id,
+      );
+    } else {
+      db.prepare(
+        `INSERT INTO vector_document (
+           id, source_kind, source_ref, title, body, snapshot_hash, metadata_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        id,
+        input.sourceKind,
+        input.sourceRef ?? null,
+        input.title ?? null,
+        body,
+        snapshot,
+        input.metadata ? JSON.stringify(input.metadata) : null,
+      );
+    }
 
-  db.prepare(
-    `INSERT INTO vector_embedding (document_id, model, dims, vector_blob)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(document_id) DO UPDATE SET
-       model = excluded.model,
-       dims = excluded.dims,
-       vector_blob = excluded.vector_blob,
-       embedded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
-  ).run(id, model, dims, float32ToBlob(vec));
+    db.prepare(
+      `INSERT INTO vector_embedding (document_id, model, dims, vector_blob)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(document_id) DO UPDATE SET
+         model = excluded.model,
+         dims = excluded.dims,
+         vector_blob = excluded.vector_blob,
+         embedded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+    ).run(id, model, dims, float32ToBlob(vec));
+  } catch (err) {
+    db.exec("ROLLBACK TO upsert_document");
+    db.exec("RELEASE upsert_document");
+    throw err;
+  }
+  db.exec("RELEASE upsert_document");
 
   return { id, model, dims, replaced };
 }

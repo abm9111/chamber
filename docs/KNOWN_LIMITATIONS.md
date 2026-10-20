@@ -806,8 +806,9 @@ total. The only symptom is a query that cannot find text the corpus visibly
 contains, which reads as bad retrieval rather than as content that was never
 indexed.
 
-`chamber ingest` now reports it — passage count, tokens dropped, longest input
-— on stderr, where a scheduled run greps for surprises.
+`chamber ingest` now reports it on stderr — passage count, tokens dropped,
+longest input — for passages embedded in that run only; a later ingest that
+keeps unchanged passages does not print them again.
 
 Measured over a real 43,541-passage corpus on 2026-09-13: **541 passages
 (1.24%) exceeded the limit and 80,989 tokens were dropped**, the worst single
@@ -851,6 +852,12 @@ Also note: `models/minilm/tokenizer.json` declares `truncation.max_length:
 used — but any *other* consumer of that tokenizer file gets 128 silently. A
 measurement script written against it reported "0 passages over 256" for this
 corpus, which was the instrument capping, not the data.
+
+**What invalidates a stored vector.** Ingest leaves a passage in place when its
+text is unchanged and its model is exactly `minilm-l6-v2-q`. A change to the
+vector itself — `scripts/embed_minilm.py`, the ONNX file, the pooling — does not
+reach those passages until that model string changes. Until then they keep the
+vectors the old code wrote.
 
 ## The paraphrase gate softens when its embedder is unavailable — deliberately
 

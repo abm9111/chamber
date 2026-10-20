@@ -50,6 +50,7 @@ import {
   type LexicalSearchError,
 } from "./vector.ts";
 import {
+  formatIngestLine,
   ingestDirectory,
   parseIngestArgs,
   type IngestSkipKind,
@@ -1116,13 +1117,12 @@ async function main(): Promise<void> {
           );
           return false;
         }
-        console.log(
-          `ingested ${r.ingested} file(s) as ${r.passages} passage(s) from ${path}`,
-        );
+        console.log(formatIngestLine(r, path));
         // stderr, not stdout: a scheduled run greps its log for surprises, and
-        // "the fast path silently became the slow path" is one. The corpus is
-        // still fully embedded — the per-passage path degrades instead of
-        // throwing — so this is a warning, not a failure.
+        // "the fast path silently became the slow path" is one. Kept passages
+        // stay on their existing vector; passages the fallback wrote may be
+        // hash vectors until the next run. The per-passage path degrades
+        // instead of throwing — so this is a warning, not a failure.
         if (r.embedFallback) {
           console.error(
             `  [embed_fallback] batch embedder failed; fell back to per-passage embedding: ${r.embedFallback}`,
@@ -1136,9 +1136,9 @@ async function main(): Promise<void> {
         if (r.truncated) {
           const t = r.truncated;
           console.error(
-            `  [truncated] ${t.passages} passage(s) exceeded the embedder's ` +
-              `${t.limit}-token limit; ${t.tokensDropped} token(s) dropped, ` +
-              `longest input ${t.longest} tokens. Those passages are indexed ` +
+            `  [truncated] ${t.passages} passage(s) embedded this run exceeded ` +
+              `the embedder's ${t.limit}-token limit; ${t.tokensDropped} token(s) ` +
+              `dropped, longest input ${t.longest} tokens. They were indexed ` +
               `from their first ${t.limit} tokens only — split the notes if ` +
               `their tails need to be findable.`,
           );

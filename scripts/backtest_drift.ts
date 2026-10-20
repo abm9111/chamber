@@ -102,6 +102,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { openChamberDb } from "../src/db.ts";
 import { ingestDirectory } from "../src/ingest.ts";
+import { countDocuments } from "../src/vector.ts";
 import { commitBelief } from "../src/commit_belief.ts";
 import { buildVerifyReport } from "../src/pins.ts";
 import { passagePathOf } from "../src/chunk.ts";
@@ -590,7 +591,10 @@ try {
   materialise(repo, args.to, corpus, args.exclude);
   const after = ingestDirectory(db, corpus, ingestOpts);
   if (after.aborted) throw new BacktestAbort(`ingest refused: ${after.abortReason}`);
-  log(`re-ingest ${after.ingested} file(s) → ${after.passages} passage(s) at ${args.to}`);
+  log(
+    `re-ingest ${after.ingested} file(s) → ${countDocuments(db)} passage(s) at ${args.to} ` +
+      `(wrote ${after.passages}, kept ${after.unchanged})`,
+  );
   if (after.removed > 0) log(`          ${after.removed} stale passage(s) removed from shrunken notes`);
 
   // ── 5. join verdicts against truth ─────────────────────────────────────────
@@ -645,7 +649,7 @@ try {
     pinsInUntouchedFiles: untouchedCells.length,
     falseAlarmsInUntouchedFiles: untouchedCells.filter((c) => isAlarm(c) && !isChanged(c)).length,
     corpusPassagesBefore: before.passages,
-    corpusPassagesAfter: after.passages,
+    corpusPassagesAfter: countDocuments(db),
     pins: pins.length,
     scored: scored.length,
     selfTest: Number(selfTest.toFixed(4)),

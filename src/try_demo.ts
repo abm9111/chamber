@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url";
 import type { DatabaseSync } from "node:sqlite";
 
 import { openChamberDb } from "./db.ts";
-import { ingestDirectory } from "./ingest.ts";
+import { formatIngestLine, ingestDirectory } from "./ingest.ts";
 import { countDocuments, searchVector } from "./vector.ts";
 import { commitBelief } from "./commit_belief.ts";
 import { listOpenDebts, proposeAllDebtPayments } from "./debt.ts";
@@ -78,7 +78,7 @@ export function runTry(opts: { keep?: boolean } = {}): number {
 
     step("chamber ingest ./notes", "index two sample notes");
     const ing = ingestDirectory(db, notes, {});
-    line(`ingested ${ing.ingested} file(s) as ${ing.passages} passage(s)`);
+    line(formatIngestLine(ing));
 
     step("chamber corpus", "what is actually in the index");
     line(`${countDocuments(db)} passages`);
@@ -127,7 +127,7 @@ export function runTry(opts: { keep?: boolean } = {}): number {
 
     step("chamber ingest ./notes", "re-index after the edit");
     const re = ingestDirectory(db, notes, {});
-    line(`ingested ${re.ingested} file(s) as ${re.passages} passage(s)`);
+    line(formatIngestLine(re));
 
     step("chamber verify");
     const after = verifyBeliefSources(db);

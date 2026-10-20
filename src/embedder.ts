@@ -543,6 +543,7 @@ export function embedLocal(
 export function embedLocalBatch(
   texts: string[],
   prefer: EmbedderKind | "auto" = "auto",
+  spawn?: MinilmSpawn,
 ): EmbedResult[] {
   const kind =
     prefer === "auto"
@@ -585,7 +586,7 @@ export function embedLocalBatch(
   }
 
   if (kind === "minilm") {
-    const vecs = embedMinilmBatch(texts);
+    const vecs = embedMinilmBatch(texts, spawn);
     return vecs.map((vector) => ({
       vector,
       model: MINILM_MODEL,

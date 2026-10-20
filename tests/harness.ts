@@ -15910,6 +15910,144 @@ test("embedder", "a missing interpreter reports spawn error and close stays safe
   assert(after.includes("embed_minilm: session is closed"), after);
 });
 
+
+test("pins", "hash ingest and an embedBatch override do not spawn MiniLM", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-ingest-"));
+  writeFileSync(join(dir, "a.md"), "Alpha body stays short.\n");
+  const db = freshDb();
+  const { command, log } = stubCommand(dir, "stay");
+  const saved = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_EMBEDDER = "hash";
+  resetMinilmProbe();
+  try {
+    ingestDirectory(db, dir, {
+      minilmSession: () => createMinilmSession({ command }),
+    });
+    ingestDirectory(db, dir, {
+      embedBatch: (texts) => embedLocalBatch(texts, "hash"),
+      minilmSession: () => createMinilmSession({ command }),
+    });
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_EMBEDDER;
+    else process.env.CHAMBER_EMBEDDER = saved;
+    resetMinilmProbe();
+  }
+  assert(startLines(log).length === 0, startLines(log).join(","));
+});
+
+test("pins", "a batch throw stops the session and the first error is the report", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-ingest-"));
+  writeFileSync(join(dir, "a.md"), "Alpha body stays short.\n");
+  writeFileSync(join(dir, "b.md"), "Beta body stays short.\n");
+  const db = freshDb();
+  let stops = 0;
+  let closes = 0;
+  const saved = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_EMBEDDER = "hash";
+  resetMinilmProbe();
+  let report: ReturnType<typeof ingestDirectory> | undefined;
+  try {
+    report = ingestDirectory(db, dir, {
+      embedBatch: () => {
+        throw new Error("batch broke");
+      },
+      minilmSession: () => ({
+        cleanupError: undefined,
+        send() {
+          throw new Error("send");
+        },
+        stop() {
+          stops += 1;
+        },
+        close() {
+          closes += 1;
+        },
+      }),
+    });
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_EMBEDDER;
+    else process.env.CHAMBER_EMBEDDER = saved;
+    resetMinilmProbe();
+  }
+  assert(stops === 2, String(stops));
+  assert(closes === 1, String(closes));
+  assert(report?.embedFallback?.includes("batch broke"), report?.embedFallback);
+});
+
+test("pins", "close runs before truncation is read, and a cleanup failure replaces a successful return", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-ingest-"));
+  writeFileSync(join(dir, "a.md"), "Alpha body stays short.\n");
+  const db = freshDb();
+  resetMinilmProbe();
+  const line = JSON.stringify({
+    chamber_truncation: { limit: 256, passages: 2, of: 2, tokens_dropped: 5, longest: 300 },
+  });
+  const report = ingestDirectory(db, dir, {
+    embedBatch: (texts) => embedLocalBatch(texts, "hash"),
+    minilmSession: () => ({
+      cleanupError: undefined,
+      send() {
+        throw new Error("send");
+      },
+      stop() {},
+      close() {
+        noteMinilmStderr(line);
+      },
+    }),
+  });
+  assert(report.truncated?.passages === 2, JSON.stringify(report.truncated));
+  assert(report.truncated?.tokensDropped === 5, JSON.stringify(report.truncated));
+
+  let thrown = "";
+  try {
+    ingestDirectory(db, dir, {
+      embedBatch: (texts) => embedLocalBatch(texts, "hash"),
+      minilmSession: () => ({
+        cleanupError: undefined as Error | undefined,
+        send() {
+          throw new Error("send");
+        },
+        stop() {},
+        close() {
+          this.cleanupError = new Error("child still alive");
+        },
+      }),
+    });
+  } catch (err) {
+    thrown = err instanceof Error ? err.message : String(err);
+  }
+  assert(thrown === "child still alive", thrown);
+  resetMinilmProbe();
+});
+
+test("pins", "a cleanup failure becomes the cause when the body error has none", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-ingest-"));
+  const file = join(dir, "not-a-directory");
+  writeFileSync(file, "x");
+  const db = freshDb();
+  const cleanup = new Error("cleanup failed");
+  let caught: unknown;
+  try {
+    ingestDirectory(db, file, {
+      minilmSession: () => ({
+        cleanupError: undefined as Error | undefined,
+        send() {
+          throw new Error("send");
+        },
+        stop() {},
+        close() {
+          this.cleanupError = cleanup;
+        },
+      }),
+    });
+  } catch (err) {
+    caught = err;
+  }
+  assert(caught instanceof Error, String(caught));
+  assert(caught instanceof Error && caught.cause === cleanup, String(caught));
+});
+
+
 reportingStarted = true;
 
 const passed = results.filter((r) => r.ok).length;

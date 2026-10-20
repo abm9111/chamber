@@ -1136,9 +1136,9 @@ async function main(): Promise<void> {
         if (r.truncated) {
           const t = r.truncated;
           console.error(
-            `  [truncated] ${t.passages} passage(s) exceeded the embedder's ` +
-              `${t.limit}-token limit; ${t.tokensDropped} token(s) dropped, ` +
-              `longest input ${t.longest} tokens. Those passages are indexed ` +
+            `  [truncated] ${t.passages} passage(s) embedded this run exceeded ` +
+              `the embedder's ${t.limit}-token limit; ${t.tokensDropped} token(s) ` +
+              `dropped, longest input ${t.longest} tokens. They were indexed ` +
               `from their first ${t.limit} tokens only — split the notes if ` +
               `their tails need to be findable.`,
           );

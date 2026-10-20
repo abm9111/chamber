@@ -126,7 +126,9 @@ export interface IngestReport {
    */
   embedFallback?: string;
   /**
-   * Passages whose tail the embedder dropped, when any were.
+   * Passages embedded in this run whose tail the embedder dropped, when any were.
+   * A passage kept because its text and MiniLM vector were already current is not
+   * re-embedded and does not appear here, even if an earlier run truncated it.
    *
    * 256 tokens is all-MiniLM-L6-v2's trained sequence length, so truncating
    * is correct; doing it silently is not. A half-embedded passage produces a

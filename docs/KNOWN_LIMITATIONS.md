@@ -807,8 +807,9 @@ total. The only symptom is a query that cannot find text the corpus visibly
 contains, which reads as bad retrieval rather than as content that was never
 indexed.
 
-`chamber ingest` now reports it — passage count, tokens dropped, longest input
-— on stderr, where a scheduled run greps for surprises.
+`chamber ingest` now reports it on stderr — passage count, tokens dropped,
+longest input — for passages embedded in that run only; a later ingest that
+keeps unchanged passages does not print them again.
 
 Measured over a real 43,541-passage corpus on 2026-09-13: **541 passages
 (1.24%) exceeded the limit and 80,989 tokens were dropped**, the worst single

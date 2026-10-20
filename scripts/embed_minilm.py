@@ -4,6 +4,11 @@
 Usage:
   python3 embed_minilm.py "single text"
   python3 embed_minilm.py --json '["a","b"]'     # JSON array of strings → JSON array of vectors
+  python3 embed_minilm.py --json -                # same, JSON array on stdin
+
+Arguments longer than 2048 characters are refused before the model is imported.
+Page text must not sit on the process command line, where `pgrep -f` copies it
+into a model transcript.
 
 Stdout: JSON float arrays. Stderr: logs.
 """
@@ -13,9 +18,11 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
-import onnxruntime as ort
-from tokenizers import Tokenizer
+# Imported in _import_stack(), after the argv length check, so a long argument
+# is refused on a machine with no model installed.
+np = None
+ort = None
+Tokenizer = None
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_DIR = ROOT / "models" / "minilm"
@@ -156,12 +163,38 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     return pooled.astype(np.float32).tolist()
 
 
+ARGV_LIMIT = 2048
+ARGV_REFUSAL = (
+    "refusing an argument longer than "
+    f"{ARGV_LIMIT} characters; pass the JSON array on stdin: --json -"
+)
+
+
+def _import_stack() -> None:
+    global np, ort, Tokenizer
+    import numpy as np  # noqa: PLC0415
+    import onnxruntime as ort  # noqa: PLC0415
+    from tokenizers import Tokenizer as _Tokenizer  # noqa: PLC0415
+
+    Tokenizer = _Tokenizer
+
+
 def main() -> None:
     if len(sys.argv) < 2:
-        print("usage: embed_minilm.py <text> | --json '[\"a\",\"b\"]'", file=sys.stderr)
+        print(
+            "usage: embed_minilm.py <text> | --json '[\"a\",\"b\"]' | --json -",
+            file=sys.stderr,
+        )
         sys.exit(2)
+    if any(len(a) > ARGV_LIMIT for a in sys.argv[1:]):
+        print(ARGV_REFUSAL, file=sys.stderr)
+        sys.exit(2)
+    _import_stack()
     if sys.argv[1] == "--json":
-        texts = json.loads(sys.argv[2])
+        if len(sys.argv) < 3:
+            raise SystemExit("usage: --json '<array>' | --json -")
+        raw = sys.stdin.read() if sys.argv[2] == "-" else sys.argv[2]
+        texts = json.loads(raw)
         if not isinstance(texts, list):
             raise SystemExit("expected JSON array")
         vecs = embed_texts([str(t) for t in texts])

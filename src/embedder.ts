@@ -238,12 +238,60 @@ function pythonBin(): string {
   return raw && raw.trim() !== "" ? raw.trim() : "python3";
 }
 
-/** Embed one string with MiniLM (subprocess). */
-export function embedMinilm(text: string): Float32Array {
-  const r = spawnSync(pythonBin(), [SCRIPT, text], {
+/** UTF-8 bytes of JSON on one stdin write. Under the pipe buffer spawnSync fills in one write. */
+export const STDIN_CAP_BYTES = 12_288;
+
+/** Runs one stdin payload and returns one vector per text in that payload. */
+export type MinilmSpawn = (payload: string) => number[][];
+
+function stdinCapError(bytes: number, capBytes: number): Error {
+  return new Error(`stdin cap exceeded (${bytes} > ${capBytes} bytes)`);
+}
+
+function payloadBytes(texts: readonly string[]): number {
+  return Buffer.byteLength(JSON.stringify(texts), "utf8");
+}
+
+/**
+ * Groups whose JSON fits in `capBytes`, in input order.
+ * A text that does not fit alone throws before any group is returned.
+ */
+export function chunkJsonStdin(texts: readonly string[], capBytes: number): string[][] {
+  const groups: string[][] = [];
+  let current: string[] = [];
+  for (const text of texts) {
+    const alone = payloadBytes([text]);
+    if (alone > capBytes) throw stdinCapError(alone, capBytes);
+    if (current.length === 0) {
+      current = [text];
+      continue;
+    }
+    const next = [...current, text];
+    if (payloadBytes(next) <= capBytes) {
+      current = next;
+      continue;
+    }
+    groups.push(current);
+    current = [text];
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
+function readVectors(stdout: string): number[][] {
+  const line = stdout.trim().split("\n").filter(Boolean).pop();
+  if (!line) throw new Error("embed_minilm: no stdout");
+  const arr = JSON.parse(line) as number[][];
+  if (!Array.isArray(arr)) throw new Error("embed_minilm: expected a JSON array of vectors");
+  return arr;
+}
+
+function spawnMinilmStdin(payload: string): number[][] {
+  const r = spawnSync(pythonBin(), [SCRIPT, "--json", "-"], {
+    input: payload,
     encoding: "utf-8",
-    maxBuffer: 16 * 1024 * 1024,
-    timeout: 120_000,
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: 180_000,
   });
   if (r.error) throw r.error;
   if (r.status !== 0) {
@@ -252,38 +300,33 @@ export function embedMinilm(text: string): Float32Array {
     );
   }
   noteTruncation(r.stderr || "");
-  const line = (r.stdout || "").trim().split("\n").filter(Boolean).pop();
-  if (!line) throw new Error("embed_minilm: no stdout");
-  return parseVector(line);
+  return readVectors(r.stdout || "");
 }
 
-/** Batch embed (one process). */
-export function embedMinilmBatch(texts: string[]): Float32Array[] {
+/** Embed one string with MiniLM. The text goes on stdin, not argv. */
+export function embedMinilm(text: string): Float32Array {
+  const groups = chunkJsonStdin([text], STDIN_CAP_BYTES);
+  const vecs = spawnMinilmStdin(JSON.stringify(groups[0]));
+  if (vecs.length !== 1 || !vecs[0]) throw new Error("embed_minilm: expected one vector");
+  return Float32Array.from(vecs[0]);
+}
+
+/**
+ * Batch embed. One spawn per group that fits on stdin. A later failure
+ * discards vectors already produced in this call.
+ */
+export function embedMinilmBatch(texts: string[], spawn: MinilmSpawn = spawnMinilmStdin): Float32Array[] {
   if (texts.length === 0) return [];
-  if (texts.length === 1) return [embedMinilm(texts[0]!)];
-  const r = spawnSync(
-    // Not the literal "python3": the whole point of pythonBin is that PATH
-    // resolves differently for a login shell, and this batch path is the one
-    // the scheduled ingest actually takes.
-    pythonBin(),
-    [SCRIPT, "--json", JSON.stringify(texts)],
-    {
-      encoding: "utf-8",
-      maxBuffer: 64 * 1024 * 1024,
-      timeout: 180_000,
-    },
-  );
-  if (r.error) throw r.error;
-  if (r.status !== 0) {
-    throw new Error(
-      `embed_minilm batch failed (${r.status}): ${(r.stderr || "").slice(0, 400)}`,
-    );
+  const groups = chunkJsonStdin(texts, STDIN_CAP_BYTES);
+  const out: Float32Array[] = [];
+  for (const group of groups) {
+    const vecs = spawn(JSON.stringify(group));
+    if (vecs.length !== group.length) {
+      throw new Error(`embed_minilm batch returned ${vecs.length} vectors for ${group.length} texts`);
+    }
+    for (const v of vecs) out.push(Float32Array.from(v));
   }
-  noteTruncation(r.stderr || "");
-  const line = (r.stdout || "").trim().split("\n").filter(Boolean).pop();
-  if (!line) throw new Error("embed_minilm batch: no stdout");
-  const arr = JSON.parse(line) as number[][];
-  return arr.map((v) => Float32Array.from(v));
+  return out;
 }
 
 export interface EmbedResult {

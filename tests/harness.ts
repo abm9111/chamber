@@ -5116,7 +5116,7 @@ const THREE_PASSAGES =
 
 function minilmVectors(texts: readonly string[]) {
   return texts.map(() => ({
-    vector: new Float32Array(8).fill(0.25),
+    vector: new Float32Array(384).fill(0.25),
     model: MINILM_MODEL,
     dims: 8,
     kind: "hash" as const,
@@ -9779,7 +9779,7 @@ test("pins", "check: an edited note is judged from disk, a deleted path is not",
     assert(fresh[0]!.status === "SUPPORTED" && fresh[1]!.status === "TERMS_ABSENT", `after ingest: ${JSON.stringify(fresh.map((x) => x.status))}`);
     // A file added after ingest is not in the index, whatever it says.
     writeFileSync(join(dir, "notes", "new.md"), "The audit store is SQLite.\n");
-    const added = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [join(dir, "notes", "new.md")] }])[0]!;
+    const added = checkClaims(db, [{ text: "The audit store is SQLite.", sources: [join(dir, "notes", "new.md")] }], { folders: [{ root: dir, exclude: [] }] })[0]!;
     assert(added.status === "SUPPORTED" && added.problems.some((p) => p === "not indexed yet"), JSON.stringify(added));
     rmSync(note);
     const gone = checkClaims(db, [{ text: "The audit store is Postgres.", sources: [note] }]);
@@ -10043,7 +10043,7 @@ test("pins", "check: one source the index does not hold stops record, even besid
     writeFileSync(extra, "The audit store is SQLite.\n");
     const count = (): number => (db.prepare("SELECT count(*) AS n FROM belief").get() as { n: number }).n;
     const claim = { text: "The audit store is SQLite.", sources: [note, extra] };
-    const [mixed] = checkClaims(db, [claim], { record: true });
+    const [mixed] = checkClaims(db, [claim], { record: true, folders: [{ root: dir, exclude: [] }] });
     assert(mixed!.status === "SUPPORTED" && mixed!.problems.includes("not indexed yet"), JSON.stringify(mixed));
     assert(
       mixed!.foundIn.every((r) => !r.startsWith("notes/extra.md")),
@@ -10058,7 +10058,7 @@ test("pins", "check: one source the index does not hold stops record, even besid
     const [alone] = checkClaims(db, [{ text: claim.text, sources: [note] }], { record: true });
     assert(alone!.recorded?.status === "ALLOWED" && count() === 1, JSON.stringify(alone));
     // A claim that is not SUPPORTED does not gain the line.
-    const [absent] = checkClaims(db, [{ text: "The audit store is Postgres.", sources: [note, extra] }], { record: true });
+    const [absent] = checkClaims(db, [{ text: "The audit store is Postgres.", sources: [note, extra] }], { record: true, folders: [{ root: dir, exclude: [] }] });
     assert(absent!.status === "TERMS_ABSENT" && !absent!.problems.some((p) => p.startsWith("not recorded")), JSON.stringify(absent));
   } finally {
     rmSync(dir, { recursive: true, force: true });

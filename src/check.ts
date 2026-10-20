@@ -31,6 +31,7 @@ import { passagePathOf, splitPassages } from "./chunk.ts";
 import { citedPassage, joinPrepared, specificTerms, termsMissingIn, type PreparedText } from "./claim_support.ts";
 import { enforceClaimContract, type ContractSource } from "./contract.ts";
 import { countExcludeMatches, passageTitle, pathRefusal, splitFrontmatter } from "./ingest.ts";
+import { vaultPageHash } from "./vault_page_hash.ts";
 import { mergeDeclaredFolders, type DeclaredFolder } from "./declared_folders.ts";
 
 /** One claim per call, usually opening with its subject: check that word too. */
@@ -126,8 +127,15 @@ function buildPoisonedRoots(folders: readonly DeclaredFolder[]): Map<string, str
     const key = `${folder.root}\0${folder.exclude.join("\0")}`;
     let message = excludePoisonCache.get(key);
     if (message === undefined) {
+      const counts = countExcludeMatches(folder.root, folder.exclude);
+      // An unreadable root is not "the exclude matched nothing". Caching that
+      // lie refuses the folder for the rest of the process after the disk returns.
+      if (counts.some((c) => c.unreadable)) {
+        poisoned.set(folder.root, "notes folder is unreadable — nothing in this folder was checked");
+        continue;
+      }
       message = null;
-      for (const count of countExcludeMatches(folder.root, folder.exclude)) {
+      for (const count of counts) {
         if (count.matched === 0) {
           message = `--exclude matched nothing: ${JSON.stringify(count.raw)} — nothing in this folder was checked`;
           break;
@@ -274,6 +282,7 @@ function resolveSource(
   freshness: Map<string, string | null>,
   folders: readonly DeclaredFolder[],
   poisoned: ReadonlyMap<string, string>,
+  declaredRoots: ReadonlySet<string>,
 ): Resolved {
   const src = raw.trim();
   if (src === "") return { rows: [], problem: "empty source" };
@@ -281,6 +290,8 @@ function resolveSource(
     const row = index.byId(src);
     if (!row) return { rows: [], problem: `${src}: no such passage in the index` };
     if (row.root === null) return { rows: [], problem: NO_ROOT(src) };
+    const blocked = citationRefusal(src, resolve(row.root, passagePathOf(row.ref)), folders, poisoned);
+    if (blocked) return { rows: [], problem: blocked, refused: true };
     const stale = staleness(index, passagePathOf(row.ref), row.root, freshness);
     return stale ? { rows: [row], notes: [PASSAGE_MOVED], unpinnable: true } : { rows: [row] };
   }
@@ -300,14 +311,14 @@ function resolveSource(
     // (review A, 2026-09-27).
     // An absolute path with no passage is the file the agent read: judged from
     // disk, and compared with whatever the index holds for it.
-    if (!passage) return resolveFromDisk(index, src, pathPart, null, folders, poisoned);
-    // The indexed branch below reads the file too (staleness). A path under a
-    // declared folder whose --exclude matched nothing is refused before that,
-    // exactly as resolveFromDisk refuses it.
-    const poison = poisonOf(declaredHolders(pathPart, folders), poisoned);
-    if (poison) return { rows: [], problem: poison, refused: true };
+    const blocked = citationRefusal(src, pathPart, folders, poisoned);
+    if (blocked) return { rows: [], problem: blocked, refused: true };
+    if (!passage) {
+      if (indexedHolder(index, pathPart)) return judgeIndexed(index, src, pathPart, null);
+      return resolveFromDisk(index, src, pathPart, null, folders, poisoned, declaredRoots);
+    }
     const hits = rootHits(index, pathPart);
-    if (hits.length === 0) return resolveFromDisk(index, src, pathPart, Number(passage[1]), folders, poisoned);
+    if (hits.length === 0) return resolveFromDisk(index, src, pathPart, Number(passage[1]), folders, poisoned, declaredRoots);
     const holder = indexedHolder(index, pathPart, hits) ?? hits[0]!;
     root = holder.r;
     file = holder.rel;
@@ -326,7 +337,7 @@ function resolveSource(
   rows = rows.filter((r) => r.root !== null);
   if (rows.length === 0) {
     if (isAbsolute(pathPart)) {
-      return resolveFromDisk(index, src, pathPart, passage ? Number(passage[1]) : null, folders, poisoned);
+      return resolveFromDisk(index, src, pathPart, passage ? Number(passage[1]) : null, folders, poisoned, declaredRoots);
     }
     return { rows: [], problem: `${src}: not in the index — pass the absolute path` };
   }
@@ -338,13 +349,14 @@ function resolveSource(
   if (!passage) {
     // A relative path the index maps to exactly one file is that file's
     // absolute path, so it and the absolute path cannot disagree about an edit.
-    return resolveFromDisk(index, src, located, null, folders, poisoned);
+    const blocked = citationRefusal(src, located, folders, poisoned);
+    if (blocked) return { rows: [], problem: blocked, refused: true };
+    return judgeIndexed(index, src, located, null);
   }
-  // A relative `file.md#pN` is the same file. The poison check has to run
-  // before staleness, which opens it: an exclude that matched nothing must
-  // refuse this citation too, not only the absolute spelling.
-  const poison = poisonOf(declaredHolders(located, folders), poisoned);
-  if (poison) return { rows: [], problem: poison, refused: true };
+  // A relative `file.md#pN` is the same file. Exclude and poison run before
+  // staleness opens it, for this spelling and for a vdoc_ id alike.
+  const blocked = citationRefusal(src, located, folders, poisoned);
+  if (blocked) return { rows: [], problem: blocked, refused: true };
   const want = `${file}#p${passage[1]}`;
   const row = rows.find((r) => r.ref === want);
   if (!row) return { rows: [], problem: `${src}: the note has no passage p${passage[1]} in the index` };
@@ -391,6 +403,102 @@ function poisonOf(holders: readonly Holder[], poisoned: ReadonlyMap<string, stri
   return undefined;
 }
 
+/**
+ * Refuse a citation a declared folder does not allow, before the file is opened.
+ * A path under no declared folder is not refused here: an indexed note stays
+ * reachable. A missing file is left to the freshness read, which names prune.
+ */
+function citationRefusal(
+  src: string,
+  pathPart: string,
+  folders: readonly DeclaredFolder[],
+  poisoned: ReadonlyMap<string, string>,
+): string | undefined {
+  const holders = declaredHolders(pathPart, folders);
+  const poison = poisonOf(holders, poisoned);
+  if (poison) return poison;
+  const keep = (reason: string, kind: string): string | undefined =>
+    kind === "unreadable" && reason.includes("ENOENT") ? undefined : `${src}: ${reason}`;
+  for (const h of holders) {
+    const refusal = pathRefusal(h.folder.root, h.folder.exclude, h.path);
+    if (!refusal) continue;
+    const line = keep(refusal.reason, refusal.kind);
+    if (line) return line;
+  }
+  const target = strictReal(resolve(pathPart));
+  if (!("path" in target)) return undefined;
+  for (const folder of folders) {
+    if (!inside(relative(realOrSelf(folder.root), target.path))) continue;
+    const refusal = pathRefusal(folder.root, folder.exclude, target.path);
+    if (!refusal) continue;
+    const line = keep(refusal.reason, refusal.kind);
+    if (line) return line;
+  }
+  return undefined;
+}
+
+/** The disk text is the indexed text, title included. Body-only equality misses a frontmatter rename. */
+function diskMatches(rows: readonly Row[], text: string, fileRel: string): boolean {
+  const { title, body } = splitFrontmatter(text);
+  const passages = text.trim() === "" || body.trim() === "" ? [] : splitPassages(body);
+  if (passages.length !== rows.length) return false;
+  const docTitle = title ?? fileRel.replace(/\.(?:md|markdown)$/i, "");
+  const byRef = new Map(rows.map((r) => [r.ref, r]));
+  return passages.every((p) => {
+    const ref = `${fileRel}#p${p.index}`;
+    const row = byRef.get(ref);
+    if (!row) return false;
+    return (
+      row.hash ===
+      vaultPageHash({ title: passageTitle(docTitle, p.headings), body: p.body, source_ref: ref })
+    );
+  });
+}
+
+/** An indexed file, read from disk and compared. A declared folder's exclude already ran. */
+function judgeIndexed(
+  index: Index,
+  src: string,
+  pathPart: string,
+  passageNo: number | null,
+): Resolved {
+  const refuse = (problem: string): Resolved => ({ rows: [], problem, refused: true });
+  const held = indexedHolder(index, pathPart);
+  if (!held) return refuse(`${src}: not in the index — pass the absolute path`);
+  const full = resolve(held.r, held.rel);
+  const target = strictReal(full);
+  if (!("path" in target)) {
+    return target.code === "ENOENT"
+      ? refuse(`${src}: indexed, but no longer on disk — run \`chamber prune\``)
+      : refuse(`${src}: its path does not resolve (${target.code}) — not read, not judged`);
+  }
+  const read = readBounded(full, target.path);
+  if ("problem" in read) return refuse(`${src}: ${read.problem} — not read, not judged`);
+  const indexed = index.passagesOf(held.rel).filter((r) => r.root === held.r);
+  if (diskMatches(indexed, read.text, held.rel)) {
+    if (passageNo === null) return { rows: indexed };
+    const row = indexed.find((r) => r.ref === `${held.rel}#p${passageNo}`);
+    return row ? { rows: [row] } : refuse(`${src}: the note has no passage p${passageNo}`);
+  }
+  const { title, body } = splitFrontmatter(read.text);
+  const passages = body.trim() === "" ? [] : splitPassages(body);
+  if (passages.length === 0) return refuse(`${src}: empty body — nothing to judge`);
+  const docTitle = title ?? held.rel.replace(/\.(?:md|markdown)$/i, "");
+  const all: Row[] = passages.map((p) => ({
+    id: `disk:${target.path}#p${p.index}`,
+    ref: `${held.rel}#p${p.index}`,
+    body: p.body,
+    title: passageTitle(docTitle, p.headings),
+    hash: "",
+    root: held.r,
+    disk: true,
+  }));
+  const notes = [BEHIND];
+  if (passageNo === null) return { rows: all, notes, unpinnable: true };
+  const one = all.find((r) => r.ref === `${held.rel}#p${passageNo}`);
+  return one ? { rows: [one], notes, unpinnable: true } : refuse(`${src}: the note has no passage p${passageNo}`);
+}
+
 /** Every ingest root that holds `pathPart`, by the path as written and with links resolved. */
 function rootHits(index: Index, pathPart: string): { r: string; rel: string }[] {
   const hits = index.ingestRoots().flatMap((r) =>
@@ -430,6 +538,7 @@ function resolveFromDisk(
   passageNo: number | null,
   folders: readonly DeclaredFolder[],
   poisoned: ReadonlyMap<string, string>,
+  declaredRoots: ReadonlySet<string>,
 ): Resolved {
   const refuse = (problem: string): Resolved => ({ rows: [], problem, refused: true });
   if (folders.length === 0) {
@@ -476,6 +585,15 @@ function resolveFromDisk(
     const refusal = pathRefusal(folder.root, folder.exclude, real);
     if (refusal) return refuse(`${src}: ${refusal.reason}`);
   }
+  // A root that exists only on indexed rows has already applied the walk.
+  // It does not authorize reading a file those rows do not hold.
+  if (!holders.some((h) => declaredRoots.has(realOrSelf(h.folder.root)))) {
+    return refuse(
+      declaredRoots.size === 0
+        ? "no notes folder declared — chamber mcp --notes <folder>"
+        : `${src}: not under any declared folder`,
+    );
+  }
 
   const read = readBounded(outer.path, real);
   if ("problem" in read) return refuse(`${src}: ${read.problem} — not read, not judged`);
@@ -491,8 +609,7 @@ function resolveFromDisk(
     // the indexed rows are the disk text and carry the pins `record` needs.
     const indexed = index.passagesOf(held.rel).filter((r) => r.root === held.r);
     const byRef = new Map(indexed.map((r) => [r.ref, r]));
-    const equal =
-      passages.length === indexed.length && passages.every((p) => byRef.get(`${held.rel}#p${p.index}`)?.body === p.body);
+    const equal = diskMatches(indexed, read.text, held.rel);
     if (equal) {
       if (passageNo === null) return { rows: indexed };
       const row = byRef.get(`${held.rel}#p${passageNo}`);
@@ -661,10 +778,9 @@ function readAndCompare(index: Index, full: string, root: string, file: string, 
       chunks.push(buf.subarray(0, n));
     }
     const text = Buffer.concat(chunks).toString("utf8");
-    const disk = splitPassages(splitFrontmatter(text).body);
-    const indexed = new Map(rows.map((r) => [r.ref, r.body]));
-    const matches = disk.length === indexed.size && disk.every((p) => indexed.get(`${file}#p${p.index}`) === p.body);
-    return matches ? null : `${file}: changed on disk since the last ingest — run \`chamber ingest\``;
+    return diskMatches(rows, text, file)
+      ? null
+      : `${file}: changed on disk since the last ingest — run \`chamber ingest\``;
   } finally {
     closeSync(fd);
   }
@@ -721,10 +837,13 @@ export function checkClaims(
     }
   });
   const index = new Index(db);
-  // Declared folders plus every root the index recorded (no excludes: the index
-  // does not keep what its ingest excluded).
+  // Caller folders authorize a disk read of a file the index does not hold.
+  // Roots remembered on rows still take part in the walk (dotted entries,
+  // links) but do not grant that read: their ingest excludes were not stored.
+  const declared = opts.folders ?? [];
+  const declaredRoots = new Set(declared.map((f) => realOrSelf(f.root)));
   const folders = mergeDeclaredFolders([
-    ...(opts.folders ?? []),
+    ...declared,
     ...index.ingestRoots().map((root) => ({ root, exclude: [] as string[] })),
   ]);
   const poisoned = buildPoisonedRoots(folders);
@@ -746,7 +865,7 @@ export function checkClaims(
     let refused = false;
     let unpinnable = false;
     for (const s of c.sources) {
-      const r = resolveSource(index, s, freshness, folders, poisoned);
+      const r = resolveSource(index, s, freshness, folders, poisoned, declaredRoots);
       if (r.problem) base.problems.push(r.problem);
       if (r.notes) base.problems.push(...r.notes);
       if (r.refused) refused = true;

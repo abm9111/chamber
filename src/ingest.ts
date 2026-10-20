@@ -25,11 +25,13 @@ import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { deleteDocument, upsertDocument } from "./vector.ts";
 import {
   embedLocalBatch,
+  MINILM_MODEL,
   minilmTruncationSeen,
   type EmbedResult,
   type MinilmTruncation,
 } from "./embedder.ts";
 import { passagePathOf, passageSourceRef, splitPassages } from "./chunk.ts";
+import { vaultPageHash } from "./vault_page_hash.ts";
 
 /**
  * Extensions treated as markdown, compared case-insensitively.
@@ -83,10 +85,12 @@ export interface IngestReport {
   /** Files ingested. Unchanged meaning: one per markdown file stored. */
   ingested: number;
   /**
-   * Rows written. A file is split into passages before embedding, so this is
-   * `>= ingested` and is the number that actually describes the corpus.
+   * Rows written this call, not the size of the corpus. A kept passage is
+   * counted in `unchanged`.
    */
   passages: number;
+  /** Passages kept without a write. The text and the MiniLM vector were already current. */
+  unchanged: number;
   /**
    * Passage rows deleted because the note they came from no longer contains
    * them. Non-zero means a note shrank; see the orphan sweep in
@@ -113,12 +117,12 @@ export interface IngestReport {
   abortKind?: "invalid_exclude" | "unmatched_exclude";
   abortReason?: string;
   /**
-   * Set when the batch embedder threw and the run fell back to the
-   * per-passage path. The corpus is still fully embedded — the singular path
-   * degrades per passage instead of throwing (the documented batch/singular
-   * divergence) — it was just embedded the slow way. One message for the
-   * whole run, the first failure's: per-file repeats are seven hundred
-   * copies of the same broken python.
+   * Set when the batch embedder threw or returned a short array, and this run
+   * used the per-passage path for the passages that needed a vector. Kept
+   * passages are not re-embedded. A file can hold `minilm-l6-v2-q` for a kept
+   * passage and `local-hash-v1` for a passage the fallback just wrote, until
+   * the next run replaces the hash vector. One message for the run, the first
+   * failure's.
    */
   embedFallback?: string;
   /**
@@ -592,6 +596,20 @@ function readIngestRoot(json: string | null): string | null {
   return null;
 }
 
+function readSection(json: string | null): number | string | undefined {
+  if (!json) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (parsed !== null && typeof parsed === "object") {
+      const v = (parsed as { section?: unknown }).section;
+      if (typeof v === "number" || typeof v === "string") return v;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 function stripMarkdownExt(ref: string): string {
   const ext = extname(ref).toLowerCase();
   return MARKDOWN_EXTENSIONS.includes(ext) ? ref.slice(0, -ext.length) : ref;
@@ -624,6 +642,7 @@ export function ingestDirectory(
       return {
         ingested: 0,
         passages: 0,
+        unchanged: 0,
         removed: 0,
         skipped: [],
         documentIds: [],
@@ -666,6 +685,7 @@ export function ingestDirectory(
   const report: IngestReport = {
     ingested: 0,
     passages: 0,
+    unchanged: 0,
     removed: 0,
     skipped: ctx.skipped,
     documentIds: [],
@@ -700,20 +720,34 @@ export function ingestDirectory(
     ref: string;
     /** Recorded ingest root, or null for a row written before roots existed. */
     rowRoot: string | null;
+    snapshotHash: string;
+    model: string | null;
+    section: number | string | undefined;
   }
   const existingByPath = new Map<string, ExistingRow[]>();
   for (const row of db
     .prepare(
-      `SELECT id, source_ref, metadata_json FROM vector_document
-       WHERE source_kind = 'vault_page' AND source_ref IS NOT NULL`,
+      `SELECT d.id, d.source_ref, d.snapshot_hash, d.metadata_json, e.model
+       FROM vector_document d
+       LEFT JOIN vector_embedding e ON e.document_id = d.id
+       WHERE d.source_kind = 'vault_page' AND d.source_ref IS NOT NULL`,
     )
-    .all() as { id: string; source_ref: string; metadata_json: string | null }[]) {
+    .all() as {
+      id: string;
+      source_ref: string;
+      snapshot_hash: string;
+      metadata_json: string | null;
+      model: string | null;
+    }[]) {
     const path = passagePathOf(row.source_ref);
     const list = existingByPath.get(path);
     const entry: ExistingRow = {
       id: row.id,
       ref: row.source_ref,
       rowRoot: readIngestRoot(row.metadata_json),
+      snapshotHash: row.snapshot_hash,
+      model: row.model,
+      section: readSection(row.metadata_json),
     };
     if (list) list.push(entry);
     else existingByPath.set(path, [entry]);
@@ -834,52 +868,88 @@ export function ingestDirectory(
 
     const docTitle = title ?? stripMarkdownExt(path);
 
+    const rowById = new Map(owned.map((o) => [o.id, o]));
+    const pending: {
+      body: string;
+      sourceRef: string;
+      title: string;
+      id: string | undefined;
+      section: number;
+    }[] = [];
+    const writtenIds = new Set<string>();
+    for (const p of passages) {
+      const sourceRef = passageSourceRef(path, p.index);
+      // One title value is hashed and stored. Hashing a different title than
+      // upsertDocument receives would skip a heading change.
+      const title = passageTitle(docTitle, p.headings);
+      const hash = vaultPageHash({ title, body: p.body, source_ref: sourceRef });
+      const existingId = idByRef.get(sourceRef);
+      const row = existingId ? rowById.get(existingId) : undefined;
+      // `row.ref === sourceRef` keeps an adopted pre-chunking row (ref is the
+      // bare path) out of the skip: it must be re-keyed to `path#p0` by a write.
+      if (
+        row &&
+        row.ref === sourceRef &&
+        row.snapshotHash === hash &&
+        row.model === MINILM_MODEL &&
+        row.section === p.section
+      ) {
+        writtenIds.add(row.id);
+        report.unchanged += 1;
+        continue;
+      }
+      pending.push({ body: p.body, sourceRef, title, id: existingId, section: p.section });
+    }
+
     // One batch call per file instead of one embedder spawn per passage —
     // the "single largest performance win available in the ingest path" per
     // KNOWN_LIMITATIONS entry 15 (~158 ms/spawn × 28k passages ≈ 75 minutes).
     // The batch path THROWS where the per-passage path degrades to hash
-    // vectors; on throw this run falls back to the per-passage path for this
-    // file — whole-file, never half-batched, so a corpus can not end up with
-    // half its passages in one embedding space and half in another — and the
-    // report says so once (`embedFallback`). Positional correspondence is by
-    // array order: bodies are mapped from `passages` and consumed by the same
-    // array's loop below, so `p.index` semantics never enter into it.
+    // vectors; on throw this run falls back to the per-passage path for the
+    // passages that need a vector, and the report says so once
+    // (`embedFallback`).
+    //
+    // The batch is the passages that need a vector, in this list's order.
+    // Vector i belongs to pending[i]. Zipping it onto `passages` would attach
+    // a new vector to a passage that was kept. An empty list makes no call.
+    // A short result is discarded: the fallback embeds this list only, and a
+    // file may then hold MiniLM for what was kept and a hash vector for what
+    // the fallback wrote.
     let embeds: EmbedResult[] | undefined;
-    try {
-      const batch = (opts.embedBatch ?? embedLocalBatch)(
-        passages.map((p) => p.body),
-      );
-      // A short batch would silently shift every later passage into the
-      // wrong vector; treat it as the failure it is.
-      embeds = batch.length === passages.length ? batch : undefined;
-      if (!embeds) throw new Error(`batch returned ${batch.length} vectors for ${passages.length} passages`);
-    } catch (err) {
-      embeds = undefined;
-      report.embedFallback ??= errText(err);
-    }
-
-    const writtenIds = new Set<string>();
-    for (let i = 0; i < passages.length; i++) {
-      const p = passages[i]!;
-      const sourceRef = passageSourceRef(path, p.index);
-      const doc = upsertDocument(db, {
-        id: idByRef.get(sourceRef),
-        sourceKind: "vault_page",
-        sourceRef,
-        // The heading breadcrumb is in the title as well as the body: the body
-        // is what gets embedded, the title is what a citation is rendered as.
-        // Both are pin-hash inputs, so renaming a heading correctly shows up
-        // as drift on every passage under it.
-        title: passageTitle(docTitle, p.headings),
-        body: p.body,
-        metadata: { ingestRoot: root, section: p.section },
-        ...(embeds
-          ? { embedding: embeds[i]!.vector, model: embeds[i]!.model }
-          : {}),
-      });
-      report.passages += 1;
-      report.documentIds.push(doc.id);
-      writtenIds.add(doc.id);
+    if (pending.length > 0) {
+      try {
+        const batch = (opts.embedBatch ?? embedLocalBatch)(pending.map((p) => p.body));
+        embeds = batch.length === pending.length ? batch : undefined;
+        if (!embeds) {
+          throw new Error(
+            `batch returned ${batch.length} vectors for ${pending.length} passages`,
+          );
+        }
+      } catch (err) {
+        embeds = undefined;
+        report.embedFallback ??= errText(err);
+      }
+      for (let i = 0; i < pending.length; i++) {
+        const item = pending[i]!;
+        const doc = upsertDocument(db, {
+          id: item.id,
+          sourceKind: "vault_page",
+          sourceRef: item.sourceRef,
+          // The heading breadcrumb is in the title as well as the body: the body
+          // is what gets embedded, the title is what a citation is rendered as.
+          // Both are pin-hash inputs, so renaming a heading correctly shows up
+          // as drift on every passage under it.
+          title: item.title,
+          body: item.body,
+          metadata: { ingestRoot: root, section: item.section },
+          ...(embeds
+            ? { embedding: embeds[i]!.vector, model: embeds[i]!.model }
+            : {}),
+        });
+        report.passages += 1;
+        report.documentIds.push(doc.id);
+        writtenIds.add(doc.id);
+      }
     }
 
     // Shrink sweep. A note edited from 10 passages down to 4 leaves 6 rows

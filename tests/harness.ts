@@ -5034,12 +5034,227 @@ test(
 
     assert(before === after, `re-ingest changed rows:\n${before}\n${after}`);
     assert(
-      JSON.stringify(first.documentIds) === JSON.stringify(second.documentIds),
-      "re-ingest rotated document ids",
+      second.unchanged + second.passages === first.passages,
+      `re-ingest lost passages: wrote ${second.passages}, kept ${second.unchanged}, had ${first.passages}`,
     );
     assert(second.removed === 0, `an unchanged file removed ${second.removed} row(s)`);
   },
 );
+
+const THREE_PASSAGES =
+  "# Note\n\nalpha body one\n\n## Two\n\nbeta body two\n\n## Three\n\ngamma body three\n";
+
+function minilmVectors(texts: readonly string[]) {
+  return texts.map(() => ({
+    vector: new Float32Array(8).fill(0.25),
+    model: MINILM_MODEL,
+    dims: 8,
+    kind: "hash" as const,
+  }));
+}
+
+function plantUpdatedAt(db: ReturnType<typeof freshDb>): void {
+  db.prepare(
+    `UPDATE vector_document SET updated_at = '2000-01-01T00:00:00.000Z'`,
+  ).run();
+}
+
+test("pins", "a second ingest of an unchanged MiniLM file calls no embedder", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-skip-same-"));
+  writeFileSync(join(dir, "note.md"), THREE_PASSAGES);
+  const calls: string[][] = [];
+  const first = ingestDirectory(db, dir, {
+    embedBatch: (texts) => {
+      calls.push(texts);
+      return minilmVectors(texts);
+    },
+  });
+  assert(first.passages === 3, `setup: expected 3 passages, got ${first.passages}`);
+  assert(first.unchanged === 0, `first ingest kept ${first.unchanged}`);
+  const ids = first.documentIds.slice();
+  plantUpdatedAt(db);
+  calls.length = 0;
+  const second = ingestDirectory(db, dir, {
+    embedBatch: (texts) => {
+      calls.push(texts);
+      return minilmVectors(texts);
+    },
+  });
+  assert(calls.length === 0, `unchanged file called the embedder: ${JSON.stringify(calls)}`);
+  assert(second.unchanged === 3 && second.passages === 0, JSON.stringify(second));
+  assert(second.documentIds.length === 0, "a kept passage is not a row written this call");
+  assert(second.ingested === 1, "a fully kept file was still read");
+  const rows = db
+    .prepare(`SELECT id, updated_at FROM vector_document ORDER BY source_ref`)
+    .all() as { id: string; updated_at: string }[];
+  assert(rows.map((r) => r.id).join() === ids.join(), `ids rotated: ${JSON.stringify(rows)}`);
+  assert(
+    rows.every((r) => r.updated_at === "2000-01-01T00:00:00.000Z"),
+    `a rewrite hid inside the same clock instant: ${JSON.stringify(rows)}`,
+  );
+});
+
+test("pins", "editing the middle passage embeds that body and leaves the other two", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-skip-mid-"));
+  const file = join(dir, "note.md");
+  writeFileSync(file, THREE_PASSAGES);
+  const first = ingestDirectory(db, dir, { embedBatch: minilmVectors });
+  const before = db
+    .prepare(`SELECT id, source_ref, snapshot_hash FROM vector_document ORDER BY source_ref`)
+    .all() as { id: string; source_ref: string; snapshot_hash: string }[];
+  plantUpdatedAt(db);
+  writeFileSync(file, THREE_PASSAGES.replace("beta body two", "beta body changed"));
+  const calls: string[][] = [];
+  const second = ingestDirectory(db, dir, {
+    embedBatch: (texts) => {
+      calls.push(texts);
+      return minilmVectors(texts);
+    },
+  });
+  assert(first.passages === 3, `setup: expected 3 passages, got ${first.passages}`);
+  assert(calls.length === 1 && calls[0]!.length === 1, JSON.stringify(calls));
+  assert(calls[0]![0]!.includes("beta body changed"), calls[0]![0]);
+  assert(second.unchanged === 2 && second.passages === 1, JSON.stringify(second));
+  const after = db
+    .prepare(`SELECT id, source_ref, snapshot_hash, updated_at FROM vector_document ORDER BY source_ref`)
+    .all() as { id: string; source_ref: string; snapshot_hash: string; updated_at: string }[];
+  assert(after.map((r) => r.id).join() === before.map((r) => r.id).join(), "ids rotated");
+  const mid = after[1]!;
+  assert(mid.snapshot_hash !== before[1]!.snapshot_hash, "the edited passage kept its old hash");
+  assert(after[0]!.updated_at === "2000-01-01T00:00:00.000Z", "passage 0 was rewritten");
+  assert(after[2]!.updated_at === "2000-01-01T00:00:00.000Z", "passage 2 was rewritten");
+  assert(second.documentIds.length === 1 && second.documentIds[0] === mid.id, "documentIds must be the written row only");
+});
+
+test("pins", "a hash vector of unchanged text is embedded again", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-skip-hash-"));
+  writeFileSync(join(dir, "note.md"), THREE_PASSAGES);
+  ingestDirectory(db, dir, {
+    embedBatch: (texts) =>
+      texts.map(() => ({
+        vector: new Float32Array(8).fill(0.1),
+        model: "local-hash-v1",
+        dims: 8,
+        kind: "hash" as const,
+      })),
+  });
+  const calls: string[][] = [];
+  const second = ingestDirectory(db, dir, {
+    embedBatch: (texts) => {
+      calls.push(texts);
+      return minilmVectors(texts);
+    },
+  });
+  assert(calls.length === 1 && calls[0]!.length === 3, JSON.stringify(calls));
+  assert(second.unchanged === 0 && second.passages === 3, JSON.stringify(second));
+  const models = db.prepare(`SELECT DISTINCT model FROM vector_embedding`).all() as { model: string }[];
+  assert(models.length === 1 && models[0]!.model === MINILM_MODEL, JSON.stringify(models));
+});
+
+test("pins", "shrinking a file keeps the first id and deletes the other two", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-skip-shrink-"));
+  const file = join(dir, "note.md");
+  writeFileSync(file, THREE_PASSAGES);
+  const first = ingestDirectory(db, dir, { embedBatch: minilmVectors });
+  const keep = first.documentIds[0]!;
+  writeFileSync(file, "# Note\n\nonly one passage now\n");
+  const second = ingestDirectory(db, dir, { embedBatch: minilmVectors });
+  const rows = db.prepare(`SELECT id FROM vector_document`).all() as { id: string }[];
+  assert(rows.length === 1 && rows[0]!.id === keep, JSON.stringify(rows));
+  assert(second.removed === 2, `removed ${second.removed}`);
+});
+
+test("pins", "the same relative path under a second root is not the first root's row", () => {
+  const db = freshDb();
+  const a = mkdtempSync(join(tmpdir(), "chamber-skip-root-a-"));
+  const b = mkdtempSync(join(tmpdir(), "chamber-skip-root-b-"));
+  writeFileSync(join(a, "note.md"), THREE_PASSAGES);
+  writeFileSync(join(b, "note.md"), THREE_PASSAGES);
+  const first = ingestDirectory(db, a, { embedBatch: minilmVectors });
+  const calls: string[][] = [];
+  const second = ingestDirectory(db, b, {
+    embedBatch: (texts) => {
+      calls.push(texts);
+      return minilmVectors(texts);
+    },
+  });
+  assert(calls.length === 1 && calls[0]!.length === 3, JSON.stringify(calls));
+  assert(second.unchanged === 0, `second root was skipped: ${second.unchanged}`);
+  const ids = db.prepare(`SELECT id FROM vector_document`).all() as { id: string }[];
+  assert(ids.length === 6, `expected two files of three, got ${ids.length}`);
+  assert(!ids.some((r) => first.documentIds.includes(r.id) && second.documentIds.includes(r.id)), "roots shared an id");
+});
+
+test("pins", "a different section number is written even when the text matches", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-skip-section-"));
+  writeFileSync(join(dir, "note.md"), THREE_PASSAGES);
+  ingestDirectory(db, dir, { embedBatch: minilmVectors });
+  db.prepare(
+    `UPDATE vector_document SET metadata_json = json_set(metadata_json, '$.section', 99)
+     WHERE source_ref LIKE '%#p1'`,
+  ).run();
+  const calls: string[][] = [];
+  ingestDirectory(db, dir, {
+    embedBatch: (texts) => {
+      calls.push(texts);
+      return minilmVectors(texts);
+    },
+  });
+  assert(calls.length === 1 && calls[0]!.length === 1, JSON.stringify(calls));
+  const section = db
+    .prepare(`SELECT metadata_json FROM vector_document WHERE source_ref LIKE '%#p1'`)
+    .get() as { metadata_json: string };
+  const stored = (JSON.parse(section.metadata_json) as { section: number }).section;
+  assert(stored === 2, `section stayed ${stored}`);
+});
+
+test("pins", "a short batch is discarded and the kept passage stays MiniLM", () => {
+  const db = freshDb();
+  const dir = mkdtempSync(join(tmpdir(), "chamber-skip-short-"));
+  const file = join(dir, "note.md");
+  writeFileSync(file, THREE_PASSAGES);
+  ingestDirectory(db, dir, { embedBatch: minilmVectors });
+  plantUpdatedAt(db);
+  writeFileSync(
+    file,
+    THREE_PASSAGES.replace("beta body two", "beta body changed").replace(
+      "gamma body three",
+      "gamma body changed",
+    ),
+  );
+  const saved = process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  process.env.CHAMBER_EMBEDDER = "hash";
+  try {
+    const second = ingestDirectory(db, dir, {
+      embedBatch: (texts) => {
+        if (texts.length === 2) return minilmVectors(texts).slice(0, 1);
+        return minilmVectors(texts);
+      },
+    });
+    assert(typeof second.embedFallback === "string", "a short batch must be reported");
+    const models = db
+      .prepare(
+        `SELECT d.source_ref, e.model, d.updated_at
+         FROM vector_document d JOIN vector_embedding e ON e.document_id = d.id
+         ORDER BY d.source_ref`,
+      )
+      .all() as { source_ref: string; model: string; updated_at: string }[];
+    assert(models[0]!.model === MINILM_MODEL, JSON.stringify(models[0]));
+    assert(models[0]!.updated_at === "2000-01-01T00:00:00.000Z", JSON.stringify(models[0]));
+    assert(models[1]!.model === "local-hash-v1", JSON.stringify(models[1]));
+    assert(models[2]!.model === "local-hash-v1", JSON.stringify(models[2]));
+  } finally {
+    resetMinilmProbe();
+    if (saved === undefined) delete process.env.CHAMBER_EMBEDDER;
+    else process.env.CHAMBER_EMBEDDER = saved;
+  }
+});
 
 // ─── decision 3: shrinking files ─────────────────────────────────────────────
 
@@ -5184,6 +5399,10 @@ test(
     const original = "# Note\n\n## A\n\nFirst body.\n\n## B\n\nSecond body.\n";
     writeFileSync(file, original);
     const first = ingestDirectory(db, dir);
+    const idsOf = (): string => JSON.stringify(
+      db.prepare(`SELECT id FROM vector_document ORDER BY source_ref`).all(),
+    );
+    const idsBefore = idsOf();
 
     writeFileSync(file, "");
     const during = ingestDirectory(db, dir);
@@ -5194,10 +5413,10 @@ test(
     );
 
     writeFileSync(file, original);
-    const after = ingestDirectory(db, dir);
+    ingestDirectory(db, dir);
     assert(
-      JSON.stringify(after.documentIds) === JSON.stringify(first.documentIds),
-      `ids rotated across a transient empty read: ${JSON.stringify(first.documentIds)} -> ${JSON.stringify(after.documentIds)}`,
+      idsOf() === idsBefore,
+      `ids rotated across a transient empty read: ${idsBefore} -> ${idsOf()}`,
     );
   },
 );
@@ -5234,6 +5453,10 @@ test(
       const file = join(dir, "note.md");
       writeFileSync(file, original);
       const first = ingestDirectory(db, dir);
+      const idsOf = (): string => JSON.stringify(
+        db.prepare(`SELECT id FROM vector_document ORDER BY source_ref`).all(),
+      );
+      const idsBefore = idsOf();
       assert(
         first.passages === 2,
         `setup (${label}): expected 2 passages, got ${first.passages}`,
@@ -5274,10 +5497,10 @@ test(
       );
 
       writeFileSync(file, original);
-      const after = ingestDirectory(db, dir);
+      ingestDirectory(db, dir);
       assert(
-        JSON.stringify(after.documentIds) === JSON.stringify(first.documentIds),
-        `ids rotated across a transient ${label} read: ${JSON.stringify(first.documentIds)} -> ${JSON.stringify(after.documentIds)}`,
+        idsOf() === idsBefore,
+        `ids rotated across a transient ${label} read: ${idsBefore} -> ${idsOf()}`,
       );
 
       // The note is byte-identical to what the pin was minted against, so the

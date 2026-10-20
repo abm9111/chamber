@@ -275,8 +275,14 @@ export function upsertDocument(
          embedded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
     ).run(id, model, dims, float32ToBlob(vec));
   } catch (err) {
-    db.exec("ROLLBACK TO upsert_document");
-    db.exec("RELEASE upsert_document");
+    try {
+      db.exec("ROLLBACK TO upsert_document");
+      db.exec("RELEASE upsert_document");
+    } catch (rollbackErr) {
+      if (err instanceof Error && rollbackErr instanceof Error && err.cause === undefined) {
+        err.cause = rollbackErr;
+      }
+    }
     throw err;
   }
   db.exec("RELEASE upsert_document");

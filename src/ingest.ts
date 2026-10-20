@@ -22,9 +22,10 @@ import {
   statSync,
 } from "node:fs";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { deleteDocument, upsertDocument } from "./vector.ts";
+import { blobToFloat32, deleteDocument, upsertDocument } from "./vector.ts";
 import {
   embedLocalBatch,
+  MINILM_DIMS,
   MINILM_MODEL,
   minilmTruncationSeen,
   type EmbedResult,
@@ -752,12 +753,12 @@ export function pathRefusal(
 export function countExcludeMatches(
   rootInput: string,
   exclude: readonly string[],
-): { raw: string; matched: number }[] {
+): { raw: string; matched: number; unreadable?: boolean }[] {
   let root: string;
   try {
     root = realpathSync(resolve(rootInput));
   } catch {
-    return exclude.map((raw) => ({ raw, matched: 0 }));
+    return exclude.map((raw) => ({ raw, matched: 0, unreadable: true }));
   }
   const { patterns, owners } = buildWalkPatternsIndexed(root, exclude);
   const ctx: WalkContext = {
@@ -801,6 +802,38 @@ function readSection(json: string | null): number | string | undefined {
     return undefined;
   }
   return undefined;
+}
+
+/** Ids whose stored vector is a finite 384-d MiniLM blob. A label alone is not enough. */
+function soundMiniLmIds(db: DatabaseSync, ids: readonly string[]): Set<string> {
+  const ok = new Set<string>();
+  for (let i = 0; i < ids.length; i += 400) {
+    const slice = ids.slice(i, i + 400);
+    const rows = db
+      .prepare(
+        `SELECT document_id, dims, vector_blob FROM vector_embedding
+         WHERE document_id IN (${slice.map(() => "?").join(",")})`,
+      )
+      .all(...slice) as { document_id: string; dims: number; vector_blob: Buffer }[];
+    for (const r of rows) {
+      if (r.dims !== MINILM_DIMS || r.vector_blob.byteLength !== MINILM_DIMS * 4) continue;
+      let floats: Float32Array;
+      try {
+        floats = blobToFloat32(r.vector_blob);
+      } catch {
+        continue;
+      }
+      let finite = true;
+      for (let n = 0; n < floats.length; n++) {
+        if (!Number.isFinite(floats[n])) {
+          finite = false;
+          break;
+        }
+      }
+      if (finite) ok.add(r.document_id);
+    }
+  }
+  return ok;
 }
 
 function stripMarkdownExt(ref: string): string {
@@ -1062,6 +1095,7 @@ export function ingestDirectory(
     const docTitle = title ?? stripMarkdownExt(path);
 
     const rowById = new Map(owned.map((o) => [o.id, o]));
+    const sound = soundMiniLmIds(db, owned.map((o) => o.id));
     const pending: {
       body: string;
       sourceRef: string;
@@ -1085,6 +1119,7 @@ export function ingestDirectory(
         row.ref === sourceRef &&
         row.snapshotHash === hash &&
         row.model === MINILM_MODEL &&
+        sound.has(row.id) &&
         row.section === p.section
       ) {
         writtenIds.add(row.id);

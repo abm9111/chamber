@@ -227,7 +227,8 @@ Then edit that config to add a notes folder and a model:
 
 `--exclude <pattern>` repeats after `--notes`; config ingest roots and their
 excludes also count as declared folders for the check, and an exclude that
-matches nothing refuses that folder.
+matches nothing refuses that folder. A root remembered only on an indexed row
+does not authorize reading a file the index does not hold.
 
 `model.base` may name any OpenAI-compatible endpoint. A loopback address needs
 no API key; anything else reads `CHAMBER_API_KEY` from the environment, never

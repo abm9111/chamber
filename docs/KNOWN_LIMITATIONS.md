@@ -228,7 +228,10 @@ deployment machine is the stated entry criterion for any capability level above 
 >   one classifier, so the real path of a note inside a declared folder is
 >   judged from disk, and an edited file is no longer returned as `STALE`. A
 >   link that leaves the folder, a dotted entry, and an excluded entry are still
->   not read. A directory swapped for a link between resolving and opening
+>   not read. A root that exists only on indexed rows does not authorize a file
+>   the index does not hold, and an exclude on `--notes` or in config applies
+>   to a passage ref and a `vdoc_` id of that file as well as to its path.
+>   A directory swapped for a link between resolving and opening
 >   leaves a small window; Node has no `openat`.
 > - Meaning, as everywhere in this section: a negated or misattributed claim
 >   built from the note's own words is `SUPPORTED`.

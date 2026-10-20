@@ -15633,7 +15633,9 @@ function writeMinilmStub(dir: string): string {
       "    return;",
       "  }",
       "  const vecs = group.map((_, i) => [replies, i, 1]);",
-      "  process.stdout.write(JSON.stringify(vecs) + '\\n');",
+      "  const out = () => process.stdout.write(JSON.stringify(vecs) + '\\n');",
+      "  if (mode === 'bad-second-line') setTimeout(out, 300);",
+      "  else out();",
       
       "  if (mode === 'exit-after-reply') process.exit(0);",
       "}",

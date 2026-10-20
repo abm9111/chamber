@@ -83,6 +83,10 @@ function killChild(target) {
   detachChild(target);
 }
 
+function isCurrent(target) {
+  return child === target;
+}
+
 function bind(target) {
   child = target;
   Atomics.store(pidSlot, 0, target.pid || 0);
@@ -90,6 +94,7 @@ function bind(target) {
   target.stderr.setEncoding("utf8");
   target.stdin.on("error", () => {});
   target.stdout.on("data", (chunk) => {
+    if (!isCurrent(target)) return;
     if (stdout.length + chunk.length > REPLY_LIMIT) {
       killChild(target);
       stderrPending += "reply longer than 64 MiB";
@@ -118,17 +123,21 @@ function bind(target) {
     }
     pendingVectors = vectors;
     setImmediate(() => {
+      if (!isCurrent(target)) return;
       if (settled || !requestOpen) return;
-      const alive = child === target && target.exitCode === null && target.signalCode === null;
+      const alive = target.exitCode === null && target.signalCode === null;
       finishRequest({ ok: true, vectors, alive });
     });
   });
   target.stderr.on("data", (chunk) => {
+    if (!isCurrent(target)) return;
     stderrPending += chunk;
   });
   target.on("exit", (code) => {
+    const wasCurrent = isCurrent(target);
     detachChild(target);
     setImmediate(() => {
+      if (!wasCurrent) return;
       if (!requestOpen || settled) return;
       if (pendingVectors) {
         finishRequest({ ok: true, vectors: pendingVectors, alive: false, status: code });
@@ -138,6 +147,7 @@ function bind(target) {
     });
   });
   target.on("error", (err) => {
+    if (!isCurrent(target)) return;
     detachChild(target);
     stderrPending += String(err);
     if (requestOpen) finishRequest({ ok: false, status: null });

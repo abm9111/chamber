@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Implement in a new worktree from `origin/main`: `git worktree add .worktrees/pin-release -b feat/pin-release origin/main`. Do not implement in `/Users/shadow/Projects/chamber` itself: it is on another branch and has unrelated edits in `.gitignore`, `src/embedder.ts` and `scripts/embed_minilm.py`.
+- Implement in a new worktree from `origin/main`: `git worktree add .worktrees/pin-release -b feat/pin-release origin/main`. Do not implement in the main checkout itself: it is on another branch and has unrelated edits in `.gitignore`, `src/embedder.ts` and `scripts/embed_minilm.py`.
 - The release checkout is `~/.local/share/chamber-release`. It is never `~/.local/share/chamber`, which is the data directory and holds `chamber.sqlite`.
 - The job runs each of `config show`, `ingest` and `verify` as `node "$HOME/.local/share/chamber-release/bin/chamber.js"`. It names `node` because `bin/chamber.js` is mode `100644` in every tag. Nothing else in the script changes: not the banner, the failure line, the notification text, or `CHAMBER_PYTHON`.
 - The installed plist's script is accepted only when it decodes to exactly `BARE_SCRIPT` or `PINNED_SCRIPT`. Never find-and-replace `chamber` in a script. That is a blocklist, and it would also rewrite the banner and the log path.
@@ -68,7 +68,7 @@
 - [ ] **Step 1: Make the worktree and commit the design**
 
 ```bash
-cd /Users/shadow/Projects/chamber
+cd "$(git rev-parse --show-toplevel)"   # the main checkout
 git fetch origin
 git worktree add .worktrees/pin-release -b feat/pin-release origin/main
 mkdir -p .worktrees/pin-release/docs/superpowers/specs .worktrees/pin-release/docs/superpowers/plans

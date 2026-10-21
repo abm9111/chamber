@@ -15,7 +15,18 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 
 export const JOB_LABEL = "com.chamber.verify";
@@ -121,13 +132,63 @@ interface GitRun {
   message: string;
 }
 
-function git(cwd: string, args: readonly string[]): GitRun {
-  const r = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
+export interface GitTimeouts {
+  fetchMs: number;
+  otherMs: number;
+}
+
+let gitTimeouts: GitTimeouts = { fetchMs: 120_000, otherMs: 30_000 };
+
+/** Test seam: replace the git timeouts and return the ones that were set. */
+export function setGitTimeouts(next: GitTimeouts): GitTimeouts {
+  const previous = gitTimeouts;
+  gitTimeouts = next;
+  return previous;
+}
+
+/**
+ * `scheme://user:password@host` becomes `scheme://<redacted>@host`, wherever a
+ * URL appears in text. Git's own error messages quote the URL they failed on,
+ * and an origin URL can carry credentials.
+ */
+export function redactUserinfo(text: string): string {
+  return text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#]*@/gi, "$1<redacted>@");
+}
+
+// Variables that point git at some other repository than the one `-C` names.
+// Pin runs from places that set them: a git hook exports GIT_DIR and
+// GIT_INDEX_FILE, and with those inherited `git -C <release dir>` answers for
+// the hook's repository instead.
+const GIT_REDIRECTS = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+] as const;
+
+function gitEnv(): NodeJS.ProcessEnv {
+  // A fetch that wants a password must fail, not wait on a terminal nobody is
+  // watching.
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  for (const name of GIT_REDIRECTS) delete env[name];
+  return env;
+}
+
+function git(cwd: string, args: readonly string[], timeoutMs: number = gitTimeouts.otherMs): GitRun {
+  const r = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", env: gitEnv(), timeout: timeoutMs });
+  const timedOut = (r.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
   const stderr = r.error !== undefined ? String(r.error) : (r.stderr ?? "").trim();
+  const message = timedOut
+    ? `git ${args[0] ?? ""} timed out after ${timeoutMs / 1000}s`
+    : stderr !== ""
+      ? stderr
+      : `git ${args[0] ?? ""} exited ${r.status}`;
   return {
-    ok: r.status === 0,
+    ok: r.status === 0 && r.error === undefined,
     out: (r.stdout ?? "").trim(),
-    message: stderr !== "" ? stderr : `git ${args[0] ?? ""} exited ${r.status}`,
+    message: redactUserinfo(message),
   };
 }
 
@@ -138,7 +199,11 @@ function tagNameRefusal(tag: string): string | null {
     return `the tag name ${JSON.stringify(tag)} contains a space or a newline`;
   }
   // git's own grammar for a ref name, not a hand-written list of bad characters.
-  const format = spawnSync("git", ["check-ref-format", `refs/tags/${tag}`], { encoding: "utf8" });
+  const format = spawnSync("git", ["check-ref-format", `refs/tags/${tag}`], {
+    encoding: "utf8",
+    env: gitEnv(),
+    timeout: gitTimeouts.otherMs,
+  });
   if (format.error !== undefined) return `git did not run: ${String(format.error)}`;
   if (format.status !== 0) return `${JSON.stringify(tag)} is not a valid tag name`;
   return null;
@@ -178,7 +243,8 @@ function existingCheckoutRefusal(dir: string, originUrl: string): string | null 
   if (!isCheckoutRoot(dir)) return `${dir} exists and is not a git checkout; left alone`;
   const origin = git(dir, ["remote", "get-url", "origin"]);
   if (!origin.ok || origin.out !== originUrl) {
-    return `${dir} fetches from ${origin.ok ? origin.out : "no origin"}, not ${originUrl}; left alone`;
+    const found = origin.ok ? redactUserinfo(origin.out) : "no origin";
+    return `${dir} fetches from ${found}, not ${redactUserinfo(originUrl)}; left alone`;
   }
   // dist/ is gitignored, so no tag provides it, and bin/chamber.js runs
   // dist/cli.js instead of the tag's src/ whenever it exists.
@@ -198,12 +264,18 @@ function moveCheckout(dir: string, created: boolean, originUrl: string, tag: str
     mkdirSync(dirname(dir), { recursive: true });
     const init = git(dirname(dir), ["init", "--quiet", dir]);
     if (!init.ok) return { ok: false, reason: `git init: ${init.message}` };
-    const remote = git(dir, ["remote", "add", "origin", originUrl]);
+    // `--`: the URL comes from another repository's config, and one that starts
+    // with "-" must be a URL here, not an option.
+    const remote = git(dir, ["remote", "add", "--", "origin", originUrl]);
     if (!remote.ok) return { ok: false, reason: `git remote add: ${remote.message}` };
   }
   // Only refs/tags/<tag>, so a branch or a raw commit is simply not found.
   // No `+`: a tag that moved on origin is git's refusal, not a silent move.
-  const fetch = git(dir, ["fetch", "--quiet", "--no-tags", "origin", `refs/tags/${tag}:refs/tags/${tag}`]);
+  const fetch = git(
+    dir,
+    ["fetch", "--quiet", "--no-tags", "origin", `refs/tags/${tag}:refs/tags/${tag}`],
+    gitTimeouts.fetchMs,
+  );
   if (!fetch.ok) return { ok: false, reason: `git fetch: ${fetch.message}` };
   const commit = git(dir, ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}^{commit}`]);
   if (!commit.ok) return { ok: false, reason: `${tag} does not point at a commit` };
@@ -220,6 +292,25 @@ function moveCheckout(dir: string, created: boolean, originUrl: string, tag: str
   const bin = join(dir, "bin", "chamber.js");
   if (!existsSync(bin)) return { ok: false, reason: `${bin} is not on disk after checkout` };
   return { ok: true, commit: commit.out, already };
+}
+
+/**
+ * http(s) origins may not carry a username or a password: the URL is copied
+ * into the release checkout's config and shows up in git's messages. scp-like
+ * `user@host:path` and `ssh://user@host/...` are not URLs with secrets in them
+ * and are allowed. The URL is never part of the message.
+ */
+export function originCredentialRefusal(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null; // not a URL: a path, or scp-like user@host:path
+  }
+  if ((parsed.protocol === "http:" || parsed.protocol === "https:") && (parsed.username !== "" || parsed.password !== "")) {
+    return "the origin URL carries credentials; use a credential helper instead";
+  }
+  return null;
 }
 
 /**
@@ -244,9 +335,19 @@ export function pinCheckout(opts: CheckoutOptions): CheckoutResult {
     return { ok: false, reason: `${sourceRoot} has no origin remote to fetch ${tag} from` };
   }
 
+  const credentials = originCredentialRefusal(origin.out);
+  if (credentials !== null) return { ok: false, reason: credentials };
+
   // Decided once, before anything is written: only a directory this run
-  // creates may be removed.
-  const created = !pathExists(releaseDir);
+  // creates may be removed. An lstat that fails for any reason but "not there"
+  // (a parent that is a file, a permission error) is a refusal, not a crash.
+  let created: boolean;
+  try {
+    created = !pathExists(releaseDir);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code ?? String(e);
+    return { ok: false, reason: `cannot look at ${releaseDir}: ${code}; left alone` };
+  }
   if (!created) {
     const kept = existingCheckoutRefusal(releaseDir, origin.out);
     if (kept !== null) return { ok: false, reason: kept };
@@ -254,6 +355,30 @@ export function pinCheckout(opts: CheckoutOptions): CheckoutResult {
   const moved = moveCheckout(releaseDir, created, origin.out, tag);
   if (!moved.ok && created) rmSync(releaseDir, { recursive: true, force: true });
   return moved;
+}
+
+/**
+ * Write `text` to `path` so a reader sees the old file or the new one, never
+ * half of it: a temp file in the same directory with the original's mode, then
+ * a rename over it. A symlinked `path` is followed, so the link survives and
+ * its target is what is replaced. A failure removes the temp file and rethrows.
+ */
+export function writeFileAtomic(
+  path: string,
+  text: string,
+  rename: (from: string, to: string) => void = renameSync,
+): void {
+  const target = realpathSync(path);
+  const mode = statSync(target).mode & 0o7777;
+  const tmp = `${target}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmp, text, { flag: "wx", mode });
+    chmodSync(tmp, mode); // the umask may have narrowed the mode above
+    rename(tmp, target);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
 }
 
 export interface LaunchctlResult {
@@ -308,7 +433,15 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
   }
   const rewritten = read.form === "bare";
   if (rewritten) {
-    writeFileSync(plistPath, pinJobPlist(xml));
+    try {
+      writeFileAtomic(plistPath, pinJobPlist(xml));
+    } catch (e) {
+      err.push(
+        `chamber pin: could not write ${plistPath}: ${e instanceof Error ? e.message : String(e)}; ` +
+          `the checkout is pinned and the job was not changed`,
+      );
+      return 1;
+    }
     out.push(`${plistPath} now runs config show, ingest and verify with ${RELEASE_COMMAND}`);
   } else {
     out.push(`${plistPath} already runs ${RELEASE_COMMAND}`);

@@ -81,10 +81,14 @@ import {
   JOB_LABEL,
   PINNED_SCRIPT,
   RELEASE_COMMAND,
+  originCredentialRefusal,
   pinCheckout,
   pinJobPlist,
   pinRelease,
   readJobPlist,
+  redactUserinfo,
+  setGitTimeouts,
+  writeFileAtomic,
   type Launchctl,
   type LaunchctlResult,
   type PinOptions,
@@ -13290,6 +13294,240 @@ test("config", "chamber-jobs.service keeps the hardening chamber.service has, an
       assert(!src.includes(mod), `${f} imports ${mod} and is reachable from chamber jobs run`);
     }
   }
+});
+
+// ─── pin hardening: git environment, timeouts, URLs, atomic write ───────────
+
+/**
+ * A `git` that goes first on PATH, records how it was called (the prompt
+ * setting, GIT_DIR and GIT_INDEX_FILE it saw, and its arguments) and runs the
+ * real git. With SHIM_HANG=fetch it hangs on `fetch` instead, and with
+ * SHIM_FAIL=fetch it fails `fetch` with a message that quotes a URL carrying
+ * the userinfo in SHIM_USERINFO, the way git's own errors do.
+ */
+function gitShim(root: string): { dir: string; log: string; real: string } {
+  const dir = join(root, "shim");
+  mkdirSync(dir, { recursive: true });
+  const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  const log = join(root, "git-calls.log");
+  writeFileSync(
+    join(dir, "git"),
+    [
+      "#!/bin/sh",
+      'echo "${GIT_TERMINAL_PROMPT-unset}|${GIT_DIR-unset}|${GIT_INDEX_FILE-unset}|$*" >> "$SHIM_LOG"',
+      'if [ "$SHIM_HANG" = fetch ]; then for a in "$@"; do [ "$a" = fetch ] && exec sleep 30; done; fi',
+      `if [ "$SHIM_FAIL" = fetch ]; then for a in "$@"; do [ "$a" = fetch ] && { echo "fatal: unable to access 'https://$SHIM_USERINFO@example.invalid/x.git/': 401" >&2; exit 128; }; done; fi`,
+      'exec "$SHIM_REAL_GIT" "$@"',
+      "",
+    ].join("\n"),
+  );
+  chmodSync(join(dir, "git"), 0o755);
+  return { dir, log, real };
+}
+
+/** Run `fn` with these variables set in this process, then put every one back. */
+function withProcessEnv(vars: Record<string, string>, fn: () => void): void {
+  const saved = new Map<string, string | undefined>();
+  for (const [k, v] of Object.entries(vars)) {
+    saved.set(k, process.env[k]);
+    process.env[k] = v;
+  }
+  try {
+    fn();
+  } finally {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test("release", "every git call pin makes has prompts off and none of the variables that redirect git", () => {
+  withReleaseFixture((fx) => {
+    const shim = gitShim(fx.root);
+    withProcessEnv(
+      {
+        PATH: `${shim.dir}:${process.env.PATH ?? ""}`,
+        SHIM_LOG: shim.log,
+        SHIM_REAL_GIT: shim.real,
+        GIT_DIR: join(fx.root, "not-a-repo"),
+        GIT_WORK_TREE: join(fx.root, "not-a-tree"),
+        GIT_INDEX_FILE: join(fx.root, "not-an-index"),
+        GIT_TERMINAL_PROMPT: "1",
+      },
+      () => {
+        const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+        assert(r.ok, `pin refused with GIT_DIR and friends set: ${JSON.stringify(r)}`);
+      },
+    );
+    const calls = readFileSync(shim.log, "utf8").trim().split("\n");
+    assert(calls.length >= 6, `expected pin's git calls to be logged, got ${calls.length}`);
+    for (const c of calls) {
+      assert(c.startsWith("0|unset|unset|"), `a git call inherited the environment: ${c}`);
+    }
+  });
+});
+
+test("release", "a git fetch that hangs is a refusal naming the command, and a first pin cleans up", () => {
+  withReleaseFixture((fx) => {
+    const shim = gitShim(fx.root);
+    const previous = setGitTimeouts({ fetchMs: 400, otherMs: 10_000 });
+    try {
+      withProcessEnv(
+        { PATH: `${shim.dir}:${process.env.PATH ?? ""}`, SHIM_LOG: shim.log, SHIM_REAL_GIT: shim.real, SHIM_HANG: "fetch" },
+        () => {
+          const started = Date.now();
+          const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+          assert(!r.ok && r.reason.includes("git fetch timed out after 0.4s"), JSON.stringify(r));
+          assert(Date.now() - started < 10_000, "the timeout did not stop the fetch");
+        },
+      );
+    } finally {
+      setGitTimeouts(previous);
+    }
+    assert(!existsSync(fx.releaseDir), "a first pin that timed out left its clone behind");
+    assert(
+      previous.fetchMs === 120_000 && previous.otherMs === 30_000,
+      `the default timeouts are 120 s for fetch and 30 s for the rest, got ${JSON.stringify(previous)}`,
+    );
+  });
+});
+
+test("release", "a URL in git's own error message has its userinfo redacted in the refusal", () => {
+  withReleaseFixture((fx) => {
+    const shim = gitShim(fx.root);
+    const userinfo = ["bob", "pw"].join(":");
+    withProcessEnv(
+      {
+        PATH: `${shim.dir}:${process.env.PATH ?? ""}`,
+        SHIM_LOG: shim.log,
+        SHIM_REAL_GIT: shim.real,
+        SHIM_FAIL: "fetch",
+        SHIM_USERINFO: userinfo,
+      },
+      () => {
+        const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+        assert(!r.ok && r.reason.includes("https://<redacted>@example.invalid/x.git/"), JSON.stringify(r));
+        assert(!r.reason.includes("bob") && !r.reason.includes("pw@"), `the refusal printed the userinfo: ${r.reason}`);
+      },
+    );
+  });
+});
+
+test("release", "an origin URL that starts with a dash is added as a URL, not read as an option", () => {
+  withReleaseFixture((fx) => {
+    fixtureGit(fx.source, ["config", "remote.origin.url", "-not-an-option"]);
+    const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+    assert(!r.ok, "a pin from a dash-named origin succeeded");
+    assert(
+      r.reason.startsWith("git fetch:"),
+      `the failure must come from the fetch, not from option parsing in remote add: ${r.reason}`,
+    );
+    assert(!existsSync(fx.releaseDir), "a failed first pin left its clone behind");
+  });
+});
+
+test("release", "an http(s) origin with credentials is refused before anything is created, and never echoed", () => {
+  withReleaseFixture((fx) => {
+    // Assembled here so no literal credential sits in this file.
+    const secret = ["hunter", "2"].join("");
+    for (const url of [
+      `https://alice:${secret}@example.invalid/chamber.git`,
+      `http://alice@example.invalid/chamber.git`,
+      `https://:${secret}@example.invalid/chamber.git`,
+    ]) {
+      fixtureGit(fx.source, ["config", "remote.origin.url", url]);
+      const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+      assert(
+        !r.ok && r.reason === "the origin URL carries credentials; use a credential helper instead",
+        `${JSON.stringify(r)}`,
+      );
+      assert(!r.reason.includes(secret) && !r.reason.includes("alice"), "the refusal echoed the URL");
+      assert(!existsSync(dirname(fx.releaseDir)), "a refused pin created a directory");
+    }
+  });
+  for (const [url, refused] of [
+    ["https://example.invalid/chamber.git", false],
+    ["https://@example.invalid/chamber.git", false],
+    ["http://example.invalid:8080/chamber.git", false],
+    ["https://alice@example.invalid/chamber.git", true],
+    ["http://alice:pw@example.invalid/chamber.git", true],
+    ["https://:pw@example.invalid/chamber.git", true],
+    ["ssh://git@example.invalid/chamber.git", false],
+    ["git@example.invalid:org/chamber.git", false],
+    ["user:pw@example.invalid:org/chamber.git", false],
+    ["/srv/git/chamber.git", false],
+    ["-not-an-option", false],
+  ] as const) {
+    assert((originCredentialRefusal(url) !== null) === refused, `${url}: expected ${refused ? "a refusal" : "no refusal"}`);
+  }
+});
+
+test("release", "a URL printed in a message has its userinfo redacted", () => {
+  const table: ReadonlyArray<readonly [string, string]> = [
+    ["fatal: unable to access 'https://u:p@host/x.git/': 401", "fatal: unable to access 'https://<redacted>@host/x.git/': 401"],
+    ["ssh://git@host/x.git", "ssh://<redacted>@host/x.git"],
+    ["https://a:b@c@host/x", "https://<redacted>@host/x"],
+    ["git@host:org/r.git", "git@host:org/r.git"],
+    ["https://host/x.git", "https://host/x.git"],
+    ["nothing to redact", "nothing to redact"],
+  ];
+  for (const [input, want] of table) assert(redactUserinfo(input) === want, `${input} -> ${redactUserinfo(input)}`);
+
+  withReleaseFixture((fx) => {
+    const secret = ["hunter", "2"].join("");
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    fixtureGit(fx.releaseDir, ["remote", "set-url", "origin", `https://bob:${secret}@example.invalid/other.git`]);
+    const r = pinCheckout({ ...opts, tag: "v2" });
+    assert(!r.ok && r.reason.includes("https://<redacted>@example.invalid/other.git"), JSON.stringify(r));
+    assert(!r.reason.includes(secret) && !r.reason.includes("bob"), `the refusal printed the credentials: ${r.reason}`);
+  });
+});
+
+test("release", "a release directory that cannot be looked at is a refusal, not a crash", () => {
+  withReleaseFixture((fx) => {
+    const file = join(fx.root, "a-file");
+    writeFileSync(file, "not a directory\n");
+    const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: join(file, "release") });
+    assert(!r.ok && r.reason.includes("cannot look at") && r.reason.includes("ENOTDIR"), JSON.stringify(r));
+  });
+});
+
+test("release", "the job plist is replaced atomically with its mode kept, and a failed write leaves no temp file", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    chmodSync(fx.plistPath, 0o640);
+    const inodeBefore = lstatSync(fx.plistPath).ino;
+    const r = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run));
+    assert(r.code === 0, r.err.join("\n"));
+    const after = lstatSync(fx.plistPath);
+    assert(after.ino !== inodeBefore, "the plist was rewritten in place, not replaced by a rename");
+    assert((after.mode & 0o777) === 0o640, `the plist's mode changed to ${(after.mode & 0o777).toString(8)}`);
+    assert(!existsSync(`${fx.plistPath}.tmp-${process.pid}`), "a temp file was left beside the plist");
+    assert(plistForm(fx.plistPath) === "pinned", plistForm(fx.plistPath));
+
+    // A rename that fails: the original is intact and the temp file is gone.
+    const original = readFileSync(fx.plistPath, "utf8");
+    let threw = "";
+    try {
+      writeFileAtomic(fx.plistPath, "replacement\n", () => {
+        throw new Error("rename failed");
+      });
+    } catch (e) {
+      threw = e instanceof Error ? e.message : String(e);
+    }
+    assert(threw === "rename failed", `the failure was swallowed: "${threw}"`);
+    assert(readFileSync(fx.plistPath, "utf8") === original, "a failed write changed the plist");
+    assert(!existsSync(`${fx.plistPath}.tmp-${process.pid}`), "a failed write left its temp file");
+
+    // A symlinked plist keeps its link; the target is what is replaced.
+    const link = join(fx.root, "link.plist");
+    symlinkSync(fx.plistPath, link);
+    writeFileAtomic(link, "through the link\n");
+    assert(lstatSync(link).isSymbolicLink(), "the symlink was replaced by a regular file");
+    assert(readFileSync(fx.plistPath, "utf8") === "through the link\n", "the link's target was not written");
+  });
 });
 
 // ─── cli process smoke tests ────────────────────────────────────────────────

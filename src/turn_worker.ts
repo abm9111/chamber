@@ -35,7 +35,17 @@ try {
 } catch {
   /* slack optional */
 }
-const db = openChamberDb(dbPath);
+// The server opened `dbPath` itself and handed over the path it actually got, so
+// this open can only land somewhere else if the location went bad in between.
+// `openChamberDb` would then carry on in `/tmp/chamber.sqlite` with a warning on
+// stderr, and the turns on this thread would write to a second database while
+// the main thread's routes and the audit chain stayed in the first. Refuse
+// instead: the thread fails to start and the pool fails the request in flight.
+const db = openChamberDb(dbPath, (actual) => {
+  throw new Error(
+    `turn worker refused: the database at ${dbPath} could not be opened (fallback was ${actual})`,
+  );
+});
 
 port.on("message", (job: TurnJob) => {
   let reply: TurnReply;

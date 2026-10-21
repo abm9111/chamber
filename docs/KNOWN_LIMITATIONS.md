@@ -1135,6 +1135,19 @@ way round: a `POST /turn` whose worker waits out SQLite's 5 s for a lock that a 
 this thread holds answers the same 503, flagged `busy` by the worker, which is where the
 error object exists.
 
+Three more things follow from the 250 ms limit.
+
+- It applies to any writer, not only the turn worker. A scheduled `chamber ingest` or
+  `chamber verify` in another process holds the same single write lock, and while it does
+  the routes above answer 503 `busy` just the same.
+- A 503 `busy` from `POST /turn` can come after the turn's session and opening rows have
+  committed (`runTurn` in `src/turn.ts` writes the session and the opening messages as
+  separate statements before the belief commit). A client that retries can therefore
+  create a second session for what the user sees as one message.
+- `POST /deliberate` is one transaction (`BEGIN IMMEDIATE` in `src/server.ts`), so a 503
+  there writes nothing and a failure part-way leaves nothing; a retry cannot double it.
+  The other callers of `openDeliberation` (the CLI, skill activation) are unchanged.
+
 Two smaller things follow from the turn living in another thread. The `/turn` rate-limit
 bucket is in memory in that thread, so a worker that dies and is restarted starts with a
 full bucket. And an in-memory database (`CHAMBER_DB=:memory:`, or the last-resort fallback

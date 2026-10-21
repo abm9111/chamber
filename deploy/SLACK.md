@@ -50,6 +50,8 @@ fail-closed like the approver list: **empty means nobody**, and the runner logs
 `chamber: CHAMBER_SLACK_ALLOWED_USERS is empty, so nobody can talk to this bot` at
 startup. A user who is not listed gets `You are not on CHAMBER_SLACK_ALLOWED_USERS.` when
 they mention the bot, DM it or run `/chamber`, and no turn is started. Being allowed to
-talk does not make anyone an approver. Before this variable existed the Slack runner let
+talk does not make anyone an approver. An approver who is not on
+`CHAMBER_SLACK_ALLOWED_USERS` cannot use `/chamber approve` or `/chamber reject`, though the
+Approve and Reject buttons still work for them. Before this variable existed the Slack runner let
 any user in a channel with the bot drive a turn, so an existing deployment answers
 nobody until it is set.

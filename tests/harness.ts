@@ -16898,6 +16898,45 @@ test("turn_pool", "isSqliteBusy reads the error code, not the message, and follo
   assert(!isSqliteBusy("database is locked"), "a string is not busy");
 });
 
+test("turn_pool", "the real worker refuses to run on a fallback database, and writes no turn to it", async () => {
+  // A directory as the database path: the open fails with the same code as an
+  // unwritable one (see the cli redirect test), and it fails as root too. The
+  // main thread of a live server would have redirected and handed the worker
+  // the fallback path; here the worker is handed the requested path, which is
+  // what happens when the location goes bad between the two opens.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-workerfallback-"));
+  const TMP_FALLBACK = "/tmp/chamber.sqlite";
+  const tmpFallbackPreexisted = existsSync(TMP_FALLBACK);
+  const sessionsIn = (path: string): number => {
+    if (!existsSync(path)) return 0;
+    const probe = openChamberDb(path);
+    try {
+      return count(probe, `SELECT COUNT(*) AS c FROM session`);
+    } finally {
+      probe.close();
+    }
+  };
+  const before = sessionsIn(TMP_FALLBACK);
+  const requested = join(dir, "iam-a-directory");
+  mkdirSync(requested);
+  const pool = new TurnPool(new URL("../src/turn_worker.ts", import.meta.url), requested);
+  try {
+    const err = await rejectionWithin(pool.run("hello"), 15_000);
+    const text = `${err.message}\n${(err as TurnWorkerError).chain?.join("\n") ?? ""}`;
+    assert(/turn worker refused/.test(text), `the worker should refuse by name, got: ${text}`);
+    assert(text.includes(requested), `the refusal must name the path asked for, got: ${text}`);
+    assert(text.includes(TMP_FALLBACK), `the refusal must name the fallback it found, got: ${text}`);
+    assert(
+      sessionsIn(TMP_FALLBACK) === before,
+      `the turn wrote ${sessionsIn(TMP_FALLBACK) - before} session row(s) to ${TMP_FALLBACK}`,
+    );
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+    if (!tmpFallbackPreexisted) rmSync(TMP_FALLBACK, { force: true });
+  }
+});
+
 test("turn_pool", "requests run one at a time, in the order they were made", async () => {
   const { pool, dir } = poolOf(POOL_WORKER_COUNTS);
   try {
@@ -17049,6 +17088,122 @@ test("server", "a route that needs the write lock a turn holds answers 503 busy 
   } finally {
     await s.stop();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Rows a deliberation leaves behind, read through a connection of the test's own. */
+function deliberationRows(dbPath: string): { del: number; votes: number; spend: number; audit: number } {
+  const db = openChamberDb(dbPath);
+  try {
+    return {
+      del: count(db, `SELECT COUNT(*) AS c FROM deliberation`),
+      votes: count(db, `SELECT COUNT(*) AS c FROM faculty_vote`),
+      spend: count(db, `SELECT COUNT(*) AS c FROM spend_event WHERE channel = 'faculty'`),
+      audit: count(db, `SELECT COUNT(*) AS c FROM audit_event WHERE action = 'faculty_deliberation'`),
+    };
+  } finally {
+    db.close();
+  }
+}
+
+test("server", "POST /deliberate while a turn holds the write lock answers 503 busy and writes nothing; the retry writes exactly one deliberation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-delib-busy-"));
+  const stub = join(dir, "slow-python");
+  writeFileSync(join(dir, "slow-python.js"), SLOW_PYTHON_JS);
+  writeFileSync(stub, `#!/bin/sh\nexec "${process.execPath}" "${join(dir, "slow-python.js")}" "$@"\n`, {
+    mode: 0o755,
+  });
+  const s = await startLiveServer({ CHAMBER_PYTHON: stub }, (dbPath) => {
+    const seed = openChamberDb(dbPath);
+    commitBelief(seed, {
+      type: "belief",
+      text: "Customers may return goods within 30 days of purchase.",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    seed.close();
+  });
+  try {
+    const before = deliberationRows(s.dbPath);
+    const turn = s.request({
+      method: "POST",
+      path: "/turn",
+      body: JSON.stringify({ message: "believe: Customers may return goods within 14 days of purchase." }),
+    });
+    void turn.catch(() => undefined);
+    const marker = join(dir, "embedding");
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(marker) && Date.now() < deadline) {
+      await new Promise((ok) => setTimeout(ok, 25));
+    }
+    assert(existsSync(marker), `setup: the turn never reached the embedder.\n${s.stderr()}`);
+
+    const refused = await s.request({
+      method: "POST",
+      path: "/deliberate",
+      body: JSON.stringify({ kind: "other", subjectId: "x", question: "May this proceed?" }),
+    });
+    assert(refused.status === 503, `/deliberate gave ${refused.status} while a turn held the lock: ${refused.text.slice(0, 200)}`);
+    assert(JSON.stringify(refused.json) === JSON.stringify({ error: "busy" }), `body was ${refused.text.slice(0, 200)}`);
+    assert(refused.headers["retry-after"] === "1", `Retry-After was ${String(refused.headers["retry-after"])}`);
+
+    const done = await turn;
+    assert(done.status === 200, `the turn gave ${done.status}: ${done.text.slice(0, 300)}`);
+    const after = deliberationRows(s.dbPath);
+    assert(
+      JSON.stringify(after) === JSON.stringify(before),
+      `a 503 must write nothing, but the rows went from ${JSON.stringify(before)} to ${JSON.stringify(after)}`,
+    );
+
+    // The client was told to retry. The retry must leave one deliberation, not
+    // two: nothing from the refused attempt may be left to add to it.
+    const retried = await s.request({
+      method: "POST",
+      path: "/deliberate",
+      body: JSON.stringify({ kind: "other", subjectId: "x", question: "May this proceed?" }),
+    });
+    assert(retried.status === 200, `the retry gave ${retried.status}: ${retried.text.slice(0, 200)}`);
+    const final = deliberationRows(s.dbPath);
+    assert(
+      final.del === before.del + 1 && final.votes === before.votes + 5 && final.spend === before.spend + 1 && final.audit === before.audit + 1,
+      `one deliberation should add 1 deliberation, 5 votes, 1 spend and 1 audit row to ${JSON.stringify(before)}, got ${JSON.stringify(final)}`,
+    );
+  } finally {
+    await s.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("server", "POST /deliberate that fails part-way leaves no deliberation, vote, spend or audit row behind", async () => {
+  // Plant the failure in the database: the third faculty's vote cannot be
+  // inserted. That is a stand-in for any failure after the first write (a full
+  // disk, a lock taken between two statements); only the rollback is under test.
+  const s = await startLiveServer({}, (dbPath) => {
+    const seed = openChamberDb(dbPath);
+    seed.exec(
+      `CREATE TRIGGER test_refuse_third_vote BEFORE INSERT ON faculty_vote
+       WHEN NEW.faculty = 'applied_ethics'
+       BEGIN SELECT RAISE(ABORT, 'planted failure'); END`,
+    );
+    seed.close();
+  });
+  try {
+    const before = deliberationRows(s.dbPath);
+    const r = await s.request({
+      method: "POST",
+      path: "/deliberate",
+      body: JSON.stringify({ kind: "other", subjectId: "x", question: "May this proceed?" }),
+    });
+    assert(r.status === 500, `the planted failure should reach the client as 500, got ${r.status}: ${r.text.slice(0, 200)}`);
+    assert(/planted failure/.test(s.stderr()), `the failure never happened, so nothing was tested:\n${s.stderr()}`);
+    const after = deliberationRows(s.dbPath);
+    assert(
+      JSON.stringify(after) === JSON.stringify(before),
+      `a failed deliberation must leave nothing, but the rows went from ${JSON.stringify(before)} to ${JSON.stringify(after)}`,
+    );
+  } finally {
+    await s.stop();
   }
 });
 

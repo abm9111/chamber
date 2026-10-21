@@ -628,20 +628,45 @@ const server = createServer(async (req, res) => {
         json(res, 400, { error: "question required" });
         return;
       }
-      const r = openDeliberation(db, {
-        subjectKind: kind,
-        subjectId,
-        question,
-        stakes: (body.stakes as "routine" | "elevated" | "consequential") ?? "routine",
-        context: {
-          openDebts: Number(body.openDebts ?? 0) || 0,
-          hasSources: body.hasSources === false ? false : undefined,
-          riskTags: Array.isArray(body.riskTags)
-            ? (body.riskTags as string[])
-            : undefined,
-          isSkillMutation: kind === "skill",
-        },
-      });
+      // One transaction, so a 503 `busy` writes nothing and a failure part-way
+      // leaves nothing. `openDeliberation` is a run of autocommit statements
+      // (the deliberation row, one vote per faculty, the tally, the audit row,
+      // the spend row); with this thread's 250 ms wait on the write lock
+      // (`MAIN_THREAD_BUSY_MS`) a turn on the worker can take the lock between
+      // two of them, and the client was told to retry a request that had half
+      // happened. It is safe to wrap because everything it calls is synchronous
+      // and local: `completeSync` is the stub (it throws on the openai mode and
+      // `openDeliberation` catches that), and `appendAudit` joins a transaction
+      // that is already open instead of starting its own. Nothing here awaits,
+      // so no other request runs on this connection between BEGIN and COMMIT.
+      db.exec("BEGIN IMMEDIATE");
+      let r: ReturnType<typeof openDeliberation>;
+      try {
+        r = openDeliberation(db, {
+          subjectKind: kind,
+          subjectId,
+          question,
+          stakes: (body.stakes as "routine" | "elevated" | "consequential") ?? "routine",
+          context: {
+            openDebts: Number(body.openDebts ?? 0) || 0,
+            hasSources: body.hasSources === false ? false : undefined,
+            riskTags: Array.isArray(body.riskTags)
+              ? (body.riskTags as string[])
+              : undefined,
+            isSkillMutation: kind === "skill",
+          },
+        });
+        db.exec("COMMIT");
+      } catch (e) {
+        // SQLite rolls some failures back by itself (a full disk, an I/O error);
+        // a ROLLBACK that then throws must not replace the error that matters.
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          /* already rolled back */
+        }
+        throw e;
+      }
       json(res, 200, {
         ...r,
         votes: r.votes.map((v) => ({

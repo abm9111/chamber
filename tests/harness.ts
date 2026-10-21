@@ -259,6 +259,7 @@ import {
   appendFileSync,
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -12465,6 +12466,27 @@ test("release", "a release directory that is not its own git checkout is left al
   });
 });
 
+test("release", "a dangling symlink at the release directory is left alone", () => {
+  withReleaseFixture((fx) => {
+    mkdirSync(dirname(fx.releaseDir), { recursive: true });
+    symlinkSync(join(fx.root, "missing-target"), fx.releaseDir);
+    const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+    assert(!r.ok && r.reason.includes("is not a git checkout"), JSON.stringify(r));
+    assert(lstatSync(fx.releaseDir).isSymbolicLink(), "pin removed the user's symlink");
+  });
+});
+
+test("release", "a tag moved on origin is refused, not followed", () => {
+  withReleaseFixture((fx) => {
+    const opts = { tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout(opts).ok, "first pin refused");
+    fixtureGit(fx.origin, ["tag", "-f", "v1", fx.v2]);
+    const r = pinCheckout(opts);
+    assert(!r.ok && r.reason.includes("git fetch:"), JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD followed a tag that moved on origin");
+  });
+});
+
 test("release", "a release checkout with another origin is left alone", () => {
   withReleaseFixture((fx) => {
     const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
@@ -12513,37 +12535,54 @@ test("release", "pin runs only from a checkout that has an origin", () => {
 });
 
 /**
- * A launchctl that records its calls and keeps one loaded flag. `load:
- * "fails"` exits non-zero; `load: "lies"` exits 0 and loads nothing, which is
- * what pin's `list` after `load` exists to catch. `unload: "fails"` exits
- * non-zero and leaves the agent loaded.
+ * A launchctl that models what launchd holds: `loadedScript` is the script of
+ * the definition it is running, or null when nothing is loaded. `list` shows it
+ * the way macOS does, in a ProgramArguments block, and exits 113 when nothing
+ * is loaded. `load` reads the plist file and, like launchd, keeps the old
+ * definition when one is already loaded. `load: "fails"` exits non-zero;
+ * `load: "lies"` exits 0 and loads nothing; `load: "stale"` exits 0 and loads
+ * BARE_SCRIPT whatever the plist says. `unload: "fails"` exits non-zero and
+ * leaves the agent loaded; `unload: "lies"` exits 0 and changes nothing.
  */
 function fakeLaunchctl(start: {
   loaded: boolean;
-  load?: "ok" | "fails" | "lies";
-  unload?: "ok" | "fails";
+  script?: string;
+  load?: "ok" | "fails" | "lies" | "stale";
+  unload?: "ok" | "fails" | "lies";
 }): {
   run: Launchctl;
   calls: string[];
 } {
-  let loaded = start.loaded;
+  let loadedScript: string | null = start.loaded ? (start.script ?? BARE_SCRIPT) : null;
   const calls: string[] = [];
-  const done = (status: number, stderr = ""): LaunchctlResult => ({ status, stdout: "", stderr });
+  const done = (status: number, stdout = "", stderr = ""): LaunchctlResult => ({ status, stdout, stderr });
   const run: Launchctl = (args) => {
     calls.push(args.join(" "));
     switch (args[0]) {
       case "list":
-        return loaded ? done(0) : done(113, `Could not find service "${JOB_LABEL}" in domain for port`);
+        if (loadedScript === null) return done(113, "", `Could not find service "${JOB_LABEL}" in domain for port`);
+        return done(
+          0,
+          `{\n\t"Label" = "${JOB_LABEL}";\n\t"ProgramArguments" = (\n\t\t"/bin/sh";\n\t\t"-lc";\n\t\t"${loadedScript}";\n\t);\n};\n`,
+        );
       case "unload":
-        if (start.unload === "fails") return done(5, "Unload failed: 5: Input/output error");
-        loaded = false;
+        if (start.unload === "fails") return done(5, "", "Unload failed: 5: Input/output error");
+        if (start.unload !== "lies") loadedScript = null;
         return done(0);
-      case "load":
-        if (start.load === "fails") return done(5, "Load failed: 5: Input/output error");
-        if (start.load !== "lies") loaded = true;
+      case "load": {
+        if (start.load === "fails") return done(5, "", "Load failed: 5: Input/output error");
+        if (start.load === "lies" || loadedScript !== null) return done(0);
+        if (start.load === "stale") {
+          loadedScript = BARE_SCRIPT;
+          return done(0);
+        }
+        const read = readJobPlist(readFileSync(args[1] ?? "", "utf8"));
+        assert(read.ok, "the fake launchctl was asked to load a plist Chamber does not recognise");
+        loadedScript = read.form === "pinned" ? PINNED_SCRIPT : BARE_SCRIPT;
         return done(0);
+      }
       default:
-        return done(64, `unexpected launchctl ${args.join(" ")}`);
+        return done(64, "", `unexpected launchctl ${args.join(" ")}`);
     }
   };
   return { run, calls };
@@ -12573,7 +12612,7 @@ test("release", "pin points a loaded bare job at the release checkout and reload
     assert(plistForm(fx.plistPath) === "pinned", plistForm(fx.plistPath));
     assert(
       JSON.stringify(lc.calls) ===
-        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `list ${JOB_LABEL}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
       lc.calls.join(" | "),
     );
     assert(r.out.some((l) => l.includes("is on v1")), r.out.join("\n"));
@@ -12618,7 +12657,7 @@ test("release", "pinning the tag already checked out still checks the plist", ()
     assert(readFileSync(fx.plistPath, "utf8") === before, "a pinned plist was rewritten");
     assert(
       JSON.stringify(idle.calls) ===
-        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `list ${JOB_LABEL}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
       idle.calls.join(" | "),
     );
     assert(r2.out.some((l) => l.includes(`reloaded ${JOB_LABEL}`)), r2.out.join("\n"));
@@ -12640,7 +12679,7 @@ test("release", "a re-run after a failed unload still reloads the pinned job", (
     assert(r.code === 0, r.err.join("\n"));
     assert(
       JSON.stringify(rerun.calls) ===
-        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `list ${JOB_LABEL}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
       rerun.calls.join(" | "),
     );
     assert(r.out.some((l) => l.includes(`reloaded ${JOB_LABEL}`)), r.out.join("\n"));
@@ -12682,11 +12721,60 @@ test("release", "a missing plist still pins the checkout and exits 0", () => {
 test("release", "a failed reload exits non-zero and keeps the checkout and the plist", () => {
   withReleaseFixture((fx) => {
     writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
-    const r = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: true, load: "fails" }).run));
+    const lc = fakeLaunchctl({ loaded: true, load: "fails" });
+    const r = pinRelease(pinOpts(fx, "v1", lc.run));
     assert(r.code === 1, "a failed load exited 0");
     assert(r.err.some((l) => l.includes("launchctl load failed")), r.err.join("\n"));
-    assert(headOf(fx.releaseDir) === fx.v1, "the checkout was rolled back");
-    assert(plistForm(fx.plistPath) === "pinned", "the plist was rolled back");
+    assert(
+      JSON.stringify(lc.calls) ===
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `list ${JOB_LABEL}`, `load ${fx.plistPath}`]),
+      lc.calls.join(" | "),
+    );
+    assert(
+      r.err.some((l) => l.includes("the agent is now unloaded")),
+      `a failed load after a successful unload did not say the agent is unloaded:\n${r.err.join("\n")}`,
+    );
+    assert(headOf(fx.releaseDir) === fx.v1, "the release checkout is no longer at v1, so the failure rolled it back");
+    assert(plistForm(fx.plistPath) === "pinned", "the plist is no longer pinned, so the failure rolled it back");
+
+    // An agent that was not loaded has nothing to be "now unloaded".
+    const idle = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false, load: "fails" }).run));
+    assert(idle.code === 1, "a failed load exited 0");
+    assert(!idle.err.some((l) => l.includes("now unloaded")), idle.err.join("\n"));
+  });
+});
+
+test("release", "a reload that leaves the old definition loaded is a failure", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const lc = fakeLaunchctl({ loaded: true, unload: "lies" });
+    const r = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(r.code === 1, "an unload that changed nothing was reported as a reload");
+    assert(
+      r.err.some((l) => l.includes(`launchctl unload exited 0 but ${JOB_LABEL} is still loaded`)),
+      r.err.join("\n"),
+    );
+    assert(!lc.calls.some((c) => c.startsWith("load ")), `load ran after an unload that did not unload: ${lc.calls.join(" | ")}`);
+    assert(plistForm(fx.plistPath) === "pinned", plistForm(fx.plistPath));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD is not v1");
+  });
+});
+
+test("release", "a load that leaves another script running is a failure", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(PINNED_SCRIPT));
+    const lc = fakeLaunchctl({ loaded: true, script: BARE_SCRIPT, load: "stale" });
+    const r = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(r.code === 1, "a job running the bare script was reported as pinned");
+    assert(
+      r.err.some((l) => l.includes(`${JOB_LABEL} is loaded but launchd is not running the pinned script`)),
+      r.err.join("\n"),
+    );
+    assert(
+      r.err.some((l) => l.includes(`launchctl unload ${fx.plistPath}`) && l.includes(`launchctl load ${fx.plistPath}`)),
+      `no manual reload command:\n${r.err.join("\n")}`,
+    );
+    assert(!r.out.some((l) => l.includes(`reloaded ${JOB_LABEL}`)), r.out.join("\n"));
   });
 });
 

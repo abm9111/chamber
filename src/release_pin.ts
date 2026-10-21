@@ -15,7 +15,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export const JOB_LABEL = "com.chamber.verify";
@@ -145,13 +145,33 @@ function tagNameRefusal(tag: string): string | null {
 }
 
 /**
+ * Whether anything is at `path`, a dangling symlink included. existsSync
+ * follows symlinks and calls a dangling one absent, and a directory "created"
+ * over it would be removed along with the user's link.
+ */
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw e;
+  }
+}
+
+/**
  * True only when `dir` is the top of its own checkout. Asking whether `git -C`
  * succeeds is not enough: inside another repository it succeeds and answers
  * for that repository instead.
  */
 function isCheckoutRoot(dir: string): boolean {
   const top = git(dir, ["rev-parse", "--show-toplevel"]);
-  return top.ok && realpathSync(top.out) === realpathSync(dir);
+  if (!top.ok) return false;
+  try {
+    return realpathSync(top.out) === realpathSync(dir);
+  } catch {
+    return false;
+  }
 }
 
 function existingCheckoutRefusal(dir: string, originUrl: string): string | null {
@@ -226,7 +246,7 @@ export function pinCheckout(opts: CheckoutOptions): CheckoutResult {
 
   // Decided once, before anything is written: only a directory this run
   // creates may be removed.
-  const created = !existsSync(releaseDir);
+  const created = !pathExists(releaseDir);
   if (!created) {
     const kept = existingCheckoutRefusal(releaseDir, origin.out);
     if (kept !== null) return { ok: false, reason: kept };
@@ -268,10 +288,14 @@ export interface PinOutcome {
  * Rewrite a bare job to the release command and make sure the agent runs it.
  * A loaded agent is always reloaded, even when its plist is already pinned:
  * launchd keeps the definition it loaded, so "loaded" does not mean "runs the
- * pinned script". A reload is checked with `launchctl list` afterwards:
- * `load` has exited 0 on macOS without loading anything. Nothing here is
- * rolled back. The checkout and the plist stay as written, and a failure
- * exits 1.
+ * pinned script". The exit codes of the legacy `launchctl load` and `unload`
+ * are not trusted either: both have exited 0 on macOS while changing nothing.
+ * What is trusted is `launchctl list <label>`, which exits non-zero for an
+ * agent that is not loaded and otherwise prints the ProgramArguments launchd
+ * actually holds. So an unload is followed by a `list` that must say "not
+ * loaded", and a load by a `list` that must show the pinned script. Nothing
+ * here is rolled back. The checkout and the plist stay as written, and a
+ * failure exits 1.
  */
 function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: string[]): 0 | 1 {
   // Read again at the moment of writing, not trusted from the check made
@@ -296,14 +320,30 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
       err.push(`chamber pin: launchctl unload failed (${unload.status}): ${unload.stderr.trim()}`);
       return 1;
     }
+    if (launchctl(["list", JOB_LABEL]).status === 0) {
+      err.push(`chamber pin: launchctl unload exited 0 but ${JOB_LABEL} is still loaded`);
+      err.push(`${plistPath} is pinned; reload it by hand: launchctl unload ${plistPath} && launchctl load ${plistPath}`);
+      return 1;
+    }
   }
   const load = launchctl(["load", plistPath]);
   if (load.status !== 0) {
     err.push(`chamber pin: launchctl load failed (${load.status}): ${load.stderr.trim()}`);
+    if (wasLoaded) {
+      err.push(
+        `chamber pin: the agent is now unloaded and will not run at 08:30; load it with: launchctl load ${plistPath}`,
+      );
+    }
     return 1;
   }
-  if (launchctl(["list", JOB_LABEL]).status !== 0) {
+  const listed = launchctl(["list", JOB_LABEL]);
+  if (listed.status !== 0) {
     err.push(`chamber pin: launchctl load exited 0 but ${JOB_LABEL} is not loaded`);
+    return 1;
+  }
+  if (!listed.stdout.includes(PINNED_SCRIPT)) {
+    err.push(`chamber pin: ${JOB_LABEL} is loaded but launchd is not running the pinned script`);
+    err.push(`${plistPath} is pinned; reload it by hand: launchctl unload ${plistPath} && launchctl load ${plistPath}`);
     return 1;
   }
   out.push(`${wasLoaded ? "reloaded" : "loaded"} ${JOB_LABEL}`);

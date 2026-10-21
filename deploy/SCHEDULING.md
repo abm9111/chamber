@@ -26,7 +26,7 @@ morning until you pin another one. The release checkout sits beside
 
 If `~/Library/LaunchAgents/com.chamber.verify.plist` is installed, pin also
 checks its script, points its `config show`, `ingest` and `verify` commands at
-the release checkout, and reloads it. Pin refuses before it moves anything in
+the release checkout, and loads or reloads it. Pin refuses before it moves anything in
 these cases:
 
 - the installed script is not the one Chamber ships

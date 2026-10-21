@@ -15627,6 +15627,15 @@ function writeMinilmStub(dir: string): string {
       "    process.stderr.write(mode + '\\n');",
       "    process.exit(9);",
       "  }",
+      "  if (mode === 'close-stdout-second' && replies === 2) {",
+      "    process.stdout.end();",
+      "    return;",
+      "  }",
+      "  if (mode === 'late-stderr') {",
+      "    const late = \"setTimeout(() => process.stderr.write('late-stderr\\\\n'), 200)\";",
+      "    require('child_process').spawn(process.execPath, ['-e', late], { stdio: ['ignore', 'ignore', 'inherit'] });",
+      "    process.exit(7);",
+      "  }",
       "  if (mode === 'truncate') process.stderr.write(trunc + '\\n');",
       "  if (mode === 'bad-second-line' && replies === 2) {",
       "    process.stdout.write('not-json\\n');",
@@ -15651,9 +15660,11 @@ function writeMinilmStub(dir: string): string {
       "    reply(group);",
       "  }",
       "});",
-      "if (mode === 'ignore-eof') setInterval(() => {}, 500);",
+      "if (mode === 'ignore-term') process.on('SIGTERM', () => {});",
+      "const lingers = mode === 'ignore-eof' || mode === 'ignore-term' || mode === 'close-stdout-second';",
+      "if (lingers) setInterval(() => {}, 500);",
       "process.stdin.on('end', () => {",
-      "  if (mode === 'ignore-eof') return;",
+      "  if (mode === 'ignore-eof' || mode === 'close-stdout-second') return;",
       "  if (mode === 'truncate-on-end') process.stderr.write(trunc + '\\n');",
       "  process.exit(0);",
       "});",
@@ -15910,6 +15921,95 @@ test("embedder", "a missing interpreter reports spawn error and close stays safe
   assert(after.includes("embed_minilm: session is closed"), after);
 });
 
+
+test("embedder", "a child that closes stdout fails the request without waiting out the timeout", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  const { command, log } = stubCommand(dir, "close-stdout-second");
+  const session = createMinilmSession({ command });
+  let second = "";
+  let dt: number;
+  try {
+    session.send(JSON.stringify(["a"]));
+    const t0 = Date.now();
+    try {
+      session.send(JSON.stringify(["b"]));
+    } catch (err) {
+      second = err instanceof Error ? err.message : String(err);
+    }
+    dt = Date.now() - t0;
+  } finally {
+    session.close();
+  }
+  assert(second.includes("embed_minilm failed ("), second);
+  assert(second.includes("stdout closed"), second);
+  assert(!second.includes("timed out"), second);
+  assert(dt < 5000, `second send took ${dt}ms`);
+  assert(startLines(log).length === 1, readFileSync(log, "utf8"));
+});
+
+test("embedder", "stop waits out a child that ignores SIGTERM, then SIGKILL", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  const { command, log } = stubCommand(dir, "ignore-term");
+  const session = createMinilmSession({ command });
+  let pid: number;
+  let dt: number;
+  let alive = true;
+  try {
+    session.send(JSON.stringify(["a"]));
+    pid = Number(startLines(log)[0]!.split(" ")[1]);
+    const t0 = Date.now();
+    session.stop();
+    dt = Date.now() - t0;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+  } finally {
+    session.close();
+  }
+  assert(dt >= 1000, `stop returned in ${dt}ms`);
+  assert(dt < 10000, `stop took ${dt}ms`);
+  assert(alive === false, `pid ${pid} still running`);
+  assert(session.cleanupError === undefined, String(session.cleanupError));
+});
+
+test("embedder", "stderr that arrives after exit stays with that child's request", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  const { command } = stubCommand(dir, "late-stderr");
+  const session = createMinilmSession({ command });
+  let thrown = "";
+  try {
+    session.send(JSON.stringify(["a"]));
+  } catch (err) {
+    thrown = err instanceof Error ? err.message : String(err);
+  } finally {
+    session.close();
+  }
+  assert(thrown.includes("embed_minilm failed (7):"), thrown);
+  assert(thrown.includes("late-stderr"), thrown);
+});
+
+test("embedder", "a payload with a raw line break is refused before it is written", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-session-"));
+  const { command, log } = stubCommand(dir, "stay");
+  const session = createMinilmSession({ command });
+  const refused: string[] = [];
+  for (const payload of ['["a"]\n["b"]', '["a"]\r']) {
+    try {
+      session.send(payload);
+    } catch (err) {
+      refused.push(err instanceof Error ? err.message : String(err));
+    }
+  }
+  session.close();
+  assert(
+    refused.length === 2 &&
+      refused.every((m) => m === "embed_minilm: payload must be one line") &&
+      startLines(log).length === 0,
+    `${JSON.stringify(refused)} starts=${startLines(log).length}`,
+  );
+});
 
 test("pins", "hash ingest and an embedBatch override do not spawn MiniLM", () => {
   const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-ingest-"));

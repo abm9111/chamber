@@ -33,11 +33,11 @@ let port = null;
 let flag = null;
 let pidSlot = null;
 let child = null;
+let owner = null;
+let request = null;
 let stdout = "";
 let stderrPending = "";
-let requestOpen = false;
-let settled = false;
-let pendingVectors = null;
+const states = new WeakMap();
 
 function reply(message) {
   message.stderr = (message.stderr || "") + stderrPending;
@@ -61,11 +61,14 @@ function waitExit(target, ms) {
   });
 }
 
-function finishRequest(message) {
-  if (settled || !requestOpen) return;
-  settled = true;
-  requestOpen = false;
-  pendingVectors = null;
+function drained(target) {
+  const state = states.get(target);
+  return state ? state.drained : Promise.resolve();
+}
+
+function finishRequest(target, message) {
+  if (!request || request.target !== target) return;
+  request = null;
   reply(message);
 }
 
@@ -87,102 +90,121 @@ function isCurrent(target) {
   return child === target;
 }
 
+function owns(target) {
+  return request !== null && request.target === target;
+}
+
 function bind(target) {
+  const state = { code: null, reason: "", stdoutEnded: false, stdoutLost: false, drained: null };
+  let markDrained = null;
+  state.drained = new Promise((resolve) => { markDrained = resolve; });
+  states.set(target, state);
   child = target;
+  owner = target;
+  stdout = "";
   Atomics.store(pidSlot, 0, target.pid || 0);
   target.stdout.setEncoding("utf8");
   target.stderr.setEncoding("utf8");
   target.stdin.on("error", () => {});
+  const fail = (reason) => {
+    state.reason = reason;
+    killChild(target);
+  };
   target.stdout.on("data", (chunk) => {
     if (!isCurrent(target)) return;
     if (stdout.length + chunk.length > REPLY_LIMIT) {
-      killChild(target);
-      stderrPending += "reply longer than 64 MiB";
-      finishRequest({ ok: false, status: null });
+      fail("reply longer than 64 MiB");
       return;
     }
     stdout += chunk;
+    if (!owns(target) || request.vectors) return;
     const nl = stdout.indexOf("\n");
-    if (nl < 0 || settled) return;
+    if (nl < 0) return;
     const line = stdout.slice(0, nl);
     stdout = stdout.slice(nl + 1);
-    let vectors;
+    let vectors = null;
     try {
       vectors = JSON.parse(line);
-    } catch (err) {
-      killChild(target);
-      stderrPending += "embed_minilm: expected a JSON array of vectors";
-      finishRequest({ ok: false, status: null });
-      return;
-    }
+    } catch (err) {}
     if (!Array.isArray(vectors)) {
-      killChild(target);
-      stderrPending += "embed_minilm: expected a JSON array of vectors";
-      finishRequest({ ok: false, status: null });
+      fail("embed_minilm: expected a JSON array of vectors");
       return;
     }
-    pendingVectors = vectors;
+    request.vectors = vectors;
     setImmediate(() => {
       if (!isCurrent(target)) return;
-      if (settled || !requestOpen) return;
-      const alive = target.exitCode === null && target.signalCode === null;
-      finishRequest({ ok: true, vectors, alive });
+      const alive =
+        target.exitCode === null && target.signalCode === null && !state.stdoutEnded;
+      finishRequest(target, { ok: true, vectors, alive });
     });
+  });
+  target.stdout.on("end", () => {
+    state.stdoutEnded = true;
+    if (!isCurrent(target) || !owns(target) || request.vectors) return;
+    state.stdoutLost = true;
+    killChild(target);
   });
   target.stderr.on("data", (chunk) => {
-    if (!isCurrent(target)) return;
+    if (owner !== target) return;
     stderrPending += chunk;
   });
+  let drainTimer = null;
+  let gone = false;
+  const settle = () => {
+    if (gone) return;
+    gone = true;
+    if (drainTimer) clearTimeout(drainTimer);
+    markDrained();
+    if (!owns(target)) return;
+    const code = state.code;
+    if (request.vectors) {
+      finishRequest(target, { ok: true, vectors: request.vectors, alive: false, status: code });
+      return;
+    }
+    const note = state.reason || (state.stdoutLost && code === null ? "embed_minilm: stdout closed" : "");
+    if (note) {
+      if (stderrPending && !stderrPending.endsWith("\n")) stderrPending += "\n";
+      stderrPending += note;
+    }
+    finishRequest(target, { ok: false, status: code, gone: code === 0 && !note });
+  };
   target.on("exit", (code) => {
-    const wasCurrent = isCurrent(target);
+    state.code = code;
     detachChild(target);
-    setImmediate(() => {
-      if (!wasCurrent) return;
-      if (!requestOpen || settled) return;
-      if (pendingVectors) {
-        finishRequest({ ok: true, vectors: pendingVectors, alive: false, status: code });
-        return;
-      }
-      finishRequest({ ok: false, status: code, gone: code === 0 });
-    });
+    drainTimer = setTimeout(settle, STOP_WAIT_MS);
   });
+  target.on("close", settle);
   target.on("error", (err) => {
     if (!isCurrent(target)) return;
     detachChild(target);
     stderrPending += String(err);
-    if (requestOpen) finishRequest({ ok: false, status: null });
+    finishRequest(target, { ok: false, status: null });
   });
+}
+
+async function endChild(target) {
+  let gone = await waitExit(target, STOP_WAIT_MS);
+  if (!gone) {
+    try { target.kill("SIGKILL"); } catch (err) {}
+    gone = await waitExit(target, STOP_WAIT_MS);
+  }
+  detachChild(target);
+  if (!gone) throw new Error("embed_minilm: child " + target.pid + " still running after SIGKILL");
+  await drained(target);
 }
 
 async function stopChild() {
   if (!child) return;
   const target = child;
   try { target.kill("SIGTERM"); } catch (err) {}
-  let gone = await waitExit(target, STOP_WAIT_MS);
-  if (!gone) {
-    try { target.kill("SIGKILL"); } catch (err) {}
-    await waitExit(target, STOP_WAIT_MS);
-  }
-  if (child === target) {
-    child = null;
-    Atomics.store(pidSlot, 0, 0);
-  }
+  await endChild(target);
 }
 
 async function closeChild() {
   if (!child) return;
   const target = child;
   try { target.stdin.end(); } catch (err) {}
-  let gone = await waitExit(target, STOP_WAIT_MS);
-  if (!gone) {
-    try { target.kill("SIGKILL"); } catch (err) {}
-    gone = await waitExit(target, STOP_WAIT_MS);
-  }
-  if (child === target) {
-    child = null;
-    Atomics.store(pidSlot, 0, 0);
-  }
-  if (!gone) throw new Error("embed_minilm: child did not exit");
+  await endChild(target);
 }
 
 parentPort.on("message", (msg) => {
@@ -197,43 +219,35 @@ parentPort.on("message", (msg) => {
   if (msg.op === "start") {
     try {
       if (child) {
+        const state = states.get(child);
         if (
           !child.killed &&
           child.exitCode === null &&
-          child.signalCode === null
+          child.signalCode === null &&
+          !(state && state.stdoutEnded)
         ) {
           reply({ ok: true, alive: true });
           return;
         }
-        detachChild(child);
+        killChild(child);
       }
       stdout = "";
-      settled = false;
-      pendingVectors = null;
-      requestOpen = false;
-      let startReplied = false;
-      const replyStart = (message) => {
-        if (startReplied) return;
-        startReplied = true;
-        reply(message);
-      };
+      request = null;
       const target = spawn(msg.command[0], msg.command.slice(1), {
         stdio: ["pipe", "pipe", "pipe"],
       });
       const onSpawn = () => {
+        target.removeListener("error", onError);
         bind(target);
-        replyStart({ ok: true, alive: true });
+        reply({ ok: true, alive: true });
       };
-      target.once("error", (err) => {
+      const onError = (err) => {
+        target.removeListener("spawn", onSpawn);
         stderrPending += String(err);
-        detachChild(target);
-        replyStart({ ok: false, status: null });
-      });
-      if (target.pid !== undefined) {
-        onSpawn();
-      } else {
-        target.once("spawn", onSpawn);
-      }
+        reply({ ok: false, status: null });
+      };
+      target.once("spawn", onSpawn);
+      target.once("error", onError);
     } catch (err) {
       stderrPending += String(err);
       reply({ ok: false, status: null });
@@ -241,31 +255,30 @@ parentPort.on("message", (msg) => {
     return;
   }
   if (msg.op === "send") {
+    const state = child && states.get(child);
+    if (state && state.stdoutEnded) killChild(child);
     if (!child) {
       reply({ ok: false, status: null, gone: true });
       return;
     }
-    settled = false;
-    pendingVectors = null;
-    requestOpen = true;
+    const target = child;
+    request = { target, vectors: null };
     try {
-      child.stdin.write(msg.payload + "\n");
+      target.stdin.write(msg.payload + "\n");
     } catch (err) {
       stderrPending += String(err);
-      finishRequest({ ok: false, status: null });
+      finishRequest(target, { ok: false, status: null });
     }
     return;
   }
   if (msg.op === "stop") {
     stopChild().then(() => reply({ ok: true })).catch((err) => {
-      stderrPending += String(err);
-      reply({ ok: false, status: null });
+      reply({ ok: false, status: null, error: String(err) });
     });
     return;
   }
   if (msg.op === "close") {
     closeChild().then(() => reply({ ok: true })).catch((err) => {
-      stderrPending += String(err);
       reply({ ok: false, error: String(err) });
     });
   }
@@ -311,8 +324,10 @@ export function createMinilmSession(opts?: { command?: string[] }): MinilmSessio
           const trailed = takeMessage();
           if (trailed.stderr) noteMinilmStderr(trailed.stderr);
         }
-      } else if (msg.stderr) {
-        noteMinilmStderr(msg.stderr);
+        session.cleanupError ??= new Error("embed_minilm: stop timed out");
+      } else {
+        if (msg.stderr) noteMinilmStderr(msg.stderr);
+        if (msg.error) session.cleanupError ??= new Error(msg.error);
       }
       childAlive = false;
       if (!replied) dead = true;
@@ -328,13 +343,13 @@ export function createMinilmSession(opts?: { command?: string[] }): MinilmSessio
           if (pid > 0) {
             try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
           }
-          session.cleanupError = new Error("embed_minilm: close timed out");
+          session.cleanupError ??= new Error("embed_minilm: close timed out");
         } else {
           if (msg.stderr) noteMinilmStderr(msg.stderr);
-          if (msg.error) session.cleanupError = new Error(msg.error);
+          if (msg.error) session.cleanupError ??= new Error(msg.error);
         }
       } catch (err) {
-        session.cleanupError = err instanceof Error ? err : new Error(String(err));
+        session.cleanupError ??= err instanceof Error ? err : new Error(String(err));
       }
       childAlive = false;
       void worker.terminate();
@@ -394,6 +409,7 @@ export function createMinilmSession(opts?: { command?: string[] }): MinilmSessio
       dead = true;
       throw failed(msg.status ?? null, `${msg.stderr || ""}${msg.error || ""}`);
     }
+    if (msg.stderr) noteMinilmStderr(msg.stderr);
     started += 1;
     childAlive = true;
     replied = false;
@@ -402,6 +418,7 @@ export function createMinilmSession(opts?: { command?: string[] }): MinilmSessio
   function send(payload: string, retried: boolean): number[][] {
     if (closed) throw new Error("embed_minilm: session is closed");
     if (dead) throw new Error("embed_minilm: session is dead");
+    if (/[\n\r]/.test(payload)) throw new Error("embed_minilm: payload must be one line");
     if (!childAlive) startChild();
     const msg = roundtrip({ op: "send", payload }, SEND_TIMEOUT_MS);
     if (msg.timeout) {
@@ -418,6 +435,7 @@ export function createMinilmSession(opts?: { command?: string[] }): MinilmSessio
       if (!replied) dead = true;
       throw failed(null, "timed out");
     }
+    if (msg.stderr) noteMinilmStderr(msg.stderr);
     if (msg.gone) {
       childAlive = false;
       if (retried || !replied) {
@@ -426,7 +444,6 @@ export function createMinilmSession(opts?: { command?: string[] }): MinilmSessio
       }
       return send(payload, true);
     }
-    if (msg.stderr) noteMinilmStderr(msg.stderr);
     if (msg.ok !== true || !Array.isArray(msg.vectors)) {
       childAlive = false;
       if (!replied) dead = true;

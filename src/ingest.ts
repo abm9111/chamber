@@ -1222,17 +1222,21 @@ export function ingestDirectory(
 ): IngestReport {
   const session = (opts.minilmSession ?? createMinilmSession)();
   let bodyError: unknown;
+  let didThrow = false;
   let report: IngestReport | undefined;
   try {
     report = ingestDirectoryBody(db, rootInput, opts, session);
   } catch (err) {
     bodyError = err;
+    didThrow = true;
   }
   session.close();
-  if (bodyError instanceof Error && bodyError.cause === undefined && session.cleanupError) {
-    bodyError.cause = session.cleanupError;
+  if (didThrow) {
+    if (bodyError instanceof Error && bodyError.cause === undefined && session.cleanupError) {
+      bodyError.cause = session.cleanupError;
+    }
+    throw bodyError;
   }
-  if (bodyError) throw bodyError;
   if (session.cleanupError) throw session.cleanupError;
   const truncated = minilmTruncationSeen();
   if (truncated && report) report.truncated = truncated;

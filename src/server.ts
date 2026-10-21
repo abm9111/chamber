@@ -25,29 +25,23 @@ import type { DatabaseSync } from "node:sqlite";
 import { openChamberDb } from "./db.ts";
 import { configPath, loadConfig } from "./config.ts";
 import { formatErrorChain } from "./error_chain.ts";
-import { sha256, newId } from "./hash.ts";
-import { commitBelief } from "./commit_belief.ts";
-import { completeSync, syncCompletionAvailable } from "./model.ts";
-import { enforceReplyContract } from "./contract.ts";
-import { runExpiryJob } from "./expiry.ts";
-import { spendLastHours, formatSpendFooter, assertSpendBudget } from "./spend.ts";
+import { spendLastHours, formatSpendFooter } from "./spend.ts";
 import {
-  proposeWrite,
   decideWrite,
   listPendingQueue,
   markApplied,
   expireStalePending,
 } from "./approvals.ts";
-import { evaluateWorkflows } from "./approval_workflows.ts";
-import { appendAudit } from "./audit.ts";
 import { openDeliberation, FACULTY_LABEL } from "./faculty.ts";
 import { buildCheckpointReceipt } from "./checkpoint_export.ts";
 import { listOpenDebts } from "./debt.ts";
 import { listMemory } from "./memory.ts";
-import { startSession, appendMessage } from "./sessions.ts";
 import { registerSlackPendingHook } from "./slack_ops.ts";
-import { quarantineUntrustedText, stripInvisibleNoise, checkRateLimit, surfaceRateKey } from "./surface_harden.ts";
+import { runTurn } from "./turn.ts";
+import { TurnPool, TurnWorkerError } from "./turn_pool.ts";
 
+// Registered here for the one case where a turn still runs on this thread (an
+// in-memory database, see `turns` below). A turn on the worker registers its own.
 try { registerSlackPendingHook(); } catch { /* slack optional */ }
 const PORT = Number(process.env.PORT ?? process.env.CHAMBER_PORT ?? 8787);
 /** When set, all routes except GET /health require this bearer/token. */
@@ -203,6 +197,9 @@ function assertBindIsSafe(): void {
  */
 let dbPath = "";
 
+/** How long this thread's connection waits for the write lock the turn worker may hold. */
+const MAIN_THREAD_BUSY_MS = 250;
+
 /**
  * Open the configured database, or refuse to start.
  *
@@ -230,9 +227,18 @@ let dbPath = "";
 const db: DatabaseSync = ((): DatabaseSync => {
   try {
     dbPath = loadConfig().database;
-    return openChamberDb(dbPath, (actual) => {
+    const opened = openChamberDb(dbPath, (actual) => {
       dbPath = actual;
     });
+    // A turn on the worker holds SQLite's one write lock across an embedder
+    // spawn (FM-6: the check and the write are one transaction, and that is
+    // not negotiable). A route on this thread that writes would then wait on
+    // that lock, and `DatabaseSync` waits with the whole event loop stopped.
+    // `openChamberDb` leaves a 5 s wait, which is right for a command line and
+    // wrong here: keep it short, so a contended write fails fast with the 503
+    // below instead of freezing every other route. Reads are not affected (WAL).
+    opened.exec(`PRAGMA busy_timeout = ${MAIN_THREAD_BUSY_MS}`);
+    return opened;
   } catch (err) {
     process.stderr.write(
       `chamber-server: FATAL — cannot open Chamber's database: ` +
@@ -243,6 +249,29 @@ const db: DatabaseSync = ((): DatabaseSync => {
     process.exit(1);
   }
 })();
+
+/**
+ * Where `POST /turn` runs.
+ *
+ * On a worker thread, with its own connection to the same file, unless the
+ * database is `:memory:` (the dev and test mode, or the last-resort fallback
+ * `openChamberDb` announces on stderr): an in-memory database belongs to the
+ * connection that created it, so a second thread would see an empty one. There
+ * the turn runs on this thread, as it always did.
+ *
+ * `.ts` when this file is running as TypeScript, `.js` from the compiled npm
+ * package.
+ */
+const turns: TurnPool | null =
+  dbPath === ":memory:"
+    ? null
+    : new TurnPool(
+        new URL(
+          `./turn_worker${import.meta.url.endsWith(".ts") ? ".ts" : ".js"}`,
+          import.meta.url,
+        ),
+        dbPath,
+      );
 
 function extractToken(req: IncomingMessage): string {
   const auth = req.headers.authorization ?? "";
@@ -416,143 +445,23 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(data);
 }
 
-function runTurn(message: string): Record<string, unknown> {
-  // Asked before anything is written. Every one of these surfaces commits an
-  // observation, opens a session and writes audit rows before it reaches
-  // completeSync, which refuses the openai mode by design — so the ledger gained
-  // rows and the caller gained an exception, in that order. Guarding only the
-  // CLI left four other surfaces reproducing the exact defect the guard was
-  // written to remove.
-  const model = syncCompletionAvailable();
-  if (!model.ok) throw new Error(`turn unavailable: ${model.reason}`);
-
-  const budget = assertSpendBudget(db);
-  if (!budget.ok) {
-    return {
-      ok: false,
-      error: budget.reason,
-      spend: formatSpendFooter(budget.report),
-    };
+/**
+ * Did SQLite refuse because another connection holds the write lock?
+ *
+ * Decided from the error's `errcode`, never its message text. node:sqlite sets
+ * `code` to the constant `ERR_SQLITE_ERROR` for every failure and puts SQLite's
+ * own result code in `errcode`; `SQLITE_BUSY` is 5, and its extended forms
+ * (`SQLITE_BUSY_RECOVERY` 261, `SQLITE_BUSY_SNAPSHOT` 517) keep 5 in the low
+ * byte. A `cause` is followed in case a caller wrapped the error.
+ */
+function isSqliteBusy(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current instanceof Error; depth++) {
+    const errcode = (current as { errcode?: unknown }).errcode;
+    if (typeof errcode === "number" && (errcode & 0xff) === 5) return true;
+    current = current.cause;
   }
-  const rate = checkRateLimit(surfaceRateKey("http", "http", "turn"));
-  if (!rate.ok) {
-    return {
-      ok: false,
-      error: `Rate limited. Retry in ~${Math.ceil((rate.retryAfterMs ?? 60000) / 1000)}s.`,
-    };
-  }
-  const cleaned = stripInvisibleNoise(message);
-  const turnId = newId("trn");
-  const sessionId = startSession(db, { channel: "http", title: cleaned.slice(0, 48) });
-  appendMessage(db, sessionId, "user", cleaned, turnId);
-  runExpiryJob(db);
-
-  appendAudit(db, {
-    category: "session",
-    action: "turn_start",
-    actor: "human",
-    turnId,
-    sessionId,
-    detail: { message: cleaned.slice(0, 200) },
-  });
-
-  const obs = commitBelief(db, {
-    type: "observation",
-    text: `user said: ${cleaned.slice(0, 240)}`,
-    sources: [
-      {
-        kind: "transcript",
-        refId: turnId,
-        snapshotHash: sha256(cleaned),
-        provenance: "transcript",
-      },
-    ],
-    authorFamily: "http",
-    sessionId,
-    path: "fast",
-    turnId,
-  });
-
-  const wantsBelief =
-    /\b(believe|note that)\b/i.test(cleaned) || /\b(fact|commit)\s*:/i.test(cleaned);
-  let belief: unknown = null;
-  if (wantsBelief) {
-    const claim =
-      cleaned.replace(/^.*\b(believe|fact:|commit:)\s*/i, "").trim() || cleaned;
-    belief = commitBelief(db, {
-      type: "belief",
-      text: claim,
-      sources: [],
-      authorFamily: "http",
-      sessionId,
-      path: "deep",
-      turnId,
-    });
-  }
-
-  if (/\b(remember|prefer)\b/i.test(message)) {
-    const q = proposeWrite(db, {
-      target: "memory",
-      action: "add",
-      subject: "user_preference",
-      payload: { stakes: "routine", text: message.slice(0, 300) },
-      origin: "foreground",
-      authorFamily: "http",
-      reason: "http turn preference",
-    });
-    if (q.status === "queued") evaluateWorkflows(db, q.writeId);
-  }
-
-  const completion = completeSync(db, {
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are Chamber. Prefer observations over assertions. Mark uncertainty explicitly.",
-      },
-      { role: "user", content: quarantineUntrustedText(cleaned, "http") },
-    ],
-    channel: "chat",
-    turnId,
-    sessionId,
-    userText: message,
-  });
-
-  const contract = enforceReplyContract(db, completion.text, {
-    sessionId,
-    turnId,
-    strict: process.env.CHAMBER_STRICT_CONTRACT === "1",
-  });
-
-  appendAudit(db, {
-    category: "session",
-    action: "turn_end",
-    actor: "system",
-    turnId,
-    sessionId,
-  });
-
-  const spend = spendLastHours(db, 24);
-  expireStalePending(db);
-
-  appendMessage(db, sessionId, "assistant", completion.text, turnId);
-
-  return {
-    turnId,
-    sessionId,
-    observation: obs,
-    belief,
-    assistant: completion.text,
-    model: completion.model,
-    contract: contract.results.map((r, i) => ({
-      claim: contract.claims[i]?.kind,
-      status: r.status,
-      reason: r.reason,
-    })),
-    spend: formatSpendFooter(spend),
-    queue: listPendingQueue(db, 10),
-    debts: listOpenDebts(db, 10),
-  };
+  return false;
 }
 
 const server = createServer(async (req, res) => {
@@ -672,7 +581,7 @@ const server = createServer(async (req, res) => {
         json(res, 400, { error: "message required" });
         return;
       }
-      json(res, 200, runTurn(message));
+      json(res, 200, turns === null ? runTurn(db, message) : await turns.run(message));
       return;
     }
 
@@ -764,12 +673,21 @@ const server = createServer(async (req, res) => {
 
     json(res, 404, { error: "not found" });
   } catch (err) {
+    // The write lock is held by a turn on the worker (see `MAIN_THREAD_BUSY_MS`).
+    // That is a wait that ran out, not a fault: say so, tell the client when to
+    // come back, and log nothing, so no error id points an operator at a bug.
+    if (!res.headersSent && isSqliteBusy(err)) {
+      res.setHeader("Retry-After", "1");
+      json(res, 503, { error: "busy" });
+      return;
+    }
     // The client learns that something failed and a number to quote; the cause
     // goes to stderr beside the same number. `String(err)` used to be the body,
     // which sent paths, SQL and module names to whoever asked.
     const id = randomUUID().slice(0, 8);
     process.stderr.write(
-      `chamber server error ${id}: ${formatErrorChain(err).join("; ")}\n` +
+      `chamber server error ${id}: ` +
+        `${(err instanceof TurnWorkerError ? err.chain : formatErrorChain(err)).join("; ")}\n` +
         `${err instanceof Error && err.stack ? err.stack : ""}\n`,
     );
     if (res.headersSent) {

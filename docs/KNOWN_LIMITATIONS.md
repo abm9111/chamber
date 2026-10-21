@@ -1101,3 +1101,35 @@ npm deletion made. Not done here because the embedder path's Python
 dependencies (`scripts/embed_minilm.py`, numpy/onnxruntime) are not yet proven
 on musl, and shipping an image whose semantic gate silently degrades to hash
 vectors would trade a scanner number for a correctness regression.
+
+## 21. While a turn waits on the embedder, only `/health` is certain to answer
+
+`POST /turn` runs on a worker thread (`src/turn_worker.ts`), on its own connection to the
+same database file, so a turn no longer stops the event loop. What it cannot stop is
+SQLite's single write lock. A turn that reaches the paraphrase check holds `BEGIN
+IMMEDIATE` across a Python embedding spawn, which can take up to 180 s, because the check
+and the write are one transaction (FM-6, `src/commit_belief.ts`) and that is not up for
+negotiation.
+
+**What it costs.** Measured against a real server with an embedder that takes 3 s:
+`/health` and `/checkpoint` answer in about 2 ms. `/status` and `/queue` answer `503
+{"error":"busy"}` with `Retry-After: 1` after about 290 ms, and log nothing, because both
+run the TTL sweep (`expireStalePending`), which is an `UPDATE` even when nothing has
+expired. `/approve` for a write that exists, and `/deliberate`, need the same lock and fail
+the same way (`/reject` makes the same `decideWrite` call). A second `POST /turn`
+waits behind the first. Before the worker, every one of those routes, `/health` included,
+froze for the whole wait; the main thread's connection now gives up after 250 ms
+(`MAIN_THREAD_BUSY_MS` in `src/server.ts`) instead of SQLite's default 5 s. The server
+recognises the refusal by SQLite's result code (`errcode` 5, `SQLITE_BUSY`), not by the
+message, and a client that gets the 503 is expected to retry.
+
+Two smaller things follow from the turn living in another thread. The `/turn` rate-limit
+bucket is in memory in that thread, so a worker that dies and is restarted starts with a
+full bucket. And an in-memory database (`CHAMBER_DB=:memory:`, or the last-resort fallback
+`openChamberDb` announces on stderr) cannot be shared with a thread, so there the turn runs
+on the main thread as it always did, and blocks.
+
+**What would fix it.** Skip the TTL sweep when the lock is held (`decideWrite` already
+refuses an expired write by itself, so only the listing is momentarily stale), or run it
+from the worker. Not done here: it changes `src/approvals.ts`, which this change does not
+otherwise touch.

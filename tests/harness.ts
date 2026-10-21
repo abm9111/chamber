@@ -7,6 +7,7 @@
 
 import { openChamberDb, secureDatabaseFile } from "../src/db.ts";
 import { CURL_FIXED_ARGV, buildCurlInvocation, httpSync } from "../src/http_sync.ts";
+import { TurnPool, TurnWorkerError } from "../src/turn_pool.ts";
 import { mcpDiscover } from "../src/mcp_client.ts";
 import { TelegramGateway } from "../src/gateway.ts";
 import { claimHash, newId, sha256 } from "../src/hash.ts";
@@ -260,7 +261,7 @@ import {
   explainConfig,
 } from "../src/config.ts";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync, spawn, execFileSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
 import type { AddressInfo } from "node:net";
@@ -307,6 +308,7 @@ type Suite =
   | "db"
   | "server"
   | "http_sync"
+  | "turn_pool"
   | "all";
 
 interface TestResult {
@@ -422,6 +424,7 @@ function suiteFromArg(): Suite {
     "db",
     "server",
     "http_sync",
+    "turn_pool",
     "all",
   ].includes(v)
     ? v
@@ -16626,6 +16629,323 @@ test("http_sync", "a header and a body with quotes, backslashes, newlines and no
   } finally {
     receiver.kill("SIGKILL");
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── POST /turn OFF THE EVENT LOOP (src/turn_pool.ts, src/turn_worker.ts) ───
+
+/**
+ * Worker bodies for exercising the pool without a database. The pool hands each
+ * worker `{ dbPath }` as `workerData`; these treat that string as a marker file.
+ */
+const POOL_WORKER_CRASH_ONCE = `
+import { parentPort, workerData } from "node:worker_threads";
+import { existsSync, writeFileSync } from "node:fs";
+parentPort.on("message", (job) => {
+  if (!existsSync(workerData.dbPath)) {
+    writeFileSync(workerData.dbPath, "crashed once");
+    process.exit(3);
+  }
+  parentPort.postMessage({ id: job.id, ok: true, result: { echoed: job.message } });
+});
+`;
+
+const POOL_WORKER_THROWS = `
+import { parentPort } from "node:worker_threads";
+parentPort.on("message", () => {
+  setTimeout(() => { throw new Error("boom outside a turn"); }, 0);
+});
+`;
+
+const POOL_WORKER_FAILS = `
+import { parentPort } from "node:worker_threads";
+parentPort.on("message", (job) => {
+  parentPort.postMessage({
+    id: job.id,
+    ok: false,
+    chain: ["Error: first", "  caused by: Error: second"],
+    stack: "Error: first\\n    at fake (fake.ts:1:1)",
+  });
+});
+`;
+
+const POOL_WORKER_COUNTS = `
+import { parentPort } from "node:worker_threads";
+let seq = 0;
+parentPort.on("message", (job) => {
+  seq += 1;
+  parentPort.postMessage({ id: job.id, ok: true, result: { echoed: job.message, seq } });
+});
+`;
+
+/** A pool whose worker is `source`, run from a temp dir that is returned for cleanup. */
+function poolOf(source: string): { pool: TurnPool; dir: string } {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-pool-"));
+  const entry = join(dir, "worker.mjs");
+  writeFileSync(entry, source);
+  return { pool: new TurnPool(pathToFileURL(entry), join(dir, "marker")), dir };
+}
+
+test("turn_pool", "a worker that exits mid-turn fails that request, and the next request gets a fresh worker", async () => {
+  const { pool, dir } = poolOf(POOL_WORKER_CRASH_ONCE);
+  try {
+    const err = await rejectionWithin(pool.run("first"), 10_000);
+    assert(/exited/.test(err.message) && /3/.test(err.message), `wrong message: ${err.message}`);
+    const second = await resolvesWithin(pool.run("second"), 10_000, "the restarted worker");
+    assert(second.echoed === "second", `the restarted worker answered ${JSON.stringify(second)}`);
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("turn_pool", "a worker that throws outside a turn fails the request in flight with the thrown error", async () => {
+  const { pool, dir } = poolOf(POOL_WORKER_THROWS);
+  try {
+    const err = await rejectionWithin(pool.run("anything"), 10_000);
+    assert(/boom outside a turn/.test(err.message), `wrong message: ${err.message}`);
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("turn_pool", "a failure reply becomes a TurnWorkerError that keeps the chain and the stack", async () => {
+  const { pool, dir } = poolOf(POOL_WORKER_FAILS);
+  try {
+    const err = await rejectionWithin(pool.run("x"), 10_000);
+    assert(err instanceof TurnWorkerError, `expected a TurnWorkerError, got ${err.name}`);
+    assert(
+      JSON.stringify(err.chain) === JSON.stringify(["Error: first", "  caused by: Error: second"]),
+      `chain: ${JSON.stringify(err.chain)}`,
+    );
+    assert(/at fake/.test(err.stack ?? ""), `stack: ${err.stack}`);
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("turn_pool", "requests run one at a time, in the order they were made", async () => {
+  const { pool, dir } = poolOf(POOL_WORKER_COUNTS);
+  try {
+    const all = await resolvesWithin(
+      Promise.all([pool.run("a"), pool.run("b"), pool.run("c")]),
+      10_000,
+      "three queued runs",
+    );
+    assert(
+      all.map((r) => `${String(r.echoed)}${String(r.seq)}`).join(",") === "a1,b2,c3",
+      `got ${JSON.stringify(all)}`,
+    );
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Stands in for the Python interpreter: answers the embedder's availability
+ * probe at once, and answers a real embedding request after 3 s, having first
+ * created `embedding` beside itself so the test knows the turn is waiting on it.
+ * Every vector is the same unit vector, so every comparison scores 1.0.
+ */
+const SLOW_PYTHON_JS = `const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+const vector = Array(384).fill(1 / Math.sqrt(384));
+if (args[1] === "--json") {
+  const texts = JSON.parse(fs.readFileSync(0, "utf8"));
+  fs.writeFileSync(path.join(__dirname, "embedding"), "waiting\\n");
+  setTimeout(() => {
+    process.stdout.write(JSON.stringify(texts.map(() => vector)) + "\\n");
+  }, 3000);
+} else {
+  process.stdout.write(JSON.stringify(vector) + "\\n");
+}
+`;
+
+test("server", "POST /turn runs off the event loop: /health answers while the paraphrase check waits on the embedder", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-slowpy-"));
+  // CHAMBER_PYTHON must be one executable, so a one-line shell wrapper runs the
+  // Node script with the Node that is running this harness.
+  const stub = join(dir, "slow-python");
+  writeFileSync(join(dir, "slow-python.js"), SLOW_PYTHON_JS);
+  writeFileSync(stub, `#!/bin/sh\nexec "${process.execPath}" "${join(dir, "slow-python.js")}" "$@"\n`, {
+    mode: 0o755,
+  });
+  const s = await startLiveServer({ CHAMBER_PYTHON: stub }, (dbPath) => {
+    // An open blocking debt is what makes the next assertion reach the
+    // embedder: the paraphrase check has something to compare against.
+    const seed = openChamberDb(dbPath);
+    commitBelief(seed, {
+      type: "belief",
+      text: "Customers may return goods within 30 days of purchase.",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    assert(listOpenDebts(seed, 5).length === 1, "setup: exactly one blocking debt must be open");
+    seed.close();
+  });
+  try {
+    const turn = s.request({
+      method: "POST",
+      path: "/turn",
+      body: JSON.stringify({ message: "believe: Customers may return goods within 14 days of purchase." }),
+    });
+    // If an assertion below fails first, this request is abandoned when the
+    // server is stopped. Without this line that rejection is unhandled and
+    // takes the whole harness down, hiding the failure that mattered.
+    void turn.catch(() => undefined);
+    const marker = join(dir, "embedding");
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(marker) && Date.now() < deadline) {
+      await new Promise((ok) => setTimeout(ok, 25));
+    }
+    assert(existsSync(marker), `setup: the turn never reached the embedder.\n${s.stderr()}`);
+
+    // The turn is now inside the 3 s embedder wait, holding the write lock.
+    const health = await s.request({ path: "/health" });
+    assert(health.status === 200, `/health gave ${health.status}`);
+    assert(health.ms < 500, `/health took ${health.ms} ms while a turn was running; the loop is blocked`);
+
+    // A route that writes needs the lock the turn holds. It must give up
+    // quickly (503 busy), not freeze the loop for SQLite's default 5 s.
+    const queue = await s.request({ path: "/queue" });
+    assert(queue.ms < 1500, `/queue took ${queue.ms} ms; the main connection waited on the turn's lock`);
+
+    const done = await turn;
+    assert(done.status === 200, `the turn gave ${done.status}: ${done.text.slice(0, 300)}`);
+    assert(done.ms >= 2500, `the turn took ${done.ms} ms, so the 3 s embedder wait never happened`);
+    const body = done.json as Record<string, unknown>;
+    for (const key of ["turnId", "sessionId", "observation", "assistant", "model", "contract", "spend", "queue", "debts"]) {
+      assert(key in body, `the turn reply lacks "${key}": ${done.text.slice(0, 300)}`);
+    }
+    const after = await s.request({ path: "/queue" });
+    assert(after.status === 200, `once the turn is over /queue must work: ${after.status} ${after.text.slice(0, 200)}`);
+  } finally {
+    await s.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("server", "a route that needs the write lock a turn holds answers 503 busy with Retry-After, not 500", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-busy-"));
+  const stub = join(dir, "slow-python");
+  writeFileSync(join(dir, "slow-python.js"), SLOW_PYTHON_JS);
+  writeFileSync(stub, `#!/bin/sh\nexec "${process.execPath}" "${join(dir, "slow-python.js")}" "$@"\n`, {
+    mode: 0o755,
+  });
+  const s = await startLiveServer({ CHAMBER_PYTHON: stub }, (dbPath) => {
+    const seed = openChamberDb(dbPath);
+    commitBelief(seed, {
+      type: "belief",
+      text: "Customers may return goods within 30 days of purchase.",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    seed.close();
+  });
+  try {
+    const turn = s.request({
+      method: "POST",
+      path: "/turn",
+      body: JSON.stringify({ message: "believe: Customers may return goods within 14 days of purchase." }),
+    });
+    void turn.catch(() => undefined);
+    const marker = join(dir, "embedding");
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(marker) && Date.now() < deadline) {
+      await new Promise((ok) => setTimeout(ok, 25));
+    }
+    assert(existsSync(marker), `setup: the turn never reached the embedder.\n${s.stderr()}`);
+
+    const status = await s.request({ path: "/status" });
+    assert(status.status === 503, `/status gave ${status.status} while a turn held the lock: ${status.text.slice(0, 200)}`);
+    assert(status.ms < 1500, `/status took ${status.ms} ms; the main connection waited on the turn's lock`);
+    assert(status.headers["retry-after"] === "1", `Retry-After was ${String(status.headers["retry-after"])}`);
+    assert(
+      JSON.stringify(status.json) === JSON.stringify({ error: "busy" }),
+      `body was ${status.text.slice(0, 200)}`,
+    );
+    assert(!/chamber server error/.test(s.stderr()), `a busy lock is not a server error, but stderr says:\n${s.stderr()}`);
+
+    const done = await turn;
+    assert(done.status === 200, `the turn gave ${done.status}: ${done.text.slice(0, 300)}`);
+  } finally {
+    await s.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("server", "the /turn rate limit survives between turns, and the other thread sees what the worker wrote", async () => {
+  // capacity 1 and a one-hour refill: the second turn is refused only if the
+  // bucket from the first is still there, i.e. the worker is one long-lived thread.
+  const s = await startLiveServer({
+    CHAMBER_SURFACE_RATE_CAPACITY: "1",
+    CHAMBER_SURFACE_RATE_REFILL_MS: "3600000",
+  });
+  try {
+    const first = await s.request({
+      method: "POST",
+      path: "/turn",
+      body: JSON.stringify({ message: "believe: the audit store is SQLite" }),
+    });
+    assert(first.status === 200 && "turnId" in (first.json as object), `first turn: ${first.status} ${first.text.slice(0, 200)}`);
+    const second = await s.request({ method: "POST", path: "/turn", body: JSON.stringify({ message: "hello again" }) });
+    const refused = second.json as { ok?: boolean; error?: string };
+    assert(
+      second.status === 200 && refused.ok === false && /Rate limited/.test(refused.error ?? ""),
+      `second turn must be rate limited: ${second.status} ${second.text.slice(0, 200)}`,
+    );
+    // /status reads on the server's own connection; the belief was written on the worker's.
+    const status = await s.request({ path: "/status" });
+    assert(((status.json as { beliefs?: number }).beliefs ?? 0) >= 1, `main thread sees: ${status.text.slice(0, 200)}`);
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "a turn run on the worker still posts its pending write to the Slack ops channel", async () => {
+  // registerSlackPendingHook() registers a listener in the module that holds it.
+  // proposeWrite now runs in the worker, so the worker has to register it too;
+  // the main thread's registration can no longer fire. Observed through a curl
+  // shim: the card is posted with the token on curl's stdin.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-slackshim-"));
+  writeCurlShim(dir);
+  const s = await startLiveServer({
+    PATH: `${dir}:${process.env.PATH ?? ""}`,
+    CHAMBER_SHIM_DIR: dir,
+    SLACK_BOT_TOKEN: "SHIMSECRET-worker-slack",
+    CHAMBER_SLACK_OPS_CHANNEL: "C0OPS",
+  });
+  try {
+    const r = await s.request({
+      method: "POST",
+      path: "/turn",
+      body: JSON.stringify({ message: "please remember I prefer tea" }),
+    });
+    assert(r.status === 200, `turn: ${r.status} ${r.text.slice(0, 300)}`);
+    const calls = shimCalls(dir);
+    assert(
+      calls.some((c) => c.stdin.includes("chat.postMessage") && c.stdin.includes("SHIMSECRET-worker-slack")),
+      `no Slack card was posted; curl calls: ${JSON.stringify(calls.map((c) => c.argv))}\n${s.stderr()}`,
+    );
+  } finally {
+    await s.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("server", "with an in-memory database the turn runs inline, because a thread cannot share it", async () => {
+  const s = await startLiveServer({ CHAMBER_DB: ":memory:" });
+  try {
+    const r = await s.request({ method: "POST", path: "/turn", body: JSON.stringify({ message: "hello" }) });
+    assert(r.status === 200 && "turnId" in (r.json as object), `inline turn: ${r.status} ${r.text.slice(0, 300)}`);
+  } finally {
+    await s.stop();
   }
 });
 

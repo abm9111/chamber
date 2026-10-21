@@ -82,13 +82,13 @@ but a payload can still fill them.
 
 **What it costs.** Less than the old probe output suggested, and you should know
 why. No agent loop in the shipped code sends model-written code to the sandbox.
-Three paths run source that did not come from Chamber: `chamber tool synth`
+Three paths run source that did not come from Chamber: `chamber tool-synth`
 (`synthesizeTool` in `src/tools.ts`), `runTool` for a registered tool, and
 `verifyMcpToolSource` in `src/mcp_bridge.ts` for a tool declared by an imported
-MCP manifest. On Linux with `bwrap` they are confined as above. Anywhere else,
-with the flag off, they run with your full user privileges, and "it ran in the
-sandbox" is not a safety statement. With the flag on they refuse, which is safe
-and means a Mac cannot run them at all.
+MCP manifest. On Linux with `bwrap` they are confined as above. Anywhere else
+they refuse by default, which is safe and means a Mac cannot run them at all.
+With `CHAMBER_SANDBOX_REQUIRED=0` they run with your full user privileges, and
+"it ran in the sandbox" is not a safety statement.
 
 **What would fix it.** A `runDocker` (`docker run --rm --network none --read-only
 --memory 512m --pids-limit 128`) would give macOS an isolating backend and give

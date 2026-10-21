@@ -43,8 +43,9 @@ checkpointed, the `cp` copy had lost a whole table that `.backup` and
 `VACUUM INTO` kept. A backup that cannot be told from a good one until the day
 you restore it is worse than none.
 
-Keep backups private. The database holds the text of your notes' passages and
-your audit trail:
+Keep backups private. A backup holds everything the database does, including
+the text of your notes' passages, your audit trail, and the OAuth tokens of any
+MCP server you connected Chamber to:
 
 ```bash
 chmod 600 "$DEST"
@@ -55,24 +56,42 @@ makes the backup file `0600` from the start.
 
 ## Restore
 
-1. Stop everything that writes to the database. On macOS that is the scheduled
-   job; on a server it is the service and the timer:
+1. Stop everything that opens the database, not only what writes to it. On a
+   server that is the API service, the job timer and its service, and the Slack
+   and Discord gateways; leave out any unit you do not run:
+
+   ```bash
+   sudo systemctl stop chamber.service chamber-jobs.timer chamber-jobs.service \
+     chamber-slack.service chamber-discord.service
+   ```
+
+   On macOS, unload both scheduled jobs and quit anything else that runs
+   Chamber: an MCP client with `chamber mcp` attached, or a server you started
+   by hand:
 
    ```bash
    launchctl unload ~/Library/LaunchAgents/com.chamber.verify.plist
-   # or: sudo systemctl stop chamber.service chamber-jobs.timer chamber-jobs.service
+   launchctl unload ~/Library/LaunchAgents/com.chamber.daily-snapshot.plist
    ```
 
    `unload` stops a job that is running at that moment. Do this when it is not.
-
-2. Replace the file and remove the old write-ahead files. A `-wal` or `-shm`
-   file left over from the database you are replacing belongs to that database,
-   and SQLite would apply it to the restored one:
+   Then check that nothing still has the file open, because the next step
+   deletes files an open connection is using:
 
    ```bash
+   lsof "$DB"
+   ```
+
+   No output means nothing has it open.
+
+2. Remove the old write-ahead files, then replace the database. A `-wal` or
+   `-shm` file left over from the database you are replacing belongs to that
+   database, and SQLite would apply it to the restored one:
+
+   ```bash
+   rm -f "$DB-wal" "$DB-shm"
    cp "$BACKUP" "$DB"
    chmod 600 "$DB"
-   rm -f "$DB-wal" "$DB-shm"
    ```
 
 3. Check it:
@@ -89,7 +108,9 @@ makes the backup file `0600` from the start.
 
    ```bash
    launchctl load ~/Library/LaunchAgents/com.chamber.verify.plist
-   # or: sudo systemctl start chamber.service chamber-jobs.timer
+   launchctl load ~/Library/LaunchAgents/com.chamber.daily-snapshot.plist
+   # or: sudo systemctl start chamber.service chamber-jobs.timer \
+   #       chamber-slack.service chamber-discord.service
    ```
 
 ## After a restore, check the checkpoint

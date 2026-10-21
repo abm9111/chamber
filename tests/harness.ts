@@ -13975,10 +13975,16 @@ test("config", "the docs agree with the code: limitation count, sandbox claims, 
 
   // The sandbox is described as it is in src/sandbox.ts, everywhere it was described.
   assert(!limits.includes("## 1. The sandbox does not isolate"), "entry 1 still has the old title");
-  assert(
-    limits.includes("probes/sandbox_confines.ts") && limits.includes("ISOLATING_BACKENDS"),
-    "entry 1 does not describe the bwrap backend and its probe",
-  );
+  const entry1 = limits.slice(limits.indexOf("\n## 1. "), limits.indexOf("\n## 2. "));
+  assert(entry1.length > 0, "KNOWN_LIMITATIONS has no entry 1 followed by an entry 2");
+  for (const needle of ["probes/sandbox_confines.ts", "ISOLATING_BACKENDS", "CHAMBER_SANDBOX_REQUIRED=0"]) {
+    assert(entry1.includes(needle), `entry 1 does not mention ${needle}`);
+  }
+  // The command is `tool-synth` (src/cli.ts); a doc that names another one sends the reader nowhere.
+  assert(read("src", "cli.ts").includes('case "tool-synth":'), "the CLI no longer has tool-synth; update this test");
+  for (const doc of [limits, readme, read("deploy", "SCHEDULING.md"), read("docs", "BACKUP.md")]) {
+    assert(!doc.includes("tool synth"), "a doc names `chamber tool synth`; the command is `tool-synth`");
+  }
   assert(!readme.includes("does not fail closed"), "README still says CHAMBER_SANDBOX_REQUIRED does not fail closed");
   assert(read("benchmarks", "BENCHMARK.md").includes("As of 2026-08-02 the sandbox did not isolate"), "BENCHMARK T1 row lost its date");
   assert(!limits.includes("one was closed in deploy: `src/checkpoint_export.ts`"), "entry 3 still claims a scheduled export");
@@ -13988,7 +13994,13 @@ test("config", "the docs agree with the code: limitation count, sandbox claims, 
   assert(!pilot.includes("cp chamber.sqlite chamber.sqlite.bak"), "PILOT.md still tells the operator to cp the database");
   assert(pilot.includes("docs/BACKUP.md"), "PILOT.md does not point at docs/BACKUP.md");
   const backup = read("docs", "BACKUP.md");
-  for (const needle of [".backup", "VACUUM INTO", "-wal", "-shm", "chamber config show", "chamber verify", "chamber checkpoint verify", "chmod 600"]) {
+  for (const needle of [
+    ".backup", "VACUUM INTO", "-wal", "-shm", "chamber config show", "chamber verify", "chamber checkpoint verify", "chmod 600",
+    // Restore must stop every process that opens the database, then prove none does.
+    "chamber-slack.service", "chamber-discord.service", "com.chamber.daily-snapshot.plist", "chamber mcp", 'lsof "$DB"',
+    // A backup leaks what the database holds.
+    "OAuth tokens",
+  ]) {
     assert(backup.includes(needle), `docs/BACKUP.md does not mention ${needle}`);
   }
 
@@ -13999,7 +14011,8 @@ test("config", "the docs agree with the code: limitation count, sandbox claims, 
   }
   assert((sched.match(/^=== verify exit \d ===$/gm) ?? []).length >= 3, "the samples do not end with the job's exit line");
   assert((sched.match(/^ {2}database = .*\[from default\]$/gm) ?? []).length >= 3, "the samples do not show the database line");
-  assert(sched.includes("not over\nSSH") && sched.includes("`unload` stops the job"), "the pin notes are missing");
+  const schedFlat = sched.replace(/\s+/g, " ");
+  assert(schedFlat.includes("not over SSH") && schedFlat.includes("`unload` stops the job"), "the pin notes are missing");
   assert(sched.includes("This takes effect for a release tag that contains this script"), "the daily-snapshot effective-date note is missing");
   assert(sched.includes("`release: <tag>`"), "the daily-snapshot section does not mention the release line");
 });

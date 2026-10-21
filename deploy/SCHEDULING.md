@@ -8,29 +8,60 @@ It never mutates a belief or the corpus. It only reports.
 
 ## Prerequisite
 
-The scheduled job calls `chamber`, not `node …/src/cli.ts`. Install the command
-first:
+The scheduled job does not call the `chamber` on your `PATH`. `npm link` points
+that command at your development checkout, so a job that called it would run
+whatever branch you had checked out at 08:30. The job runs a second checkout,
+pinned to a release tag:
 
 ```bash
-npm link          # from the repository root
-which chamber     # should print a path on your PATH
+chamber pin v0.1.9    # from a clone of this repository
 ```
 
-The job runs `/bin/sh -lc`, a *login* shell, and that `-l` is load-bearing.
-launchd itself hands a job a minimal `PATH` — on a stock macOS install,
-`/usr/bin:/bin:/usr/sbin:/sbin`, which contains neither `/opt/homebrew/bin` nor
-`/usr/local/bin`, so it cannot see what `npm link` installed. The login shell
-sources your profile and recovers the real `PATH`.
+`chamber pin <tag>` fetches the tag from your clone's `origin` and keeps
+`~/.local/share/chamber-release` detached at it. The first run clones that
+directory, and a later run moves it to the tag you name. The job itself never
+fetches and never checks anything out, so it runs the same release every
+morning until you pin another one. The release checkout sits beside
+`~/.local/share/chamber`, the data directory, not inside it.
 
-The consequence is that this job inherits your shell profile. If `which
-chamber` prints a directory that your `.zprofile` / `.bash_profile` does not
-put on `PATH` (because your interactive `.zshrc` adds it instead), the job logs
-`chamber: command not found` and nothing else. Check the log after the first
-run rather than assuming.
+If `~/Library/LaunchAgents/com.chamber.verify.plist` is installed, pin also
+checks its script, points its `config show`, `ingest` and `verify` commands at
+the release checkout, and reloads it. Pin refuses before it moves anything in
+these cases:
+
+- the installed script is not the one Chamber ships
+- the release checkout has tracked changes or a `dist/` folder
+- the tag has no `bin/chamber.js`
+
+The job runs each command as
+`node "$HOME/.local/share/chamber-release/bin/chamber.js"`. It names `node`
+because `bin/chamber.js` is not executable in git. The release checkout has no
+`dist/`, so `bin/chamber.js` runs the TypeScript directly and needs Node 23.6
+or newer.
+
+The job runs `/bin/sh -lc`, a *login* shell, and that `-l` is load-bearing.
+launchd itself hands a job a minimal `PATH`. On a stock macOS install that is
+`/usr/bin:/bin:/usr/sbin:/sbin`, which contains neither `/opt/homebrew/bin` nor
+`/usr/local/bin`, so the job cannot find `node`. The login shell sources your
+profile and recovers the real `PATH`.
+
+The consequence is that this job inherits your shell profile. Your interactive
+`.zshrc` may put `node`'s directory on `PATH` while your `.zprofile` /
+`.bash_profile` does not. Then the job logs `node: command not found` and
+nothing else. Check the log after the first run rather than assuming.
 
 ## macOS (launchd)
 
-1. Copy the plist and substitute your home directory:
+1. Pin a release (see the prerequisite above):
+
+   ```bash
+   chamber pin v0.1.9
+   ```
+
+   With no job installed yet, pin clones the checkout and prints that no
+   LaunchAgent was installed.
+
+2. Copy the plist and substitute your home directory:
 
    ```bash
    mkdir -p ~/Library/LaunchAgents
@@ -39,17 +70,27 @@ run rather than assuming.
      > ~/Library/LaunchAgents/com.chamber.verify.plist
    ```
 
-2. Load it:
+   The template already runs
+   `node "$HOME/.local/share/chamber-release/bin/chamber.js"`. The job's shell
+   expands that `$HOME`, not `sed`.
+
+3. Load it:
 
    ```bash
    launchctl load ~/Library/LaunchAgents/com.chamber.verify.plist
    ```
 
-3. Watch it:
+4. Watch it:
 
    ```bash
    tail -f ~/Library/Logs/chamber-verify.log
    ```
+
+To move the job to a newer release, pin that tag. Pin reloads the agent itself:
+
+```bash
+chamber pin <tag>
+```
 
 To run it once immediately rather than waiting for the schedule:
 
@@ -66,8 +107,12 @@ launchctl unload ~/Library/LaunchAgents/com.chamber.verify.plist
 ## Linux (cron)
 
 ```cron
-30 8 * * * /bin/sh -lc 'echo "=== chamber $(date -Is) ==="; chamber ingest || echo "!! ingest FAILED (exit $?) - verifying against the corpus as it stands, which may be stale"; chamber verify' >> "$HOME/.local/state/chamber-verify.log" 2>&1
+30 8 * * * /bin/sh -lc 'echo "=== chamber $(date -Is) ==="; node "$HOME/.local/share/chamber-release/bin/chamber.js" ingest || echo "!! ingest FAILED (exit $?) - verifying against the corpus as it stands, which may be stale"; node "$HOME/.local/share/chamber-release/bin/chamber.js" verify' >> "$HOME/.local/state/chamber-verify.log" 2>&1
 ```
+
+Run `chamber pin <tag>` first. Pin does not edit your crontab, so a line
+written before pin existed keeps calling the `chamber` on `PATH` until you
+replace it.
 
 Two things that will bite you if you change that line:
 

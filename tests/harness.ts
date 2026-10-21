@@ -12723,6 +12723,52 @@ test("release", "a pin that fails writes no plist and calls no launchctl", () =>
   });
 });
 
+const PIN_CLI = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+
+// CHAMBER_DB and CHAMBER_CONFIG point into the throwaway HOME as well. Before
+// `pin` is routed, the CLI falls through to config load and opens a database,
+// and that run must not reach the real one through an inherited variable.
+function runPinCli(home: string, args: readonly string[]): { status: number | null; stderr: string } {
+  const r = spawnSync(process.execPath, ["--experimental-strip-types", PIN_CLI, "pin", ...args], {
+    encoding: "utf8",
+    timeout: 30_000,
+    env: {
+      ...process.env,
+      HOME: home,
+      CHAMBER_DB: join(home, "never.sqlite"),
+      CHAMBER_CONFIG: join(home, "never.json"),
+    },
+  });
+  assert(r.error === undefined, `launch failed: ${r.error}`);
+  return { status: r.status, stderr: r.stderr ?? "" };
+}
+
+test("release", "chamber pin takes exactly one tag", () => {
+  const home = mkdtempSync(join(tmpdir(), "chamber-pin-home-"));
+  try {
+    for (const args of [[], ["v1", "v2"]]) {
+      const r = runPinCli(home, args);
+      assert(r.status === 1, `pin ${args.join(" ")}: status ${r.status}\n${r.stderr}`);
+      assert(r.stderr.includes("usage: chamber pin <tag>"), r.stderr);
+    }
+    assert(!existsSync(join(home, ".local")), "a usage error created a directory under HOME");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("release", "chamber pin refuses a flag-shaped tag before touching HOME", () => {
+  const home = mkdtempSync(join(tmpdir(), "chamber-pin-home-"));
+  try {
+    const r = runPinCli(home, ["-x"]);
+    assert(r.status === 1, `status ${r.status}\n${r.stderr}`);
+    assert(r.stderr.includes('chamber pin: the tag name "-x" starts with "-"'), r.stderr);
+    assert(!existsSync(join(home, ".local")), "a refused pin created the release directory");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

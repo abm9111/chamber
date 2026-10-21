@@ -72,6 +72,13 @@ import { checkClaims, formatCheck } from "../src/check.ts";
 import { citedPassage, missingTerms, missingTermsIn, specificTerms } from "../src/claim_support.ts";
 import { withSiblings } from "../src/siblings.ts";
 import {
+  BARE_SCRIPT,
+  PINNED_SCRIPT,
+  RELEASE_COMMAND,
+  pinJobPlist,
+  readJobPlist,
+} from "../src/release_pin.ts";
+import {
   minilmAvailable,
   minilmInstalled,
   resetMinilmProbe,
@@ -278,6 +285,7 @@ type Suite =
   | "pins"
   | "cli"
   | "config"
+  | "release"
   | "all";
 
 interface TestResult {
@@ -388,6 +396,7 @@ function suiteFromArg(): Suite {
     "cli",
     "config",
     "daemon",
+    "release",
     "all",
   ].includes(v)
     ? v
@@ -12094,6 +12103,111 @@ test(
     );
   },
 );
+
+// ─── release pin ────────────────────────────────────────────────────────────
+
+/** A job plist with only the parts pin reads. `script` is written as is. */
+function jobPlistXml(script: string): string {
+  return [
+    `<?xml version="1.0" encoding="UTF-8"?>`,
+    `<plist version="1.0">`,
+    `<dict>`,
+    `  <key>Label</key>`,
+    `  <string>com.chamber.verify</string>`,
+    `  <key>ProgramArguments</key>`,
+    `  <array>`,
+    `    <string>/bin/sh</string>`,
+    `    <string>-lc</string>`,
+    `    <string>${script}</string>`,
+    `  </array>`,
+    `</dict>`,
+    `</plist>`,
+    ``,
+  ].join("\n");
+}
+
+test("release", "the shipped template runs the release checkout", () => {
+  const template = readFileSync(
+    fileURLToPath(new URL("../deploy/launchd/com.chamber.verify.plist", import.meta.url)),
+    "utf8",
+  );
+  const read = readJobPlist(template);
+  assert(read.ok && read.form === "pinned", `template: ${JSON.stringify(read)}`);
+});
+
+test("release", "the pinned script differs from the bare one only in its three chamber commands", () => {
+  assert(
+    RELEASE_COMMAND === `node "$HOME/.local/share/chamber-release/bin/chamber.js"`,
+    RELEASE_COMMAND,
+  );
+  const bare = BARE_SCRIPT.split("\n");
+  const pinned = PINNED_SCRIPT.split("\n");
+  assert(bare.length === pinned.length, `${bare.length} lines vs ${pinned.length}`);
+  const changed = bare.flatMap((line, i) => (line === pinned[i] ? [] : [i]));
+  assert(JSON.stringify(changed) === "[1,2,3]", `changed lines ${JSON.stringify(changed)}`);
+  for (const i of changed) {
+    const was = bare[i] ?? "";
+    assert(was.startsWith("chamber "), `bare line ${i} is ${was}`);
+    assert(
+      pinned[i] === `${RELEASE_COMMAND}${was.slice("chamber".length)}`,
+      `pinned line ${i} is ${pinned[i]}`,
+    );
+  }
+  for (const s of [BARE_SCRIPT, PINNED_SCRIPT]) {
+    assert(!s.includes("<") && !s.includes("&"), "a job script now needs XML escaping");
+  }
+});
+
+test("release", "a bare job plist is pinned in place and nothing else changes", () => {
+  const xml = jobPlistXml(BARE_SCRIPT);
+  const before = readJobPlist(xml);
+  assert(before.ok && before.form === "bare", JSON.stringify(before));
+  const pinned = pinJobPlist(xml);
+  const after = readJobPlist(pinned);
+  assert(after.ok && after.form === "pinned", JSON.stringify(after));
+  // A string search argument is literal; only a replacement string reads `$`.
+  assert(
+    pinned.replace(PINNED_SCRIPT, "SCRIPT") === xml.replace(BARE_SCRIPT, "SCRIPT"),
+    "pinning changed more than the script",
+  );
+  assert(pinJobPlist(pinned) === pinned, "pinning a pinned plist changed it");
+});
+
+test("release", "an entity-encoded bare script is still read as bare", () => {
+  const encoded = BARE_SCRIPT.replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+  const read = readJobPlist(jobPlistXml(encoded));
+  assert(read.ok && read.form === "bare", JSON.stringify(read));
+  const after = readJobPlist(pinJobPlist(jobPlistXml(encoded)));
+  assert(after.ok && after.form === "pinned", JSON.stringify(after));
+});
+
+test("release", "a job plist with any other script is refused", () => {
+  const lines = BARE_SCRIPT.split("\n");
+  const onePinned = [
+    lines[0],
+    `${RELEASE_COMMAND} config show 2>/dev/null | grep database`,
+    ...lines.slice(2),
+  ].join("\n");
+  const cases: ReadonlyArray<readonly [string, string]> = [
+    ["an extra command", jobPlistXml(`${BARE_SCRIPT}\necho extra`)],
+    ["one command pinned", jobPlistXml(onePinned)],
+    ["another chamber", jobPlistXml(BARE_SCRIPT.replaceAll("chamber ", "/usr/local/bin/chamber "))],
+    ["a non-login shell", jobPlistXml(BARE_SCRIPT).replace("<string>-lc</string>", "<string>-c</string>")],
+    ["no ProgramArguments", jobPlistXml(BARE_SCRIPT).replace("<key>ProgramArguments</key>", "<key>Program</key>")],
+    ["two ProgramArguments", jobPlistXml(BARE_SCRIPT).replace("</dict>", "  <key>ProgramArguments</key>\n</dict>")],
+  ];
+  for (const [label, xml] of cases) {
+    const read = readJobPlist(xml);
+    assert(!read.ok, `${label} was accepted as ${JSON.stringify(read)}`);
+    let threw = false;
+    try {
+      pinJobPlist(xml);
+    } catch {
+      threw = true;
+    }
+    assert(threw, `${label}: pinJobPlist rewrote it`);
+  }
+});
 
 // ─── cli process smoke tests ────────────────────────────────────────────────
 

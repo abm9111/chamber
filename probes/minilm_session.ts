@@ -34,7 +34,7 @@ function run(): string | null {
       "import json, os, sys",
       "with open(os.environ['CHAMBER_PROBE_LOG'], 'a') as fh:",
       "    fh.write(json.dumps(sys.argv[1:]) + '\\n')",
-      "os.execv(os.environ['CHAMBER_PROBE_PYTHON'], [os.environ['CHAMBER_PROBE_PYTHON'], *sys.argv[1:]])",
+      "os.execvp(os.environ['CHAMBER_PROBE_PYTHON'], [os.environ['CHAMBER_PROBE_PYTHON'], *sys.argv[1:]])",
       "",
     ].join("\n"),
   );

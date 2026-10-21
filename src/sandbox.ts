@@ -401,8 +401,10 @@ function runBwrap(
     // The rest of the namespaces the payload does not need to share. Without
     // --unshare-pid the payload's /proc listed every process on the host, with
     // each one's command line, and could signal any process of the same user.
-    // --unshare-ipc and --unshare-uts hide SysV/POSIX IPC objects and the host
-    // name. --new-session starts a new terminal session, so a payload cannot
+    // --unshare-ipc hides the host's SysV/POSIX IPC objects. --unshare-uts
+    // gives the payload its own UTS namespace, so it cannot change the host's
+    // hostname or domain name (the name it reads is unchanged).
+    // --new-session starts a new terminal session, so a payload cannot
     // push keystrokes into the controlling terminal (TIOCSTI). Namespace flags
     // are not mount operations: they take effect before any of the mounts
     // above, so `--proc /proc` already mounts the new pid namespace's view.

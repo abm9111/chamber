@@ -1,0 +1,7 @@
+# The Python packages scripts/embed_minilm.py imports: numpy, onnxruntime,
+# tokenizers. Unpinned on purpose -- this is the input, not the lock.
+# scripts/requirements-embed.txt is the lock; CI installs only that file, with
+# --require-hashes. Regenerate it with the command on its first lines.
+numpy
+onnxruntime
+tokenizers

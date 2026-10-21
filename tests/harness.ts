@@ -13028,6 +13028,71 @@ test("config", "package.json, server.json, the served MCP version and the change
   }
 });
 
+test("config", "CI pins its actions by SHA, installs Python by hash, scans both images, audits and scans history", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const ci = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
+
+  // Every action is a full commit SHA. A tag is a pointer its owner can move.
+  const uses = [...ci.matchAll(/^\s*(?:-\s+)?uses:\s*(\S+)/gm)].map((m) => m[1] ?? "");
+  assert(uses.length >= 8, `expected the workflow's actions, found ${uses.length}`);
+  for (const u of uses) {
+    assert(/^[\w.-]+\/[\w./-]+@[0-9a-f]{40}$/.test(u), `action not pinned by a full commit SHA: ${u}`);
+  }
+
+  // Both Python installs read the hash-pinned file and refuse anything else.
+  const pips = ci.split("\n").filter((l) => /\bpip install\b/.test(l));
+  assert(pips.length === 2, `expected two pip install lines, found ${pips.length}`);
+  for (const l of pips) {
+    assert(
+      l.includes("--require-hashes") && l.includes("-r scripts/requirements-embed.txt"),
+      `pip install without --require-hashes from the pinned file: ${l.trim()}`,
+    );
+  }
+
+  // The lock itself: every requirement has a hash, and the command that made it
+  // is recorded in its first lines.
+  const lock = readFileSync(join(root, "scripts", "requirements-embed.txt"), "utf8");
+  assert(lock.split("\n").slice(0, 3).join("\n").includes("uv pip compile"), "the lock does not record its command");
+  let name: string | null = null;
+  const hashes = new Map<string, number>();
+  for (const line of lock.split("\n")) {
+    const req = /^([A-Za-z0-9][A-Za-z0-9._-]*)==\S+/.exec(line);
+    if (req !== null) {
+      name = req[1] ?? null;
+      hashes.set(name ?? "", 0);
+    } else if (name !== null && /^\s+--hash=sha256:[0-9a-f]{64}\b/.test(line)) {
+      hashes.set(name, (hashes.get(name) ?? 0) + 1);
+    }
+  }
+  for (const want of ["numpy", "onnxruntime", "tokenizers"]) {
+    assert(hashes.has(want), `${want} is not in the lock`);
+  }
+  for (const [pkg, n] of hashes) assert(n > 0, `${pkg} is pinned without a hash`);
+
+  // Both images are built and scanned under the same gate.
+  assert(/dockerfile:\s*Dockerfile\s*$/m.test(ci), "the image job does not build ./Dockerfile");
+  assert(/dockerfile:\s*deploy\/Dockerfile\s*$/m.test(ci), "the image job does not build deploy/Dockerfile");
+  assert((ci.match(/ignore-unfixed: true/g) ?? []).length === 1, "expected one fixable-only gate");
+  assert(ci.includes("exit-code: '1'") && ci.includes("severity: HIGH,CRITICAL"), "the image gate lost its severity or exit code");
+
+  // Dependency audit and a secret scan over the whole history.
+  assert(ci.includes("npm audit --audit-level=high"), "no npm audit step");
+  assert(/fetch-depth:\s*0/.test(ci), "the secret scan does not fetch the full history");
+  assert(ci.includes("gitleaks git "), "no gitleaks history scan");
+  assert(/GITLEAKS_SHA256:\s*[0-9a-f]{64}\b/.test(ci), "the gitleaks download is not checked against a SHA-256");
+
+  const bot = readFileSync(join(root, ".github", "dependabot.yml"), "utf8");
+  for (const [eco, dir] of [
+    ["npm", "/"],
+    ["github-actions", "/"],
+    ["docker", "/"],
+    ["docker", "/deploy"],
+  ] as const) {
+    const entry = new RegExp(`package-ecosystem:\\s*${eco}\\s*\\n\\s*directory:\\s*${dir.replace("/", "\\/")}\\s*\\n\\s*schedule:\\s*\\n\\s*interval:\\s*weekly`);
+    assert(entry.test(bot), `dependabot.yml has no weekly ${eco} entry for ${dir}`);
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

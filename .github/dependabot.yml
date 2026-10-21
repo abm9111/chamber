@@ -1,0 +1,23 @@
+# Weekly update PRs for the three things that were pinned by hand and then left
+# to age: the npm lockfile, the GitHub Actions (pinned by SHA, which Dependabot
+# keeps updating together with the trailing version comment), and the two
+# Dockerfile bases. Each Dockerfile lives in its own directory, so each gets its
+# own entry.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: weekly

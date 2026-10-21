@@ -79,7 +79,7 @@ Four scores moved after checking claims against code rather than impressions. Th
 | ID | Was | Now | Why |
 |----|-----|-----|-----|
 | G2 (Hermes) | 0 | 1 | `tools/skill_provenance.py` enforces a write-origin boundary — the curator may only auto-manage skills the agent itself created in the background-review fork; user-directed skills are off-limits. Scoring that 0 ("absent or pure theater") was wrong. It stays at 1, not 2, because agent-authored skills still execute without human ratification. |
-| T1 (Chamber) | 2 | 1 | The sandbox does not isolate. `CHAMBER_SANDBOX_REQUIRED=1` is unreachable, no `runDocker` exists, and a live probe read `$HOME`, wrote to it, and resolved DNS while reporting `backend: "docker"`. |
+| T1 (Chamber) | 2 | 1 | As of 2026-08-02 the sandbox did not isolate: `CHAMBER_SANDBOX_REQUIRED=1` was unreachable, no `runDocker` existed, and a live probe read `$HOME`, wrote to it, and resolved DNS while reporting `backend: "docker"`. Since then a bwrap backend confines on Linux (`probes/sandbox_confines.ts` is the evidence) and the flag fails closed. `runDocker` still does not exist and macOS has no isolating backend (`docs/KNOWN_LIMITATIONS.md` §1), so the score stays 1. |
 | A3 (Chamber) | 2 | 1 | There is no offline receipt verifier. `chamber checkpoint` writes an **unsigned** JSON to `/tmp` by default and must be run by hand. |
 | A1 (Chamber) | 2 | 2 (qualified) | The chain is real, but it is an unkeyed SHA-256 whose tip and `merkle_checkpoint` live in the same SQLite file the agent can write. Tail truncation is **detectable, with a caveat** — measured, not assumed; see "Known limitations". |
 

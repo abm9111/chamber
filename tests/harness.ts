@@ -13934,6 +13934,58 @@ test("release", "the daily snapshot has no stale labels, and its plist runs the 
   assert(!plist.includes("Projects/chamber/scripts"), "the plist still names the development checkout");
 });
 
+test("config", "the docs agree with the code: limitation count, sandbox claims, backup pointer, verify samples", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const read = (...parts: string[]): string => readFileSync(join(root, ...parts), "utf8");
+
+  // README states how many limitations the file documents.
+  const limits = read("docs", "KNOWN_LIMITATIONS.md");
+  const entries = (limits.match(/^## /gm) ?? []).length;
+  const words = [
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
+    "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "twenty-one",
+    "twenty-two", "twenty-three", "twenty-four", "twenty-five", "twenty-six", "twenty-seven", "twenty-eight",
+    "twenty-nine", "thirty",
+  ];
+  const readme = read("README.md");
+  const said = /([A-Za-z]+(?:-[a-z]+)?) limitations are documented there/.exec(readme);
+  assert(said !== null, "README no longer says how many limitations are documented");
+  assert(
+    words.indexOf(said[1]!.toLowerCase()) === entries,
+    `README says "${said[1]}" limitations; docs/KNOWN_LIMITATIONS.md has ${entries} entries`,
+  );
+
+  // The sandbox is described as it is in src/sandbox.ts, everywhere it was described.
+  assert(!limits.includes("## 1. The sandbox does not isolate"), "entry 1 still has the old title");
+  assert(
+    limits.includes("probes/sandbox_confines.ts") && limits.includes("ISOLATING_BACKENDS"),
+    "entry 1 does not describe the bwrap backend and its probe",
+  );
+  assert(!readme.includes("does not fail closed"), "README still says CHAMBER_SANDBOX_REQUIRED does not fail closed");
+  assert(read("benchmarks", "BENCHMARK.md").includes("As of 2026-08-02 the sandbox did not isolate"), "BENCHMARK T1 row lost its date");
+  assert(!limits.includes("one was closed in deploy: `src/checkpoint_export.ts`"), "entry 3 still claims a scheduled export");
+
+  // Backups.
+  const pilot = read("deploy", "PILOT.md");
+  assert(!pilot.includes("cp chamber.sqlite chamber.sqlite.bak"), "PILOT.md still tells the operator to cp the database");
+  assert(pilot.includes("docs/BACKUP.md"), "PILOT.md does not point at docs/BACKUP.md");
+  const backup = read("docs", "BACKUP.md");
+  for (const needle of [".backup", "VACUUM INTO", "-wal", "-shm", "chamber config show", "chamber verify", "chamber checkpoint verify", "chmod 600"]) {
+    assert(backup.includes(needle), `docs/BACKUP.md does not mention ${needle}`);
+  }
+
+  // Scheduling: samples as verify prints them now, and the two operator notes.
+  const sched = read("deploy", "SCHEDULING.md");
+  for (const line of sched.split("\n").filter((l) => l.includes("belief(s) checked"))) {
+    assert(line.endsWith("with some support lost"), `a sample verify line is missing the last count: ${line}`);
+  }
+  assert((sched.match(/^=== verify exit \d ===$/gm) ?? []).length >= 3, "the samples do not end with the job's exit line");
+  assert((sched.match(/^ {2}database = .*\[from default\]$/gm) ?? []).length >= 3, "the samples do not show the database line");
+  assert(sched.includes("not over\nSSH") && sched.includes("`unload` stops the job"), "the pin notes are missing");
+  assert(sched.includes("This takes effect for a release tag that contains this script"), "the daily-snapshot effective-date note is missing");
+  assert(sched.includes("`release: <tag>`"), "the daily-snapshot section does not mention the release line");
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

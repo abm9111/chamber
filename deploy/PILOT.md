@@ -19,7 +19,7 @@ export CHAMBER_SLACK_ALLOWED_USERS=U0123,U0456        # empty = nobody can talk 
 export CHAMBER_SLACK_OPS_CHANNEL=C0OPS...
 ```
 
-- [ ] SQLite path backed up (`cp chamber.sqlite chamber.sqlite.bak`)
+- [ ] SQLite path backed up with `sqlite3 ... ".backup"`, not `cp` (see [docs/BACKUP.md](../docs/BACKUP.md))
 - [ ] Spend budget written down ($/day)
 - [ ] Approvals stay **on** — no standing bypass
 - [ ] systemd: `chamber.service` + optional `chamber-slack` + `chamber-jobs.timer`

@@ -70,6 +70,57 @@ history and the GitHub releases.
   freezing; see `docs/KNOWN_LIMITATIONS.md` entry 21. If a worker crashes, only
   the turns that worker was running fail; the others carry on.
 
+### Supply chain, CI, `chamber pin` and docs
+
+- **Dependency advisories.** `npm audit fix` moved `proxy-addr` (critical) and
+  `brace-expansion` (high) inside their ranges in `package-lock.json`;
+  `npm audit` now reports 0. CI fails on `npm audit --audit-level=high`.
+- **CI installs and scans.** The embedder's Python packages come from
+  `scripts/requirements-embed.txt`, pinned with hashes and installed with
+  `--require-hashes`. A new job runs gitleaks 8.30.1 (checked against a
+  SHA-256) over the whole history, and the image job now builds and scans both
+  `Dockerfile` and `deploy/Dockerfile` under the same trivy gate. Dependabot
+  opens weekly updates for npm, GitHub Actions and both Dockerfiles.
+- **The stdio image is cleaned like the deploy image.** The root `Dockerfile`
+  now runs `apt-get upgrade` and removes npm, npx and corepack; the image had
+  three fixable HIGH findings and now has none.
+- **MiniLM weights are checked before they load.** `scripts/embed_minilm.py`
+  hashes `model_quantized.onnx` and compares it with `models/minilm/VERSION`;
+  a mismatch, a missing `VERSION` or a missing `SHA-256:` line exits 3 in every
+  mode, before the model is imported. The TypeScript side treats it like any
+  other embedder failure.
+- **One version everywhere.** `server.json` said 0.1.10 while the package said
+  0.1.9, and the MCP server reported a third, hand-typed copy. The server now
+  reads `package.json`, `server.json` agrees, and a test fails when any of
+  them, or the newest CHANGELOG heading, disagree.
+- **`chamber-jobs.service` is hardened** with the directives
+  `chamber.service` already had, including a `@system-service` syscall filter.
+- **The bwrap sandbox unshares more.** `--unshare-pid`, `--unshare-ipc`,
+  `--unshare-uts` and `--new-session` join `--unshare-net`. A payload's `/proc`
+  used to list every host process. `probes/sandbox_confines.ts` checks the pid
+  namespace with a process needle that it first proves visible without the
+  sandbox.
+- **`chamber pin` runs the release before it rewrites the job.** After the
+  checkout, `node bin/chamber.js --version` must run under `/bin/sh -lc` and
+  print the version in `package.json`; otherwise pin exits 1 and leaves the job
+  alone. The plist is replaced atomically, git runs with prompts off and
+  without inherited `GIT_DIR`, with timeouts, an http(s) origin carrying
+  credentials is refused, and a commented-out `ProgramArguments` block or a
+  `Program` key no longer confuses the plist check.
+- **The daily snapshot reports what happened.** `verify exit code` was always
+  0 (it read `$?` after an `echo`); it now carries verify's status. Drift and
+  Corpus run the pinned release checkout, or say to run `chamber pin`, and the
+  Drift section opens with `release: <tag>` (from `git describe --tags --always`
+  in that checkout; `none` when it is missing, `unknown` when it is not a git
+  checkout), so a report names the release it ran. The launchd template runs the
+  release checkout's copy of the script, which takes effect for a tag that
+  contains it.
+- **Docs.** New `docs/BACKUP.md` (live backups with `.backup`, not `cp`;
+  restore; `chamber checkpoint verify` afterwards). `docs/KNOWN_LIMITATIONS.md`
+  entry 1 describes the sandbox as it is, entry 3 no longer claims a scheduled
+  export, and the README's count matches. The sample outputs in
+  `deploy/SCHEDULING.md` match what `chamber verify` prints.
+
 ## 0.1.9 — 2026-10-03
 
 ### Changed

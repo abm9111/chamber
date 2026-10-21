@@ -1,7 +1,8 @@
 # Scheduling `chamber verify`
 
 `chamber verify` re-checks every stored citation pin against the corpus as it
-is now. It exits non-zero exactly when a belief has no verified support left,
+is now. It exits non-zero exactly when a stored pin no longer verifies, either
+because a belief has no verified support left or because it has lost some of it,
 which makes it usable as an unattended check.
 
 It never mutates a belief or the corpus. It only reports.
@@ -49,6 +50,18 @@ The consequence is that this job inherits your shell profile. Your interactive
 `.zshrc` may put `node`'s directory on `PATH` while your `.zprofile` /
 `.bash_profile` does not. Then the job logs `node: command not found` and
 nothing else. Check the log after the first run rather than assuming.
+
+Run `chamber pin` from a Terminal window on the machine's desktop, not over
+SSH. The legacy `launchctl list`, `load` and `unload` that pin uses act on the
+domain of the session they are run from, and the job lives in the domain of
+your GUI login session. From an SSH session they can fail, or change a different
+domain than the one the 08:30 job runs in.
+
+`unload` stops the job if it is running at that moment, and on a large corpus
+the 08:30 job runs for a long time (a first MiniLM ingest of about 28,500
+passages took over an hour). Pin when it is not running: look at the end of
+`~/Library/Logs/chamber-verify.log` first and pin only after today's
+`=== verify exit N ===` line is there.
 
 ## macOS (launchd)
 
@@ -104,6 +117,40 @@ To remove it:
 launchctl unload ~/Library/LaunchAgents/com.chamber.verify.plist
 ```
 
+## Daily snapshot (macOS)
+
+`scripts/daily-snapshot.sh` writes one dated Markdown report a day to
+`~/Library/Logs/chamber-daily/`: the drift result, the corpus, the ledger
+counts, the gates and the repository state. It records and does not judge, so it
+exits 0 even when a check inside it fails; `chamber verify` is the gate.
+
+The template runs the copy of the script inside the release checkout, so the
+report describes the release the 08:30 job ran. Its Drift and Corpus sections run
+that checkout's `bin/chamber.js`. If the checkout is missing, the report says
+`release checkout missing: run chamber pin <tag>` and does not fall back to the
+`chamber` on your `PATH`. The Ledger, Gates and Repository sections describe your
+development checkout (`CHAMBER_REPO`, default `~/Projects/chamber`).
+
+The Drift section opens with a `release: <tag>` line, which names the release the
+report ran. It is read with `git describe --tags --always` in the release
+checkout, so a checkout that `chamber pin` has moved to another tag shows the new
+tag from that day on. The line reads `none` when the release checkout is missing
+and `unknown` when it is there but is not a git checkout (or git cannot name it).
+
+```bash
+chamber pin <tag>      # a tag that contains the script, see below
+sed "s|REPLACE_WITH_HOME|$HOME|g" \
+  deploy/launchd/com.chamber.daily-snapshot.plist \
+  > ~/Library/LaunchAgents/com.chamber.daily-snapshot.plist
+launchctl load ~/Library/LaunchAgents/com.chamber.daily-snapshot.plist
+```
+
+**This takes effect for a release tag that contains this script.** v0.1.9's copy
+of `scripts/daily-snapshot.sh` has the old behaviour: it calls the `chamber` on
+`PATH` and prints `verify exit code: 0` whatever `verify` returned. Pin a newer
+tag before loading this plist, or the job runs the old script from the release
+checkout.
+
 ## Linux (cron)
 
 ```cron
@@ -147,7 +194,7 @@ chamber ingest || echo "!! ingest FAILED (exit $?) - verifying against the corpu
 ```
 
 The job's exit status is therefore `verify`'s alone, which preserves verify's
-contract: non-zero iff a belief has no verified support left. Folding ingest's
+contract: non-zero iff a stored pin no longer verifies. Folding ingest's
 status in would make exit 1 mean either "your evidence moved" or "a disk wasn't
 mounted" — two findings that call for entirely different responses, collapsed
 into one indistinguishable number. The distinction is kept in the log text,
@@ -167,21 +214,34 @@ On a healthy corpus:
 
 ```
 === chamber 2026-08-03T08:30:00+0400 ===
+  database = /Users/you/.local/share/chamber/chamber.sqlite   [from default]
 ingested 412 file(s) as 3907 passage(s) from /Users/you/Vault
 
-0 belief(s) checked, 0 with no verified support left
+0 belief(s) checked, 0 with no verified support left, 0 with some support lost
+=== verify exit 0 ===
 ```
+
+The `database` line says which file was checked. The last line is the job's
+exit status, which is `verify`'s.
 
 When a note behind a conclusion has changed:
 
 ```
+=== chamber 2026-08-03T08:30:00+0400 ===
+  database = /Users/you/.local/share/chamber/chamber.sqlite   [from default]
+ingested 412 file(s) as 3907 passage(s) from /Users/you/Vault
 blf_c8a38d3d16b7f617  0/1 pins verified
   "Client records are kept for 90 days after the engagement ends."
   hash_mismatch: vdoc_b60e21480430b775 — committed against retention.md#p0, which now holds: retention › Retention
     the cited passage is not what is stored there any more — it may have been edited, or shifted to another passage of the same note. Open the note and re-check; re-ingesting will not restore the pin.
 
-1 belief(s) checked, 1 with no verified support left
+1 belief(s) checked, 1 with no verified support left, 0 with some support lost
+=== verify exit 1 ===
 ```
+
+A belief that lost only some of its pins is counted in the last number instead
+(`0 with no verified support left, 1 with some support lost`). It exits 1 too:
+losing part of the evidence is drift.
 
 That is the signal worth scheduling for: a conclusion you recorded months ago,
 resting on a note you have since edited, surfaced without you remembering it
@@ -192,12 +252,14 @@ this and still verifies:
 
 ```
 === chamber 2026-08-03T08:30:00+0400 ===
+  database = /Users/you/.local/share/chamber/chamber.sqlite   [from default]
 ingest: no path given and no roots configured
   add roots to the config file, or pass a path
   run `chamber config show` to find the config file
 !! ingest FAILED (exit 1) - verifying against the corpus as it stands, which may be stale
 
-0 belief(s) checked, 0 with no verified support left
+0 belief(s) checked, 0 with no verified support left, 0 with some support lost
+=== verify exit 0 ===
 ```
 
 Run `chamber init` and add roots under `ingest` to fix it.

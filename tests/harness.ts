@@ -13093,6 +13093,158 @@ test("config", "CI pins its actions by SHA, installs Python by hash, scans both 
   }
 });
 
+// ─── MiniLM weights are checked before they are loaded ──────────────────────
+
+/**
+ * A model directory the embedder can be pointed at with CHAMBER_MINILM_DIR.
+ * The weights and tokenizer are symlinks to the real files, so nothing is
+ * copied; VERSION is a real file. `version` is the text to write there, or
+ * null for no VERSION file at all.
+ */
+function minilmDirWithVersion(version: string | null): string {
+  const real = fileURLToPath(new URL("../models/minilm", import.meta.url));
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-dir-"));
+  symlinkSync(join(real, "model_quantized.onnx"), join(dir, "model_quantized.onnx"));
+  symlinkSync(join(real, "tokenizer.json"), join(dir, "tokenizer.json"));
+  if (version !== null) writeFileSync(join(dir, "VERSION"), version);
+  return dir;
+}
+
+/** The real VERSION text with the first hex digit of its SHA-256 changed. */
+function tamperedVersion(): { text: string; expected: string; actualDigest: string } {
+  const real = readFileSync(fileURLToPath(new URL("../models/minilm/VERSION", import.meta.url)), "utf8");
+  const m = /^SHA-256:\s*([0-9a-f]{64})\s*$/m.exec(real);
+  assert(m !== null, "models/minilm/VERSION has no SHA-256 line");
+  const digest = m[1]!;
+  const wrong = (digest[0] === "0" ? "1" : "0") + digest.slice(1);
+  return { text: real.replace(digest, wrong), expected: wrong, actualDigest: digest };
+}
+
+const EMBED_SCRIPT = fileURLToPath(new URL("../scripts/embed_minilm.py", import.meta.url));
+
+function runEmbedScript(
+  dir: string,
+  args: readonly string[],
+  input?: string,
+  pythonFlags: readonly string[] = [],
+): { status: number | null; stdout: string; stderr: string } {
+  const r = spawnSync("python3", [...pythonFlags, EMBED_SCRIPT, ...args], {
+    encoding: "utf8",
+    input,
+    timeout: 120_000,
+    env: { ...process.env, CHAMBER_MINILM_DIR: dir },
+  });
+  assert(r.error === undefined, `python3 did not run: ${r.error}`);
+  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+test("config", "weights that do not match VERSION exit 3 in every mode, naming both hashes", () => {
+  const bad = tamperedVersion();
+  const dir = minilmDirWithVersion(bad.text);
+  try {
+    for (const [label, args, input] of [
+      ["one-shot", ["a sentence"], undefined],
+      ["--json -", ["--json", "-"], '["a sentence"]'],
+      ["--serve", ["--serve"], '["a sentence"]\n'],
+    ] as const) {
+      const r = runEmbedScript(dir, args, input);
+      assert(r.status === 3, `${label}: exit ${r.status}, stderr ${r.stderr}`);
+      assert(r.stdout === "", `${label}: wrote a reply before refusing: ${r.stdout}`);
+      const lines = r.stderr.trim().split("\n");
+      assert(lines.length === 1, `${label}: expected one stderr line, got ${lines.length}: ${r.stderr}`);
+      assert(
+        lines[0]!.includes(bad.actualDigest) && lines[0]!.includes(bad.expected),
+        `${label}: the line must name both hashes: ${lines[0]}`,
+      );
+    }
+    // The hash is checked before numpy and onnxruntime are imported, so the
+    // refusal needs neither installed.
+    const traced = runEmbedScript(dir, ["a sentence"], undefined, ["-X", "importtime"]);
+    assert(traced.status === 3, `importtime run: exit ${traced.status}`);
+    assert(
+      !traced.stderr.includes("numpy") && !traced.stderr.includes("onnxruntime"),
+      "the script imported numpy or onnxruntime before checking the weights",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "a missing VERSION or a VERSION without a SHA-256 line also exits 3", () => {
+  for (const [label, version, want] of [
+    ["missing VERSION", null, "cannot read"],
+    ["no SHA-256 line", "File: model_quantized.onnx\nSize: 22972370 bytes\n", "no SHA-256 line"],
+    ["short digest", "SHA-256:  afdb6f1a0e45b715d0bb9b11772f032c\n", "no SHA-256 line"],
+  ] as const) {
+    const dir = minilmDirWithVersion(version);
+    try {
+      const r = runEmbedScript(dir, ["a sentence"]);
+      assert(r.status === 3, `${label}: exit ${r.status}, stderr ${r.stderr}`);
+      assert(r.stderr.includes(want) && r.stderr.includes("VERSION"), `${label}: ${r.stderr}`);
+      assert(r.stdout === "", `${label}: wrote a reply before refusing`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("config", "the real model directory passes the weights check", () => {
+  // Same files, VERSION untouched: the check lets it through. Where an
+  // embedder runs here it must also answer; where numpy or onnxruntime is
+  // missing the script fails later and differently, which is not exit 3.
+  const dir = minilmDirWithVersion(
+    readFileSync(fileURLToPath(new URL("../models/minilm/VERSION", import.meta.url)), "utf8"),
+  );
+  try {
+    const r = runEmbedScript(dir, ["a sentence"]);
+    assert(r.status !== 3 && !r.stderr.includes("SHA-256"), `refused the real weights: ${r.stderr}`);
+    if (minilmAvailable()) {
+      assert(r.status === 0, `exit ${r.status}: ${r.stderr}`);
+      assert((JSON.parse(r.stdout) as number[]).length === 384, "expected a 384-dimension vector");
+    }
+    const plain = spawnSync("python3", [EMBED_SCRIPT, "a sentence"], { encoding: "utf8", timeout: 120_000 });
+    assert(plain.status !== 3, `the default model directory was refused: ${plain.stderr}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "failed weights degrade embedLocal and make the batch path throw", () => {
+  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const saved = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  const savedWrite = process.stderr.write;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  // The one-time fallback warning is the point of the behaviour, not noise to
+  // print into the test log.
+  let warned = "";
+  process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+    warned += String(chunk);
+    return true;
+  }) as typeof process.stderr.write;
+  resetMinilmProbe();
+  try {
+    const single = embedLocal("a sentence", "auto");
+    assert(single.kind === "hash", `embedLocal did not degrade: ${single.kind}`);
+    assert(warned.includes("SHA-256"), `the degradation did not say why: ${warned}`);
+    let batch = "";
+    try {
+      embedLocalBatch(["a sentence"], "minilm");
+    } catch (e) {
+      batch = e instanceof Error ? e.message : String(e);
+    }
+    assert(batch.includes("embed_minilm failed (3)"), `the batch path did not throw the exit 3: ${batch}`);
+  } finally {
+    process.stderr.write = savedWrite;
+    if (saved === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = saved;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

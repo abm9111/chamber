@@ -42,15 +42,22 @@
     silent and drift interrupts exactly once. `exit $rc` is load-bearing: an
     `if` whose condition fails would otherwise leave the script exiting 0 and
     quietly destroy verify's exit contract.
+
+    The three chamber commands run the release checkout that `chamber pin
+    <tag>` keeps at ~/.local/share/chamber-release. The `chamber` on PATH is
+    the one `npm link` points at the development checkout, so calling it here
+    would run whatever branch was checked out at 08:30. `node` is named
+    because bin/chamber.js is not executable in git, so a fresh checkout
+    cannot run it directly. Run `chamber pin <tag>` before loading this file.
   -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
     <string>-lc</string>
     <string>echo "=== chamber $(date '+%Y-%m-%dT%H:%M:%S%z') ==="
-chamber config show 2>/dev/null | grep database
-chamber ingest || echo "!! ingest FAILED (exit $?) - verifying against the corpus as it stands, which may be stale"
-chamber verify
+node "$HOME/.local/share/chamber-release/bin/chamber.js" config show 2>/dev/null | grep database
+node "$HOME/.local/share/chamber-release/bin/chamber.js" ingest || echo "!! ingest FAILED (exit $?) - verifying against the corpus as it stands, which may be stale"
+node "$HOME/.local/share/chamber-release/bin/chamber.js" verify
 rc=$?
 echo "=== verify exit $rc ==="
 if [ "$rc" -ne 0 ]; then

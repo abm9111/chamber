@@ -72,6 +72,19 @@ import { checkClaims, formatCheck } from "../src/check.ts";
 import { citedPassage, missingTerms, missingTermsIn, specificTerms } from "../src/claim_support.ts";
 import { withSiblings } from "../src/siblings.ts";
 import {
+  BARE_SCRIPT,
+  JOB_LABEL,
+  PINNED_SCRIPT,
+  RELEASE_COMMAND,
+  pinCheckout,
+  pinJobPlist,
+  pinRelease,
+  readJobPlist,
+  type Launchctl,
+  type LaunchctlResult,
+  type PinOptions,
+} from "../src/release_pin.ts";
+import {
   minilmAvailable,
   minilmInstalled,
   resetMinilmProbe,
@@ -246,6 +259,7 @@ import {
   appendFileSync,
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -278,6 +292,7 @@ type Suite =
   | "pins"
   | "cli"
   | "config"
+  | "release"
   | "all";
 
 interface TestResult {
@@ -388,6 +403,7 @@ function suiteFromArg(): Suite {
     "cli",
     "config",
     "daemon",
+    "release",
     "all",
   ].includes(v)
     ? v
@@ -12094,6 +12110,752 @@ test(
     );
   },
 );
+
+// ─── release pin ────────────────────────────────────────────────────────────
+
+/** A job plist with only the parts pin reads. `script` is written as is. */
+function jobPlistXml(script: string): string {
+  return [
+    `<?xml version="1.0" encoding="UTF-8"?>`,
+    `<plist version="1.0">`,
+    `<dict>`,
+    `  <key>Label</key>`,
+    `  <string>com.chamber.verify</string>`,
+    `  <key>ProgramArguments</key>`,
+    `  <array>`,
+    `    <string>/bin/sh</string>`,
+    `    <string>-lc</string>`,
+    `    <string>${script}</string>`,
+    `  </array>`,
+    `</dict>`,
+    `</plist>`,
+    ``,
+  ].join("\n");
+}
+
+test("release", "the shipped template runs the release checkout", () => {
+  const template = readFileSync(
+    fileURLToPath(new URL("../deploy/launchd/com.chamber.verify.plist", import.meta.url)),
+    "utf8",
+  );
+  const read = readJobPlist(template);
+  assert(read.ok && read.form === "pinned", `template: ${JSON.stringify(read)}`);
+});
+
+test("release", "the pinned script differs from the bare one only in its three chamber commands", () => {
+  assert(
+    RELEASE_COMMAND === `node "$HOME/.local/share/chamber-release/bin/chamber.js"`,
+    RELEASE_COMMAND,
+  );
+  const bare = BARE_SCRIPT.split("\n");
+  const pinned = PINNED_SCRIPT.split("\n");
+  assert(bare.length === pinned.length, `${bare.length} lines vs ${pinned.length}`);
+  const changed = bare.flatMap((line, i) => (line === pinned[i] ? [] : [i]));
+  assert(JSON.stringify(changed) === "[1,2,3]", `changed lines ${JSON.stringify(changed)}`);
+  for (const i of changed) {
+    const was = bare[i] ?? "";
+    assert(was.startsWith("chamber "), `bare line ${i} is ${was}`);
+    assert(
+      pinned[i] === `${RELEASE_COMMAND}${was.slice("chamber".length)}`,
+      `pinned line ${i} is ${pinned[i]}`,
+    );
+  }
+  for (const s of [BARE_SCRIPT, PINNED_SCRIPT]) {
+    assert(!s.includes("<") && !s.includes("&"), "a job script now needs XML escaping");
+  }
+});
+
+test("release", "a bare job plist is pinned in place and nothing else changes", () => {
+  const xml = jobPlistXml(BARE_SCRIPT);
+  const before = readJobPlist(xml);
+  assert(before.ok && before.form === "bare", JSON.stringify(before));
+  const pinned = pinJobPlist(xml);
+  const after = readJobPlist(pinned);
+  assert(after.ok && after.form === "pinned", JSON.stringify(after));
+  // A string search argument is literal; only a replacement string reads `$`.
+  assert(
+    pinned.replace(PINNED_SCRIPT, "SCRIPT") === xml.replace(BARE_SCRIPT, "SCRIPT"),
+    "pinning changed more than the script",
+  );
+  assert(pinJobPlist(pinned) === pinned, "pinning a pinned plist changed it");
+});
+
+test("release", "an entity-encoded bare script is still read as bare", () => {
+  const encoded = BARE_SCRIPT.replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+  const read = readJobPlist(jobPlistXml(encoded));
+  assert(read.ok && read.form === "bare", JSON.stringify(read));
+  const after = readJobPlist(pinJobPlist(jobPlistXml(encoded)));
+  assert(after.ok && after.form === "pinned", JSON.stringify(after));
+});
+
+test("release", "a job plist with any other script is refused", () => {
+  const lines = BARE_SCRIPT.split("\n");
+  const onePinned = [
+    lines[0],
+    `${RELEASE_COMMAND} config show 2>/dev/null | grep database`,
+    ...lines.slice(2),
+  ].join("\n");
+  const cases: ReadonlyArray<readonly [string, string]> = [
+    ["an extra command", jobPlistXml(`${BARE_SCRIPT}\necho extra`)],
+    ["one command pinned", jobPlistXml(onePinned)],
+    ["another chamber", jobPlistXml(BARE_SCRIPT.replaceAll("chamber ", "/usr/local/bin/chamber "))],
+    ["a non-login shell", jobPlistXml(BARE_SCRIPT).replace("<string>-lc</string>", "<string>-c</string>")],
+    ["no ProgramArguments", jobPlistXml(BARE_SCRIPT).replace("<key>ProgramArguments</key>", "<key>Program</key>")],
+    ["two ProgramArguments", jobPlistXml(BARE_SCRIPT).replace("</dict>", "  <key>ProgramArguments</key>\n</dict>")],
+  ];
+  for (const [label, xml] of cases) {
+    const read = readJobPlist(xml);
+    assert(!read.ok, `${label} was accepted as ${JSON.stringify(read)}`);
+    let threw = false;
+    try {
+      pinJobPlist(xml);
+    } catch {
+      threw = true;
+    }
+    assert(threw, `${label}: pinJobPlist rewrote it`);
+  }
+});
+
+// Fixture repositories are built with plumbing only. `commit-tree` runs no
+// hook and needs no configured identity, and nothing is ever pushed, so the
+// global pre-commit and pre-push gates never see these throwaway repos.
+const FIXTURE_GIT_ENV: NodeJS.ProcessEnv = {
+  GIT_AUTHOR_NAME: "Chamber Test",
+  GIT_AUTHOR_EMAIL: "test@example.invalid",
+  GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
+  GIT_COMMITTER_NAME: "Chamber Test",
+  GIT_COMMITTER_EMAIL: "test@example.invalid",
+  GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
+};
+
+function fixtureGit(cwd: string, args: readonly string[], input?: string): string {
+  const r = spawnSync("git", ["-C", cwd, ...args], {
+    encoding: "utf8",
+    input,
+    env: { ...process.env, ...FIXTURE_GIT_ENV },
+  });
+  if (r.status !== 0) {
+    throw new Error(`fixture git ${args.join(" ")} failed (${r.status}): ${r.stderr}`);
+  }
+  return (r.stdout ?? "").trim();
+}
+
+/** A commit holding exactly `files`, built without touching the working tree. */
+function fixtureCommit(
+  repo: string,
+  files: Readonly<Record<string, string>>,
+  message: string,
+  parent?: string,
+): string {
+  fixtureGit(repo, ["read-tree", "--empty"]);
+  for (const [path, body] of Object.entries(files)) {
+    const blob = fixtureGit(repo, ["hash-object", "-w", "--stdin"], body);
+    fixtureGit(repo, ["update-index", "--add", "--cacheinfo", `100644,${blob},${path}`]);
+  }
+  const tree = fixtureGit(repo, ["write-tree"]);
+  const args = ["commit-tree", "--no-gpg-sign", tree, "-m", message];
+  if (parent !== undefined) args.push("-p", parent);
+  return fixtureGit(repo, args);
+}
+
+interface ReleaseFixture {
+  root: string;
+  origin: string;
+  source: string;
+  releaseDir: string;
+  plistPath: string;
+  v1: string;
+  v2: string;
+  nobin: string;
+}
+
+/**
+ * An origin with three tags and a branch, a source checkout whose only job is
+ * to name that origin, and paths for a release directory and a plist that do
+ * not exist yet. v1 is a lightweight tag. v2 is annotated, so it must be
+ * peeled to its commit. v2 adds CHANGES.md. nobin has no bin/chamber.js.
+ */
+function releaseFixture(): ReleaseFixture {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "chamber-pin-")));
+  const origin = join(root, "origin");
+  fixtureGit(root, ["init", "-q", "-b", "main", origin]);
+  const v1 = fixtureCommit(origin, { "bin/chamber.js": "// v1\n", "README.md": "one\n" }, "v1");
+  const v2 = fixtureCommit(
+    origin,
+    { "bin/chamber.js": "// v2\n", "README.md": "two\n", "CHANGES.md": "two\n" },
+    "v2",
+    v1,
+  );
+  const nobin = fixtureCommit(origin, { "README.md": "three\n" }, "no bin", v2);
+  fixtureGit(origin, ["update-ref", "refs/heads/main", nobin]);
+  fixtureGit(origin, ["update-ref", "refs/heads/feature", v2]);
+  fixtureGit(origin, ["tag", "v1", v1]);
+  fixtureGit(origin, ["-c", "tag.gpgSign=false", "tag", "-a", "-m", "v2", "v2", v2]);
+  fixtureGit(origin, ["tag", "nobin", nobin]);
+  const source = join(root, "source");
+  fixtureGit(root, ["init", "-q", "-b", "main", source]);
+  fixtureGit(source, ["remote", "add", "origin", origin]);
+  return {
+    root,
+    origin,
+    source,
+    releaseDir: join(root, "share", "chamber-release"),
+    plistPath: join(root, "LaunchAgents", "com.chamber.verify.plist"),
+    v1,
+    v2,
+    nobin,
+  };
+}
+
+function withReleaseFixture(fn: (fx: ReleaseFixture) => void): void {
+  const fx = releaseFixture();
+  try {
+    fn(fx);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+}
+
+function headOf(dir: string): string {
+  return fixtureGit(dir, ["rev-parse", "HEAD"]);
+}
+
+function isDetachedHead(dir: string): boolean {
+  return spawnSync("git", ["-C", dir, "symbolic-ref", "--quiet", "HEAD"]).status !== 0;
+}
+
+test("release", "pin clones a tag into a new release directory, detached", () => {
+  withReleaseFixture((fx) => {
+    const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+    assert(r.ok, `pin refused: ${JSON.stringify(r)}`);
+    assert(r.commit === fx.v1 && !r.already, JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD is not the v1 commit");
+    assert(isDetachedHead(fx.releaseDir), "HEAD is attached to a branch");
+    assert(
+      readFileSync(join(fx.releaseDir, "bin", "chamber.js"), "utf8") === "// v1\n",
+      "bin/chamber.js is not v1's",
+    );
+    assert(
+      fixtureGit(fx.releaseDir, ["remote", "get-url", "origin"]) === fx.origin,
+      "the release checkout does not fetch from the source's origin",
+    );
+  });
+});
+
+test("release", "a second pin moves the checkout to another tag", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    const r = pinCheckout({ ...opts, tag: "v2" });
+    assert(r.ok && r.commit === fx.v2 && !r.already, JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v2, "HEAD is not the v2 commit");
+    assert(isDetachedHead(fx.releaseDir), "HEAD is attached to a branch");
+    assert(
+      readFileSync(join(fx.releaseDir, "bin", "chamber.js"), "utf8") === "// v2\n",
+      "bin/chamber.js is not v2's",
+    );
+    assert(existsSync(join(fx.releaseDir, "CHANGES.md")), "v2's new file is missing");
+  });
+});
+
+test("release", "pinning the tag already checked out succeeds without moving", () => {
+  withReleaseFixture((fx) => {
+    const opts = { tag: "v2", sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout(opts).ok, "first pin refused");
+    const again = pinCheckout(opts);
+    assert(again.ok && again.already && again.commit === fx.v2, JSON.stringify(again));
+    assert(headOf(fx.releaseDir) === fx.v2, "HEAD moved");
+  });
+});
+
+test("release", "a missing tag, a branch name and a raw commit are refused", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    for (const tag of ["nope", "feature", fx.v1]) {
+      const r = pinCheckout({ ...opts, tag });
+      assert(!r.ok && r.reason.includes("git fetch:"), `${tag}: ${JSON.stringify(r)}`);
+      assert(!existsSync(fx.releaseDir), `a refused first pin of ${tag} left its clone behind`);
+    }
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    for (const tag of ["nope", "feature", fx.v2]) {
+      const r = pinCheckout({ ...opts, tag });
+      assert(!r.ok, `${tag} was pinned`);
+      assert(existsSync(fx.releaseDir), `refusing ${tag} removed an older checkout`);
+      assert(headOf(fx.releaseDir) === fx.v1, `refusing ${tag} moved HEAD`);
+    }
+  });
+});
+
+test("release", "a malformed tag name is refused before anything is created", () => {
+  withReleaseFixture((fx) => {
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ["", "the tag name is empty"],
+      ["-v1", 'starts with "-"'],
+      ["v 1", "contains a space or a newline"],
+      ["v1\n", "contains a space or a newline"],
+      ["v1..x", "is not a valid tag name"],
+    ];
+    for (const [tag, why] of cases) {
+      const r = pinCheckout({ tag, sourceRoot: fx.source, releaseDir: fx.releaseDir });
+      assert(!r.ok && r.reason.includes(why), `${JSON.stringify(tag)}: ${JSON.stringify(r)}`);
+      assert(!existsSync(dirname(fx.releaseDir)), `${JSON.stringify(tag)} created a directory`);
+    }
+  });
+});
+
+test("release", "a tracked change in the release checkout stops pin", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    const bin = join(fx.releaseDir, "bin", "chamber.js");
+    writeFileSync(bin, "// edited\n");
+    const r = pinCheckout({ ...opts, tag: "v2" });
+    assert(!r.ok && r.reason.includes("has tracked changes"), JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved past a tracked change");
+    assert(readFileSync(bin, "utf8") === "// edited\n", "pin reset the tracked change");
+  });
+});
+
+test("release", "an untracked file the tag would overwrite stops pin with git's refusal", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    const mine = join(fx.releaseDir, "CHANGES.md");
+    writeFileSync(mine, "mine\n");
+    const r = pinCheckout({ ...opts, tag: "v2" });
+    // The file name, not git's English wording: git translates its messages.
+    assert(!r.ok && r.reason.includes("git checkout:") && r.reason.includes("CHANGES.md"), JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved");
+    assert(readFileSync(mine, "utf8") === "mine\n", "pin overwrote an untracked file");
+  });
+});
+
+test("release", "a tag without bin/chamber.js is left unpinned", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    const fresh = pinCheckout({ ...opts, tag: "nobin" });
+    assert(!fresh.ok && fresh.reason.includes("has no bin/chamber.js"), JSON.stringify(fresh));
+    assert(!existsSync(fx.releaseDir), "a refused first pin left its clone behind");
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    const over = pinCheckout({ ...opts, tag: "nobin" });
+    assert(!over.ok, "nobin was pinned over v1");
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD left v1");
+    assert(existsSync(join(fx.releaseDir, "bin", "chamber.js")), "the older checkout lost bin/chamber.js");
+  });
+});
+
+test("release", "a release directory that is not its own git checkout is left alone", () => {
+  withReleaseFixture((fx) => {
+    mkdirSync(fx.releaseDir, { recursive: true });
+    writeFileSync(join(fx.releaseDir, "chamber.sqlite"), "db\n");
+    const plain = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+    assert(!plain.ok && plain.reason.includes("is not a git checkout"), JSON.stringify(plain));
+    assert(readFileSync(join(fx.releaseDir, "chamber.sqlite"), "utf8") === "db\n", "pin touched a directory it does not own");
+    assert(!existsSync(join(fx.releaseDir, ".git")), "pin initialised a directory it does not own");
+
+    // Inside another repository, `git -C` finds the enclosing checkout. Pin
+    // must not take that checkout for the release directory and fetch into it.
+    const nested = join(fx.source, "nested");
+    mkdirSync(nested);
+    const inner = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: nested });
+    assert(!inner.ok && inner.reason.includes("is not a git checkout"), JSON.stringify(inner));
+    assert(
+      spawnSync("git", ["-C", fx.source, "rev-parse", "--verify", "--quiet", "refs/tags/v1"]).status !== 0,
+      "pin fetched into the enclosing repository",
+    );
+  });
+});
+
+test("release", "a dangling symlink at the release directory is left alone", () => {
+  withReleaseFixture((fx) => {
+    mkdirSync(dirname(fx.releaseDir), { recursive: true });
+    symlinkSync(join(fx.root, "missing-target"), fx.releaseDir);
+    const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+    assert(!r.ok && r.reason.includes("is not a git checkout"), JSON.stringify(r));
+    assert(lstatSync(fx.releaseDir).isSymbolicLink(), "pin removed the user's symlink");
+  });
+});
+
+test("release", "a tag moved on origin is refused, not followed", () => {
+  withReleaseFixture((fx) => {
+    const opts = { tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout(opts).ok, "first pin refused");
+    fixtureGit(fx.origin, ["tag", "-f", "v1", fx.v2]);
+    const r = pinCheckout(opts);
+    assert(!r.ok && r.reason.includes("git fetch:"), JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD followed a tag that moved on origin");
+  });
+});
+
+test("release", "a release checkout with another origin is left alone", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    fixtureGit(fx.releaseDir, ["remote", "set-url", "origin", join(fx.root, "elsewhere")]);
+    const r = pinCheckout({ ...opts, tag: "v2" });
+    assert(!r.ok && r.reason.includes("fetches from"), JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved");
+  });
+});
+
+test("release", "a release checkout with dist/ stops pin before HEAD moves", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    mkdirSync(join(fx.releaseDir, "dist"));
+    writeFileSync(join(fx.releaseDir, "dist", "cli.js"), "// stale\n");
+    const r = pinCheckout({ ...opts, tag: "v2" });
+    assert(!r.ok && r.reason.includes("dist exists"), JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved");
+    assert(existsSync(join(fx.releaseDir, "dist", "cli.js")), "pin removed dist/");
+  });
+});
+
+test("release", "pin runs only from a checkout that has an origin", () => {
+  withReleaseFixture((fx) => {
+    const installed = join(fx.root, "lib", "node_modules", "@bu7umaid", "chamber");
+    mkdirSync(installed, { recursive: true });
+    const a = pinCheckout({ tag: "v1", sourceRoot: installed, releaseDir: fx.releaseDir });
+    assert(!a.ok && a.reason.includes("is not a git checkout"), JSON.stringify(a));
+
+    // A package installed into some project's node_modules sits inside that
+    // project's repository, and `git -C` would report the project's origin.
+    const vendored = join(fx.source, "node_modules", "@bu7umaid", "chamber");
+    mkdirSync(vendored, { recursive: true });
+    const b = pinCheckout({ tag: "v1", sourceRoot: vendored, releaseDir: fx.releaseDir });
+    assert(!b.ok && b.reason.includes("is not a git checkout"), JSON.stringify(b));
+
+    const lonely = join(fx.root, "no-origin");
+    fixtureGit(fx.root, ["init", "-q", "-b", "main", lonely]);
+    const c = pinCheckout({ tag: "v1", sourceRoot: lonely, releaseDir: fx.releaseDir });
+    assert(!c.ok && c.reason.includes("has no origin remote"), JSON.stringify(c));
+
+    assert(!existsSync(dirname(fx.releaseDir)), "a refused source created a directory");
+  });
+});
+
+/**
+ * A launchctl that models what launchd holds: `loadedScript` is the script of
+ * the definition it is running, or null when nothing is loaded. `list` shows it
+ * the way macOS does, in a ProgramArguments block, and exits 113 when nothing
+ * is loaded. `load` reads the plist file and, like launchd, keeps the old
+ * definition when one is already loaded. `load: "fails"` exits non-zero;
+ * `load: "lies"` exits 0 and loads nothing; `load: "stale"` exits 0 and loads
+ * BARE_SCRIPT whatever the plist says. `unload: "fails"` exits non-zero and
+ * leaves the agent loaded; `unload: "lies"` exits 0 and changes nothing.
+ */
+function fakeLaunchctl(start: {
+  loaded: boolean;
+  script?: string;
+  load?: "ok" | "fails" | "lies" | "stale";
+  unload?: "ok" | "fails" | "lies";
+}): {
+  run: Launchctl;
+  calls: string[];
+} {
+  let loadedScript: string | null = start.loaded ? (start.script ?? BARE_SCRIPT) : null;
+  const calls: string[] = [];
+  const done = (status: number, stdout = "", stderr = ""): LaunchctlResult => ({ status, stdout, stderr });
+  const run: Launchctl = (args) => {
+    calls.push(args.join(" "));
+    switch (args[0]) {
+      case "list":
+        if (loadedScript === null) return done(113, "", `Could not find service "${JOB_LABEL}" in domain for port`);
+        return done(
+          0,
+          `{\n\t"Label" = "${JOB_LABEL}";\n\t"ProgramArguments" = (\n\t\t"/bin/sh";\n\t\t"-lc";\n\t\t"${loadedScript}";\n\t);\n};\n`,
+        );
+      case "unload":
+        if (start.unload === "fails") return done(5, "", "Unload failed: 5: Input/output error");
+        if (start.unload !== "lies") loadedScript = null;
+        return done(0);
+      case "load": {
+        if (start.load === "fails") return done(5, "", "Load failed: 5: Input/output error");
+        if (start.load === "lies" || loadedScript !== null) return done(0);
+        if (start.load === "stale") {
+          loadedScript = BARE_SCRIPT;
+          return done(0);
+        }
+        const read = readJobPlist(readFileSync(args[1] ?? "", "utf8"));
+        assert(read.ok, "the fake launchctl was asked to load a plist Chamber does not recognise");
+        loadedScript = read.form === "pinned" ? PINNED_SCRIPT : BARE_SCRIPT;
+        return done(0);
+      }
+      default:
+        return done(64, "", `unexpected launchctl ${args.join(" ")}`);
+    }
+  };
+  return { run, calls };
+}
+
+function pinOpts(fx: ReleaseFixture, tag: string, launchctl: Launchctl): PinOptions {
+  return { tag, sourceRoot: fx.source, releaseDir: fx.releaseDir, plistPath: fx.plistPath, launchctl };
+}
+
+function writePlistFile(path: string, xml: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, xml);
+}
+
+function plistForm(path: string): string {
+  const read = readJobPlist(readFileSync(path, "utf8"));
+  return read.ok ? read.form : `refused: ${read.reason}`;
+}
+
+test("release", "pin points a loaded bare job at the release checkout and reloads it", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const lc = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(r.code === 0, r.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD is not v1");
+    assert(plistForm(fx.plistPath) === "pinned", plistForm(fx.plistPath));
+    assert(
+      JSON.stringify(lc.calls) ===
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `list ${JOB_LABEL}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+      lc.calls.join(" | "),
+    );
+    assert(r.out.some((l) => l.includes("is on v1")), r.out.join("\n"));
+    assert(r.out.some((l) => l.includes(`reloaded ${JOB_LABEL}`)), r.out.join("\n"));
+  });
+});
+
+test("release", "an agent that was not loaded is loaded, not unloaded", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const lc = fakeLaunchctl({ loaded: false });
+    const r = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(r.code === 0, r.err.join("\n"));
+    assert(
+      JSON.stringify(lc.calls) === JSON.stringify([`list ${JOB_LABEL}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+      lc.calls.join(" | "),
+    );
+    assert(r.out.some((l) => l.includes(`loaded ${JOB_LABEL}`)), r.out.join("\n"));
+  });
+});
+
+test("release", "pinning the tag already checked out still checks the plist", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: true }).run)).code === 0, "first pin failed");
+
+    // The bare template was copied over the pinned job again.
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const again = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "v1", again.run));
+    assert(r.code === 0, r.err.join("\n"));
+    assert(r.out.some((l) => l.includes("is already on v1")), r.out.join("\n"));
+    assert(plistForm(fx.plistPath) === "pinned", plistForm(fx.plistPath));
+    assert(again.calls.includes(`load ${fx.plistPath}`), again.calls.join(" | "));
+
+    // A pinned plist is not rewritten, but a loaded agent is still reloaded:
+    // launchd keeps the definition it loaded, not the file on disk.
+    const before = readFileSync(fx.plistPath, "utf8");
+    const idle = fakeLaunchctl({ loaded: true });
+    const r2 = pinRelease(pinOpts(fx, "v1", idle.run));
+    assert(r2.code === 0, r2.err.join("\n"));
+    assert(readFileSync(fx.plistPath, "utf8") === before, "a pinned plist was rewritten");
+    assert(
+      JSON.stringify(idle.calls) ===
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `list ${JOB_LABEL}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+      idle.calls.join(" | "),
+    );
+    assert(r2.out.some((l) => l.includes(`reloaded ${JOB_LABEL}`)), r2.out.join("\n"));
+  });
+});
+
+test("release", "a re-run after a failed unload still reloads the pinned job", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const failed = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: true, unload: "fails" }).run));
+    assert(failed.code === 1, "a failed unload exited 0");
+    assert(failed.err.some((l) => l.includes("launchctl unload failed")), failed.err.join("\n"));
+    assert(plistForm(fx.plistPath) === "pinned", plistForm(fx.plistPath));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD is not v1");
+
+    // The plist on disk is pinned, but launchd still holds the bare job.
+    const rerun = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "v1", rerun.run));
+    assert(r.code === 0, r.err.join("\n"));
+    assert(
+      JSON.stringify(rerun.calls) ===
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `list ${JOB_LABEL}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+      rerun.calls.join(" | "),
+    );
+    assert(r.out.some((l) => l.includes(`reloaded ${JOB_LABEL}`)), r.out.join("\n"));
+  });
+});
+
+test("release", "a job with another script stops pin before HEAD moves", () => {
+  withReleaseFixture((fx) => {
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "first pin failed");
+    const edited = jobPlistXml(`${BARE_SCRIPT}\necho extra`);
+    writePlistFile(fx.plistPath, edited);
+    const lc = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "v2", lc.run));
+    assert(r.code === 1, "pin accepted an edited job");
+    assert(r.err.some((l) => l.startsWith("chamber pin: ") && l.includes(fx.plistPath)), r.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved before the plist was checked");
+    assert(readFileSync(fx.plistPath, "utf8") === edited, "the edited plist was changed");
+    assert(lc.calls.length === 0, lc.calls.join(" | "));
+
+    rmSync(fx.releaseDir, { recursive: true, force: true });
+    const fresh = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(fresh.code === 1, "pin accepted an edited job on a first pin");
+    assert(!existsSync(fx.releaseDir), "a first pin cloned before the plist was checked");
+  });
+});
+
+test("release", "a missing plist still pins the checkout and exits 0", () => {
+  withReleaseFixture((fx) => {
+    const lc = fakeLaunchctl({ loaded: false });
+    const r = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(r.code === 0, r.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD is not v1");
+    assert(r.out.some((l) => l.includes(`no LaunchAgent was installed at ${fx.plistPath}`)), r.out.join("\n"));
+    assert(lc.calls.length === 0, lc.calls.join(" | "));
+    assert(!existsSync(fx.plistPath), "pin created a plist");
+  });
+});
+
+test("release", "a failed reload exits non-zero and keeps the checkout and the plist", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const lc = fakeLaunchctl({ loaded: true, load: "fails" });
+    const r = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(r.code === 1, "a failed load exited 0");
+    assert(r.err.some((l) => l.includes("launchctl load failed")), r.err.join("\n"));
+    assert(
+      JSON.stringify(lc.calls) ===
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `list ${JOB_LABEL}`, `load ${fx.plistPath}`]),
+      lc.calls.join(" | "),
+    );
+    assert(
+      r.err.some((l) => l.includes("the agent is now unloaded")),
+      `a failed load after a successful unload did not say the agent is unloaded:\n${r.err.join("\n")}`,
+    );
+    assert(headOf(fx.releaseDir) === fx.v1, "the release checkout is no longer at v1, so the failure rolled it back");
+    assert(plistForm(fx.plistPath) === "pinned", "the plist is no longer pinned, so the failure rolled it back");
+
+    // An agent that was not loaded has nothing to be "now unloaded".
+    const idle = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false, load: "fails" }).run));
+    assert(idle.code === 1, "a failed load exited 0");
+    assert(!idle.err.some((l) => l.includes("now unloaded")), idle.err.join("\n"));
+  });
+});
+
+test("release", "a reload that leaves the old definition loaded is a failure", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const lc = fakeLaunchctl({ loaded: true, unload: "lies" });
+    const r = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(r.code === 1, "an unload that changed nothing was reported as a reload");
+    assert(
+      r.err.some((l) => l.includes(`launchctl unload exited 0 but ${JOB_LABEL} is still loaded`)),
+      r.err.join("\n"),
+    );
+    assert(!lc.calls.some((c) => c.startsWith("load ")), `load ran after an unload that did not unload: ${lc.calls.join(" | ")}`);
+    assert(plistForm(fx.plistPath) === "pinned", plistForm(fx.plistPath));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD is not v1");
+  });
+});
+
+test("release", "a load that leaves another script running is a failure", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(PINNED_SCRIPT));
+    const lc = fakeLaunchctl({ loaded: true, script: BARE_SCRIPT, load: "stale" });
+    const r = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(r.code === 1, "a job running the bare script was reported as pinned");
+    assert(
+      r.err.some((l) => l.includes(`${JOB_LABEL} is loaded but launchd is not running the pinned script`)),
+      r.err.join("\n"),
+    );
+    assert(
+      r.err.some((l) => l.includes(`launchctl unload ${fx.plistPath}`) && l.includes(`launchctl load ${fx.plistPath}`)),
+      `no manual reload command:\n${r.err.join("\n")}`,
+    );
+    assert(!r.out.some((l) => l.includes(`reloaded ${JOB_LABEL}`)), r.out.join("\n"));
+  });
+});
+
+test("release", "a load that exits 0 without loading the agent is a failure", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const r = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false, load: "lies" }).run));
+    assert(r.code === 1, "an agent that never loaded was reported loaded");
+    assert(r.err.some((l) => l.includes("is not loaded")), r.err.join("\n"));
+  });
+});
+
+test("release", "a pin that fails writes no plist and calls no launchctl", () => {
+  withReleaseFixture((fx) => {
+    const bare = jobPlistXml(BARE_SCRIPT);
+    writePlistFile(fx.plistPath, bare);
+    const missing = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "nope", missing.run));
+    assert(r.code === 1, "a missing tag was pinned");
+    assert(readFileSync(fx.plistPath, "utf8") === bare, "a failed pin wrote the plist");
+    assert(missing.calls.length === 0, missing.calls.join(" | "));
+    assert(!existsSync(fx.releaseDir), "a failed first pin left its clone behind");
+
+    rmSync(fx.plistPath);
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "v1 failed");
+    writeFileSync(join(fx.releaseDir, "CHANGES.md"), "mine\n");
+    writePlistFile(fx.plistPath, bare);
+    const blocked = fakeLaunchctl({ loaded: true });
+    const r2 = pinRelease(pinOpts(fx, "v2", blocked.run));
+    assert(r2.code === 1 && r2.err.join("\n").includes("CHANGES.md"), r2.err.join("\n"));
+    assert(readFileSync(fx.plistPath, "utf8") === bare, "git refused the checkout and the plist was still written");
+    assert(blocked.calls.length === 0, blocked.calls.join(" | "));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved");
+  });
+});
+
+const PIN_CLI = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
+
+// CHAMBER_DB and CHAMBER_CONFIG point into the throwaway HOME as well. Before
+// `pin` is routed, the CLI falls through to config load and opens a database,
+// and that run must not reach the real one through an inherited variable.
+function runPinCli(home: string, args: readonly string[]): { status: number | null; stderr: string } {
+  const r = spawnSync(process.execPath, ["--experimental-strip-types", PIN_CLI, "pin", ...args], {
+    encoding: "utf8",
+    timeout: 30_000,
+    env: {
+      ...process.env,
+      HOME: home,
+      CHAMBER_DB: join(home, "never.sqlite"),
+      CHAMBER_CONFIG: join(home, "never.json"),
+    },
+  });
+  assert(r.error === undefined, `launch failed: ${r.error}`);
+  return { status: r.status, stderr: r.stderr ?? "" };
+}
+
+test("release", "chamber pin takes exactly one tag", () => {
+  const home = mkdtempSync(join(tmpdir(), "chamber-pin-home-"));
+  try {
+    for (const args of [[], ["v1", "v2"]]) {
+      const r = runPinCli(home, args);
+      assert(r.status === 1, `pin ${args.join(" ")}: status ${r.status}\n${r.stderr}`);
+      assert(r.stderr.includes("usage: chamber pin <tag>"), r.stderr);
+    }
+    assert(!existsSync(join(home, ".local")), "a usage error created a directory under HOME");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("release", "chamber pin refuses a flag-shaped tag before touching HOME", () => {
+  const home = mkdtempSync(join(tmpdir(), "chamber-pin-home-"));
+  try {
+    const r = runPinCli(home, ["-x"]);
+    assert(r.status === 1, `status ${r.status}\n${r.stderr}`);
+    assert(r.stderr.includes('chamber pin: the tag name "-x" starts with "-"'), r.stderr);
+    assert(!existsSync(join(home, ".local")), "a refused pin created the release directory");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 // ─── cli process smoke tests ────────────────────────────────────────────────
 

@@ -58,6 +58,7 @@ import {
 import { completeSync, syncCompletionAvailable } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { runAsk, stubDisclosure } from "./ask.ts";
+import { JOB_LABEL, RELEASE_SUBDIR, pinRelease, systemLaunchctl } from "./release_pin.ts";
 import {
   buildVerifyReport,
   findExcludedDocuments,
@@ -869,12 +870,37 @@ function cmdConfig(rest: string[]): void {
   }
 }
 
+/**
+ * `chamber pin <tag>`: keep ~/.local/share/chamber-release detached at a
+ * release tag and point the 08:30 job at it. See src/release_pin.ts. Like
+ * `init` and `config show`, this runs before config load and never opens the
+ * database. It touches neither, and it must work when either is broken.
+ */
+function cmdPin(rest: string[]): number {
+  const tag = rest[0];
+  if (rest.length !== 1 || tag === undefined) {
+    console.error("usage: chamber pin <tag>");
+    return 1;
+  }
+  const r = pinRelease({
+    tag,
+    sourceRoot: join(dirname(fileURLToPath(import.meta.url)), ".."),
+    releaseDir: join(homedir(), RELEASE_SUBDIR),
+    plistPath: join(homedir(), "Library", "LaunchAgents", `${JOB_LABEL}.plist`),
+    launchctl: systemLaunchctl,
+  });
+  for (const line of r.out) console.log(line);
+  for (const line of r.err) console.error(line);
+  return r.code;
+}
+
 function help(): void {
   console.log(`Chamber CLI — minimal vertical slice
 
 Usage:
   init [--force]                     write a starter config file
   config show                        print every setting and where it came from
+  pin <tag>                          run the 08:30 job from a release checkout at that tag
   --version                          print the version (works with a broken config)
   chamber turn "<message>"     Run one gated turn (stub model)
   chamber status               Spend + queue + counts
@@ -1000,6 +1026,10 @@ async function main(): Promise<void> {
   }
   if (cmd === "config") {
     cmdConfig(rest);
+    return;
+  }
+  if (cmd === "pin") {
+    process.exitCode = cmdPin(rest);
     return;
   }
 

@@ -3,6 +3,20 @@
 All notable changes to Chamber. Versions before 0.1.6 are described in the git
 history and the GitHub releases.
 
+## Unreleased
+
+### Added
+
+- `chamber pin <tag>` keeps a release checkout at
+  `~/.local/share/chamber-release`, detached at that tag, and points the 08:30
+  LaunchAgent at it. The job used to call the `chamber` on `PATH`, which
+  `npm link` points at the development checkout, so it ran whatever branch was
+  checked out. It now runs
+  `node "$HOME/.local/share/chamber-release/bin/chamber.js"` and never fetches.
+  Pin refuses before moving anything when the installed job's script is not
+  the shipped one, when the release checkout has tracked changes or `dist/`,
+  or when the tag has no `bin/chamber.js`.
+
 ## 0.1.9 — 2026-10-03
 
 ### Changed

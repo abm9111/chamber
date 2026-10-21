@@ -70,6 +70,27 @@ export type JobPlistRead =
 const PROGRAM_ARGUMENTS =
   /(<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]*)<\/string>\s*<string>([^<]*)<\/string>\s*<string>)([^<]*)(<\/string>\s*<\/array>)/;
 
+const XML_COMMENT = /<!--[\s\S]*?-->/g;
+
+function stripXmlComments(xml: string): string {
+  return xml.replace(XML_COMMENT, "");
+}
+
+/**
+ * The ProgramArguments block that is not inside an XML comment. The shipped
+ * template explains itself in comments, and a user may keep an old block
+ * commented out above the live one; the first match in the raw text is then the
+ * dead one.
+ */
+function findProgramArguments(xml: string): RegExpExecArray | null {
+  const comments = [...xml.matchAll(XML_COMMENT)].map((c) => [c.index, c.index + c[0].length] as const);
+  const all = new RegExp(PROGRAM_ARGUMENTS.source, "g");
+  for (let m = all.exec(xml); m !== null; m = all.exec(xml)) {
+    if (!comments.some(([from, to]) => m!.index >= from && m!.index < to)) return m;
+  }
+  return null;
+}
+
 // `&amp;` last, so `&amp;lt;` decodes once, to `&lt;`, and not on to `<`.
 function decodeXmlText(raw: string): string {
   return raw
@@ -86,10 +107,16 @@ function encodeXmlText(text: string): string {
 
 /** Which shipped form an installed job plist holds, or why it holds neither. */
 export function readJobPlist(xml: string): JobPlistRead {
-  if (xml.split("<key>ProgramArguments</key>").length !== 2) {
+  const live = stripXmlComments(xml);
+  if (live.split("<key>ProgramArguments</key>").length !== 2) {
     return { ok: false, reason: "ProgramArguments does not appear exactly once" };
   }
-  const m = PROGRAM_ARGUMENTS.exec(xml);
+  // launchd runs `Program` instead of ProgramArguments[0] when both exist, so a
+  // plist with the key could run something other than the script checked below.
+  if (/<key>\s*Program\s*<\/key>/.test(live)) {
+    return { ok: false, reason: "it has a Program key, which overrides ProgramArguments[0]" };
+  }
+  const m = findProgramArguments(xml);
   if (m === null || m[2] !== "/bin/sh" || m[3] !== "-lc" || m[4] === undefined) {
     return { ok: false, reason: "ProgramArguments is not /bin/sh -lc followed by one script" };
   }
@@ -107,12 +134,15 @@ export function pinJobPlist(xml: string): string {
   const read = readJobPlist(xml);
   if (!read.ok) throw new Error(read.reason);
   if (read.form === "pinned") return xml;
-  // A replacer function, not a replacement string: the script is full of `$`,
-  // and String.prototype.replace reads `$'` and `$&` in a string as patterns.
-  return xml.replace(
-    PROGRAM_ARGUMENTS,
-    (_all: string, head: string, _shell: string, _flag: string, _script: string, tail: string) =>
-      `${head}${encodeXmlText(PINNED_SCRIPT)}${tail}`,
+  const m = findProgramArguments(xml);
+  if (m === null) throw new Error("ProgramArguments vanished between the read and the rewrite");
+  // Spliced by position, not with String.prototype.replace: the script is full
+  // of `$`, which replace reads as a pattern, and the match to rewrite is the
+  // live block, which need not be the first one in the text.
+  const head = m[1] ?? "";
+  const tail = m[5] ?? "";
+  return (
+    xml.slice(0, m.index) + head + encodeXmlText(PINNED_SCRIPT) + tail + xml.slice(m.index + m[0].length)
   );
 }
 
@@ -305,7 +335,12 @@ export function originCredentialRefusal(url: string): string | null {
   try {
     parsed = new URL(url);
   } catch {
-    return null; // not a URL: a path, or scp-like user@host:path
+    // The parser rejects some http(s) URLs git still accepts (a port out of
+    // range, a fragment before the host), and userinfo can hide in those. Only
+    // what is not http(s) at all is a path or an scp-like user@host:path.
+    return /^https?:/i.test(url)
+      ? "the origin URL could not be parsed, so it cannot be checked for credentials; use a plain URL and a credential helper"
+      : null;
   }
   if ((parsed.protocol === "http:" || parsed.protocol === "https:") && (parsed.username !== "" || parsed.password !== "")) {
     return "the origin URL carries credentials; use a credential helper instead";
@@ -401,6 +436,11 @@ export const systemLaunchctl: Launchctl = (args) => {
 export interface PinOptions extends CheckoutOptions {
   plistPath: string;
   launchctl: Launchctl;
+  /**
+   * The environment the proof run gets (its HOME decides which login profile
+   * the shell reads). Defaults to process.env.
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface PinOutcome {
@@ -471,7 +511,10 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
   }
   const listed = launchctl(["list", JOB_LABEL]);
   if (listed.status !== 0) {
-    err.push(`chamber pin: launchctl load exited 0 but ${JOB_LABEL} is not loaded`);
+    err.push(
+      `chamber pin: launchctl load exited 0 but ${JOB_LABEL} is not loaded, so the 08:30 job will not run; ` +
+        `load it with: launchctl load ${plistPath}`,
+    );
     return 1;
   }
   if (!listed.stdout.includes(PINNED_SCRIPT)) {
@@ -483,11 +526,56 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
   return 0;
 }
 
+const RUN_PROOF_TIMEOUT_MS = 60_000;
+
+/**
+ * Run the release the way the job will: the same `/bin/sh -lc`, the same
+ * `node`. A tag that checks out cleanly can still fail to run (a Node too old,
+ * a `node` the login shell cannot find, a bin that throws), and without this
+ * pin would rewrite the job to a release that cannot start, and the next
+ * morning's check would not happen.
+ */
+type RunProof = { ok: true; version: string } | { ok: false; reason: string };
+
+function proveReleaseRuns(releaseDir: string, env: NodeJS.ProcessEnv): RunProof {
+  const pkgPath = join(releaseDir, "package.json");
+  let version: unknown;
+  try {
+    version = (JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: unknown }).version;
+  } catch (e) {
+    return { ok: false, reason: `${pkgPath} cannot be read: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  if (typeof version !== "string" || version === "") return { ok: false, reason: `${pkgPath} has no version` };
+
+  const r = spawnSync("/bin/sh", ["-lc", 'node "$1" --version', "sh", join(releaseDir, "bin", "chamber.js")], {
+    encoding: "utf8",
+    env,
+    timeout: RUN_PROOF_TIMEOUT_MS,
+  });
+  if (r.error !== undefined) {
+    const timedOut = (r.error as NodeJS.ErrnoException).code === "ETIMEDOUT";
+    return { ok: false, reason: timedOut ? `it did not finish in ${RUN_PROOF_TIMEOUT_MS / 1000}s` : String(r.error) };
+  }
+  if (r.status !== 0) {
+    const said = (r.stderr ?? "").trim().split("\n").slice(-3).join(" | ").slice(0, 300);
+    return { ok: false, reason: `it exited ${r.status ?? `from signal ${r.signal}`}${said !== "" ? `: ${said}` : ""}` };
+  }
+  const printed = (r.stdout ?? "").trim();
+  if (printed !== version) {
+    return {
+      ok: false,
+      reason: `--version printed ${JSON.stringify(printed.slice(0, 80))}, but its package.json says ${JSON.stringify(version)}`,
+    };
+  }
+  return { ok: true, version };
+}
+
 /**
  * `chamber pin <tag>`. The installed job is checked before the checkout
  * moves, and written only after the checkout is on the tag with
- * bin/chamber.js on disk. With no job installed, the checkout is still
- * pinned and the run exits 0.
+ * bin/chamber.js on disk and after that release has run once, `--version`,
+ * under the job's own login shell. With no job installed, the checkout is
+ * still pinned and, if the release runs, the run exits 0.
  */
 export function pinRelease(opts: PinOptions): PinOutcome {
   const out: string[] = [];
@@ -510,6 +598,13 @@ export function pinRelease(opts: PinOptions): PinOutcome {
       ? `${opts.releaseDir} is already on ${opts.tag} (${short})`
       : `${opts.releaseDir} is on ${opts.tag} (${short})`,
   );
+  const proof = proveReleaseRuns(opts.releaseDir, opts.env ?? process.env);
+  if (!proof.ok) {
+    err.push(`chamber pin: the release at ${opts.tag} did not run: ${proof.reason}`);
+    err.push(`${opts.releaseDir} stays on ${opts.tag}; the job and its plist were not changed`);
+    return { code: 1, out, err };
+  }
+  out.push(`the release runs: node bin/chamber.js --version printed ${proof.version}`);
   if (!existsSync(opts.plistPath)) {
     out.push(`no LaunchAgent was installed at ${opts.plistPath}; nothing else was changed`);
     return { code: 0, out, err };

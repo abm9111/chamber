@@ -13245,6 +13245,53 @@ test("config", "failed weights degrade embedLocal and make the batch path throw"
   }
 });
 
+test("config", "chamber-jobs.service keeps the hardening chamber.service has, and the jobs path cannot reach a sandbox", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const unit = readFileSync(join(root, "deploy", "systemd", "chamber-jobs.service"), "utf8");
+  const have = new Set(unit.split("\n").map((l) => l.trim()));
+  for (const want of [
+    "NoNewPrivileges=true",
+    "CapabilityBoundingSet=",
+    "AmbientCapabilities=",
+    "LockPersonality=true",
+    "RestrictRealtime=true",
+    "SystemCallFilter=@system-service",
+    "SystemCallErrorNumber=EPERM",
+  ]) {
+    assert(have.has(want), `chamber-jobs.service lacks ${want}`);
+  }
+
+  // SystemCallFilter=@system-service would stop bubblewrap (it needs unshare
+  // and mount), so it is only safe on this unit while `chamber jobs run` cannot
+  // reach the sandbox or start any child process. Walk the imports of the job
+  // queue, the module `jobs run` calls, and fail if that stops being true: the
+  // answer is then to revisit the filter, not to delete this test.
+  const seen = new Set<string>();
+  const stack = [join(root, "src", "job_queue.ts")];
+  while (stack.length > 0) {
+    const file = stack.pop()!;
+    if (seen.has(file)) continue;
+    seen.add(file);
+    const text = readFileSync(file, "utf8");
+    for (const m of text.matchAll(/(?:from\s+|import\s*\(\s*|import\s+)["'](\.[^"']+\.ts)["']/g)) {
+      stack.push(resolve(dirname(file), m[1]!));
+    }
+  }
+  const reached = [...seen].map((f) => relative(root, f)).sort();
+  for (const forbidden of ["src/sandbox.ts", "src/tools.ts", "src/mcp_bridge.ts"]) {
+    assert(!reached.includes(forbidden), `chamber jobs run now reaches ${forbidden}: ${reached.join(", ")}`);
+  }
+  // worker_threads is checked too: turn_pool.ts starts workers, and a worker
+  // is a thread the filter has to let through, not a process, but it is the
+  // other way a job path grows beyond a single plain thread.
+  for (const f of reached) {
+    const src = readFileSync(join(root, f), "utf8");
+    for (const mod of ["node:child_process", "node:worker_threads"]) {
+      assert(!src.includes(mod), `${f} imports ${mod} and is reachable from chamber jobs run`);
+    }
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

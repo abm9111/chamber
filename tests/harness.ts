@@ -13922,6 +13922,24 @@ test("release", "the daily snapshot says the release checkout is missing instead
   }
 });
 
+test("release", "the daily snapshot does not take the release name from a repository around HOME", () => {
+  const home = mkdtempSync(join(tmpdir(), "chamber-snapshot-"));
+  try {
+    // HOME itself is a tagged git repository, and the release checkout under
+    // it has chamber.js but no .git. Git run from the checkout would walk up
+    // and answer with HOME's tag.
+    fixtureGit(home, ["init", "--quiet"]);
+    const sha = fixtureCommit(home, { "README.md": "home\n" }, "home");
+    fixtureGit(home, ["update-ref", "HEAD", sha]);
+    fixtureGit(home, ["tag", "vHOME", sha]);
+    const report = runSnapshot(home, { verifyExit: 0 });
+    assert(/^release: unknown$/m.test(report), `a checkout without .git has no known release:\n${report}`);
+    assert(!report.includes("vHOME"), `the report named the tag of the repository around HOME:\n${report}`);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("release", "the daily snapshot has no stale labels, and its plist runs the release checkout's copy", () => {
   const root = join(dirname(fileURLToPath(import.meta.url)), "..");
   const script = readFileSync(join(root, "scripts", "daily-snapshot.sh"), "utf8");

@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS pending_write (
   reason            TEXT,                  -- why the agent wants this write
   created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   decided_at        TEXT,
-  decided_by        TEXT,                  -- human | auto_policy
+  decided_by        TEXT,                  -- human (CLI) | auto_policy | system (TTL expiry) | http | slack:<id> | discord:<id>
   decision_note     TEXT,
   expires_at        TEXT,                  -- pending TTL; expire ≠ approve
   applied_at        TEXT

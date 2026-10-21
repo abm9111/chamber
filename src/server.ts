@@ -13,12 +13,13 @@
  *   GET  /status
  *   GET  /queue
  *   POST /turn          { "message": "..." }
- *   POST /approve       { "writeId": "..." }
+ *   POST /approve       { "writeId": "..." }   (decided_by is always "http")
  *   POST /reject        { "writeId": "...", "note": "..." }
  *   POST /deliberate    { "kind", "subjectId", "question", "stakes?" }
  *   GET  /checkpoint
  */
 
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 import { openChamberDb } from "./db.ts";
@@ -113,6 +114,36 @@ function originAllowed(req: IncomingMessage): boolean {
   // Same-origin form posts and some clients send `Origin: null`; it names no
   // allowlistable host, so it is treated as untrusted rather than absent.
   return CORS_ORIGINS.has(origin);
+}
+
+/** Hostnames a request may name when no token protects the port. */
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/**
+ * With no token set, does this request's `Host` header name this machine?
+ *
+ * Binding 127.0.0.1 keeps other machines out, but not a web page the operator
+ * is browsing: DNS rebinding points `attacker.example` at 127.0.0.1, the
+ * browser then treats `http://attacker.example:8787` as that page's own origin,
+ * and with no token nothing else stands in the way. The page's `Host` header is
+ * still `attacker.example`, so refusing every Host that is not loopback closes
+ * it. The hostname comes from parsing `http://<Host>`, which drops the port and
+ * any userinfo (`127.0.0.1@attacker.example` has the host `attacker.example`);
+ * a header that does not parse, or is missing, is refused.
+ *
+ * With a token the check is off: the token is the credential, and proxies that
+ * forward `Host: $host` must keep working. Every proxy deployment in `deploy/`
+ * sets one.
+ */
+function hostAllowed(req: IncomingMessage): boolean {
+  if (API_TOKEN) return true;
+  const header = req.headers.host;
+  if (typeof header !== "string" || header === "") return false;
+  try {
+    return LOOPBACK_HOSTS.has(new URL(`http://${header}`).hostname);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -266,19 +297,110 @@ function requireAuth(
   return false;
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+/** Largest request body Chamber will read: the `client_max_body_size 1m` of deploy/nginx-chamber.conf. */
+const MAX_BODY_BYTES = 1_048_576;
+/** After a 413, how much more of the body is thrown away before the socket is closed. */
+const LINGER_BYTES = 8 * 1024 * 1024;
+/** After a 413, how long the client has to finish sending before the socket is closed. */
+const LINGER_MS = 2000;
+
+/**
+ * Answer 413 and close, without ever buffering the body.
+ *
+ * The response is written whole (it has a Content-Length, so the client has
+ * everything it needs) and `res.end()` is held back while the rest of the
+ * upload is read and discarded, up to LINGER_BYTES or LINGER_MS. Closing at
+ * once is what a naive refusal does, and measured here it loses the response
+ * more often than not: the client is still writing 2 MiB, the close resets the
+ * connection, and the 413 never arrives (22 of 40 tries saw no response at
+ * all). Discarding is not reading: nothing is kept.
+ */
+function refuseBody(req: IncomingMessage, res: ServerResponse): void {
+  const payload = JSON.stringify({ error: "payload_too_large", limit: MAX_BODY_BYTES }, null, 2);
+  res.writeHead(413, {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(payload),
+    Connection: "close",
+  });
+  res.write(payload);
+  let discarded = 0;
+  let finished = false;
+  const finish = (): void => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    res.end();
+  };
+  const timer = setTimeout(finish, LINGER_MS);
+  req.on("data", (c: Buffer) => {
+    discarded += c.length;
+    if (discarded > LINGER_BYTES) finish();
+  });
+  req.on("end", finish);
+  req.on("error", finish);
+  req.on("close", finish);
+}
+
+/**
+ * The request body as text, or null after answering 413 itself.
+ *
+ * A declared Content-Length over the cap is refused before a byte is read. A
+ * body with no Content-Length (chunked) is refused the moment the running total
+ * passes the cap, and what was buffered is dropped.
+ */
+function readBody(req: IncomingMessage, res: ServerResponse): Promise<string | null> {
+  const declared = Number(req.headers["content-length"]);
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+    refuseBody(req, res);
+    return Promise.resolve(null);
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    let total = 0;
+    let refused = false;
+    req.on("data", (c: Buffer) => {
+      if (refused) return;
+      total += c.length;
+      if (total > MAX_BODY_BYTES) {
+        refused = true;
+        chunks.length = 0;
+        refuseBody(req, res);
+        resolve(null);
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (!refused) resolve(Buffer.concat(chunks).toString("utf8"));
+    });
     req.on("error", reject);
   });
 }
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const raw = await readBody(req);
+/**
+ * The request body as a JSON object, or null after answering the request itself
+ * (413 for a body over the cap, 400 `invalid_json` for text that is not JSON or
+ * is JSON but not an object). An empty body is `{}`.
+ */
+async function readJson(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<Record<string, unknown> | null> {
+  const raw = await readBody(req, res);
+  if (raw === null) return null;
   if (!raw.trim()) return {};
-  return JSON.parse(raw) as Record<string, unknown>;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    json(res, 400, { error: "invalid_json" });
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    json(res, 400, { error: "invalid_json" });
+    return null;
+  }
+  return parsed as Record<string, unknown>;
 }
 
 // CORS is applied once per request with `res.setHeader` in the handler below,
@@ -435,6 +557,13 @@ function runTurn(message: string): Record<string, unknown> {
 
 const server = createServer(async (req, res) => {
   try {
+    // First, before CORS headers, the OPTIONS branch, the Origin check and auth,
+    // and for every path including /health: see `hostAllowed`.
+    if (!hostAllowed(req)) {
+      json(res, 403, { error: "host_not_allowed" });
+      return;
+    }
+
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${PORT}`);
     const path = url.pathname;
     const method = req.method ?? "GET";
@@ -536,7 +665,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (method === "POST" && path === "/turn") {
-      const body = await readJson(req);
+      const body = await readJson(req, res);
+      if (body === null) return;
       const message = String(body.message ?? body.text ?? "").trim();
       if (!message) {
         json(res, 400, { error: "message required" });
@@ -547,17 +677,21 @@ const server = createServer(async (req, res) => {
     }
 
     if (method === "POST" && path === "/approve") {
-      const body = await readJson(req);
+      const body = await readJson(req, res);
+      if (body === null) return;
       const writeId = String(body.writeId ?? "");
       if (!writeId) {
         json(res, 400, { error: "writeId required" });
         return;
       }
-      const actor = String(body.actor ?? "human");
+      // The decider is "http", always. `body.actor` used to be written into
+      // `pending_write.decided_by`, so a caller could sign its approval as
+      // `human` or `slack:U123`. A route that cannot tell who is calling must
+      // not let the caller say.
       const r = decideWrite(db, {
         writeId,
         decision: "approved",
-        decidedBy: actor,
+        decidedBy: "http",
       });
       let applied = null;
       if (r.ok && (r.status === "approved" || r.idempotent)) {
@@ -572,13 +706,13 @@ const server = createServer(async (req, res) => {
     }
 
     if (method === "POST" && path === "/reject") {
-      const body = await readJson(req);
+      const body = await readJson(req, res);
+      if (body === null) return;
       const writeId = String(body.writeId ?? "");
-      const actor = String(body.actor ?? "human");
       const r = decideWrite(db, {
         writeId,
         decision: "rejected",
-        decidedBy: actor,
+        decidedBy: "http",
         note: body.note ? String(body.note) : undefined,
       });
       const status = r.ok ? 200 : r.code === "not_found" ? 404
@@ -590,7 +724,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (method === "POST" && path === "/deliberate") {
-      const body = await readJson(req);
+      const body = await readJson(req, res);
+      if (body === null) return;
       const kind = String(body.kind ?? "other") as
         | "skill"
         | "belief"
@@ -629,7 +764,19 @@ const server = createServer(async (req, res) => {
 
     json(res, 404, { error: "not found" });
   } catch (err) {
-    json(res, 500, { error: String(err) });
+    // The client learns that something failed and a number to quote; the cause
+    // goes to stderr beside the same number. `String(err)` used to be the body,
+    // which sent paths, SQL and module names to whoever asked.
+    const id = randomUUID().slice(0, 8);
+    process.stderr.write(
+      `chamber server error ${id}: ${formatErrorChain(err).join("; ")}\n` +
+        `${err instanceof Error && err.stack ? err.stack : ""}\n`,
+    );
+    if (res.headersSent) {
+      res.end();
+    } else {
+      json(res, 500, { error: "internal_error", id });
+    }
   }
 });
 

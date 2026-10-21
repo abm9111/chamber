@@ -256,6 +256,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { fileURLToPath } from "node:url";
 import { spawnSync, spawn, execFileSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
+import type { AddressInfo } from "node:net";
 import {
   appendFileSync,
   chmodSync,
@@ -296,6 +297,7 @@ type Suite =
   | "release"
   | "model"
   | "db"
+  | "server"
   | "all";
 
 interface TestResult {
@@ -409,6 +411,7 @@ function suiteFromArg(): Suite {
     "release",
     "model",
     "db",
+    "server",
     "all",
   ].includes(v)
     ? v
@@ -16030,6 +16033,330 @@ test("db", "an in-memory database touches no file and prints nothing", () => {
   const { value, stderr } = captureStderr(() => openChamberDb(":memory:"));
   value.close();
   assert(stderr === "", `got ${JSON.stringify(stderr)}`);
+});
+
+// ─── LIVE SERVER FIXTURE (src/server.ts as a real process) ───────────────────
+
+/** A TCP port that was free a moment ago. */
+async function freePort(): Promise<number> {
+  const { createServer: createNetServer } = await import("node:net");
+  return new Promise<number>((ok, fail) => {
+    const probe = createNetServer();
+    probe.once("error", fail);
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address() as AddressInfo;
+      probe.close(() => ok(port));
+    });
+  });
+}
+
+interface LiveReply {
+  status: number;
+  headers: Record<string, string | string[] | undefined>;
+  text: string;
+  /** The body parsed as JSON, or null when it is not JSON. */
+  json: unknown;
+  /** Milliseconds from sending the request to the end of the response. */
+  ms: number;
+}
+
+interface LiveRequest {
+  method?: string;
+  path: string;
+  headers?: Record<string, string>;
+  body?: string | Buffer;
+}
+
+interface LiveServer {
+  port: number;
+  dbPath: string;
+  stdout: () => string;
+  stderr: () => string;
+  request: (req: LiveRequest) => Promise<LiveReply>;
+  stop: () => Promise<void>;
+}
+
+/**
+ * Start `src/server.ts` as its own process on a free port and wait for its
+ * "Chamber HTTP" line.
+ *
+ * It is a process, not an import, because the server opens its database and
+ * listens at module scope, and because these tests exist to catch what a stubbed
+ * handler cannot: the event loop, the socket and the response a client really
+ * sees. The database is a file in a temp directory (a worker thread cannot share
+ * `:memory:`). `setup` runs before the process starts and may seed that file.
+ * Config-deciding variables, any ambient token and the embedder selectors are
+ * removed first, so the developer's shell cannot change what a test proves.
+ */
+async function startLiveServer(
+  overrides: Record<string, string> = {},
+  setup?: (dbPath: string) => void,
+): Promise<LiveServer> {
+  const { request: httpRequest } = await import("node:http");
+  const dir = mkdtempSync(join(tmpdir(), "chamber-live-"));
+  const dbPath = join(dir, "live.sqlite");
+  setup?.(dbPath);
+  const port = await freePort();
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of CONFIG_ENV_KEYS) delete env[key];
+  delete env.CHAMBER_API_TOKEN;
+  delete env.CHAMBER_CORS_ORIGIN;
+  delete env.CHAMBER_EMBEDDER;
+  delete env.CHAMBER_PYTHON;
+  const child = spawn(process.execPath, ["--experimental-strip-types", SERVER_PATH], {
+    env: { ...env, PORT: String(port), CHAMBER_BIND: "127.0.0.1", CHAMBER_DB: dbPath, ...overrides },
+  });
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d: Buffer) => {
+    out += d.toString();
+  });
+  child.stderr.on("data", (d: Buffer) => {
+    err += d.toString();
+  });
+  const exited = new Promise<number | null>((ok) => child.once("exit", (code) => ok(code)));
+  await new Promise<void>((ok, fail) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      fail(new Error(`server did not start within 15 s:\n${out}${err}`));
+    }, 15_000);
+    const poll = setInterval(() => {
+      if (out.includes("Chamber HTTP")) {
+        clearInterval(poll);
+        clearTimeout(timer);
+        ok();
+      }
+    }, 25);
+    void exited.then((code) => {
+      clearInterval(poll);
+      clearTimeout(timer);
+      fail(new Error(`server exited ${code} before listening:\n${out}${err}`));
+    });
+  });
+  const request = (req: LiveRequest): Promise<LiveReply> =>
+    new Promise<LiveReply>((ok, fail) => {
+      const started = Date.now();
+      const payload =
+        req.body === undefined
+          ? undefined
+          : typeof req.body === "string"
+            ? Buffer.from(req.body, "utf8")
+            : req.body;
+      const headers: Record<string, string> = { ...(req.headers ?? {}) };
+      const chunked = Object.keys(headers).some((k) => k.toLowerCase() === "transfer-encoding");
+      if (payload !== undefined && !chunked) headers["Content-Length"] = String(payload.length);
+      const clientReq = httpRequest(
+        { host: "127.0.0.1", port, method: req.method ?? "GET", path: req.path, agent: false, headers },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString("utf8");
+            let parsed: unknown = null;
+            try {
+              parsed = JSON.parse(text);
+            } catch {
+              // Not JSON; `text` still carries it.
+            }
+            ok({
+              status: res.statusCode ?? 0,
+              headers: res.headers,
+              text,
+              json: parsed,
+              ms: Date.now() - started,
+            });
+          });
+        },
+      );
+      clientReq.on("error", fail);
+      clientReq.end(payload);
+    });
+  return {
+    port,
+    dbPath,
+    stdout: () => out,
+    stderr: () => err,
+    request,
+    stop: async () => {
+      child.kill("SIGTERM");
+      await exited;
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+// ─── SERVER: Host check, body limits, 500 shape, /approve actor ─────────────
+
+test("server", "with no token, a Host that is not loopback is refused on every path", async () => {
+  const s = await startLiveServer();
+  try {
+    for (const [method, path] of [["GET", "/status"], ["GET", "/health"], ["OPTIONS", "/approve"], ["POST", "/turn"]] as const) {
+      const r = await s.request({ method, path, headers: { Host: "attacker.example" }, body: method === "POST" ? "{}" : undefined });
+      assert(r.status === 403, `${method} ${path} with a foreign Host gave ${r.status}`);
+      assert(
+        JSON.stringify(r.json) === '{"error":"host_not_allowed"}',
+        `${method} ${path}: wrong body ${r.text}`,
+      );
+    }
+    // A name that merely starts like a loopback one is still foreign.
+    for (const host of ["127.0.0.1.attacker.example", "localhost.attacker.example:80", "127.0.0.1@attacker.example"]) {
+      const r = await s.request({ path: "/status", headers: { Host: host } });
+      assert(r.status === 403, `Host ${host} gave ${r.status}`);
+    }
+    for (const host of [`127.0.0.1:${s.port}`, `localhost:${s.port}`, `[::1]:${s.port}`, "LOCALHOST"]) {
+      const r = await s.request({ path: "/status", headers: { Host: host } });
+      assert(r.status === 200, `Host ${host} gave ${r.status}: ${r.text}`);
+    }
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "with a token, the Host header is not policed and the token still is", async () => {
+  const s = await startLiveServer({ CHAMBER_API_TOKEN: "test-token-value" });
+  try {
+    const ok = await s.request({
+      path: "/status",
+      headers: { Host: "chamber.example.com", Authorization: "Bearer test-token-value" },
+    });
+    assert(ok.status === 200, `a proxied Host with a valid token gave ${ok.status}: ${ok.text}`);
+    const noToken = await s.request({ path: "/status", headers: { Host: "chamber.example.com" } });
+    assert(noToken.status === 401, `no token gave ${noToken.status}`);
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "a request body over 1 MiB is refused with 413 and the server keeps serving", async () => {
+  const s = await startLiveServer();
+  try {
+    const two = Buffer.alloc(2 * 1024 * 1024, 97);
+    const declared = await s.request({ method: "POST", path: "/turn", body: two });
+    assert(declared.status === 413, `a 2 MiB Content-Length body gave ${declared.status}`);
+    assert(
+      JSON.stringify(declared.json) === '{"error":"payload_too_large","limit":1048576}',
+      `wrong 413 body: ${declared.text}`,
+    );
+    assert(
+      String(declared.headers.connection).toLowerCase() === "close",
+      `the 413 must say Connection: close, got ${String(declared.headers.connection)}`,
+    );
+    const chunked = await s.request({
+      method: "POST",
+      path: "/turn",
+      headers: { "Transfer-Encoding": "chunked" },
+      body: two,
+    });
+    assert(chunked.status === 413, `a 2 MiB chunked body gave ${chunked.status}`);
+    const after = await s.request({ path: "/health" });
+    assert(after.status === 200, `the server must answer the next request, got ${after.status}`);
+
+    // The boundary: exactly 1 MiB passes the size check, one byte more does not.
+    const shell = '{"writeId":"","pad":""}';
+    const atCap = Buffer.from(`{"writeId":"","pad":"${"a".repeat(1_048_576 - shell.length)}"}`);
+    assert(atCap.length === 1_048_576, `setup: ${atCap.length}`);
+    const exact = await s.request({ method: "POST", path: "/approve", body: atCap });
+    assert(exact.status === 400 && /writeId required/.test(exact.text), `exactly 1 MiB must be read: ${exact.status} ${exact.text.slice(0, 100)}`);
+    const over = await s.request({ method: "POST", path: "/approve", body: Buffer.concat([atCap, Buffer.from(" ")]) });
+    assert(over.status === 413, `1 MiB + 1 byte gave ${over.status}`);
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "a body that is not a JSON object is a 400 invalid_json, an empty body is {}", async () => {
+  const s = await startLiveServer();
+  try {
+    for (const body of ["{", "[]", '"text"', "5", "null", "not json"]) {
+      const r = await s.request({ method: "POST", path: "/approve", body });
+      assert(r.status === 400, `${JSON.stringify(body)} gave ${r.status}`);
+      assert(
+        JSON.stringify(r.json) === '{"error":"invalid_json"}',
+        `${JSON.stringify(body)}: wrong body ${r.text}`,
+      );
+    }
+    const empty = await s.request({ method: "POST", path: "/approve", body: "" });
+    assert(
+      empty.status === 400 && JSON.stringify(empty.json) === '{"error":"writeId required"}',
+      `an empty body is {}, which then fails on its own terms: ${empty.status} ${empty.text}`,
+    );
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "a handler error answers 500 internal_error with an id, and the detail goes to stderr", async () => {
+  // CHAMBER_MODEL=openai makes POST /turn throw "turn unavailable" before it
+  // writes anything: a real handler error through the real path.
+  const s = await startLiveServer({ CHAMBER_MODEL: "openai" });
+  try {
+    const r = await s.request({ method: "POST", path: "/turn", body: '{"message":"hello"}' });
+    assert(r.status === 500, `expected 500, got ${r.status}: ${r.text}`);
+    const body = r.json as { error?: string; id?: string } | null;
+    assert(body !== null && Object.keys(body).sort().join(",") === "error,id", `wrong shape: ${r.text}`);
+    assert(body.error === "internal_error", `wrong error: ${r.text}`);
+    assert(/^[0-9a-f]{8}$/.test(body.id ?? ""), `id must be 8 hex characters: ${r.text}`);
+    assert(!/turn unavailable/.test(r.text), `no error text may reach the client: ${r.text}`);
+    // stderr is a separate pipe; give it a moment to arrive.
+    const deadline = Date.now() + 3000;
+    while (!s.stderr().includes(`chamber server error ${body.id}:`) && Date.now() < deadline) {
+      await new Promise((ok) => setTimeout(ok, 25));
+    }
+    assert(
+      s.stderr().includes(`chamber server error ${body.id}: `) && /turn unavailable/.test(s.stderr()),
+      `stderr must carry the same id and the detail:\n${s.stderr()}`,
+    );
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "/approve and /reject record decided_by 'http' whatever actor the caller names", async () => {
+  const ids: string[] = [];
+  const s = await startLiveServer({}, (dbPath) => {
+    const seed = openChamberDb(dbPath);
+    for (const subject of ["approve-me", "reject-me"]) {
+      const q = proposeWrite(seed, {
+        target: "skill",
+        action: "create",
+        subject,
+        payload: { body: "x" },
+        origin: "background_review",
+        reason: "test",
+      });
+      assert(q.status === "queued", `setup: ${JSON.stringify(q)}`);
+      ids.push(q.writeId);
+    }
+    seed.close();
+  });
+  try {
+    const approved = await s.request({
+      method: "POST",
+      path: "/approve",
+      body: JSON.stringify({ writeId: ids[0], actor: "admin" }),
+    });
+    assert(approved.status === 200, `approve gave ${approved.status}: ${approved.text}`);
+    const rejected = await s.request({
+      method: "POST",
+      path: "/reject",
+      body: JSON.stringify({ writeId: ids[1], actor: "admin" }),
+    });
+    assert(rejected.status === 200, `reject gave ${rejected.status}: ${rejected.text}`);
+    const check = openChamberDb(s.dbPath);
+    try {
+      const rows = check
+        .prepare(`SELECT id, decided_by FROM pending_write WHERE id IN (?, ?) ORDER BY id`)
+        .all(ids[0]!, ids[1]!) as { id: string; decided_by: string }[];
+      assert(rows.length === 2, `setup: expected both rows, got ${rows.length}`);
+      for (const row of rows) {
+        assert(row.decided_by === "http", `${row.id} was decided by ${row.decided_by}, want http`);
+      }
+    } finally {
+      check.close();
+    }
+  } finally {
+    await s.stop();
+  }
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────

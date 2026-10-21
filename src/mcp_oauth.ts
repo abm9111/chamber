@@ -16,6 +16,7 @@ import { spawnSync } from "node:child_process";
 import type { DatabaseSync } from "node:sqlite";
 import { appendAudit } from "./audit.ts";
 import { canSealSecrets, sealSecret, openSecret } from "./secret_box.ts";
+import { isLoopbackBase } from "./config.ts";
 
 const META_TTL_MS = 60 * 60 * 1000;
 
@@ -121,9 +122,26 @@ export function normalizeResourceUrl(url: string): string {
   return `${u.origin}${path}`;
 }
 
-function requireHttps(url: string, label: string): void {
+/**
+ * Refuse to send OAuth traffic anywhere but TLS or this machine.
+ *
+ * This used to test the *string*: `startsWith("http://127.0.0.1")` accepts
+ * `http://127.0.0.1.attacker.invalid/x` and `http://127.0.0.1@attacker.invalid/x`,
+ * and a refresh token and client secret go to whatever host the URL really
+ * names. The decision is now made on the parsed URL. `https:` passes; `http:`
+ * passes only for the loopback hosts `isLoopbackBase` accepts; anything else,
+ * including a string that does not parse, is refused with the same message.
+ */
+export function requireHttps(url: string, label: string): void {
   if (process.env.CHAMBER_OAUTH_ALLOW_HTTP === "1") return;
-  if (!url.startsWith("https://") && !url.startsWith("http://127.0.0.1") && !url.startsWith("http://localhost")) {
+  let protocol = "";
+  try {
+    protocol = new URL(url).protocol;
+  } catch {
+    // Not a URL: protocol stays "" and the refusal below applies.
+  }
+  const ok = protocol === "https:" || (protocol === "http:" && isLoopbackBase(url));
+  if (!ok) {
     throw new Error(`${label} must be HTTPS (or set CHAMBER_OAUTH_ALLOW_HTTP=1 for lab)`);
   }
 }

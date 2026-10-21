@@ -5,7 +5,7 @@
  *   npm test
  */
 
-import { openChamberDb } from "../src/db.ts";
+import { openChamberDb, secureDatabaseFile } from "../src/db.ts";
 import { claimHash, newId, sha256 } from "../src/hash.ts";
 import { commitBelief } from "../src/commit_belief.ts";
 import {
@@ -179,6 +179,7 @@ import {
   refreshAccessTokenWithRetry,
   resetRefreshMockSequence,
   formatRefreshError,
+  requireHttps,
 } from "../src/mcp_oauth.ts";
 import { sealSecret, openSecret } from "../src/secret_box.ts";
 // Aliased because the v1-compatibility test has to rebuild the *old* sealed
@@ -294,6 +295,7 @@ type Suite =
   | "config"
   | "release"
   | "model"
+  | "db"
   | "all";
 
 interface TestResult {
@@ -406,6 +408,7 @@ function suiteFromArg(): Suite {
     "daemon",
     "release",
     "model",
+    "db",
     "all",
   ].includes(v)
     ? v
@@ -15874,6 +15877,159 @@ test("model", "a timed-out MCP call does not wedge the calls queued behind it", 
     model.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ─── OAUTH ENDPOINTS: requireHttps parses the URL ───────────────────────────
+
+test("oauth", "requireHttps judges the parsed host, not a prefix of the string", () => {
+  // The old check was `startsWith("http://127.0.0.1")`, which accepts
+  // `http://127.0.0.1.attacker.invalid/x` and `http://127.0.0.1@attacker.invalid/x`
+  // (the host of that last one is attacker.invalid). It guards where a refresh
+  // token and a client secret are sent.
+  const saved = process.env.CHAMBER_OAUTH_ALLOW_HTTP;
+  delete process.env.CHAMBER_OAUTH_ALLOW_HTTP;
+  try {
+    const refused = [
+      "http://127.0.0.1.attacker.invalid/x",
+      "http://localhost.attacker.invalid/x",
+      "http://127.0.0.1@attacker.invalid/x",
+      "http://example.com/x",
+      "ftp://127.0.0.1/x",
+      "not a url",
+      "",
+    ];
+    for (const url of refused) {
+      let message = "";
+      try {
+        requireHttps(url, "resource");
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      assert(
+        message === "resource must be HTTPS (or set CHAMBER_OAUTH_ALLOW_HTTP=1 for lab)",
+        `${JSON.stringify(url)} must be refused with the existing message, got ${JSON.stringify(message)}`,
+      );
+    }
+    const accepted = [
+      "http://127.0.0.1:9/x",
+      "http://localhost/x",
+      "http://[::1]/x",
+      "https://example.com/x",
+    ];
+    for (const url of accepted) requireHttps(url, "resource");
+    process.env.CHAMBER_OAUTH_ALLOW_HTTP = "1";
+    requireHttps("http://example.com/x", "resource"); // the lab switch keeps its meaning
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_OAUTH_ALLOW_HTTP;
+    else process.env.CHAMBER_OAUTH_ALLOW_HTTP = saved;
+  }
+});
+
+// ─── DATABASE FILE PERMISSIONS (src/db.ts) ──────────────────────────────────
+
+/** Run `fn` and return what it wrote to stderr, without letting it through. */
+function captureStderr<T>(fn: () => T): { value: T; stderr: string } {
+  const original = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+    captured += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    return { value: fn(), stderr: captured };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
+/** The permission bits of `path`, e.g. 0o600. */
+function modeOf(path: string): number {
+  return lstatSync(path).mode & 0o777;
+}
+
+test("db", "an existing world-readable database is tightened to 0600 with one notice, once", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-dbmode-"));
+  try {
+    const path = join(dir, "c.sqlite");
+    openChamberDb(path).close();
+    // A closed WAL database has no sidecar files, so make the stale ones a
+    // crashed run would have left behind.
+    for (const file of [path, `${path}-wal`, `${path}-shm`]) {
+      if (!existsSync(file)) writeFileSync(file, "");
+      chmodSync(file, 0o644);
+    }
+    const first = captureStderr(() => openChamberDb(path));
+    try {
+      const lines = first.stderr.split("\n").filter((l) => l !== "");
+      assert(lines.length === 1, `exactly one notice expected, got ${JSON.stringify(lines)}`);
+      assert(
+        lines[0] ===
+          `chamber: tightened ${path} from 0644 to 0600 (it holds note text and tokens)`,
+        `wrong notice: ${lines[0]}`,
+      );
+      assert(modeOf(path) === 0o600, `database is ${modeOf(path).toString(8)}, want 600`);
+      for (const side of [`${path}-wal`, `${path}-shm`]) {
+        assert(modeOf(side) === 0o600, `${side} is ${modeOf(side).toString(8)}, want 600`);
+      }
+    } finally {
+      first.value.close();
+    }
+    const second = captureStderr(() => openChamberDb(path));
+    second.value.close();
+    assert(second.stderr === "", `a second open must print nothing, got ${JSON.stringify(second.stderr)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("db", "a database Chamber creates is 0600 from the start, in directories made 0700", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-dbnew-"));
+  // umask 0 is what makes this a test: without an explicit mode SQLite would
+  // create the file 0644 and mkdir would create 0777.
+  const previousUmask = process.umask(0);
+  try {
+    const path = join(dir, "a", "b", "c.sqlite");
+    const opened = captureStderr(() => openChamberDb(path));
+    try {
+      assert(opened.stderr === "", `a new database needs no notice, got ${JSON.stringify(opened.stderr)}`);
+      assert(modeOf(path) === 0o600, `database is ${modeOf(path).toString(8)}, want 600`);
+      for (const side of [`${path}-wal`, `${path}-shm`]) {
+        if (existsSync(side)) {
+          assert(modeOf(side) === 0o600, `${side} is ${modeOf(side).toString(8)}, want 600`);
+        }
+      }
+      for (const made of [join(dir, "a"), join(dir, "a", "b")]) {
+        assert(modeOf(made) === 0o700, `${made} is ${modeOf(made).toString(8)}, want 700`);
+      }
+    } finally {
+      opened.value.close();
+    }
+  } finally {
+    process.umask(previousUmask);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("db", "a loose database owned by someone else is left alone, with a notice", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-dbforeign-"));
+  try {
+    const path = join(dir, "c.sqlite");
+    openChamberDb(path).close();
+    chmodSync(path, 0o644);
+    // Another user is simulated by passing a uid that is not ours.
+    const { stderr } = captureStderr(() => secureDatabaseFile(path, process.getuid!() + 1));
+    assert(modeOf(path) === 0o644, `a foreign file must not be chmod-ed, now ${modeOf(path).toString(8)}`);
+    assert(/owned by another user/.test(stderr), `expected a notice, got ${JSON.stringify(stderr)}`);
+    assert(stderr.split("\n").filter((l) => l !== "").length === 1, "exactly one line");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("db", "an in-memory database touches no file and prints nothing", () => {
+  const { value, stderr } = captureStderr(() => openChamberDb(":memory:"));
+  value.close();
+  assert(stderr === "", `got ${JSON.stringify(stderr)}`);
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────

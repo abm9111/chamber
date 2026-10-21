@@ -23,7 +23,8 @@
 set -u
 
 REPO="${CHAMBER_REPO:-$HOME/Projects/chamber}"
-RELEASE_BIN="$HOME/.local/share/chamber-release/bin/chamber.js"
+RELEASE_DIR="$HOME/.local/share/chamber-release"
+RELEASE_BIN="$RELEASE_DIR/bin/chamber.js"
 RELEASE_MISSING="release checkout missing: run chamber pin <tag>"
 # Exported because the inline node script below reads it from the environment.
 # It is single-quoted there so the shell leaves it alone, which means an
@@ -52,6 +53,18 @@ probe_exit() {
   echo
 
   echo "## Drift"
+  echo
+  # Name the release that produced Drift and Corpus: `chamber pin` can move the
+  # checkout between two runs. --git-dir pins git to this checkout, so neither an
+  # inherited GIT_DIR nor a repository that contains $HOME can answer instead.
+  if [ ! -f "$RELEASE_BIN" ]; then
+    release_id="none"
+  elif [ -d "$RELEASE_DIR/.git" ]; then
+    release_id=$(git --git-dir="$RELEASE_DIR/.git" describe --tags --always 2>/dev/null) || release_id="unknown"
+  else
+    release_id="unknown"
+  fi
+  echo "release: $release_id"
   echo
   echo '```'
   # One run, and its exit status captured on the very next line: `$?` after a

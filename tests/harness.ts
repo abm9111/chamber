@@ -13846,7 +13846,7 @@ test("release", "a plist write that fails is a refusal, not a crash, and leaves 
  * probes. A `chamber` that announces itself is first on PATH, so a report that
  * contains its output was produced by the development command.
  */
-function runSnapshot(home: string, release: { verifyExit: number } | null): string {
+function runSnapshot(home: string, release: { verifyExit: number; tag?: string } | null): string {
   const root = join(dirname(fileURLToPath(import.meta.url)), "..");
   const bin = join(home, "bin");
   mkdirSync(bin, { recursive: true });
@@ -13867,6 +13867,15 @@ function runSnapshot(home: string, release: { verifyExit: number } | null): stri
         "",
       ].join("\n"),
     );
+    if (release.tag !== undefined) {
+      // The release checkout is a git clone that `chamber pin` checked out at a
+      // tag. Built with plumbing, like every fixture repo here.
+      const checkout = join(home, ".local", "share", "chamber-release");
+      fixtureGit(checkout, ["init", "--quiet"]);
+      const sha = fixtureCommit(checkout, { "README.md": "release\n" }, "release");
+      fixtureGit(checkout, ["update-ref", "HEAD", sha]);
+      fixtureGit(checkout, ["tag", release.tag, sha]);
+    }
   }
   const r = spawnSync("sh", [join(root, "scripts", "daily-snapshot.sh")], {
     encoding: "utf8",
@@ -13887,10 +13896,11 @@ function runSnapshot(home: string, release: { verifyExit: number } | null): stri
 test("release", "the daily snapshot records verify's own exit status from the release checkout", () => {
   const home = mkdtempSync(join(tmpdir(), "chamber-snapshot-"));
   try {
-    const report = runSnapshot(home, { verifyExit: 1 });
+    const report = runSnapshot(home, { verifyExit: 1, tag: "v9.9.9" });
     assert(report.includes("3 belief(s) checked, 1 with no verified support left"), report);
     assert(report.includes("corpus from the release checkout"), "the Corpus section did not run the release checkout");
     assert(/^verify exit code: 1$/m.test(report), `the report must carry verify's exit status (1):\n${report}`);
+    assert(/^release: v9\.9\.9$/m.test(report), `the report must name the release that ran:\n${report}`);
     assert(!report.includes("DEV CHAMBER CALLED"), "the report ran the chamber on PATH");
     assert(!report.includes("release checkout missing"), "the release checkout was there");
   } finally {
@@ -13905,6 +13915,7 @@ test("release", "the daily snapshot says the release checkout is missing instead
     const said = report.split("release checkout missing: run chamber pin <tag>").length - 1;
     assert(said === 2, `expected the message in the Drift and Corpus sections, found it ${said} times:\n${report}`);
     assert(/^verify exit code: n\/a$/m.test(report), `no exit status to report:\n${report}`);
+    assert(/^release: none$/m.test(report), `no release ran, and the report must say so:\n${report}`);
     assert(!report.includes("DEV CHAMBER CALLED"), "the report ran the chamber on PATH");
   } finally {
     rmSync(home, { recursive: true, force: true });

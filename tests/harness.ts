@@ -13356,7 +13356,7 @@ test("config", "chamber-jobs.service keeps the hardening chamber.service has, an
 
 /**
  * A `git` that goes first on PATH, records how it was called (the prompt
- * setting, GIT_DIR and GIT_INDEX_FILE it saw, and its arguments) and runs the
+ * setting, the six variables that redirect git, and its arguments) and runs the
  * real git. With SHIM_HANG=fetch it hangs on `fetch` instead, and with
  * SHIM_FAIL=fetch it fails `fetch` with a message that quotes a URL carrying
  * the userinfo in SHIM_USERINFO, the way git's own errors do.
@@ -13370,7 +13370,7 @@ function gitShim(root: string): { dir: string; log: string; real: string } {
     join(dir, "git"),
     [
       "#!/bin/sh",
-      'echo "${GIT_TERMINAL_PROMPT-unset}|${GIT_DIR-unset}|${GIT_INDEX_FILE-unset}|$*" >> "$SHIM_LOG"',
+      'echo "${GIT_TERMINAL_PROMPT-unset}|${GIT_DIR-unset}|${GIT_WORK_TREE-unset}|${GIT_INDEX_FILE-unset}|${GIT_OBJECT_DIRECTORY-unset}|${GIT_ALTERNATE_OBJECT_DIRECTORIES-unset}|${GIT_COMMON_DIR-unset}|$*" >> "$SHIM_LOG"',
       'if [ "$SHIM_HANG" = fetch ]; then for a in "$@"; do [ "$a" = fetch ] && exec sleep 30; done; fi',
       `if [ "$SHIM_FAIL" = fetch ]; then for a in "$@"; do [ "$a" = fetch ] && { echo "fatal: unable to access 'https://$SHIM_USERINFO@example.invalid/x.git/': 401" >&2; exit 128; }; done; fi`,
       'exec "$SHIM_REAL_GIT" "$@"',
@@ -13409,6 +13409,9 @@ test("release", "every git call pin makes has prompts off and none of the variab
         GIT_DIR: join(fx.root, "not-a-repo"),
         GIT_WORK_TREE: join(fx.root, "not-a-tree"),
         GIT_INDEX_FILE: join(fx.root, "not-an-index"),
+        GIT_OBJECT_DIRECTORY: join(fx.root, "not-objects"),
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: join(fx.root, "not-alternates"),
+        GIT_COMMON_DIR: join(fx.root, "not-a-common-dir"),
         GIT_TERMINAL_PROMPT: "1",
       },
       () => {
@@ -13419,7 +13422,9 @@ test("release", "every git call pin makes has prompts off and none of the variab
     const calls = readFileSync(shim.log, "utf8").trim().split("\n");
     assert(calls.length >= 6, `expected pin's git calls to be logged, got ${calls.length}`);
     for (const c of calls) {
-      assert(c.startsWith("0|unset|unset|"), `a git call inherited the environment: ${c}`);
+      // prompt off, then GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY,
+      // GIT_ALTERNATE_OBJECT_DIRECTORIES and GIT_COMMON_DIR, all unset.
+      assert(c.startsWith("0|unset|unset|unset|unset|unset|unset|"), `a git call inherited the environment: ${c}`);
     }
   });
 });
@@ -13634,6 +13639,134 @@ test("release", "the release is run even when no job is installed", () => {
     const good = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run));
     assert(good.code === 0, good.err.join("\n"));
     assert(good.out.some((l) => l.includes("the release runs")), good.out.join("\n"));
+  });
+});
+
+// ─── a pin whose release does not run leaves the checkout where it was ──────
+
+test("release", "a pin whose release does not run puts the checkout back, so a pinned job keeps running the old release", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const first = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: true }).run));
+    assert(first.code === 0, first.err.join("\n"));
+    assert(plistForm(fx.plistPath) === "pinned", "the first pin did not leave the job in the pinned form");
+    const pinned = readFileSync(fx.plistPath, "utf8");
+
+    // The job is now in the form every later pin starts from, and its command
+    // is the release checkout's bin/chamber.js: moving the checkout moves the job.
+    const lc = fakeLaunchctl({ loaded: true });
+    const second = pinRelease(pinOpts(fx, "badexit", lc.run));
+    assert(second.code === 1, "a release that exits 1 was pinned");
+    assert(
+      second.err.some((l) => l.startsWith("chamber pin: the release at badexit did not run: ") && l.includes("boom")),
+      second.err.join("\n"),
+    );
+    assert(
+      second.err.some((l) => l.includes(`is back on ${fx.v1.slice(0, 12)}, where it was before this pin`)),
+      second.err.join("\n"),
+    );
+    assert(!second.err.some((l) => l.includes("stays on badexit")), "the message still says the checkout stays on the failed tag");
+    assert(headOf(fx.releaseDir) === fx.v1, "the checkout was not put back on v1");
+    assert(isDetachedHead(fx.releaseDir), "the checkout is attached to a branch");
+    assert(readFileSync(join(fx.releaseDir, "README.md"), "utf8") === "one\n", "the working tree is not v1's");
+    assert(readFileSync(fx.plistPath, "utf8") === pinned, "the plist was rewritten");
+    assert(lc.calls.length === 0, `launchctl was called: ${lc.calls.join(" | ")}`);
+
+    // What the pinned job runs tomorrow: the same shell and command, against the checkout.
+    const job = spawnSync("/bin/sh", ["-lc", 'node "$1" --version', "sh", join(fx.releaseDir, "bin", "chamber.js")], {
+      encoding: "utf8",
+      env: loginEnv(fx),
+    });
+    assert(job.status === 0 && job.stdout.trim() === "1.0.1", `the pinned job no longer runs v1: ${job.status} ${job.stdout} ${job.stderr}`);
+  });
+});
+
+test("release", "a checkout that was on a branch goes back onto that branch when the release does not run", () => {
+  withReleaseFixture((fx) => {
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin failed");
+    fixtureGit(fx.releaseDir, ["checkout", "--quiet", "-b", "keep"]);
+    const r = pinRelease(pinOpts(fx, "wrongver", fakeLaunchctl({ loaded: false }).run));
+    assert(r.code === 1 && r.err.some((l) => l.includes("did not run")), r.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "the checkout was not put back on v1");
+    assert(
+      fixtureGit(fx.releaseDir, ["symbolic-ref", "HEAD"]) === "refs/heads/keep",
+      "the checkout is no longer on the branch it was on",
+    );
+  });
+});
+
+test("release", "when the checkout cannot be put back, pin says the job is on the release that failed and how to fix it", () => {
+  withReleaseFixture((fx) => {
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin failed");
+    // A git that lets the first `checkout` through (the move onto the failing
+    // tag) and refuses every later one (the move back).
+    const dir = join(fx.root, "checkout-shim");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "git"),
+      [
+        "#!/bin/sh",
+        'for a in "$@"; do',
+        '  if [ "$a" = checkout ]; then',
+        '    n=$(cat "$SHIM_COUNT" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$SHIM_COUNT"',
+        '    if [ "$n" -ge 2 ]; then echo "fatal: refusing to move the checkout back" >&2; exit 128; fi',
+        "  fi",
+        "done",
+        'exec "$SHIM_REAL_GIT" "$@"',
+        "",
+      ].join("\n"),
+    );
+    chmodSync(join(dir, "git"), 0o755);
+    const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    const outcomes: PinOutcome[] = [];
+    withProcessEnv(
+      { PATH: `${dir}:${process.env.PATH ?? ""}`, SHIM_COUNT: join(fx.root, "checkout-count"), SHIM_REAL_GIT: real },
+      () => {
+        outcomes.push(pinRelease(pinOpts(fx, "badexit", fakeLaunchctl({ loaded: false }).run)));
+      },
+    );
+    const outcome = outcomes[0];
+    assert(outcome !== undefined && outcome.code === 1, "a release that exits 1 was pinned");
+    const err = outcome === undefined ? "" : outcome.err.join("\n");
+    assert(err.includes("could not be put back on"), err);
+    assert(err.includes(`git -C ${fx.releaseDir} checkout --detach ${fx.v1}`), `the message does not give the command that fixes it:\n${err}`);
+    assert(!err.includes("is back on"), `pin claimed the checkout was put back:\n${err}`);
+    assert(headOf(fx.releaseDir) === fx.badexit, "the shim should have left the checkout on the failed tag");
+  });
+});
+
+test("release", "the run proof goes through a login shell: a node only the profile can find is found", () => {
+  withReleaseFixture((fx) => {
+    // The shell starts with no node on PATH. The profile adds a directory that
+    // holds a link to this process's node, which is all /bin/sh -lc has to go on.
+    const home = join(fx.root, "profile-home");
+    const nodeDir = join(home, "node-bin");
+    mkdirSync(nodeDir, { recursive: true });
+    symlinkSync(process.execPath, join(nodeDir, "node"));
+    writeFileSync(join(home, ".profile"), `PATH="${nodeDir}:$PATH"\nexport PATH\n`);
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, PATH: "/nonexistent" };
+    // The fixture is only worth something if a plain `sh -c` cannot find node.
+    const plain = spawnSync("/bin/sh", ["-c", "command -v node"], { encoding: "utf8", env });
+    assert(plain.status !== 0, `node is visible without the profile (${plain.stdout.trim()}), so this cannot tell -c from -lc`);
+    const r = pinRelease({ ...pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run), env });
+    assert(r.code === 0, r.err.join("\n"));
+    assert(r.out.some((l) => l.includes("the release runs")), r.out.join("\n"));
+  });
+});
+
+test("release", "a login profile that prints does not make a release that runs look like one that does not", () => {
+  withReleaseFixture((fx) => {
+    // Its own HOME: pinOpts writes the plain login profile into fx.root/home.
+    const home = join(fx.root, "banner-home");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(
+      join(home, ".profile"),
+      `PATH="${dirname(process.execPath)}:$PATH"\nexport PATH\necho "welcome back"\n`,
+    );
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home };
+    const r = pinRelease({ ...pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run), env });
+    assert(r.code === 0, r.err.join("\n"));
+    assert(r.out.some((l) => l.includes("printed 1.0.1")), r.out.join("\n"));
   });
 });
 
@@ -14013,6 +14146,10 @@ test("config", "the docs agree with the code: limitation count, sandbox claims, 
   assert((sched.match(/^ {2}database = .*\[from default\]$/gm) ?? []).length >= 3, "the samples do not show the database line");
   const schedFlat = sched.replace(/\s+/g, " ");
   assert(schedFlat.includes("not over SSH") && schedFlat.includes("`unload` stops the job"), "the pin notes are missing");
+  // What pin does besides the checkout: the refusals it makes, the run proof, and what a failed proof leaves.
+  for (const needle of ["`Program` key", "username or password", "`node bin/chamber.js --version`", "puts the checkout back"]) {
+    assert(schedFlat.includes(needle), `SCHEDULING.md does not describe pin's ${needle}`);
+  }
   assert(sched.includes("This takes effect for a release tag that contains this script"), "the daily-snapshot effective-date note is missing");
   assert(sched.includes("`release: <tag>`"), "the daily-snapshot section does not mention the release line");
 });

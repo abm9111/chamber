@@ -87,8 +87,8 @@ Afterwards, `npm audit` reports 0 vulnerabilities.
 
 After the checkout is on the tag, and before the plist is read for writing, pin runs `/bin/sh -lc 'node "$1" --version' sh <releaseDir>/bin/chamber.js`. This is the same login shell and `node` the job will use, with a 60 s timeout.
 
-- **Pass.** The trimmed stdout must equal the `version` in `<releaseDir>/package.json`, and the exit code must be 0.
-- **Fail.** On any failure, pin exits 1 with `the release at <tag> did not run: <reason>`. The job and the plist are left untouched, and the checkout stays on the tag.
+- **Pass.** The last non-empty line of stdout must equal the `version` in `<releaseDir>/package.json`, and the exit code must be 0. (A login profile may print before the command does.)
+- **Fail.** On any failure, pin exits 1 with `the release at <tag> did not run: <reason>`. The plist and the loaded job are left untouched. The job's command is the release checkout's `bin/chamber.js`, so a checkout left on the failed tag would move a job that is already in the pinned form onto the release just proven not to run. Pin therefore puts an existing checkout back on the commit (and branch) it held, reads that back from git, and says which of three things happened: put back, could not be put back (with the `git checkout` that does it), or nothing to put back. A checkout this pin created has no earlier release and stays on the tag; a job still in its bare form does not use it. (An earlier version of this text said the job was untouched and the checkout stays on the tag in every case, which holds only for a job not yet pinned.)
 - **Runs every time.** This happens even when there is no plist installed, so `chamber pin` alone proves the release runs.
 - **Test fixture.** The fixture's tag trees gain a `package.json` and a `bin/chamber.js` that prints that version. Add tests for a release whose bin exits non-zero, and for one that prints the wrong version: each refuses, and the plist is unchanged.
 

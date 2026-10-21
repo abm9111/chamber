@@ -163,9 +163,18 @@ export interface CheckoutOptions {
   releaseDir: string;
 }
 
+/** Where the release checkout's HEAD was before a pin moved it. */
+export interface PreviousCheckout {
+  commit: string;
+  /** The full ref HEAD was attached to (`refs/heads/x`), or null when it was detached. */
+  branch: string | null;
+}
+
 export type CheckoutResult =
-  | { ok: true; commit: string; already: boolean }
+  | { ok: true; commit: string; already: boolean; previous: PreviousCheckout | null }
   | { ok: false; reason: string };
+
+type CheckoutMoved = Extract<CheckoutResult, { ok: true }>;
 
 interface GitRun {
   ok: boolean;
@@ -324,15 +333,20 @@ function moveCheckout(dir: string, created: boolean, originUrl: string, tag: str
     return { ok: false, reason: `${tag} has no bin/chamber.js; left unpinned` };
   }
   const head = git(dir, ["rev-parse", "--verify", "--quiet", "HEAD"]);
-  const detached = !git(dir, ["symbolic-ref", "--quiet", "HEAD"]).ok;
+  const attached = git(dir, ["symbolic-ref", "--quiet", "HEAD"]);
+  const detached = !attached.ok;
   const already = head.ok && head.out === commit.out && detached;
+  // Remembered so that a release which turns out not to run can be left again.
+  const previous: PreviousCheckout | null = head.ok
+    ? { commit: head.out, branch: attached.ok ? attached.out : null }
+    : null;
   if (!already) {
     const checkout = git(dir, ["checkout", "--quiet", "--detach", commit.out]);
     if (!checkout.ok) return { ok: false, reason: `git checkout: ${checkout.message}` };
   }
   const bin = join(dir, "bin", "chamber.js");
   if (!existsSync(bin)) return { ok: false, reason: `${bin} is not on disk after checkout` };
-  return { ok: true, commit: commit.out, already };
+  return { ok: true, commit: commit.out, already, previous };
 }
 
 /**
@@ -537,6 +551,56 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
   return 0;
 }
 
+/**
+ * Leave the release checkout where it was before this pin moved it: detached at
+ * the commit it held, and attached again to the branch it was on, if any. The
+ * result is read back from git rather than assumed, because a pin that says
+ * "put back" about a checkout still on the failed release would repeat the
+ * mistake this exists to fix.
+ */
+function restoreCheckout(dir: string, previous: PreviousCheckout): { ok: true } | { ok: false; reason: string } {
+  const back = git(dir, ["checkout", "--quiet", "--detach", previous.commit]);
+  if (!back.ok) return { ok: false, reason: `git checkout: ${back.message}` };
+  if (previous.branch !== null) {
+    const attach = git(dir, ["symbolic-ref", "HEAD", previous.branch]);
+    if (!attach.ok) return { ok: false, reason: `git symbolic-ref: ${attach.message}` };
+  }
+  const now = git(dir, ["rev-parse", "--verify", "--quiet", "HEAD"]);
+  if (!now.ok || now.out !== previous.commit) {
+    return {
+      ok: false,
+      reason: `HEAD is ${now.ok ? now.out.slice(0, 12) : "unreadable"} afterwards, not ${previous.commit.slice(0, 12)}`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * What a pin whose release did not run leaves behind, in words. The job's
+ * command is the release checkout's bin/chamber.js, so once the checkout has
+ * moved, a job already in the pinned form runs whatever is there. A failed pin
+ * therefore goes back to the commit the checkout held, when there was one. A
+ * checkout this pin created has nothing to go back to, and no job runs it yet.
+ */
+function afterFailedProof(releaseDir: string, tag: string, moved: CheckoutMoved): string[] {
+  const unchanged = "the job and its plist were not changed";
+  const previous = moved.previous;
+  if (previous === null) return [`${releaseDir} stays on ${tag}; ${unchanged}`];
+  if (moved.already) {
+    return [
+      `${releaseDir} was already on ${tag} before this pin, so a job that runs it was already running a release that does not run; ${unchanged}`,
+    ];
+  }
+  const short = previous.commit.slice(0, 12);
+  const restored = restoreCheckout(releaseDir, previous);
+  if (restored.ok) return [`${releaseDir} is back on ${short}, where it was before this pin; ${unchanged}`];
+  return [
+    `${releaseDir} could not be put back on ${short}: ${restored.reason}`,
+    `${releaseDir} is still on ${tag}, which did not run, so a job that already runs it is running that release; ` +
+      `put it back with: git -C ${releaseDir} checkout --detach ${previous.commit}`,
+  ];
+}
+
 const RUN_PROOF_TIMEOUT_MS = 60_000;
 
 /**
@@ -571,7 +635,9 @@ function proveReleaseRuns(releaseDir: string, env: NodeJS.ProcessEnv): RunProof 
     const said = (r.stderr ?? "").trim().split("\n").slice(-3).join(" | ").slice(0, 300);
     return { ok: false, reason: `it exited ${r.status ?? `from signal ${r.signal}`}${said !== "" ? `: ${said}` : ""}` };
   }
-  const printed = (r.stdout ?? "").trim();
+  // A login profile may print before the command does (a banner, a fortune),
+  // and the job's output only lands in a log. The version is the last line.
+  const printed = (r.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l !== "").at(-1) ?? "";
   if (printed !== version) {
     return {
       ok: false,
@@ -585,7 +651,9 @@ function proveReleaseRuns(releaseDir: string, env: NodeJS.ProcessEnv): RunProof 
  * `chamber pin <tag>`. The installed job is checked before the checkout
  * moves, and written only after the checkout is on the tag with
  * bin/chamber.js on disk and after that release has run once, `--version`,
- * under the job's own login shell. With no job installed, the checkout is
+ * under the job's own login shell. When it does not run, an existing checkout
+ * is put back on the commit it held, because a job already in the pinned form
+ * runs whatever the checkout holds. With no job installed, the checkout is
  * still pinned and, if the release runs, the run exits 0.
  */
 export function pinRelease(opts: PinOptions): PinOutcome {
@@ -612,7 +680,7 @@ export function pinRelease(opts: PinOptions): PinOutcome {
   const proof = proveReleaseRuns(opts.releaseDir, opts.env ?? process.env);
   if (!proof.ok) {
     err.push(`chamber pin: the release at ${opts.tag} did not run: ${proof.reason}`);
-    err.push(`${opts.releaseDir} stays on ${opts.tag}; the job and its plist were not changed`);
+    err.push(...afterFailedProof(opts.releaseDir, opts.tag, moved));
     return { code: 1, out, err };
   }
   out.push(`the release runs: node bin/chamber.js --version printed ${proof.version}`);

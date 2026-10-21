@@ -102,8 +102,13 @@ history and the GitHub releases.
   sandbox.
 - **`chamber pin` runs the release before it rewrites the job.** After the
   checkout, `node bin/chamber.js --version` must run under `/bin/sh -lc` and
-  print the version in `package.json`; otherwise pin exits 1 and leaves the job
-  alone. The plist is replaced atomically, git runs with prompts off and
+  print the version in `package.json` (as its last line, so a login profile that
+  echoes does not fail the pin); otherwise pin exits 1, puts the checkout back on
+  the commit it held, and leaves the plist and the loaded job alone, so a job
+  that was already pinned keeps running the release it ran before. If the
+  checkout cannot be put back, pin says so and prints the command that does. A
+  first pin has no earlier release, so its checkout stays on the tag that
+  failed. The plist is replaced atomically, git runs with prompts off and
   without inherited `GIT_DIR`, with timeouts, an http(s) origin carrying
   credentials is refused, and a commented-out `ProgramArguments` block or a
   `Program` key no longer confuses the plist check.

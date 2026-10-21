@@ -30,9 +30,22 @@ checks its script, points its `config show`, `ingest` and `verify` commands at
 the release checkout, and loads or reloads it. Pin refuses before it moves anything in
 these cases:
 
-- the installed script is not the one Chamber ships
+- the installed script is not the one Chamber ships, or the plist has a
+  `Program` key, which launchd runs instead of the script
+- your clone's `origin` is an http(s) URL with a username or password in it
 - the release checkout has tracked changes or a `dist/` folder
 - the tag has no `bin/chamber.js`
+
+After the checkout moves, and before it touches the plist, pin runs the release
+once: `node bin/chamber.js --version` under `/bin/sh -lc`, the shell and `node`
+the job uses. It must exit 0 and print the version in the release's
+`package.json`. If it does not, pin exits 1, puts the checkout back on the commit
+it held before and prints that commit, and leaves the plist and the loaded job
+alone, so a job that was already pinned keeps running the release it ran
+yesterday. If pin cannot put the checkout back, it says so and prints the
+`git checkout` that does; until then the job runs the release that failed. A
+first pin has no earlier release to go back to: its checkout stays on the tag
+that failed, and a job still in its original form does not use that checkout.
 
 The job runs each command as
 `node "$HOME/.local/share/chamber-release/bin/chamber.js"`. It names `node`

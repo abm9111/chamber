@@ -16733,6 +16733,143 @@ test("http_sync", "a header and a body with quotes, backslashes, newlines and no
   }
 });
 
+// ─── THE URL CURL IS GIVEN IS THE URL THE CHECK PARSED ──────────────────────
+
+/** The unquoted value of the `url = "..."` line of a curl config. */
+function configUrl(config: string): string {
+  const line = config.split("\n")[0] ?? "";
+  assert(line.startsWith('url = "') && line.endsWith('"'), `not a url line: ${line}`);
+  return JSON.parse(line.slice("url = ".length)) as string;
+}
+
+test("http_sync", "curl is given the parsed href, so a backslash cannot move the host", () => {
+  // WHATWG URL reads `\` as `/` for http(s), so these name 127.0.0.1 and
+  // localhost. curl 8.7.1 reads the same bytes as userinfo and connects to
+  // evil.invalid. The config must carry what the check parsed.
+  const cases: [string, string][] = [
+    ["http://127.0.0.1\\@evil.invalid/x", 'url = "http://127.0.0.1/'],
+    ["http://localhost\\@evil.invalid/x", 'url = "http://localhost/'],
+  ];
+  for (const [raw, prefix] of cases) {
+    const { config } = buildCurlInvocation({ url: raw, timeoutSec: 5 });
+    const line = config.split("\n")[0] ?? "";
+    assert(line.startsWith(prefix), `${JSON.stringify(raw)}: url line was ${line}`);
+    assert(!line.includes("\\"), `${JSON.stringify(raw)}: a backslash survived into ${line}`);
+    assert(new URL(configUrl(config)).hostname === new URL(raw).hostname, `host differs for ${raw}`);
+    assert(new URL(configUrl(config)).hostname !== "evil.invalid", `curl would be sent to evil.invalid for ${raw}`);
+  }
+  const exact = buildCurlInvocation({ url: "http://127.0.0.1\\@evil.invalid/x", timeoutSec: 5 }).config;
+  assert(exact.split("\n")[0] === 'url = "http://127.0.0.1/@evil.invalid/x"', `href: ${exact.split("\n")[0]}`);
+});
+
+test("http_sync", "an ordinary URL with a query and a percent-encoding is written unchanged", () => {
+  const url = "https://example.com/a%20b/c?q=x%26y&r=%E6%BC%A2#frag";
+  const { config } = buildCurlInvocation({ url, timeoutSec: 5 });
+  assert(configUrl(config) === url, `round trip: ${configUrl(config)}`);
+  const withPort = "http://127.0.0.1:8080/p?x=[1]&y={a}";
+  assert(new URL(withPort).href === withPort, "precondition: this form is already normalised");
+  assert(configUrl(buildCurlInvocation({ url: withPort, timeoutSec: 5 }).config) === withPort, "query brackets changed");
+});
+
+test("http_sync", "a URL that does not parse is refused before curl runs", () => {
+  for (const url of ["http://", "http://[::1", "https://exa mple.com/"]) {
+    let message = "";
+    try {
+      buildCurlInvocation({ url, timeoutSec: 5 });
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    assert(message.startsWith("http_sync:"), `${JSON.stringify(url)}: expected a refusal, got ${JSON.stringify(message)}`);
+  }
+});
+
+test("oauth", "requireHttps and the curl config agree on the host for the backslash forms", () => {
+  const saved = process.env.CHAMBER_OAUTH_ALLOW_HTTP;
+  delete process.env.CHAMBER_OAUTH_ALLOW_HTTP;
+  try {
+    for (const raw of ["http://127.0.0.1\\@evil.invalid/x", "http://localhost\\@evil.invalid/x"]) {
+      requireHttps(raw, "token_endpoint"); // passes: the parsed host is loopback
+      const { config } = buildCurlInvocation({ url: raw, timeoutSec: 5 });
+      const sent = new URL(configUrl(config));
+      // Both sides parse with WHATWG URL, so only a string curl cannot read two ways agrees: no backslash, already normalised.
+      assert(!configUrl(config).includes("\\"), `a backslash reaches curl: ${configUrl(config)}`);
+      assert(sent.href === configUrl(config), `curl is given ${configUrl(config)}, which parses to ${sent.href}`);
+      assert(sent.hostname === new URL(raw).hostname, `the check saw ${new URL(raw).hostname}, curl is given ${sent.hostname}`);
+      assert(sent.hostname === "127.0.0.1" || sent.hostname === "localhost", `curl is given ${sent.hostname}`);
+      requireHttps(sent.href, "token_endpoint"); // and the string curl is given passes the same check
+    }
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_OAUTH_ALLOW_HTTP;
+    else process.env.CHAMBER_OAUTH_ALLOW_HTTP = saved;
+  }
+});
+
+test("oauth", "a token_endpoint that is not HTTPS or loopback is refused before any request is made", async () => {
+  await withCurlShim(async (dir) => {
+    await withEnvAsync({ CHAMBER_TOKEN_KEY: TEST_TOKEN_KEY, CHAMBER_OAUTH_ALLOW_HTTP: undefined }, async () => {
+      const db = freshDb();
+      const res = normalizeResourceUrl("https://mcp.example.com/mcp");
+      const seed = (tokenEndpoint: string): void => {
+        db.prepare(`DELETE FROM mcp_oauth_token`).run();
+        db.prepare(
+          `INSERT INTO mcp_oauth_token (
+             resource_url, issuer, client_id, access_token, refresh_token, expires_at
+           ) VALUES (?, ?, ?, ?, ?, ?)`,
+        ).run(res, "https://auth.example", "chamber-cli", "old", "RT-SECRET", new Date(Date.now() - 1).toISOString());
+        db.prepare(`DELETE FROM mcp_oauth_meta_cache`).run();
+        db.prepare(`INSERT INTO mcp_oauth_meta_cache (key, body_json, expires_at) VALUES (?, ?, ?)`).run(
+          "as:https://auth.example",
+          JSON.stringify({
+            issuer: "https://auth.example",
+            authorization_endpoint: "https://auth.example/authorize",
+            token_endpoint: tokenEndpoint,
+          }),
+          new Date(Date.now() + 60_000).toISOString(),
+        );
+      };
+
+      // Refresh, endpoint taken from the authorization server's metadata.
+      for (const bad of ["http://evil.invalid/token", "http://127.0.0.1.evil.invalid/token"]) {
+        seed(bad);
+        const r = refreshAccessTokenDetailed(db, res, { clientSecret: "CS-SECRET" });
+        assert(!r.ok, `refresh to ${bad} must fail: ${JSON.stringify(r)}`);
+        assert(shimCalls(dir).length === 0, `refresh to ${bad} started curl`);
+      }
+      // Refresh, endpoint passed in.
+      seed("https://auth.example/token");
+      const r2 = refreshAccessTokenDetailed(db, res, { tokenEndpoint: "http://evil.invalid/token", clientSecret: "CS-SECRET" });
+      assert(!r2.ok, `a passed-in endpoint must be checked too: ${JSON.stringify(r2)}`);
+      assert(shimCalls(dir).length === 0, "a passed-in http endpoint started curl");
+
+      // Authorization-code exchange.
+      let message = "";
+      try {
+        exchangeAuthorizationCode(db, {
+          tokenEndpoint: "http://evil.invalid/token",
+          clientId: "client-id",
+          clientSecret: "CS-SECRET",
+          code: "CODE-SECRET",
+          redirectUri: "http://127.0.0.1:8765/callback",
+          codeVerifier: "VERIFIER-SECRET",
+          resource: "https://mcp.example.com/mcp",
+          issuer: "https://auth.example",
+        });
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      assert(message === "token_endpoint must be HTTPS (or set CHAMBER_OAUTH_ALLOW_HTTP=1 for lab)", `exchange: ${JSON.stringify(message)}`);
+      assert(shimCalls(dir).length === 0, "the code exchange started curl");
+
+      // Loopback still works.
+      seed("http://127.0.0.1:9/token");
+      refreshAccessTokenDetailed(db, res, { clientSecret: "CS-SECRET" });
+      const calls = shimCalls(dir);
+      assert(calls.length === 1, `a loopback token endpoint must be used, saw ${calls.length} calls`);
+      assert(calls[0]!.stdin.includes('url = "http://127.0.0.1:9/token"'), `stdin: ${calls[0]!.stdin}`);
+    });
+  });
+});
+
 // ─── POST /turn OFF THE EVENT LOOP (src/turn_pool.ts, src/turn_worker.ts) ───
 
 /**

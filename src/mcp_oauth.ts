@@ -331,6 +331,7 @@ export function exchangeAuthorizationCode(
   };
   if (opts.clientSecret) fields.client_secret = opts.clientSecret;
 
+  requireHttps(opts.tokenEndpoint, "token_endpoint");
   const res = httpPostForm(opts.tokenEndpoint, fields);
   if (res.status < 200 || res.status >= 300) {
     appendAudit(db, {
@@ -752,6 +753,7 @@ export function refreshAccessTokenDetailed(
 
   let res: { status: number; body: string };
   try {
+    requireHttps(tokenEndpoint, "token_endpoint");
     res = httpPostForm(tokenEndpoint, fields);
   } catch (e) {
     const err: RefreshResultErr = {

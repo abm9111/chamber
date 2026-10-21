@@ -94,6 +94,18 @@ export function quoteCurlConfigValue(value: string): string {
 export function buildCurlInvocation(req: HttpSyncRequest): { argv: string[]; config: string } {
   checkText(req.url, "the URL", false);
   if (!/^https?:\/\//i.test(req.url)) refuse("the URL must start with http:// or https://");
+  // curl is given the URL the WHATWG parser produced, never the caller's string.
+  // WHATWG reads `\` as `/` in an http(s) URL, curl does not, so
+  // `http://127.0.0.1\@evil.invalid/x` names 127.0.0.1 to a check made with
+  // `new URL` and evil.invalid to curl. The href has one reading.
+  let href = "";
+  try {
+    href = new URL(req.url).href;
+  } catch {
+    refuse("the URL does not parse");
+  }
+  checkText(href, "the URL", false);
+  if (!/^https?:\/\//i.test(href)) refuse("the URL must start with http:// or https://");
   if (!Number.isFinite(req.timeoutSec) || req.timeoutSec <= 0) {
     refuse("timeoutSec must be a positive number of seconds");
   }
@@ -101,7 +113,7 @@ export function buildCurlInvocation(req: HttpSyncRequest): { argv: string[]; con
   if (method === "GET" && req.body !== undefined) refuse("a GET request cannot carry a body");
 
   const lines = [
-    `url = ${quoteCurlConfigValue(req.url)}`,
+    `url = ${quoteCurlConfigValue(href)}`,
     "globoff",
     `max-time = ${quoteCurlConfigValue(String(req.timeoutSec))}`,
     `write-out = ${quoteCurlConfigValue("\n%{http_code}")}`,

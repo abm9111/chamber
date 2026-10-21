@@ -15,7 +15,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export const JOB_LABEL = "com.chamber.verify";
@@ -234,4 +234,113 @@ export function pinCheckout(opts: CheckoutOptions): CheckoutResult {
   const moved = moveCheckout(releaseDir, created, origin.out, tag);
   if (!moved.ok && created) rmSync(releaseDir, { recursive: true, force: true });
   return moved;
+}
+
+export interface LaunchctlResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+export type Launchctl = (args: readonly string[]) => LaunchctlResult;
+
+export const systemLaunchctl: Launchctl = (args) => {
+  const r = spawnSync("launchctl", [...args], { encoding: "utf8" });
+  return {
+    status: r.status,
+    stdout: r.stdout ?? "",
+    stderr: r.error !== undefined ? String(r.error) : (r.stderr ?? ""),
+  };
+};
+
+export interface PinOptions extends CheckoutOptions {
+  plistPath: string;
+  launchctl: Launchctl;
+}
+
+export interface PinOutcome {
+  code: 0 | 1;
+  out: string[];
+  err: string[];
+}
+
+/**
+ * Rewrite a bare job to the release command and make sure the agent is
+ * loaded. A reload is checked with `launchctl list` afterwards: `load` has
+ * exited 0 on macOS without loading anything. Nothing here is rolled back.
+ * The checkout and the plist stay as written, and a failure exits 1.
+ */
+function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: string[]): 0 | 1 {
+  // Read again at the moment of writing, not trusted from the check made
+  // before the checkout moved.
+  const xml = readFileSync(plistPath, "utf8");
+  const read = readJobPlist(xml);
+  if (!read.ok) {
+    err.push(`chamber pin: ${plistPath}: ${read.reason}; the checkout is pinned and the job was not changed`);
+    return 1;
+  }
+  const rewritten = read.form === "bare";
+  if (rewritten) {
+    writeFileSync(plistPath, pinJobPlist(xml));
+    out.push(`${plistPath} now runs config show, ingest and verify with ${RELEASE_COMMAND}`);
+  } else {
+    out.push(`${plistPath} already runs ${RELEASE_COMMAND}`);
+  }
+  const wasLoaded = launchctl(["list", JOB_LABEL]).status === 0;
+  if (wasLoaded && !rewritten) {
+    out.push(`${JOB_LABEL} is loaded`);
+    return 0;
+  }
+  if (wasLoaded) {
+    const unload = launchctl(["unload", plistPath]);
+    if (unload.status !== 0) {
+      err.push(`chamber pin: launchctl unload failed (${unload.status}): ${unload.stderr.trim()}`);
+      return 1;
+    }
+  }
+  const load = launchctl(["load", plistPath]);
+  if (load.status !== 0) {
+    err.push(`chamber pin: launchctl load failed (${load.status}): ${load.stderr.trim()}`);
+    return 1;
+  }
+  if (launchctl(["list", JOB_LABEL]).status !== 0) {
+    err.push(`chamber pin: launchctl load exited 0 but ${JOB_LABEL} is not loaded`);
+    return 1;
+  }
+  out.push(`${wasLoaded ? "reloaded" : "loaded"} ${JOB_LABEL}`);
+  return 0;
+}
+
+/**
+ * `chamber pin <tag>`. The installed job is checked before the checkout
+ * moves, and written only after the checkout is on the tag with
+ * bin/chamber.js on disk. With no job installed, the checkout is still
+ * pinned and the run exits 0.
+ */
+export function pinRelease(opts: PinOptions): PinOutcome {
+  const out: string[] = [];
+  const err: string[] = [];
+  if (existsSync(opts.plistPath)) {
+    const read = readJobPlist(readFileSync(opts.plistPath, "utf8"));
+    if (!read.ok) {
+      err.push(`chamber pin: ${opts.plistPath}: ${read.reason}. Nothing was moved.`);
+      return { code: 1, out, err };
+    }
+  }
+  const moved = pinCheckout(opts);
+  if (!moved.ok) {
+    err.push(`chamber pin: ${moved.reason}`);
+    return { code: 1, out, err };
+  }
+  const short = moved.commit.slice(0, 12);
+  out.push(
+    moved.already
+      ? `${opts.releaseDir} is already on ${opts.tag} (${short})`
+      : `${opts.releaseDir} is on ${opts.tag} (${short})`,
+  );
+  if (!existsSync(opts.plistPath)) {
+    out.push(`no LaunchAgent was installed at ${opts.plistPath}; nothing else was changed`);
+    return { code: 0, out, err };
+  }
+  return { code: pinAgent(opts.plistPath, opts.launchctl, out, err), out, err };
 }

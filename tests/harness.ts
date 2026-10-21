@@ -73,11 +73,16 @@ import { citedPassage, missingTerms, missingTermsIn, specificTerms } from "../sr
 import { withSiblings } from "../src/siblings.ts";
 import {
   BARE_SCRIPT,
+  JOB_LABEL,
   PINNED_SCRIPT,
   RELEASE_COMMAND,
   pinCheckout,
   pinJobPlist,
+  pinRelease,
   readJobPlist,
+  type Launchctl,
+  type LaunchctlResult,
+  type PinOptions,
 } from "../src/release_pin.ts";
 import {
   minilmAvailable,
@@ -12504,6 +12509,183 @@ test("release", "pin runs only from a checkout that has an origin", () => {
     assert(!c.ok && c.reason.includes("has no origin remote"), JSON.stringify(c));
 
     assert(!existsSync(dirname(fx.releaseDir)), "a refused source created a directory");
+  });
+});
+
+/**
+ * A launchctl that records its calls and keeps one loaded flag. `load:
+ * "fails"` exits non-zero; `load: "lies"` exits 0 and loads nothing, which is
+ * what pin's `list` after `load` exists to catch.
+ */
+function fakeLaunchctl(start: { loaded: boolean; load?: "ok" | "fails" | "lies" }): {
+  run: Launchctl;
+  calls: string[];
+} {
+  let loaded = start.loaded;
+  const calls: string[] = [];
+  const done = (status: number, stderr = ""): LaunchctlResult => ({ status, stdout: "", stderr });
+  const run: Launchctl = (args) => {
+    calls.push(args.join(" "));
+    switch (args[0]) {
+      case "list":
+        return loaded ? done(0) : done(113, `Could not find service "${JOB_LABEL}" in domain for port`);
+      case "unload":
+        loaded = false;
+        return done(0);
+      case "load":
+        if (start.load === "fails") return done(5, "Load failed: 5: Input/output error");
+        if (start.load !== "lies") loaded = true;
+        return done(0);
+      default:
+        return done(64, `unexpected launchctl ${args.join(" ")}`);
+    }
+  };
+  return { run, calls };
+}
+
+function pinOpts(fx: ReleaseFixture, tag: string, launchctl: Launchctl): PinOptions {
+  return { tag, sourceRoot: fx.source, releaseDir: fx.releaseDir, plistPath: fx.plistPath, launchctl };
+}
+
+function writePlistFile(path: string, xml: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, xml);
+}
+
+function plistForm(path: string): string {
+  const read = readJobPlist(readFileSync(path, "utf8"));
+  return read.ok ? read.form : `refused: ${read.reason}`;
+}
+
+test("release", "pin points a loaded bare job at the release checkout and reloads it", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const lc = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(r.code === 0, r.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD is not v1");
+    assert(plistForm(fx.plistPath) === "pinned", plistForm(fx.plistPath));
+    assert(
+      JSON.stringify(lc.calls) ===
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+      lc.calls.join(" | "),
+    );
+    assert(r.out.some((l) => l.includes("is on v1")), r.out.join("\n"));
+    assert(r.out.some((l) => l.includes(`reloaded ${JOB_LABEL}`)), r.out.join("\n"));
+  });
+});
+
+test("release", "an agent that was not loaded is loaded, not unloaded", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const lc = fakeLaunchctl({ loaded: false });
+    const r = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(r.code === 0, r.err.join("\n"));
+    assert(
+      JSON.stringify(lc.calls) === JSON.stringify([`list ${JOB_LABEL}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+      lc.calls.join(" | "),
+    );
+    assert(r.out.some((l) => l.includes(`loaded ${JOB_LABEL}`)), r.out.join("\n"));
+  });
+});
+
+test("release", "pinning the tag already checked out still checks the plist", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: true }).run)).code === 0, "first pin failed");
+
+    // The bare template was copied over the pinned job again.
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const again = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "v1", again.run));
+    assert(r.code === 0, r.err.join("\n"));
+    assert(r.out.some((l) => l.includes("is already on v1")), r.out.join("\n"));
+    assert(plistForm(fx.plistPath) === "pinned", plistForm(fx.plistPath));
+    assert(again.calls.includes(`load ${fx.plistPath}`), again.calls.join(" | "));
+
+    // A pinned, loaded job is left exactly as it is.
+    const before = readFileSync(fx.plistPath, "utf8");
+    const idle = fakeLaunchctl({ loaded: true });
+    const r2 = pinRelease(pinOpts(fx, "v1", idle.run));
+    assert(r2.code === 0, r2.err.join("\n"));
+    assert(readFileSync(fx.plistPath, "utf8") === before, "a pinned plist was rewritten");
+    assert(JSON.stringify(idle.calls) === JSON.stringify([`list ${JOB_LABEL}`]), idle.calls.join(" | "));
+  });
+});
+
+test("release", "a job with another script stops pin before HEAD moves", () => {
+  withReleaseFixture((fx) => {
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "first pin failed");
+    const edited = jobPlistXml(`${BARE_SCRIPT}\necho extra`);
+    writePlistFile(fx.plistPath, edited);
+    const lc = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "v2", lc.run));
+    assert(r.code === 1, "pin accepted an edited job");
+    assert(r.err.some((l) => l.startsWith("chamber pin: ") && l.includes(fx.plistPath)), r.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved before the plist was checked");
+    assert(readFileSync(fx.plistPath, "utf8") === edited, "the edited plist was changed");
+    assert(lc.calls.length === 0, lc.calls.join(" | "));
+
+    rmSync(fx.releaseDir, { recursive: true, force: true });
+    const fresh = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(fresh.code === 1, "pin accepted an edited job on a first pin");
+    assert(!existsSync(fx.releaseDir), "a first pin cloned before the plist was checked");
+  });
+});
+
+test("release", "a missing plist still pins the checkout and exits 0", () => {
+  withReleaseFixture((fx) => {
+    const lc = fakeLaunchctl({ loaded: false });
+    const r = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(r.code === 0, r.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD is not v1");
+    assert(r.out.some((l) => l.includes(`no LaunchAgent was installed at ${fx.plistPath}`)), r.out.join("\n"));
+    assert(lc.calls.length === 0, lc.calls.join(" | "));
+    assert(!existsSync(fx.plistPath), "pin created a plist");
+  });
+});
+
+test("release", "a failed reload exits non-zero and keeps the checkout and the plist", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const r = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: true, load: "fails" }).run));
+    assert(r.code === 1, "a failed load exited 0");
+    assert(r.err.some((l) => l.includes("launchctl load failed")), r.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "the checkout was rolled back");
+    assert(plistForm(fx.plistPath) === "pinned", "the plist was rolled back");
+  });
+});
+
+test("release", "a load that exits 0 without loading the agent is a failure", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const r = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false, load: "lies" }).run));
+    assert(r.code === 1, "an agent that never loaded was reported loaded");
+    assert(r.err.some((l) => l.includes("is not loaded")), r.err.join("\n"));
+  });
+});
+
+test("release", "a pin that fails writes no plist and calls no launchctl", () => {
+  withReleaseFixture((fx) => {
+    const bare = jobPlistXml(BARE_SCRIPT);
+    writePlistFile(fx.plistPath, bare);
+    const missing = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "nope", missing.run));
+    assert(r.code === 1, "a missing tag was pinned");
+    assert(readFileSync(fx.plistPath, "utf8") === bare, "a failed pin wrote the plist");
+    assert(missing.calls.length === 0, missing.calls.join(" | "));
+    assert(!existsSync(fx.releaseDir), "a failed first pin left its clone behind");
+
+    rmSync(fx.plistPath);
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "v1 failed");
+    writeFileSync(join(fx.releaseDir, "CHANGES.md"), "mine\n");
+    writePlistFile(fx.plistPath, bare);
+    const blocked = fakeLaunchctl({ loaded: true });
+    const r2 = pinRelease(pinOpts(fx, "v2", blocked.run));
+    assert(r2.code === 1 && r2.err.join("\n").includes("CHANGES.md"), r2.err.join("\n"));
+    assert(readFileSync(fx.plistPath, "utf8") === bare, "git refused the checkout and the plist was still written");
+    assert(blocked.calls.length === 0, blocked.calls.join(" | "));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved");
   });
 });
 

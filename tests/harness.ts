@@ -13713,6 +13713,72 @@ test("release", "a load that exits 0 without loading the agent says the 08:30 jo
   });
 });
 
+// The comment stripper is a regex. These plists make it and launchd disagree, so
+// each is refused outright (and, being refused by readJobPlist, never rewritten).
+const HIDDEN_XML_REASON = "the job plist uses XML that Chamber does not read";
+
+/** The live job plist with `extra` placed just before its closing </dict>. */
+function jobPlistEnding(extra: string): string {
+  return jobPlistXml(BARE_SCRIPT).replace("</dict>", `${extra}\n</dict>`);
+}
+
+function assertNeverRead(xml: string, what: string): void {
+  const read = readJobPlist(xml);
+  assert(!read.ok && read.reason.startsWith(HIDDEN_XML_REASON), `${what} was read: ${JSON.stringify(read)}`);
+  let threw = false;
+  try {
+    pinJobPlist(xml);
+  } catch {
+    threw = true;
+  }
+  assert(threw, `pinJobPlist rewrote a plist with ${what}`);
+}
+
+test("release", "a Program key hidden between two CDATA sections that hold comment markers is refused", () => {
+  // To the regex stripper everything from the first `<!--` to the last `-->` is
+  // one comment; to a parser the Program key between them is real.
+  const xml = jobPlistEnding(
+    [
+      `  <key>X</key><string><![CDATA[ <!-- ]]></string>`,
+      `  <key>Program</key><string>/usr/bin/true</string>`,
+      `  <key>Y</key><string><![CDATA[ --> ]]></string>`,
+    ].join("\n"),
+  );
+  assertNeverRead(xml, "a Program key between CDATA sections");
+});
+
+test("release", "an entity-encoded key is refused, because launchd decodes it to Program", () => {
+  const xml = jobPlistEnding("  <key>Progr&#97;m</key>\n  <string>/usr/bin/true</string>");
+  assertNeverRead(xml, "an entity-encoded key");
+});
+
+test("release", "an unterminated comment is refused, before or after the block, and plutil agrees it is not a plist", () => {
+  const before = jobPlistWith("<!-- never closed");
+  const after = jobPlistEnding("<!-- never closed");
+  assertNeverRead(before, "an unterminated comment before the block");
+  assertNeverRead(after, "an unterminated comment after the block");
+  // A comment that was closed, and one that has `--` inside it, are still plists.
+  assert(readJobPlist(jobPlistWith("<!-- closed -->")).ok, "a closed comment was refused");
+  const dashes = readJobPlist(jobPlistWith("<!-- a -- b --- c -->"));
+  assert(dashes.ok && dashes.form === "bare", `a comment containing -- was refused: ${JSON.stringify(dashes)}`);
+
+  const lint = spawnSync("plutil", ["-help"], { encoding: "utf8" });
+  if (lint.error !== undefined) {
+    process.stdout.write("      (plutil is not available: skipped the check that plutil -lint rejects the unterminated comment)\n");
+    return;
+  }
+  withReleaseFixture((fx) => {
+    const lintOf = (name: string, xml: string): number | null => {
+      const file = join(fx.root, name);
+      writeFileSync(file, xml);
+      return spawnSync("plutil", ["-lint", file], { encoding: "utf8" }).status;
+    };
+    assert(lintOf("ok.plist", jobPlistXml(BARE_SCRIPT)) === 0, "plutil -lint rejects the plain job plist; the control is broken");
+    assert(lintOf("before.plist", before) !== 0, "plutil -lint accepts a plist with an unterminated comment before the block");
+    assert(lintOf("after.plist", after) !== 0, "plutil -lint accepts a plist with an unterminated comment after the block");
+  });
+});
+
 test("release", "an http(s) origin the URL parser rejects is refused, not waved through, and never echoed", () => {
   withReleaseFixture((fx) => {
     // Assembled here so no literal credential sits in this file.

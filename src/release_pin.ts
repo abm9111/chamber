@@ -108,6 +108,17 @@ function encodeXmlText(text: string): string {
 /** Which shipped form an installed job plist holds, or why it holds neither. */
 export function readJobPlist(xml: string): JobPlistRead {
   const live = stripXmlComments(xml);
+  // The comment stripper is a regex, not an XML parser, so anything that could
+  // make it and launchd disagree about what is a comment or what a key is named
+  // is refused outright: a `<!--` left after stripping (an unterminated comment,
+  // which plutil rejects, or one opened inside CDATA), CDATA itself, and an
+  // entity in a key (`Progr&#97;m` is `Program` to launchd).
+  if (live.includes("<!--") || live.includes("<![CDATA[") || /<key>[^<]*&[^<]*<\/key>/.test(live)) {
+    return {
+      ok: false,
+      reason: "the job plist uses XML that Chamber does not read (CDATA, an unterminated comment, or an encoded key)",
+    };
+  }
   if (live.split("<key>ProgramArguments</key>").length !== 2) {
     return { ok: false, reason: "ProgramArguments does not appear exactly once" };
   }

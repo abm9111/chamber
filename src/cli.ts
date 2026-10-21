@@ -1913,6 +1913,8 @@ async function main(): Promise<void> {
       );
       if (r.sandbox?.stdout) console.log(r.sandbox.stdout.trimEnd());
       if (r.sandbox?.stderr) console.error(r.sandbox.stderr.trimEnd());
+      // A refusal has no stdout or stderr; its reason, and the way out, is here.
+      if (r.sandbox?.error) console.error(r.sandbox.error);
       if (!r.sandbox?.ok) process.exitCode = 1;
       break;
     }
@@ -1951,6 +1953,7 @@ async function main(): Promise<void> {
       console.log(
         `sandbox ok=${result.sandbox.ok} backend=${result.sandbox.backend} hash=${result.sandbox.sourceHash.slice(0, 12)}…`,
       );
+      if (result.status === "rejected") process.exitCode = 1;
       break;
     }
     case "sandbox-test": {
@@ -1962,6 +1965,7 @@ async function main(): Promise<void> {
             backend: r.backend,
             exitCode: r.exitCode,
             stdout: r.stdout.trim(),
+            ...(r.error ? { error: r.error } : {}),
             ms: r.durationMs,
           },
           null,

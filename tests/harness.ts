@@ -17105,6 +17105,54 @@ test("server", "with an in-memory database the turn runs inline, because a threa
   }
 });
 
+test("tools", "the CLI shows the sandbox refusal with its opt-out, and tool-synth exits non-zero", () => {
+  // The refusal text lives in SandboxResult.error. A CLI that prints only
+  // ok/backend/exit leaves the operator with "ok=false" and no way out.
+  const hasBwrap = spawnSync("which", ["bwrap"], { encoding: "utf8" }).status === 0;
+  if (hasBwrap) {
+    console.log("  (skipped: bwrap is on PATH, so the default may not refuse here)");
+    return;
+  }
+  const way = "Set CHAMBER_SANDBOX_REQUIRED=0 to run tool code without isolation.";
+  const dir = mkdtempSync(join(tmpdir(), "chamber-cli-refusal-"));
+  try {
+    const env: NodeJS.ProcessEnv = { ...process.env, CHAMBER_DB: join(dir, "t.sqlite") };
+    delete env.CHAMBER_SANDBOX_REQUIRED;
+    delete env.CHAMBER_SANDBOX_BACKEND;
+    const cli = (args: string[]): ReturnType<typeof spawnSync> =>
+      spawnSync(process.execPath, ["--experimental-strip-types", CLI_PATH, ...args], {
+        encoding: "utf8",
+        timeout: 30_000,
+        env,
+      });
+
+    const run = cli(["tool-run", "sha256", "abc"]);
+    assert(run.error === undefined, `launch failed: ${run.error}`);
+    assert(run.status === 1, `tool-run: expected exit 1, got ${run.status}`);
+    assert(
+      String(run.stderr).split("\n").some((line) => line.startsWith("sandbox required") && line.endsWith(way)),
+      `tool-run: stderr must carry the refusal as its own line, got ${JSON.stringify(run.stderr)}`,
+    );
+
+    const st = cli(["sandbox-test"]);
+    assert(st.error === undefined, `launch failed: ${st.error}`);
+    assert(st.status === 1, `sandbox-test: expected exit 1, got ${st.status}`);
+    const parsed = JSON.parse(String(st.stdout)) as { ok?: boolean; error?: string };
+    assert(parsed.ok === false, `sandbox-test: ok must be false, got ${JSON.stringify(parsed)}`);
+    assert(
+      typeof parsed.error === "string" && parsed.error.endsWith(way),
+      `sandbox-test: JSON error must end with the way out, got ${JSON.stringify(parsed.error)}`,
+    );
+
+    const syn = cli(["tool-synth", "foo", "--", "console.log(1)"]);
+    assert(syn.error === undefined, `launch failed: ${syn.error}`);
+    assert(syn.status === 1, `tool-synth: a rejected synthesis must exit 1, got ${syn.status}`);
+    assert(String(syn.stdout).includes(way), `tool-synth: output must still carry the refusal, got ${JSON.stringify(syn.stdout)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ─── report ──────────────────────────────────────────────────────────────────
 
 // Past this point `pending` is never read again, so an async test declared

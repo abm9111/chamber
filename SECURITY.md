@@ -20,8 +20,10 @@ Chamber's claim is that specific gates cannot be walked around. A report is
 in scope if it defeats one of them:
 
 - **The sandbox.** Model-authored or vendor-supplied code reading, writing, or
-  reaching the network outside its confinement, or `CHAMBER_SANDBOX_REQUIRED`
-  failing to refuse when nothing isolating is available.
+  reaching the network outside its confinement, or tool code running when
+  nothing isolating is available. Isolation is required unless
+  `CHAMBER_SANDBOX_REQUIRED` is set to `0`, `false`, `no` or `off`; an unset or
+  empty value is "required", and a report that defeats that default is in scope.
 - **The citation gate.** A claim gaining verified support it did not earn — a
   pin that resolves without the cited document existing, a fabricated reference
   buying support from another row's content.

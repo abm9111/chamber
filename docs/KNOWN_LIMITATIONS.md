@@ -25,6 +25,15 @@ wrong. Neither is theoretical.
 
 ## 1. The sandbox does not isolate
 
+> **Default changed, 2026-10-21.** `CHAMBER_SANDBOX_REQUIRED` now means
+> required when it is unset or empty. Without an isolating backend whose probe
+> confines (today only bubblewrap), `runInSandbox` refuses, and so does every
+> caller: `tool-run`, `tool-synth`, `sandbox-test` and `verifyMcpToolSource`.
+> The refusal ends with the way out, `Set CHAMBER_SANDBOX_REQUIRED=0 to run
+> tool code without isolation.` Only an explicit `0`, `false`, `no` or `off`
+> (any case) selects the unisolated subprocess that the rest of this entry
+> describes.
+
 `src/sandbox.ts` is named for containment it does not provide. Running
 `probes/sandbox_escape.ts` on the development machine, with
 `CHAMBER_SANDBOX_REQUIRED=1` set, produces this:

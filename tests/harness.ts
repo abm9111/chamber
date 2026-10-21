@@ -6427,15 +6427,18 @@ test("phase1", "P1_debt_propose_from_corpus", () => {
   }
 });
 
+// The sandbox is required unless an operator opts out, so a test that needs
+// tool code to actually run says so: `required: "0"` is the opt-out, and these
+// hosts (macOS, a CI runner without bubblewrap) have nothing that isolates.
 test("tools", "T1_sandbox_self_test", () => {
-  const r = sandboxSelfTest();
+  const r = withSandboxEnv({ required: "0" }, () => sandboxSelfTest());
   assert(r.ok, `sandbox failed: ${r.stderr || r.error}`);
   assert(r.stdout.includes("ok"), r.stdout);
 });
 
 test("tools", "T2_allowlist_echo", () => {
   const db = freshDb();
-  const r = runTool(db, "echo", ["hello-chamber"]);
+  const r = withSandboxEnv({ required: "0" }, () => runTool(db, "echo", ["hello-chamber"]));
   assert(r.allowed, r.reason);
   assert(r.sandbox?.ok, r.sandbox?.stderr);
   assert(r.sandbox!.stdout.includes("hello-chamber"), r.sandbox!.stdout);
@@ -6449,12 +6452,14 @@ test("tools", "T3_unknown_tool_blocked", () => {
 
 test("tools", "T4_synth_pass_queues", () => {
   const db = freshDb();
-  const r = synthesizeTool(db, {
-    name: "double",
-    description: "double a number",
-    source: `const n = Number(process.argv[2]||1); console.log(n*2);`,
-    risk: ["compute"],
-  });
+  const r = withSandboxEnv({ required: "0" }, () =>
+    synthesizeTool(db, {
+      name: "double",
+      description: "double a number",
+      source: `const n = Number(process.argv[2]||1); console.log(n*2);`,
+      risk: ["compute"],
+    }),
+  );
   assert(r.sandbox.ok, r.sandbox.stderr);
   assert(r.status === "queued", r.reason);
   assert(!!r.writeId, "writeId required");
@@ -6462,13 +6467,18 @@ test("tools", "T4_synth_pass_queues", () => {
 
 test("tools", "T5_synth_fail_rejects", () => {
   const db = freshDb();
-  const r = synthesizeTool(db, {
-    name: "boom",
-    description: "fails",
-    source: `process.exit(2)`,
-    risk: ["compute"],
-  });
+  // With the opt-out, so that the rejection comes from the source failing and
+  // not from the default refusing to run anything.
+  const r = withSandboxEnv({ required: "0" }, () =>
+    synthesizeTool(db, {
+      name: "boom",
+      description: "fails",
+      source: `process.exit(2)`,
+      risk: ["compute"],
+    }),
+  );
   assert(!r.sandbox.ok, "expected sandbox fail");
+  assert(r.sandbox.exitCode === 2, `the source must have run and exited 2, got ${r.sandbox.exitCode}`);
   assert(r.status === "rejected", r.status);
 });
 
@@ -6605,12 +6615,63 @@ test("tools", "a sandbox requirement spelled other than \"1\" still binds", () =
   }
 });
 
-test("tools", "an unset sandbox requirement still runs the subprocess fallback", () => {
-  const r = withSandboxEnv({ backend: "subprocess" }, () =>
-    runInSandbox({ runtime: "node", source: `console.log("ran")`, timeoutMs: 5000 }),
+test("tools", "an unset or empty sandbox requirement refuses a backend that does not isolate, and nothing runs", () => {
+  // The default used to be "run it anyway". Now unset, empty and blank all mean
+  // required, and the refusal says how to opt out.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-sbx-default-"));
+  const marker = join(dir, "escaped");
+  try {
+    for (const backend of ["subprocess", "docker"]) {
+      for (const spelling of [undefined, "", "   "]) {
+        const r = withSandboxEnv({ required: spelling, backend }, () =>
+          runInSandbox({
+            runtime: "node",
+            source:
+              `import { writeFileSync } from "node:fs";\n` +
+              `writeFileSync(${JSON.stringify(marker)}, "x");\n` +
+              `console.log("ran");`,
+            timeoutMs: 5000,
+          }),
+        );
+        const label = `${backend} with CHAMBER_SANDBOX_REQUIRED ${spelling === undefined ? "unset" : JSON.stringify(spelling)}`;
+        assert(!r.ok, `${label}: must refuse`);
+        assert(!existsSync(marker), `${label}: refused, but the source still ran`);
+        assert(
+          r.error?.endsWith("Set CHAMBER_SANDBOX_REQUIRED=0 to run tool code without isolation.") === true,
+          `${label}: the refusal must end with the way out, got ${JSON.stringify(r.error)}`,
+        );
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tools", "with the requirement unset and no backend named, nothing runs unisolated", () => {
+  const r = withSandboxEnv({}, () =>
+    runInSandbox({ runtime: "node", source: `console.log("ran")`, timeoutMs: 8000 }),
   );
-  assert(r.ok, `fallback must still work when isolation is not required: ${r.error}`);
-  assert(r.stdout.includes("ran"), r.stdout);
+  const hasBwrap = spawnSync("which", ["bwrap"], { encoding: "utf8" }).status === 0;
+  if (!hasBwrap) {
+    // This host has nothing that isolates: the default must refuse, and the
+    // source must not have produced output.
+    assert(!r.ok && !r.stdout.includes("ran"), `a host without bwrap ran the source: ${JSON.stringify(r)}`);
+    assert(r.backend === "none", `a refusal ran on no backend, got ${r.backend}`);
+  } else {
+    // Where bwrap exists the answer depends on whether it confines here. Either
+    // outcome is acceptable except an unisolated run.
+    assert(r.backend !== "subprocess", `ran as a plain subprocess: ${JSON.stringify(r)}`);
+  }
+});
+
+test("tools", "an explicit opt-out, spelled 0 false no or off in any case, runs the subprocess backend", () => {
+  for (const spelling of ["0", "false", "no", "off", "OFF", " Off ", "False"]) {
+    const r = withSandboxEnv({ required: spelling, backend: "subprocess" }, () =>
+      runInSandbox({ runtime: "node", source: `console.log("ran")`, timeoutMs: 5000 }),
+    );
+    assert(r.ok && r.stdout.includes("ran"), `${JSON.stringify(spelling)} must opt out: ${JSON.stringify(r)}`);
+    assert(r.backend === "subprocess", `${JSON.stringify(spelling)}: backend ${r.backend}`);
+  }
 });
 
 test("memory", "M1_remember_working", () => {

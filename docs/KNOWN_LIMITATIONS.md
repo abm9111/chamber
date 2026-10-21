@@ -298,25 +298,27 @@ it on a schedule rather than on request. `docs/NEXT_LEVEL_PLAN.md` Phase 1.4 spe
 the signing work and flags it as net-new code that is droppable if the phase overruns —
 so it is planned, but it is the first thing scheduled to be cut.
 
-## 4. A stalled model endpoint hangs the process forever
+## 4. A stalled model endpoint is abandoned after 180 seconds, and nothing bounds the whole turn
 
-`src/model.ts:93-104` calls `fetch` with no `signal`, no `AbortController`, and no
-timeout. There is no `CHAMBER_TURN_DEADLINE_MS` or any other implemented deadline on the
-model path.
+`src/model.ts` gives every model request one `AbortSignal.timeout`. The signal covers
+connecting, waiting for headers and reading the body, so a server that sends a status
+line and then stalls is abandoned on the same clock as one that never answers. The
+default is 180 000 ms; `CHAMBER_MODEL_TIMEOUT_MS` sets it. A set value that is not a
+string of digits naming 1 to 2 147 483 647 is refused with an error that names the
+variable, including `0` and the empty string; it is never replaced by the default. The
+ceiling is the largest value `AbortSignal.timeout` honours: a larger one fires at once.
+On timeout the error reads `model endpoint <base> did not answer within <N> s
+(CHAMBER_MODEL_TIMEOUT_MS)`. The MCP server's serial queue moves on to the next call.
 
-**What it costs.** `chamber ask` routes through `complete()` and inherits this. A model
-server that accepts the connection and then stops responding — a local LM Studio that
-has wedged, a remote endpoint that black-holes the request — hangs the command
-indefinitely with no output and no error. Under the scheduled job this is worse than a
-crash: a hung run produces no log line at all, so the absence of a failure reads as
-success. Note the inconsistency, which is a useful signal that this is an oversight
-rather than a decision: MCP calls are bounded (`curl -m 30`, `src/mcp_client.ts:53-58`)
-and embedding subprocesses are bounded (`src/embedder.ts:140,163`). Only the model call
-is not.
+**What it still costs.** The bound is per request. There is no wall clock across a whole
+turn, which also spends time in retrieval and in the embedding subprocess (itself
+bounded at 180 s in `src/embedder.ts`). A turn is therefore bounded by the sum of its
+parts, not by one number. What changed is that a stalled model is now an error with a
+message, where it used to be a run that never finished and wrote nothing.
 
-**What would fix it.** An `AbortSignal.timeout` on the request plus a per-turn wall
-clock. Specified in `docs/NEXT_LEVEL_PLAN.md` Phase 2A, which calls out this exact line
-of code.
+**What would fix it.** A per-turn deadline that the model request, the embedder and the
+retrieval all draw from. Specified in `docs/NEXT_LEVEL_PLAN.md` Phase 2A; the model
+request is the part that is done.
 
 ## 5. The corpus has no notion of deletion
 

@@ -110,7 +110,7 @@ import {
   verifyMmrInclusion,
   syncMerkleIncremental,
 } from "../src/merkle_inc.ts";
-import { completeSync } from "../src/model.ts";
+import { complete, completeSync, modelTimeoutMs } from "../src/model.ts";
 import {
   classifyClaims,
   enforceClaimContract,
@@ -293,6 +293,7 @@ type Suite =
   | "cli"
   | "config"
   | "release"
+  | "model"
   | "all";
 
 interface TestResult {
@@ -404,6 +405,7 @@ function suiteFromArg(): Suite {
     "config",
     "daemon",
     "release",
+    "model",
     "all",
   ].includes(v)
     ? v
@@ -15642,6 +15644,236 @@ test("pins", "a real model's answer carries no stub disclosure", () => {
     !!unknown && unknown.includes("UNKNOWN MODEL"),
     "an unrecorded provenance must disclose, not fall through to silence",
   );
+});
+
+// ─── MODEL TIMEOUT (src/model.ts, CHAMBER_MODEL_TIMEOUT_MS) ──────────────────
+
+type ModelStep = "silent" | "partial" | "answer";
+
+/**
+ * A fake OpenAI-compatible server whose behaviour is scripted per request.
+ *
+ * `silent` accepts the request and never answers. `partial` sends the status
+ * line and part of a JSON body and then stalls, which is a different failure:
+ * `fetch()` resolves, and only reading the body hangs. `answer` replies. A
+ * request past the end of the script gets `answer`.
+ */
+async function scriptedModel(
+  script: ModelStep[],
+  answerText = "scripted answer",
+): Promise<{ base: string; requests: () => number; close: () => void }> {
+  const { createServer } = await import("node:http");
+  let seen = 0;
+  const server = createServer((req, res) => {
+    const step: ModelStep = script[seen] ?? "answer";
+    seen++;
+    req.resume();
+    if (step === "silent") return;
+    req.on("end", () => {
+      if (step === "partial") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.write('{"choices":[{"message":{"content":"par');
+        return;
+      }
+      res.setHeader("Content-Type", "application/json");
+      res.end(
+        JSON.stringify({
+          choices: [{ message: { content: answerText } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+          model: "fake",
+        }),
+      );
+    });
+  });
+  await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
+  const port = (server.address() as { port: number }).port;
+  return {
+    base: `http://127.0.0.1:${port}/v1`,
+    requests: () => seen,
+    close: () => {
+      server.closeAllConnections();
+      server.close();
+    },
+  };
+}
+
+/** Set environment variables for the duration of `fn`; `undefined` deletes. */
+async function withEnvAsync<T>(
+  vars: Record<string, string | undefined>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const saved = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(vars)) {
+    saved.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [key, prev] of saved) {
+      if (prev === undefined) delete process.env[key];
+      else process.env[key] = prev;
+    }
+  }
+}
+
+/**
+ * The error `p` rejects with, or a test failure if it is still pending after
+ * `ms` or resolves. The watchdog is what makes "hangs forever" a red test
+ * instead of a hung test run.
+ */
+async function rejectionWithin(p: Promise<unknown>, ms: number): Promise<Error> {
+  let timer: NodeJS.Timeout | undefined;
+  const outcome: unknown = await Promise.race([
+    p.then(
+      () => "resolved" as const,
+      (err: unknown) => err,
+    ),
+    new Promise<"pending">((ok) => {
+      timer = setTimeout(() => ok("pending"), ms);
+    }),
+  ]);
+  clearTimeout(timer);
+  assert(outcome !== "pending", `still pending after ${ms} ms`);
+  assert(outcome !== "resolved", "expected a rejection, but the call resolved");
+  assert(outcome instanceof Error, `expected an Error, got ${String(outcome)}`);
+  return outcome;
+}
+
+/** `p`'s value, or a test failure if it is still pending after `ms`. */
+async function resolvesWithin<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const watchdog = new Promise<never>((_, fail) => {
+    timer = setTimeout(() => fail(new Error(`${what}: still pending after ${ms} ms`)), ms);
+  });
+  try {
+    return await Promise.race([p, watchdog]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test("model", "a model endpoint that never answers is abandoned at CHAMBER_MODEL_TIMEOUT_MS", async () => {
+  const model = await scriptedModel(["silent"]);
+  const db = freshDb();
+  try {
+    const err = await withEnvAsync(
+      {
+        CHAMBER_MODEL: "openai",
+        CHAMBER_API_BASE: model.base,
+        CHAMBER_API_KEY: undefined,
+        CHAMBER_MODEL_TIMEOUT_MS: "200",
+      },
+      () =>
+        rejectionWithin(
+          complete(db, { messages: [{ role: "user", content: "hi" }] }),
+          2000,
+        ),
+    );
+    assert(
+      err.message ===
+        `model endpoint ${model.base} did not answer within 0.2 s (CHAMBER_MODEL_TIMEOUT_MS)`,
+      `wrong message: ${err.message}`,
+    );
+  } finally {
+    model.close();
+  }
+});
+
+test("model", "a body that stalls after the headers is bounded by the same timeout", async () => {
+  const model = await scriptedModel(["partial"]);
+  const db = freshDb();
+  try {
+    const err = await withEnvAsync(
+      {
+        CHAMBER_MODEL: "openai",
+        CHAMBER_API_BASE: model.base,
+        CHAMBER_API_KEY: undefined,
+        CHAMBER_MODEL_TIMEOUT_MS: "300",
+      },
+      () =>
+        rejectionWithin(
+          complete(db, { messages: [{ role: "user", content: "hi" }] }),
+          2000,
+        ),
+    );
+    assert(
+      err.message ===
+        `model endpoint ${model.base} did not answer within 0.3 s (CHAMBER_MODEL_TIMEOUT_MS)`,
+      `wrong message: ${err.message}`,
+    );
+  } finally {
+    model.close();
+  }
+});
+
+test("model", "an unusable CHAMBER_MODEL_TIMEOUT_MS is refused by name, never replaced by the default", async () => {
+  const db = freshDb();
+  for (const bad of ["", "abc", "0", "000", "-5", "1.5", " 200", "200 ", "2147483648"]) {
+    const model = await scriptedModel(["answer"]);
+    try {
+      const err = await withEnvAsync(
+        {
+          CHAMBER_MODEL: "openai",
+          CHAMBER_API_BASE: model.base,
+          CHAMBER_API_KEY: undefined,
+          CHAMBER_MODEL_TIMEOUT_MS: bad,
+        },
+        () =>
+          rejectionWithin(
+            complete(db, { messages: [{ role: "user", content: "hi" }] }),
+            1000,
+          ),
+      );
+      assert(
+        err.message.includes("CHAMBER_MODEL_TIMEOUT_MS") &&
+          err.message.includes(JSON.stringify(bad)),
+        `${JSON.stringify(bad)}: the refusal must name the variable and the value: ${err.message}`,
+      );
+      assert(
+        model.requests() === 0,
+        `${JSON.stringify(bad)}: refused, but a request still reached the model`,
+      );
+    } finally {
+      model.close();
+    }
+  }
+  assert(modelTimeoutMs({}) === 180_000, "unset means the 180000 ms default");
+  assert(
+    modelTimeoutMs({ CHAMBER_MODEL_TIMEOUT_MS: "2500" }) === 2500,
+    "a whole number of milliseconds is taken as written",
+  );
+});
+
+test("model", "a timed-out MCP call does not wedge the calls queued behind it", async () => {
+  const { env, dir } = stubAskFixture();
+  const model = await scriptedModel(["silent"], "SECOND The audit store is SQLite. [1]");
+  writeFileSync(
+    env.CHAMBER_CONFIG!,
+    `${JSON.stringify({ database: env.CHAMBER_DB, ingest: [], model: { base: model.base, name: "fake", mode: "openai" } })}\n`,
+  );
+  const s = mcpSession({ ...env, CHAMBER_MODEL_TIMEOUT_MS: "500" });
+  try {
+    // Both are sent before either is answered, so the second really is queued
+    // behind the first in the server's serial chain.
+    const first = s.ask("what is the audit store");
+    const second = s.ask("what is the audit store");
+    const [a, b] = await resolvesWithin(
+      Promise.all([first, second]),
+      15_000,
+      "both queued calls",
+    );
+    assert(
+      a.includes("did not answer within 0.5 s (CHAMBER_MODEL_TIMEOUT_MS)"),
+      `the first call must fail with the timeout:\n${a}`,
+    );
+    assert(b.includes("SECOND"), `the queued call must complete:\n${b}`);
+  } finally {
+    s.stop();
+    model.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────

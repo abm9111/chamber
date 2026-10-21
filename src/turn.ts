@@ -40,7 +40,27 @@ export interface TurnJob {
 /** Worker to main thread. A failure carries the error chain and stack as text, which survive a thread boundary. */
 export type TurnReply =
   | { id: number; ok: true; result: Record<string, unknown> }
-  | { id: number; ok: false; chain: string[]; stack: string };
+  | { id: number; ok: false; chain: string[]; stack: string; busy?: boolean };
+
+/**
+ * Did SQLite refuse because another connection holds the write lock?
+ *
+ * Decided from the error's `errcode`, never its message text. node:sqlite sets
+ * `code` to the constant `ERR_SQLITE_ERROR` for every failure and puts SQLite's
+ * own result code in `errcode`; `SQLITE_BUSY` is 5, and its extended forms
+ * (`SQLITE_BUSY_RECOVERY` 261, `SQLITE_BUSY_SNAPSHOT` 517) keep 5 in the low
+ * byte. `SQLITE_LOCKED` (6) is a different condition and is not busy. A `cause`
+ * is followed in case a caller wrapped the error.
+ */
+export function isSqliteBusy(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && typeof current === "object" && current !== null; depth++) {
+    const errcode = (current as { errcode?: unknown }).errcode;
+    if (typeof errcode === "number" && (errcode & 0xff) === 5) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
 
 export function runTurn(db: DatabaseSync, message: string): Record<string, unknown> {
   // Asked before anything is written. Every one of these surfaces commits an

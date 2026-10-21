@@ -22,7 +22,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { openChamberDb } from "./db.ts";
 import { formatErrorChain } from "./error_chain.ts";
 import { registerSlackPendingHook } from "./slack_ops.ts";
-import { runTurn, type TurnJob, type TurnReply } from "./turn.ts";
+import { isSqliteBusy, runTurn, type TurnJob, type TurnReply } from "./turn.ts";
 
 if (parentPort === null) {
   throw new Error("turn_worker.ts is a worker-thread entry point; it cannot be run directly");
@@ -50,6 +50,9 @@ port.on("message", (job: TurnJob) => {
       ok: false,
       chain: formatErrorChain(err),
       stack: err instanceof Error && err.stack ? err.stack : "",
+      // Decided here, where the real error object (and its `errcode`) exists;
+      // across the thread boundary only text survives.
+      busy: isSqliteBusy(err),
     };
   }
   port.postMessage(reply);

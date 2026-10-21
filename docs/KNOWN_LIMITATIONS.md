@@ -1121,7 +1121,10 @@ waits behind the first. Before the worker, every one of those routes, `/health` 
 froze for the whole wait; the main thread's connection now gives up after 250 ms
 (`MAIN_THREAD_BUSY_MS` in `src/server.ts`) instead of SQLite's default 5 s. The server
 recognises the refusal by SQLite's result code (`errcode` 5, `SQLITE_BUSY`), not by the
-message, and a client that gets the 503 is expected to retry.
+message, and a client that gets the 503 is expected to retry. The same holds the other
+way round: a `POST /turn` whose worker waits out SQLite's 5 s for a lock that a route on
+this thread holds answers the same 503, flagged `busy` by the worker, which is where the
+error object exists.
 
 Two smaller things follow from the turn living in another thread. The `/turn` rate-limit
 bucket is in memory in that thread, so a worker that dies and is restarted starts with a

@@ -8,6 +8,7 @@
 import { openChamberDb, secureDatabaseFile } from "../src/db.ts";
 import { CURL_FIXED_ARGV, buildCurlInvocation, httpSync } from "../src/http_sync.ts";
 import { TurnPool, TurnWorkerError } from "../src/turn_pool.ts";
+import { isSqliteBusy } from "../src/turn.ts";
 import { mcpDiscover } from "../src/mcp_client.ts";
 import { TelegramGateway } from "../src/gateway.ts";
 import { claimHash, newId, sha256 } from "../src/hash.ts";
@@ -16720,10 +16721,81 @@ test("turn_pool", "a failure reply becomes a TurnWorkerError that keeps the chai
       `chain: ${JSON.stringify(err.chain)}`,
     );
     assert(/at fake/.test(err.stack ?? ""), `stack: ${err.stack}`);
+    assert(err.busy === false, `a failure reply without the flag must not read as busy: ${String(err.busy)}`);
   } finally {
     await pool.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+/**
+ * First message: the worker throws outside any handler ('error', then 'exit').
+ * Later messages (the replacement worker): a slow but healthy answer.
+ */
+const POOL_WORKER_CRASH_THEN_SLOW = `
+import { parentPort, workerData } from "node:worker_threads";
+import { existsSync, writeFileSync } from "node:fs";
+parentPort.on("message", (job) => {
+  if (!existsSync(workerData.dbPath)) {
+    writeFileSync(workerData.dbPath, "crashed once");
+    setTimeout(() => { throw new Error("boom outside a turn"); }, 0);
+    return;
+  }
+  setTimeout(() => parentPort.postMessage({ id: job.id, ok: true, result: { echoed: job.message } }), 1000);
+});
+`;
+
+test("turn_pool", "a request that arrives between a crashed worker's 'error' and its 'exit' is answered by the new worker", async () => {
+  const { pool, dir } = poolOf(POOL_WORKER_CRASH_THEN_SLOW);
+  try {
+    const first = await rejectionWithin(pool.run("first"), 10_000);
+    assert(/boom outside a turn/.test(first.message), `wrong message: ${first.message}`);
+    // Issued from the first rejection: the old worker's 'error' has run and its
+    // 'exit' has not, so the replacement's job is in flight when 'exit' arrives.
+    const second = await resolvesWithin(pool.run("second"), 10_000, "the replacement worker's turn");
+    assert(second.echoed === "second", `the replacement answered ${JSON.stringify(second)}`);
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+const POOL_WORKER_BUSY = `
+import { parentPort } from "node:worker_threads";
+parentPort.on("message", (job) => {
+  parentPort.postMessage({
+    id: job.id,
+    ok: false,
+    busy: true,
+    chain: ["Error: database is locked"],
+    stack: "Error: database is locked\\n    at fake (fake.ts:1:1)",
+  });
+});
+`;
+
+test("turn_pool", "a failure reply flagged busy becomes a TurnWorkerError with busy set", async () => {
+  const { pool, dir } = poolOf(POOL_WORKER_BUSY);
+  try {
+    const err = await rejectionWithin(pool.run("x"), 10_000);
+    assert(err instanceof TurnWorkerError, `expected a TurnWorkerError, got ${err.name}`);
+    assert(err.busy === true, `busy was ${String(err.busy)}`);
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("turn_pool", "isSqliteBusy reads the error code, not the message, and follows a cause", async () => {
+  const withCode = (code: number, message: string, cause?: unknown): Error =>
+    Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { errcode: code });
+  assert(isSqliteBusy(withCode(5, "unrelated")), "errcode 5 with an unrelated message must be busy");
+  assert(isSqliteBusy({ errcode: 5, message: "unrelated" }), "a plain object carrying errcode 5 must be busy");
+  assert(isSqliteBusy({ errcode: 517 }), "a plain object carrying errcode 517 must be busy");
+  assert(isSqliteBusy(withCode(517, "snapshot")), "an extended BUSY code (517) must be busy");
+  assert(isSqliteBusy(new Error("wrapped", { cause: withCode(5, "inner") })), "a cause carrying errcode 5 must be busy");
+  assert(!isSqliteBusy(withCode(6, "database is locked")), "SQLITE_LOCKED (6) is not busy, whatever the message says");
+  assert(!isSqliteBusy(new Error("database is locked")), "a message without an errcode is not busy");
+  assert(!isSqliteBusy("database is locked"), "a string is not busy");
 });
 
 test("turn_pool", "requests run one at a time, in the order they were made", async () => {
@@ -16877,6 +16949,29 @@ test("server", "a route that needs the write lock a turn holds answers 503 busy 
   } finally {
     await s.stop();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("server", "a turn whose worker cannot get the write lock answers 503 busy with Retry-After, with no server error line", async () => {
+  const s = await startLiveServer();
+  // The worker is started by the first turn. Without this one, the worker would
+  // fail while opening its connection, which is a different path (an uncaught
+  // 'error' event) from a turn that cannot get the lock.
+  const warm = await s.request({ method: "POST", path: "/turn", body: JSON.stringify({ message: "warm up" }) });
+  assert(warm.status === 200, `setup: the first turn gave ${warm.status}: ${warm.text.slice(0, 200)}`);
+  // Another connection holds the write lock for longer than the worker's 5 s wait.
+  const holder = openChamberDb(s.dbPath);
+  holder.exec("BEGIN IMMEDIATE");
+  try {
+    const r = await s.request({ method: "POST", path: "/turn", body: JSON.stringify({ message: "hello" }) });
+    assert(r.status === 503, `the turn gave ${r.status}: ${r.text.slice(0, 300)}\n${s.stderr()}`);
+    assert(r.headers["retry-after"] === "1", `Retry-After was ${String(r.headers["retry-after"])}`);
+    assert(JSON.stringify(r.json) === JSON.stringify({ error: "busy" }), `body was ${r.text.slice(0, 200)}`);
+    assert(!/chamber server error/.test(s.stderr()), `a busy lock is not a server error, but stderr says:\n${s.stderr()}`);
+  } finally {
+    holder.exec("ROLLBACK");
+    holder.close();
+    await s.stop();
   }
 });
 

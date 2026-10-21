@@ -20,16 +20,21 @@ import type { TurnJob, TurnReply } from "./turn.ts";
 /** A failure reported by the worker. The chain and stack are the worker's own text. */
 export class TurnWorkerError extends Error {
   readonly chain: string[];
+  /** The worker's database call failed because another connection held the write lock. */
+  readonly busy: boolean;
 
-  constructor(chain: string[], stack: string) {
+  constructor(chain: string[], stack: string, busy: boolean = false) {
     super(chain[0] ?? "turn failed");
     this.name = "TurnWorkerError";
     this.chain = chain;
+    this.busy = busy;
     if (stack !== "") this.stack = stack;
   }
 }
 
 interface InFlight {
+  /** The worker instance this job was posted to. Only its events may fail the job. */
+  owner: Worker;
   resolve: (result: Record<string, unknown>) => void;
   reject: (err: Error) => void;
 }
@@ -51,7 +56,7 @@ export class TurnPool {
     const worker = this.worker ?? this.start();
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.inFlight.set(id, { resolve, reject });
+      this.inFlight.set(id, { owner: worker, resolve, reject });
       const job: TurnJob = { id, message };
       worker.postMessage(job);
     });
@@ -61,7 +66,7 @@ export class TurnPool {
   async close(): Promise<void> {
     const worker = this.worker;
     this.worker = null;
-    this.failAll(new Error("turn worker closed"));
+    this.failJobsOf(null, new Error("turn worker closed"));
     if (worker) await worker.terminate();
   }
 
@@ -72,27 +77,36 @@ export class TurnPool {
       if (!job) return;
       this.inFlight.delete(reply.id);
       if (reply.ok) job.resolve(reply.result);
-      else job.reject(new TurnWorkerError(reply.chain, reply.stack));
+      else job.reject(new TurnWorkerError(reply.chain, reply.stack, reply.busy === true));
     });
     // An uncaught exception in the worker: 'error', then 'exit'. Forget the
     // worker at the first of them, so a request that arrives in between starts a
     // new one instead of posting to a thread that is going away.
     worker.on("error", (err) => {
       if (this.worker === worker) this.worker = null;
-      this.failAll(err instanceof Error ? err : new Error(String(err)));
+      this.failJobsOf(worker, err instanceof Error ? err : new Error(String(err)));
       void worker.terminate();
     });
     worker.on("exit", (code) => {
       if (this.worker === worker) this.worker = null;
-      this.failAll(new Error(`turn worker exited (code ${code}) before answering`));
+      this.failJobsOf(worker, new Error(`turn worker exited (code ${code}) before answering`));
     });
     this.worker = worker;
     return worker;
   }
 
-  private failAll(reason: Error): void {
-    const jobs = [...this.inFlight.values()];
-    this.inFlight.clear();
-    for (const job of jobs) job.reject(reason);
+  /**
+   * Fail the jobs posted to `owner`, or every job when `owner` is null (close).
+   *
+   * A dead worker's 'exit' can arrive after the pool has already started its
+   * replacement and posted a job to it. That event must fail only the jobs that
+   * belong to the thread that died.
+   */
+  private failJobsOf(owner: Worker | null, reason: Error): void {
+    for (const [id, job] of [...this.inFlight]) {
+      if (owner !== null && job.owner !== owner) continue;
+      this.inFlight.delete(id);
+      job.reject(reason);
+    }
   }
 }

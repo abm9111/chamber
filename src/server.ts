@@ -37,7 +37,7 @@ import { buildCheckpointReceipt } from "./checkpoint_export.ts";
 import { listOpenDebts } from "./debt.ts";
 import { listMemory } from "./memory.ts";
 import { registerSlackPendingHook } from "./slack_ops.ts";
-import { runTurn } from "./turn.ts";
+import { isSqliteBusy, runTurn } from "./turn.ts";
 import { TurnPool, TurnWorkerError } from "./turn_pool.ts";
 
 // Registered here for the one case where a turn still runs on this thread (an
@@ -445,25 +445,6 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(data);
 }
 
-/**
- * Did SQLite refuse because another connection holds the write lock?
- *
- * Decided from the error's `errcode`, never its message text. node:sqlite sets
- * `code` to the constant `ERR_SQLITE_ERROR` for every failure and puts SQLite's
- * own result code in `errcode`; `SQLITE_BUSY` is 5, and its extended forms
- * (`SQLITE_BUSY_RECOVERY` 261, `SQLITE_BUSY_SNAPSHOT` 517) keep 5 in the low
- * byte. A `cause` is followed in case a caller wrapped the error.
- */
-function isSqliteBusy(err: unknown): boolean {
-  let current: unknown = err;
-  for (let depth = 0; depth < 5 && current instanceof Error; depth++) {
-    const errcode = (current as { errcode?: unknown }).errcode;
-    if (typeof errcode === "number" && (errcode & 0xff) === 5) return true;
-    current = current.cause;
-  }
-  return false;
-}
-
 const server = createServer(async (req, res) => {
   try {
     // First, before CORS headers, the OPTIONS branch, the Origin check and auth,
@@ -676,7 +657,7 @@ const server = createServer(async (req, res) => {
     // The write lock is held by a turn on the worker (see `MAIN_THREAD_BUSY_MS`).
     // That is a wait that ran out, not a fault: say so, tell the client when to
     // come back, and log nothing, so no error id points an operator at a bug.
-    if (!res.headersSent && isSqliteBusy(err)) {
+    if (!res.headersSent && (isSqliteBusy(err) || (err instanceof TurnWorkerError && err.busy))) {
       res.setHeader("Retry-After", "1");
       json(res, 503, { error: "busy" });
       return;

@@ -26,12 +26,19 @@
     Output is a dated markdown file per day, which is what makes the record
     survive a session ending -- the analysis half can be written later, by
     anyone, from a file that is still there.
+
+    It runs the copy of the script inside the release checkout that
+    `chamber pin <tag>` keeps, not the development checkout, so the report
+    describes the release the 08:30 job ran and not whatever branch happens to
+    be checked out at 10:07. The job's login shell expands $HOME. A release tag
+    older than the one that first contains this path has the previous script,
+    which calls the `chamber` on PATH; see deploy/SCHEDULING.md.
   -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
     <string>-lc</string>
-    <string>REPLACE_WITH_HOME/Projects/chamber/scripts/daily-snapshot.sh</string>
+    <string>$HOME/.local/share/chamber-release/scripts/daily-snapshot.sh</string>
   </array>
 
   <key>StartCalendarInterval</key>

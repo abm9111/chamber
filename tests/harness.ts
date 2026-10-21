@@ -13837,6 +13837,92 @@ test("release", "a plist write that fails is a refusal, not a crash, and leaves 
   });
 });
 
+// ─── daily snapshot: release checkout, exit status, plist ───────────────────
+
+/**
+ * Run scripts/daily-snapshot.sh in a throwaway HOME and return the report it
+ * wrote. CHAMBER_REPO names a directory that does not exist, so the script's
+ * Gates section stops at its `cd` and the run needs no test suite and no
+ * probes. A `chamber` that announces itself is first on PATH, so a report that
+ * contains its output was produced by the development command.
+ */
+function runSnapshot(home: string, release: { verifyExit: number } | null): string {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const bin = join(home, "bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "chamber"), '#!/bin/sh\necho "DEV CHAMBER CALLED: $*"\nexit 7\n');
+  chmodSync(join(bin, "chamber"), 0o755);
+  if (release !== null) {
+    const dir = join(home, ".local", "share", "chamber-release", "bin");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "chamber.js"),
+      [
+        "const cmd = process.argv[2];",
+        'if (cmd === "verify") {',
+        '  console.log("3 belief(s) checked, 1 with no verified support left, 0 with some support lost");',
+        `  process.exit(${release.verifyExit});`,
+        "}",
+        'if (cmd === "corpus") console.log("corpus from the release checkout");',
+        "",
+      ].join("\n"),
+    );
+  }
+  const r = spawnSync("sh", [join(root, "scripts", "daily-snapshot.sh")], {
+    encoding: "utf8",
+    timeout: 60_000,
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      HOME: home,
+      CHAMBER_REPO: join(home, "no-dev-checkout"),
+      CHAMBER_REPORT_DIR: join(home, "reports"),
+    },
+  });
+  assert(r.error === undefined, `the script did not run: ${r.error}`);
+  const day = spawnSync("date", ["+%Y-%m-%d"], { encoding: "utf8" }).stdout.trim();
+  return readFileSync(join(home, "reports", `${day}.md`), "utf8");
+}
+
+test("release", "the daily snapshot records verify's own exit status from the release checkout", () => {
+  const home = mkdtempSync(join(tmpdir(), "chamber-snapshot-"));
+  try {
+    const report = runSnapshot(home, { verifyExit: 1 });
+    assert(report.includes("3 belief(s) checked, 1 with no verified support left"), report);
+    assert(report.includes("corpus from the release checkout"), "the Corpus section did not run the release checkout");
+    assert(/^verify exit code: 1$/m.test(report), `the report must carry verify's exit status (1):\n${report}`);
+    assert(!report.includes("DEV CHAMBER CALLED"), "the report ran the chamber on PATH");
+    assert(!report.includes("release checkout missing"), "the release checkout was there");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("release", "the daily snapshot says the release checkout is missing instead of calling the dev chamber", () => {
+  const home = mkdtempSync(join(tmpdir(), "chamber-snapshot-"));
+  try {
+    const report = runSnapshot(home, null);
+    const said = report.split("release checkout missing: run chamber pin <tag>").length - 1;
+    assert(said === 2, `expected the message in the Drift and Corpus sections, found it ${said} times:\n${report}`);
+    assert(/^verify exit code: n\/a$/m.test(report), `no exit status to report:\n${report}`);
+    assert(!report.includes("DEV CHAMBER CALLED"), "the report ran the chamber on PATH");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("release", "the daily snapshot has no stale labels, and its plist runs the release checkout's copy", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const script = readFileSync(join(root, "scripts", "daily-snapshot.sh"), "utf8");
+  assert(!script.includes("known-failing"), "a stale known-failing label is back");
+  const plist = readFileSync(join(root, "deploy", "launchd", "com.chamber.daily-snapshot.plist"), "utf8");
+  assert(
+    plist.includes("<string>$HOME/.local/share/chamber-release/scripts/daily-snapshot.sh</string>"),
+    "the plist does not run the release checkout's copy of the script",
+  );
+  assert(!plist.includes("Projects/chamber/scripts"), "the plist still names the development checkout");
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

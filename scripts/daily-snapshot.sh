@@ -13,10 +13,18 @@
 #
 # Exit code is deliberately 0 even when checks fail: this is a recorder, not a
 # gate. `chamber verify` is the gate, and it runs separately at 08:30.
+#
+# Two checkouts are involved and they are not interchangeable. The Drift and
+# Corpus sections run the release checkout that `chamber pin <tag>` keeps, the
+# same code the 08:30 job ran, so the report describes what actually checked
+# the evidence. The Ledger, Gates and Repository sections describe the
+# development checkout (REPO) on purpose: they report on the work in progress.
 
 set -u
 
 REPO="${CHAMBER_REPO:-$HOME/Projects/chamber}"
+RELEASE_BIN="$HOME/.local/share/chamber-release/bin/chamber.js"
+RELEASE_MISSING="release checkout missing: run chamber pin <tag>"
 # Exported because the inline node script below reads it from the environment.
 # It is single-quoted there so the shell leaves it alone, which means an
 # unexported REPO resolves to `undefined` and the import fails with
@@ -46,11 +54,19 @@ probe_exit() {
   echo "## Drift"
   echo
   echo '```'
-  cd "$REPO" 2>/dev/null && chamber verify 2>&1 | tail -30
+  # One run, and its exit status captured on the very next line: `$?` after a
+  # pipeline or after an `echo` is the status of tail or of echo, not of verify.
+  if [ -f "$RELEASE_BIN" ]; then
+    verify_out=$(node "$RELEASE_BIN" verify 2>&1)
+    verify_rc=$?
+    printf '%s\n' "$verify_out" | tail -30
+  else
+    verify_rc="n/a"
+    echo "$RELEASE_MISSING"
+  fi
   echo '```'
-  cd "$REPO" 2>/dev/null && chamber verify >/dev/null 2>&1
   echo
-  echo "verify exit code: $?"
+  echo "verify exit code: $verify_rc"
   echo
   echo "### The 08:30 scheduled run"
   echo
@@ -76,7 +92,11 @@ probe_exit() {
   echo "## Corpus"
   echo
   echo '```'
-  cd "$REPO" 2>/dev/null && chamber corpus 2>&1 | head -30
+  if [ -f "$RELEASE_BIN" ]; then
+    node "$RELEASE_BIN" corpus 2>&1 | head -30
+  else
+    echo "$RELEASE_MISSING"
+  fi
   echo '```'
   echo
 
@@ -118,8 +138,8 @@ probe_exit() {
   echo "  gate_audit            $(probe_exit gate_audit.ts)"
   echo "  pin_bypass            $(probe_exit pin_bypass.ts)"
   echo "  verify_partial_drift  $(probe_exit verify_partial_drift.ts)"
-  echo "  debt_paraphrase       $(probe_exit debt_paraphrase.ts)   <- known-failing, KNOWN_LIMITATIONS 14"
-  echo "  sandbox_escape        $(probe_exit sandbox_escape.ts CHAMBER_SANDBOX_REQUIRED=1)   <- known-failing, KNOWN_LIMITATIONS 1"
+  echo "  debt_paraphrase       $(probe_exit debt_paraphrase.ts)"
+  echo "  sandbox_escape        $(probe_exit sandbox_escape.ts CHAMBER_SANDBOX_REQUIRED=1)"
   echo '```'
   echo
 
@@ -127,7 +147,7 @@ probe_exit() {
   echo
   echo '```'
   echo "HEAD:     $(git -C "$REPO" rev-parse --short HEAD) on $(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
-  echo "unpushed: $(git -C "$REPO" rev-list --count @{u}..HEAD 2>/dev/null || echo 'no upstream')"
+  echo "unpushed: $(git -C "$REPO" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 'no upstream')"
   echo "dirty:    $(git -C "$REPO" status --porcelain | wc -l | tr -d ' ') file(s)"
   echo
   echo "commits in the last 24h:"

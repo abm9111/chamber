@@ -265,10 +265,13 @@ export interface PinOutcome {
 }
 
 /**
- * Rewrite a bare job to the release command and make sure the agent is
- * loaded. A reload is checked with `launchctl list` afterwards: `load` has
- * exited 0 on macOS without loading anything. Nothing here is rolled back.
- * The checkout and the plist stay as written, and a failure exits 1.
+ * Rewrite a bare job to the release command and make sure the agent runs it.
+ * A loaded agent is always reloaded, even when its plist is already pinned:
+ * launchd keeps the definition it loaded, so "loaded" does not mean "runs the
+ * pinned script". A reload is checked with `launchctl list` afterwards:
+ * `load` has exited 0 on macOS without loading anything. Nothing here is
+ * rolled back. The checkout and the plist stay as written, and a failure
+ * exits 1.
  */
 function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: string[]): 0 | 1 {
   // Read again at the moment of writing, not trusted from the check made
@@ -287,10 +290,6 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
     out.push(`${plistPath} already runs ${RELEASE_COMMAND}`);
   }
   const wasLoaded = launchctl(["list", JOB_LABEL]).status === 0;
-  if (wasLoaded && !rewritten) {
-    out.push(`${JOB_LABEL} is loaded`);
-    return 0;
-  }
   if (wasLoaded) {
     const unload = launchctl(["unload", plistPath]);
     if (unload.status !== 0) {

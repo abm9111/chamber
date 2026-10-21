@@ -12515,9 +12515,14 @@ test("release", "pin runs only from a checkout that has an origin", () => {
 /**
  * A launchctl that records its calls and keeps one loaded flag. `load:
  * "fails"` exits non-zero; `load: "lies"` exits 0 and loads nothing, which is
- * what pin's `list` after `load` exists to catch.
+ * what pin's `list` after `load` exists to catch. `unload: "fails"` exits
+ * non-zero and leaves the agent loaded.
  */
-function fakeLaunchctl(start: { loaded: boolean; load?: "ok" | "fails" | "lies" }): {
+function fakeLaunchctl(start: {
+  loaded: boolean;
+  load?: "ok" | "fails" | "lies";
+  unload?: "ok" | "fails";
+}): {
   run: Launchctl;
   calls: string[];
 } {
@@ -12530,6 +12535,7 @@ function fakeLaunchctl(start: { loaded: boolean; load?: "ok" | "fails" | "lies" 
       case "list":
         return loaded ? done(0) : done(113, `Could not find service "${JOB_LABEL}" in domain for port`);
       case "unload":
+        if (start.unload === "fails") return done(5, "Unload failed: 5: Input/output error");
         loaded = false;
         return done(0);
       case "load":
@@ -12603,13 +12609,41 @@ test("release", "pinning the tag already checked out still checks the plist", ()
     assert(plistForm(fx.plistPath) === "pinned", plistForm(fx.plistPath));
     assert(again.calls.includes(`load ${fx.plistPath}`), again.calls.join(" | "));
 
-    // A pinned, loaded job is left exactly as it is.
+    // A pinned plist is not rewritten, but a loaded agent is still reloaded:
+    // launchd keeps the definition it loaded, not the file on disk.
     const before = readFileSync(fx.plistPath, "utf8");
     const idle = fakeLaunchctl({ loaded: true });
     const r2 = pinRelease(pinOpts(fx, "v1", idle.run));
     assert(r2.code === 0, r2.err.join("\n"));
     assert(readFileSync(fx.plistPath, "utf8") === before, "a pinned plist was rewritten");
-    assert(JSON.stringify(idle.calls) === JSON.stringify([`list ${JOB_LABEL}`]), idle.calls.join(" | "));
+    assert(
+      JSON.stringify(idle.calls) ===
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+      idle.calls.join(" | "),
+    );
+    assert(r2.out.some((l) => l.includes(`reloaded ${JOB_LABEL}`)), r2.out.join("\n"));
+  });
+});
+
+test("release", "a re-run after a failed unload still reloads the pinned job", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const failed = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: true, unload: "fails" }).run));
+    assert(failed.code === 1, "a failed unload exited 0");
+    assert(failed.err.some((l) => l.includes("launchctl unload failed")), failed.err.join("\n"));
+    assert(plistForm(fx.plistPath) === "pinned", plistForm(fx.plistPath));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD is not v1");
+
+    // The plist on disk is pinned, but launchd still holds the bare job.
+    const rerun = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "v1", rerun.run));
+    assert(r.code === 0, r.err.join("\n"));
+    assert(
+      JSON.stringify(rerun.calls) ===
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+      rerun.calls.join(" | "),
+    );
+    assert(r.out.some((l) => l.includes(`reloaded ${JOB_LABEL}`)), r.out.join("\n"));
   });
 });
 

@@ -52,7 +52,7 @@ sudo systemctl enable --now chamber-discord.service
 
 | Env | Effect |
 |-----|--------|
-| `CHAMBER_DISCORD_ALLOWED_USERS` | Who may talk to the bot. **Empty = nobody** (fail-closed; it used to mean everybody). The runner logs `chamber: CHAMBER_DISCORD_ALLOWED_USERS is empty, so nobody can talk to this bot` at startup. A listed user who is refused at a mention, a DM or `/chamber` is told so; a message in a free-response channel that did not address the bot gets no reply. |
+| `CHAMBER_DISCORD_ALLOWED_USERS` | Who may talk to the bot. **Empty = nobody** (fail-closed; it used to mean everybody). The runner logs `chamber: CHAMBER_DISCORD_ALLOWED_USERS is empty, so nobody can talk to this bot` at startup. A user who is not listed and is refused at a mention, a DM or `/chamber` is told so; a message in a free-response channel that did not address the bot gets no reply. |
 | `CHAMBER_DISCORD_FREE_CHANNELS` | Channel IDs that work without @mention |
 | `CHAMBER_DISCORD_REACTION_APPROVE=1` | ✅/❌ on messages containing `pw_…` |
 | outbound | `@everyone` / `@here` neutralized; `allowedMentions.parse=[]` |

@@ -238,6 +238,10 @@ function pythonBin(): string {
   return raw && raw.trim() !== "" ? raw.trim() : "python3";
 }
 
+export function minilmServeCommand(): string[] {
+  return [pythonBin(), SCRIPT, "--serve"];
+}
+
 /** UTF-8 bytes of JSON on one stdin write. Under the pipe buffer spawnSync fills in one write. */
 export const STDIN_CAP_BYTES = 12_288;
 
@@ -416,6 +420,10 @@ function noteTruncation(stderr: string): void {
   }
 }
 
+export function noteMinilmStderr(stderr: string): void {
+  noteTruncation(stderr);
+}
+
 /** Truncation seen in this process, or null if nothing was truncated. */
 export function minilmTruncationSeen(): MinilmTruncation | null {
   return truncationTotals;
@@ -535,6 +543,7 @@ export function embedLocal(
 export function embedLocalBatch(
   texts: string[],
   prefer: EmbedderKind | "auto" = "auto",
+  spawn?: MinilmSpawn,
 ): EmbedResult[] {
   const kind =
     prefer === "auto"
@@ -577,7 +586,7 @@ export function embedLocalBatch(
   }
 
   if (kind === "minilm") {
-    const vecs = embedMinilmBatch(texts);
+    const vecs = embedMinilmBatch(texts, spawn);
     return vecs.map((vector) => ({
       vector,
       model: MINILM_MODEL,

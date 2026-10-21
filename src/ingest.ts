@@ -33,6 +33,7 @@ import {
 } from "./embedder.ts";
 import { passagePathOf, passageSourceRef, splitPassages } from "./chunk.ts";
 import { vaultPageHash } from "./vault_page_hash.ts";
+import { createMinilmSession, type MinilmSession } from "./minilm_session.ts";
 
 /**
  * Extensions treated as markdown, compared case-insensitively.
@@ -174,6 +175,7 @@ export interface IngestOptions {
    * onnxruntime install — production callers should not pass it.
    */
   embedBatch?: (texts: string[]) => EmbedResult[];
+  minilmSession?: () => MinilmSession;
 }
 
 /**
@@ -843,10 +845,11 @@ function stripMarkdownExt(ref: string): string {
 
 // ─── ingest ──────────────────────────────────────────────────────────────────
 
-export function ingestDirectory(
+function ingestDirectoryBody(
   db: DatabaseSync,
   rootInput: string,
-  opts: IngestOptions = {},
+  opts: IngestOptions,
+  session: MinilmSession,
 ): IngestReport {
   let root: string;
   try {
@@ -1146,7 +1149,9 @@ export function ingestDirectory(
     let embeds: EmbedResult[] | undefined;
     if (pending.length > 0) {
       try {
-        const batch = (opts.embedBatch ?? embedLocalBatch)(pending.map((p) => p.body));
+        const embed =
+          opts.embedBatch ?? ((texts: string[]) => embedLocalBatch(texts, "auto", session.send));
+        const batch = embed(pending.map((p) => p.body));
         embeds = batch.length === pending.length ? batch : undefined;
         if (!embeds) {
           throw new Error(
@@ -1154,6 +1159,11 @@ export function ingestDirectory(
           );
         }
       } catch (err) {
+        try {
+          session.stop();
+        } catch {
+          // The batch error is the one the report keeps.
+        }
         embeds = undefined;
         report.embedFallback ??= errText(err);
       }
@@ -1202,13 +1212,35 @@ export function ingestDirectory(
     report.ingested += 1;
   }
 
-  // Read once at the end rather than per file: the embedder accumulates across
-  // every batch this process ran, and an operator's question is how much of
-  // the corpus lost its tail, not which file was last to lose some.
-  const truncated = minilmTruncationSeen();
-  if (truncated) report.truncated = truncated;
-
   return report;
+}
+
+export function ingestDirectory(
+  db: DatabaseSync,
+  rootInput: string,
+  opts: IngestOptions = {},
+): IngestReport {
+  const session = (opts.minilmSession ?? createMinilmSession)();
+  let bodyError: unknown;
+  let didThrow = false;
+  let report: IngestReport | undefined;
+  try {
+    report = ingestDirectoryBody(db, rootInput, opts, session);
+  } catch (err) {
+    bodyError = err;
+    didThrow = true;
+  }
+  session.close();
+  if (didThrow) {
+    if (bodyError instanceof Error && bodyError.cause === undefined && session.cleanupError) {
+      bodyError.cause = session.cleanupError;
+    }
+    throw bodyError;
+  }
+  if (session.cleanupError) throw session.cleanupError;
+  const truncated = minilmTruncationSeen();
+  if (truncated && report) report.truncated = truncated;
+  return report!;
 }
 
 /**

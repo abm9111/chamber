@@ -58,7 +58,7 @@ export function blobToFloat32(blob: Buffer | Uint8Array): Float32Array {
   return new Float32Array(ab);
 }
 
-function l2Normalize(v: Float32Array): Float32Array {
+export function l2Normalize(v: Float32Array): Float32Array {
   let n = 0;
   for (let i = 0; i < v.length; i++) n += v[i]! * v[i]!;
   n = Math.sqrt(n);

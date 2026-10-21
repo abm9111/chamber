@@ -75,6 +75,7 @@ import {
   BARE_SCRIPT,
   PINNED_SCRIPT,
   RELEASE_COMMAND,
+  pinCheckout,
   pinJobPlist,
   readJobPlist,
 } from "../src/release_pin.ts";
@@ -12207,6 +12208,303 @@ test("release", "a job plist with any other script is refused", () => {
     }
     assert(threw, `${label}: pinJobPlist rewrote it`);
   }
+});
+
+// Fixture repositories are built with plumbing only. `commit-tree` runs no
+// hook and needs no configured identity, and nothing is ever pushed, so the
+// global pre-commit and pre-push gates never see these throwaway repos.
+const FIXTURE_GIT_ENV: NodeJS.ProcessEnv = {
+  GIT_AUTHOR_NAME: "Chamber Test",
+  GIT_AUTHOR_EMAIL: "test@example.invalid",
+  GIT_AUTHOR_DATE: "2026-01-01T00:00:00Z",
+  GIT_COMMITTER_NAME: "Chamber Test",
+  GIT_COMMITTER_EMAIL: "test@example.invalid",
+  GIT_COMMITTER_DATE: "2026-01-01T00:00:00Z",
+};
+
+function fixtureGit(cwd: string, args: readonly string[], input?: string): string {
+  const r = spawnSync("git", ["-C", cwd, ...args], {
+    encoding: "utf8",
+    input,
+    env: { ...process.env, ...FIXTURE_GIT_ENV },
+  });
+  if (r.status !== 0) {
+    throw new Error(`fixture git ${args.join(" ")} failed (${r.status}): ${r.stderr}`);
+  }
+  return (r.stdout ?? "").trim();
+}
+
+/** A commit holding exactly `files`, built without touching the working tree. */
+function fixtureCommit(
+  repo: string,
+  files: Readonly<Record<string, string>>,
+  message: string,
+  parent?: string,
+): string {
+  fixtureGit(repo, ["read-tree", "--empty"]);
+  for (const [path, body] of Object.entries(files)) {
+    const blob = fixtureGit(repo, ["hash-object", "-w", "--stdin"], body);
+    fixtureGit(repo, ["update-index", "--add", "--cacheinfo", `100644,${blob},${path}`]);
+  }
+  const tree = fixtureGit(repo, ["write-tree"]);
+  const args = ["commit-tree", "--no-gpg-sign", tree, "-m", message];
+  if (parent !== undefined) args.push("-p", parent);
+  return fixtureGit(repo, args);
+}
+
+interface ReleaseFixture {
+  root: string;
+  origin: string;
+  source: string;
+  releaseDir: string;
+  plistPath: string;
+  v1: string;
+  v2: string;
+  nobin: string;
+}
+
+/**
+ * An origin with three tags and a branch, a source checkout whose only job is
+ * to name that origin, and paths for a release directory and a plist that do
+ * not exist yet. v1 is a lightweight tag. v2 is annotated, so it must be
+ * peeled to its commit. v2 adds CHANGES.md. nobin has no bin/chamber.js.
+ */
+function releaseFixture(): ReleaseFixture {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "chamber-pin-")));
+  const origin = join(root, "origin");
+  fixtureGit(root, ["init", "-q", "-b", "main", origin]);
+  const v1 = fixtureCommit(origin, { "bin/chamber.js": "// v1\n", "README.md": "one\n" }, "v1");
+  const v2 = fixtureCommit(
+    origin,
+    { "bin/chamber.js": "// v2\n", "README.md": "two\n", "CHANGES.md": "two\n" },
+    "v2",
+    v1,
+  );
+  const nobin = fixtureCommit(origin, { "README.md": "three\n" }, "no bin", v2);
+  fixtureGit(origin, ["update-ref", "refs/heads/main", nobin]);
+  fixtureGit(origin, ["update-ref", "refs/heads/feature", v2]);
+  fixtureGit(origin, ["tag", "v1", v1]);
+  fixtureGit(origin, ["-c", "tag.gpgSign=false", "tag", "-a", "-m", "v2", "v2", v2]);
+  fixtureGit(origin, ["tag", "nobin", nobin]);
+  const source = join(root, "source");
+  fixtureGit(root, ["init", "-q", "-b", "main", source]);
+  fixtureGit(source, ["remote", "add", "origin", origin]);
+  return {
+    root,
+    origin,
+    source,
+    releaseDir: join(root, "share", "chamber-release"),
+    plistPath: join(root, "LaunchAgents", "com.chamber.verify.plist"),
+    v1,
+    v2,
+    nobin,
+  };
+}
+
+function withReleaseFixture(fn: (fx: ReleaseFixture) => void): void {
+  const fx = releaseFixture();
+  try {
+    fn(fx);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+}
+
+function headOf(dir: string): string {
+  return fixtureGit(dir, ["rev-parse", "HEAD"]);
+}
+
+function isDetachedHead(dir: string): boolean {
+  return spawnSync("git", ["-C", dir, "symbolic-ref", "--quiet", "HEAD"]).status !== 0;
+}
+
+test("release", "pin clones a tag into a new release directory, detached", () => {
+  withReleaseFixture((fx) => {
+    const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+    assert(r.ok, `pin refused: ${JSON.stringify(r)}`);
+    assert(r.commit === fx.v1 && !r.already, JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD is not the v1 commit");
+    assert(isDetachedHead(fx.releaseDir), "HEAD is attached to a branch");
+    assert(
+      readFileSync(join(fx.releaseDir, "bin", "chamber.js"), "utf8") === "// v1\n",
+      "bin/chamber.js is not v1's",
+    );
+    assert(
+      fixtureGit(fx.releaseDir, ["remote", "get-url", "origin"]) === fx.origin,
+      "the release checkout does not fetch from the source's origin",
+    );
+  });
+});
+
+test("release", "a second pin moves the checkout to another tag", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    const r = pinCheckout({ ...opts, tag: "v2" });
+    assert(r.ok && r.commit === fx.v2 && !r.already, JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v2, "HEAD is not the v2 commit");
+    assert(isDetachedHead(fx.releaseDir), "HEAD is attached to a branch");
+    assert(
+      readFileSync(join(fx.releaseDir, "bin", "chamber.js"), "utf8") === "// v2\n",
+      "bin/chamber.js is not v2's",
+    );
+    assert(existsSync(join(fx.releaseDir, "CHANGES.md")), "v2's new file is missing");
+  });
+});
+
+test("release", "pinning the tag already checked out succeeds without moving", () => {
+  withReleaseFixture((fx) => {
+    const opts = { tag: "v2", sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout(opts).ok, "first pin refused");
+    const again = pinCheckout(opts);
+    assert(again.ok && again.already && again.commit === fx.v2, JSON.stringify(again));
+    assert(headOf(fx.releaseDir) === fx.v2, "HEAD moved");
+  });
+});
+
+test("release", "a missing tag, a branch name and a raw commit are refused", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    for (const tag of ["nope", "feature", fx.v1]) {
+      const r = pinCheckout({ ...opts, tag });
+      assert(!r.ok && r.reason.includes("git fetch:"), `${tag}: ${JSON.stringify(r)}`);
+      assert(!existsSync(fx.releaseDir), `a refused first pin of ${tag} left its clone behind`);
+    }
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    for (const tag of ["nope", "feature", fx.v2]) {
+      const r = pinCheckout({ ...opts, tag });
+      assert(!r.ok, `${tag} was pinned`);
+      assert(existsSync(fx.releaseDir), `refusing ${tag} removed an older checkout`);
+      assert(headOf(fx.releaseDir) === fx.v1, `refusing ${tag} moved HEAD`);
+    }
+  });
+});
+
+test("release", "a malformed tag name is refused before anything is created", () => {
+  withReleaseFixture((fx) => {
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ["", "the tag name is empty"],
+      ["-v1", 'starts with "-"'],
+      ["v 1", "contains a space or a newline"],
+      ["v1\n", "contains a space or a newline"],
+      ["v1..x", "is not a valid tag name"],
+    ];
+    for (const [tag, why] of cases) {
+      const r = pinCheckout({ tag, sourceRoot: fx.source, releaseDir: fx.releaseDir });
+      assert(!r.ok && r.reason.includes(why), `${JSON.stringify(tag)}: ${JSON.stringify(r)}`);
+      assert(!existsSync(dirname(fx.releaseDir)), `${JSON.stringify(tag)} created a directory`);
+    }
+  });
+});
+
+test("release", "a tracked change in the release checkout stops pin", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    const bin = join(fx.releaseDir, "bin", "chamber.js");
+    writeFileSync(bin, "// edited\n");
+    const r = pinCheckout({ ...opts, tag: "v2" });
+    assert(!r.ok && r.reason.includes("has tracked changes"), JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved past a tracked change");
+    assert(readFileSync(bin, "utf8") === "// edited\n", "pin reset the tracked change");
+  });
+});
+
+test("release", "an untracked file the tag would overwrite stops pin with git's refusal", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    const mine = join(fx.releaseDir, "CHANGES.md");
+    writeFileSync(mine, "mine\n");
+    const r = pinCheckout({ ...opts, tag: "v2" });
+    // The file name, not git's English wording: git translates its messages.
+    assert(!r.ok && r.reason.includes("git checkout:") && r.reason.includes("CHANGES.md"), JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved");
+    assert(readFileSync(mine, "utf8") === "mine\n", "pin overwrote an untracked file");
+  });
+});
+
+test("release", "a tag without bin/chamber.js is left unpinned", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    const fresh = pinCheckout({ ...opts, tag: "nobin" });
+    assert(!fresh.ok && fresh.reason.includes("has no bin/chamber.js"), JSON.stringify(fresh));
+    assert(!existsSync(fx.releaseDir), "a refused first pin left its clone behind");
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    const over = pinCheckout({ ...opts, tag: "nobin" });
+    assert(!over.ok, "nobin was pinned over v1");
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD left v1");
+    assert(existsSync(join(fx.releaseDir, "bin", "chamber.js")), "the older checkout lost bin/chamber.js");
+  });
+});
+
+test("release", "a release directory that is not its own git checkout is left alone", () => {
+  withReleaseFixture((fx) => {
+    mkdirSync(fx.releaseDir, { recursive: true });
+    writeFileSync(join(fx.releaseDir, "chamber.sqlite"), "db\n");
+    const plain = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+    assert(!plain.ok && plain.reason.includes("is not a git checkout"), JSON.stringify(plain));
+    assert(readFileSync(join(fx.releaseDir, "chamber.sqlite"), "utf8") === "db\n", "pin touched a directory it does not own");
+    assert(!existsSync(join(fx.releaseDir, ".git")), "pin initialised a directory it does not own");
+
+    // Inside another repository, `git -C` finds the enclosing checkout. Pin
+    // must not take that checkout for the release directory and fetch into it.
+    const nested = join(fx.source, "nested");
+    mkdirSync(nested);
+    const inner = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: nested });
+    assert(!inner.ok && inner.reason.includes("is not a git checkout"), JSON.stringify(inner));
+    assert(
+      spawnSync("git", ["-C", fx.source, "rev-parse", "--verify", "--quiet", "refs/tags/v1"]).status !== 0,
+      "pin fetched into the enclosing repository",
+    );
+  });
+});
+
+test("release", "a release checkout with another origin is left alone", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    fixtureGit(fx.releaseDir, ["remote", "set-url", "origin", join(fx.root, "elsewhere")]);
+    const r = pinCheckout({ ...opts, tag: "v2" });
+    assert(!r.ok && r.reason.includes("fetches from"), JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved");
+  });
+});
+
+test("release", "a release checkout with dist/ stops pin before HEAD moves", () => {
+  withReleaseFixture((fx) => {
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    mkdirSync(join(fx.releaseDir, "dist"));
+    writeFileSync(join(fx.releaseDir, "dist", "cli.js"), "// stale\n");
+    const r = pinCheckout({ ...opts, tag: "v2" });
+    assert(!r.ok && r.reason.includes("dist exists"), JSON.stringify(r));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved");
+    assert(existsSync(join(fx.releaseDir, "dist", "cli.js")), "pin removed dist/");
+  });
+});
+
+test("release", "pin runs only from a checkout that has an origin", () => {
+  withReleaseFixture((fx) => {
+    const installed = join(fx.root, "lib", "node_modules", "@bu7umaid", "chamber");
+    mkdirSync(installed, { recursive: true });
+    const a = pinCheckout({ tag: "v1", sourceRoot: installed, releaseDir: fx.releaseDir });
+    assert(!a.ok && a.reason.includes("is not a git checkout"), JSON.stringify(a));
+
+    // A package installed into some project's node_modules sits inside that
+    // project's repository, and `git -C` would report the project's origin.
+    const vendored = join(fx.source, "node_modules", "@bu7umaid", "chamber");
+    mkdirSync(vendored, { recursive: true });
+    const b = pinCheckout({ tag: "v1", sourceRoot: vendored, releaseDir: fx.releaseDir });
+    assert(!b.ok && b.reason.includes("is not a git checkout"), JSON.stringify(b));
+
+    const lonely = join(fx.root, "no-origin");
+    fixtureGit(fx.root, ["init", "-q", "-b", "main", lonely]);
+    const c = pinCheckout({ tag: "v1", sourceRoot: lonely, releaseDir: fx.releaseDir });
+    assert(!c.ok && c.reason.includes("has no origin remote"), JSON.stringify(c));
+
+    assert(!existsSync(dirname(fx.releaseDir)), "a refused source created a directory");
+  });
 });
 
 // ─── cli process smoke tests ────────────────────────────────────────────────

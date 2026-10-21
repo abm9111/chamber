@@ -6,7 +6,7 @@
     "url": "https://github.com/abm9111/chamber",
     "source": "github"
   },
-  "version": "0.1.10",
+  "version": "0.1.9",
   "packages": [
     {
       "registryType": "npm",

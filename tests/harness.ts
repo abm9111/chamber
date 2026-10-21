@@ -12979,6 +12979,55 @@ test("release", "chamber pin refuses a flag-shaped tag before touching HOME", ()
   }
 });
 
+test("config", "package.json, server.json, the served MCP version and the changelog name one version", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version: string };
+  const registry = JSON.parse(readFileSync(join(root, "server.json"), "utf8")) as {
+    version: string;
+    packages: { version: string }[];
+  };
+  const released = /^## (?!Unreleased\b)(\S+)/m.exec(readFileSync(join(root, "CHANGELOG.md"), "utf8"));
+  assert(released !== null, "CHANGELOG.md has no released heading");
+
+  // The version the running server reports, not a constant read out of its
+  // source: a hand-typed copy and a reader of package.json look identical to a
+  // grep and differ only here.
+  const home = mkdtempSync(join(tmpdir(), "chamber-version-"));
+  try {
+    const initialize = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "version-test", version: "0" } },
+    };
+    const run = spawnSync(process.execPath, ["--experimental-strip-types", join(root, "src", "mcp_server.ts")], {
+      encoding: "utf8",
+      timeout: 30_000,
+      input: `${JSON.stringify(initialize)}\n`,
+      env: {
+        ...process.env,
+        HOME: home,
+        CHAMBER_DB: join(home, "never.sqlite"),
+        CHAMBER_CONFIG: join(home, "never.json"),
+      },
+    });
+    assert(run.error === undefined, `launch failed: ${run.error}`);
+    const line = (run.stdout ?? "").split("\n").find((l) => l.includes('"id":1'));
+    assert(line !== undefined, `no initialize reply: ${run.stdout} ${run.stderr}`);
+    const reply = JSON.parse(line) as { result?: { serverInfo?: { version?: string } } };
+    const seen: Record<string, string | undefined> = {
+      "package.json": pkg.version,
+      "server.json version": registry.version,
+      "server.json packages[0].version": registry.packages[0]?.version,
+      "CHANGELOG.md first released heading": released[1],
+      "mcp_server serverInfo.version": reply.result?.serverInfo?.version,
+    };
+    assert(new Set(Object.values(seen)).size === 1, `the version sites disagree: ${JSON.stringify(seen, null, 2)}`);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

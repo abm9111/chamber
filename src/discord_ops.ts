@@ -53,17 +53,30 @@ export function canDiscordApprove(userId: string): boolean {
   return set.has(userId);
 }
 
-/** Who may talk to the bot. Empty = allow all (pilot default). Set to restrict. */
-export function canDiscordTalk(userId: string): boolean {
+/**
+ * The ids in `CHAMBER_DISCORD_ALLOWED_USERS` (or the older
+ * `DISCORD_ALLOWED_USERS`, read only when the first is unset): a comma list,
+ * entries trimmed, blanks dropped.
+ */
+export function discordTalkAllowlist(): Set<string> {
   const raw = process.env.CHAMBER_DISCORD_ALLOWED_USERS ?? process.env.DISCORD_ALLOWED_USERS ?? "";
-  const set = new Set(
+  return new Set(
     raw
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
   );
-  if (set.size === 0) return true; // open talk; approve still fail-closed
-  return set.has(userId);
+}
+
+/**
+ * Who may talk to the bot. Fail-closed, like the approver list: an empty
+ * allowlist means nobody. An empty list used to mean everybody, so a bot
+ * invited to a server answered every member and a user who ran it as the
+ * docs said ("empty = open") gave strangers a way to spend the model budget and
+ * write observations into the ledger.
+ */
+export function canDiscordTalk(userId: string): boolean {
+  return discordTalkAllowlist().has(userId);
 }
 
 /** Free-response channels: bot replies without @mention. Empty = mention-only in guilds. */

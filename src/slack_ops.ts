@@ -53,6 +53,28 @@ export function canSlackApprove(userId: string): boolean {
   return set.has(userId);
 }
 
+/** What a user who is not on `CHAMBER_SLACK_ALLOWED_USERS` is told. */
+export const SLACK_TALK_REFUSAL = "You are not on CHAMBER_SLACK_ALLOWED_USERS.";
+
+/** The ids in `CHAMBER_SLACK_ALLOWED_USERS`: a comma list, entries trimmed, blanks dropped. */
+export function slackTalkAllowlist(): Set<string> {
+  return new Set(
+    (process.env.CHAMBER_SLACK_ALLOWED_USERS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+}
+
+/**
+ * Who may talk to the bot. Fail-closed, like `canSlackApprove`: an empty
+ * allowlist means nobody. The Slack runner had no talk gate at all, so anyone in
+ * a channel the bot was in could drive a turn.
+ */
+export function canSlackTalk(userId: string): boolean {
+  return slackTalkAllowlist().has(userId);
+}
+
 export function slackScopeId(channelId: string, userId?: string): string {
   if (channelId.startsWith("D")) {
     return `slack_dm_${userId ?? channelId}`;

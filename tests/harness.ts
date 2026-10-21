@@ -213,6 +213,8 @@ import {
   slackScopeId,
   openSlackDb,
   postPendingWriteToOps,
+  canSlackTalk,
+  SLACK_TALK_REFUSAL,
 } from "../src/slack_ops.ts";
 import {
   canDiscordApprove,
@@ -8322,12 +8324,49 @@ test("discord", "D5_attachment_meta_only", () => {
 });
 
 test("discord", "D6_talk_allowlist", () => {
-  delete process.env.CHAMBER_DISCORD_ALLOWED_USERS;
-  assert(canDiscordTalk("anyone"));
-  process.env.CHAMBER_DISCORD_ALLOWED_USERS = "u1";
-  assert(canDiscordTalk("u1"));
-  assert(!canDiscordTalk("u2"));
-  delete process.env.CHAMBER_DISCORD_ALLOWED_USERS;
+  // Fail closed: an empty list used to mean "anyone may talk to the bot".
+  const savedPrimary = process.env.CHAMBER_DISCORD_ALLOWED_USERS;
+  const savedLegacy = process.env.DISCORD_ALLOWED_USERS;
+  try {
+    delete process.env.CHAMBER_DISCORD_ALLOWED_USERS;
+    delete process.env.DISCORD_ALLOWED_USERS;
+    assert(!canDiscordTalk("anyone"), "an unset list means nobody may talk");
+    process.env.CHAMBER_DISCORD_ALLOWED_USERS = "";
+    assert(!canDiscordTalk("anyone"), "an empty list means nobody may talk");
+    process.env.CHAMBER_DISCORD_ALLOWED_USERS = " , ";
+    assert(!canDiscordTalk("anyone"), "a list of blanks means nobody may talk");
+    process.env.CHAMBER_DISCORD_ALLOWED_USERS = "u1, u3 ,";
+    assert(canDiscordTalk("u1"), "a listed user may talk");
+    assert(canDiscordTalk("u3"), "entries are trimmed");
+    assert(!canDiscordTalk("u2"), "an unlisted user may not");
+    delete process.env.CHAMBER_DISCORD_ALLOWED_USERS;
+    process.env.DISCORD_ALLOWED_USERS = "legacy1";
+    assert(canDiscordTalk("legacy1"), "the legacy variable still works when the new one is unset");
+  } finally {
+    if (savedPrimary === undefined) delete process.env.CHAMBER_DISCORD_ALLOWED_USERS;
+    else process.env.CHAMBER_DISCORD_ALLOWED_USERS = savedPrimary;
+    if (savedLegacy === undefined) delete process.env.DISCORD_ALLOWED_USERS;
+    else process.env.DISCORD_ALLOWED_USERS = savedLegacy;
+  }
+});
+
+test("slack", "S_talk_allowlist_fails_closed", () => {
+  const saved = process.env.CHAMBER_SLACK_ALLOWED_USERS;
+  try {
+    delete process.env.CHAMBER_SLACK_ALLOWED_USERS;
+    assert(!canSlackTalk("U1"), "an unset list means nobody may talk");
+    process.env.CHAMBER_SLACK_ALLOWED_USERS = "";
+    assert(!canSlackTalk("U1"), "an empty list means nobody may talk");
+    process.env.CHAMBER_SLACK_ALLOWED_USERS = " , ";
+    assert(!canSlackTalk("U1"), "a list of blanks means nobody may talk");
+    process.env.CHAMBER_SLACK_ALLOWED_USERS = "U1, U3 ,";
+    assert(canSlackTalk("U1"), "a listed user may talk");
+    assert(canSlackTalk("U3"), "entries are trimmed");
+    assert(!canSlackTalk("U2"), "an unlisted user may not");
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_SLACK_ALLOWED_USERS;
+    else process.env.CHAMBER_SLACK_ALLOWED_USERS = saved;
+  }
 });
 
 test("discord", "D7_chunk", () => {
@@ -17151,6 +17190,265 @@ test("tools", "the CLI shows the sandbox refusal with its opt-out, and tool-synt
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ─── THE RUNNERS ENFORCE THE TALK ALLOWLIST (slack_runner.ts, discord_runner.ts)
+
+/*
+ * The predicates above can be right while a runner never calls them: that is
+ * how a guard written down is never reached. These tests run the real runner
+ * modules. Their two dependencies, @slack/bolt and discord.js, are replaced by
+ * stubs through a module-resolution hook (`--import` of a file that calls
+ * `module.register`), so no network and no token is involved: each stub only
+ * records the handlers the runner registers, and a driver script then calls
+ * those handlers with fake events and prints what the bot said.
+ */
+
+const RUNNER_HOOKS = `
+export async function resolve(specifier, context, nextResolve) {
+  if (specifier === "@slack/bolt") {
+    return { url: new URL("./bolt_stub.mjs", import.meta.url).href, shortCircuit: true };
+  }
+  if (specifier === "discord.js") {
+    return { url: new URL("./discord_stub.mjs", import.meta.url).href, shortCircuit: true };
+  }
+  return nextResolve(specifier, context);
+}
+`;
+
+const RUNNER_REGISTER = `
+import { register } from "node:module";
+register("./hooks.mjs", import.meta.url);
+`;
+
+const BOLT_STUB = `
+globalThis.__stub = { handlers: {} };
+export class App {
+  constructor(options) { globalThis.__stub.options = options; }
+  event(name, fn) { globalThis.__stub.handlers["event:" + name] = fn; }
+  message(fn) { globalThis.__stub.handlers.message = fn; }
+  command(name, fn) { globalThis.__stub.handlers["command:" + name] = fn; }
+  action(name, fn) { globalThis.__stub.handlers["action:" + name] = fn; }
+  async start() {}
+}
+`;
+
+const DISCORD_STUB = `
+globalThis.__stub = { handlers: {} };
+export const GatewayIntentBits = { Guilds: 1, GuildMessages: 2, GuildMessageReactions: 4, MessageContent: 8, DirectMessages: 16 };
+export const Partials = { Channel: "Channel", Message: "Message", Reaction: "Reaction" };
+export const Events = {
+  ClientReady: "ready", Error: "error", ShardReconnecting: "shardReconnecting", ShardResume: "shardResume",
+  MessageCreate: "messageCreate", InteractionCreate: "interactionCreate", MessageReactionAdd: "messageReactionAdd",
+};
+export const MessageFlags = { Ephemeral: 64 };
+export const ActivityType = { Watching: 3 };
+export const Routes = { applicationGuildCommands: () => "g", applicationCommands: () => "c" };
+export class REST { setToken() { return this; } async put() {} }
+export class SlashCommandBuilder {
+  setName() { return this; }
+  setDescription() { return this; }
+  addStringOption(build) {
+    build({ setName() { return this; }, setDescription() { return this; }, setRequired() { return this; } });
+    return this;
+  }
+  toJSON() { return {}; }
+}
+export class Client {
+  constructor() { this.user = { id: "UBOT", tag: "bot#0001" }; }
+  once() {}
+  on(event, fn) { globalThis.__stub.handlers[event] = fn; }
+  async login() {}
+}
+`;
+
+const SLACK_DRIVER = `
+await import(process.env.RUNNER);
+const deadline = Date.now() + 15000;
+while (!globalThis.__stub.handlers["command:/chamber"] && Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, 25));
+}
+const h = globalThis.__stub.handlers;
+const user = process.env.TEST_USER;
+const said = [];
+const say = async (m) => { said.push(m.text); };
+const responded = [];
+await h["event:app_mention"]({ event: { user, text: "<@UBOT> hello there", channel: "C1", ts: "1.1" }, say });
+await h.message({ message: { channel_type: "im", user, text: "hello there", channel: "D1" }, say });
+await h["command:/chamber"]({
+  command: { user_id: user, channel_id: "C1", text: "status" },
+  ack: async () => {},
+  respond: async (m) => { responded.push(m.text); },
+  client: { chat: { postMessage: async () => ({}) } },
+});
+console.log("DRIVE " + JSON.stringify({ said, responded }));
+process.exit(0);
+`;
+
+const DISCORD_DRIVER = `
+await import(process.env.RUNNER);
+const deadline = Date.now() + 15000;
+while (!globalThis.__stub.handlers.interactionCreate && Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, 25));
+}
+const h = globalThis.__stub.handlers;
+const user = process.env.TEST_USER;
+const out = [];
+const channel = (id) => ({ id, sendTyping: async () => {}, send: async (o) => { out.push(o.content); } });
+const message = (guild, channelId, mentioned) => ({
+  author: { bot: false, id: user }, webhookId: null, system: false, guild,
+  channel: channel(channelId), mentions: { has: () => mentioned },
+  content: "hello there", attachments: new Map(),
+  reply: async (o) => { out.push(o.content); },
+});
+await h.messageCreate(message(null, "D1", false));
+const dm = out.splice(0);
+await h.messageCreate(message({ id: "G1" }, "C1", true));
+const mention = out.splice(0);
+await h.messageCreate(message({ id: "G1" }, "C9", false));
+const free = out.splice(0);
+await h.interactionCreate({
+  isChatInputCommand: () => true, commandName: "chamber", user: { id: user },
+  options: { getString: () => "status" }, channelId: "C1", guild: null, channel: null,
+  isButton: () => false,
+  reply: async (o) => { out.push(o.content); },
+  deferReply: async () => {},
+  editReply: async (o) => { out.push(typeof o === "string" ? o : o.content); },
+});
+const slash = out.splice(0);
+console.log("DRIVE " + JSON.stringify({ dm, mention, free, slash }));
+process.exit(0);
+`;
+
+/** Run a real runner against the stubs; returns what the driver printed, stderr and how many sessions the database holds. */
+function driveRunner(
+  kind: "slack" | "discord",
+  env: Record<string, string>,
+  user: string,
+): { drive: Record<string, string[]>; stderr: string; sessions: number } {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-runner-"));
+  try {
+    writeFileSync(join(dir, "hooks.mjs"), RUNNER_HOOKS);
+    writeFileSync(join(dir, "register.mjs"), RUNNER_REGISTER);
+    writeFileSync(join(dir, "bolt_stub.mjs"), BOLT_STUB);
+    writeFileSync(join(dir, "discord_stub.mjs"), DISCORD_STUB);
+    const driver = join(dir, "driver.mjs");
+    writeFileSync(driver, kind === "slack" ? SLACK_DRIVER : DISCORD_DRIVER);
+    const dbPath = join(dir, "runner.sqlite");
+    const runner = pathToFileURL(
+      join(dirname(fileURLToPath(import.meta.url)), `../src/${kind}_runner.ts`),
+    ).href;
+    const base: Record<string, string | undefined> = { ...process.env };
+    for (const key of CONFIG_ENV_KEYS) delete base[key];
+    for (const key of [
+      "CHAMBER_SLACK_ALLOWED_USERS",
+      "CHAMBER_DISCORD_ALLOWED_USERS",
+      "DISCORD_ALLOWED_USERS",
+      "CHAMBER_DISCORD_FREE_CHANNELS",
+      "CHAMBER_SLACK_OPS_CHANNEL",
+      "CHAMBER_DISCORD_OPS_CHANNEL",
+    ]) {
+      delete base[key];
+    }
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", "--import", pathToFileURL(join(dir, "register.mjs")).href, driver],
+      {
+        encoding: "utf8",
+        timeout: 60_000,
+        env: {
+          ...base,
+          CHAMBER_DB: dbPath,
+          SLACK_BOT_TOKEN: "stub-bot",
+          SLACK_APP_TOKEN: "stub-app",
+          DISCORD_BOT_TOKEN: "stub-bot",
+          RUNNER: runner,
+          TEST_USER: user,
+          ...env,
+        },
+      },
+    );
+    const line = (r.stdout ?? "").split("\n").find((l) => l.startsWith("DRIVE "));
+    assert(line !== undefined, `the driver printed no result (exit ${r.status}):\n${r.stdout}\n${r.stderr}`);
+    const db = openChamberDb(dbPath);
+    try {
+      const sessions = (db.prepare(`SELECT COUNT(*) AS c FROM session`).get() as { c: number }).c;
+      return {
+        drive: JSON.parse(line.slice("DRIVE ".length)) as Record<string, string[]>,
+        stderr: r.stderr ?? "",
+        sessions,
+      };
+    } finally {
+      db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("slack", "the Slack runner refuses a user who is not on CHAMBER_SLACK_ALLOWED_USERS at mentions, DMs and /chamber", () => {
+  const empty = driveRunner("slack", {}, "U_ANYONE");
+  assert(
+    /chamber: CHAMBER_SLACK_ALLOWED_USERS is empty, so nobody can talk to this bot/.test(empty.stderr),
+    `an empty list must be announced at startup:\n${empty.stderr}`,
+  );
+  const unlisted = driveRunner("slack", { CHAMBER_SLACK_ALLOWED_USERS: "U_OK" }, "U_BAD");
+  assert(
+    !/is empty, so nobody/.test(unlisted.stderr),
+    `a configured list must not print the empty-list warning:\n${unlisted.stderr}`,
+  );
+  for (const [label, run] of [["empty list", empty], ["unlisted user", unlisted]] as const) {
+    assert(
+      JSON.stringify(run.drive.said) === JSON.stringify([SLACK_TALK_REFUSAL, SLACK_TALK_REFUSAL]),
+      `${label}: mention and DM must each be refused, got ${JSON.stringify(run.drive.said)}`,
+    );
+    assert(
+      JSON.stringify(run.drive.responded) === JSON.stringify([SLACK_TALK_REFUSAL]),
+      `${label}: /chamber must be refused, got ${JSON.stringify(run.drive.responded)}`,
+    );
+    assert(run.sessions === 0, `${label}: a refused user must not start a turn, ${run.sessions} session(s) exist`);
+  }
+  const listed = driveRunner("slack", { CHAMBER_SLACK_ALLOWED_USERS: "U_OK" }, "U_OK");
+  assert(
+    listed.drive.said!.length === 2 && listed.drive.said!.every((t) => t !== SLACK_TALK_REFUSAL && t.length > 0),
+    `a listed user must be answered: ${JSON.stringify(listed.drive.said)}`,
+  );
+  assert(
+    listed.drive.responded!.length === 1 && listed.drive.responded![0] !== SLACK_TALK_REFUSAL,
+    `a listed user's /chamber must be answered: ${JSON.stringify(listed.drive.responded)}`,
+  );
+  assert(listed.sessions >= 1, "a listed user's mention must have run a turn");
+});
+
+test("discord", "the Discord runner refuses a user who is not on CHAMBER_DISCORD_ALLOWED_USERS at messages, mentions and /chamber", () => {
+  const refusal = "You are not on `CHAMBER_DISCORD_ALLOWED_USERS`.";
+  const env = { CHAMBER_DISCORD_FREE_CHANNELS: "C9" };
+  const empty = driveRunner("discord", env, "u_anyone");
+  assert(
+    /chamber: CHAMBER_DISCORD_ALLOWED_USERS is empty, so nobody can talk to this bot/.test(empty.stderr),
+    `an empty list must be announced at startup:\n${empty.stderr}`,
+  );
+  const unlisted = driveRunner("discord", { ...env, CHAMBER_DISCORD_ALLOWED_USERS: "u_ok" }, "u_bad");
+  assert(
+    !/is empty, so nobody/.test(unlisted.stderr),
+    `a configured list must not print the empty-list warning:\n${unlisted.stderr}`,
+  );
+  for (const [label, run] of [["empty list", empty], ["unlisted user", unlisted]] as const) {
+    assert(JSON.stringify(run.drive.dm) === JSON.stringify([refusal]), `${label}: DM got ${JSON.stringify(run.drive.dm)}`);
+    assert(JSON.stringify(run.drive.mention) === JSON.stringify([refusal]), `${label}: mention got ${JSON.stringify(run.drive.mention)}`);
+    assert(
+      run.drive.free!.length === 0,
+      `${label}: a free-channel message that did not address the bot must get no reply at all, got ${JSON.stringify(run.drive.free)}`,
+    );
+    assert(JSON.stringify(run.drive.slash) === JSON.stringify([refusal]), `${label}: /chamber got ${JSON.stringify(run.drive.slash)}`);
+    assert(run.sessions === 0, `${label}: a refused user must not start a turn, ${run.sessions} session(s) exist`);
+  }
+  const listed = driveRunner("discord", { ...env, CHAMBER_DISCORD_ALLOWED_USERS: "u_ok" }, "u_ok");
+  for (const key of ["dm", "mention", "free", "slash"] as const) {
+    const got = listed.drive[key]!;
+    assert(got.length >= 1 && got.every((t) => t !== refusal), `a listed user must be answered at ${key}: ${JSON.stringify(got)}`);
+  }
+  assert(listed.sessions >= 1, "a listed user's message must have run a turn");
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────

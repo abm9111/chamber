@@ -6,6 +6,9 @@
  */
 
 import { openChamberDb, secureDatabaseFile } from "../src/db.ts";
+import { CURL_FIXED_ARGV, buildCurlInvocation, httpSync } from "../src/http_sync.ts";
+import { mcpDiscover } from "../src/mcp_client.ts";
+import { TelegramGateway } from "../src/gateway.ts";
 import { claimHash, newId, sha256 } from "../src/hash.ts";
 import { commitBelief } from "../src/commit_belief.ts";
 import {
@@ -180,6 +183,8 @@ import {
   resetRefreshMockSequence,
   formatRefreshError,
   requireHttps,
+  exchangeAuthorizationCode,
+  fetchProtectedResourceMetadata,
 } from "../src/mcp_oauth.ts";
 import { sealSecret, openSecret } from "../src/secret_box.ts";
 // Aliased because the v1-compatibility test has to rebuild the *old* sealed
@@ -205,6 +210,7 @@ import {
   slackApprove,
   slackScopeId,
   openSlackDb,
+  postPendingWriteToOps,
 } from "../src/slack_ops.ts";
 import {
   canDiscordApprove,
@@ -215,9 +221,10 @@ import {
   formatAttachmentMeta,
   chunkDiscordMessage,
   openDiscordDb,
+  postPendingWriteToDiscordOps,
 } from "../src/discord_ops.ts";
 // Importing this module must not start a gateway; see `invokedDirectly` there.
-import { openGatewayDb } from "../src/gateway_runner.ts";
+import { openGatewayDb, DiscordGateway, SlackGateway } from "../src/gateway_runner.ts";
 import {
   checkRateLimit,
   resetRateLimits,
@@ -264,6 +271,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -298,6 +306,7 @@ type Suite =
   | "model"
   | "db"
   | "server"
+  | "http_sync"
   | "all";
 
 interface TestResult {
@@ -412,6 +421,7 @@ function suiteFromArg(): Suite {
     "model",
     "db",
     "server",
+    "http_sync",
     "all",
   ].includes(v)
     ? v
@@ -16356,6 +16366,266 @@ test("server", "/approve and /reject record decided_by 'http' whatever actor the
     }
   } finally {
     await s.stop();
+  }
+});
+
+// ─── NO SECRET ON A COMMAND LINE (src/http_sync.ts) ─────────────────────────
+
+/**
+ * Write a `curl` into `dir` that records how it was invoked and answers `{}`
+ * with status 200. It writes one `argv.<pid>` file (one argument per line) and
+ * one `stdin.<pid>` file per call into `$CHAMBER_SHIM_DIR`, which `shimCalls`
+ * reads back. `withCurlShim` also puts `dir` first on this process's PATH.
+ */
+function writeCurlShim(dir: string): void {
+  writeFileSync(
+    join(dir, "curl"),
+    `#!/bin/sh\n` +
+      `printf '%s\\n' "$@" > "$CHAMBER_SHIM_DIR/argv.$$"\n` +
+      `cat > "$CHAMBER_SHIM_DIR/stdin.$$"\n` +
+      `printf '{}\\n200'\n`,
+    { mode: 0o755 },
+  );
+}
+
+async function withCurlShim<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-curlshim-"));
+  writeCurlShim(dir);
+  const savedPath = process.env.PATH;
+  try {
+    process.env.PATH = `${dir}:${savedPath ?? ""}`;
+    return await withEnvAsync({ CHAMBER_SHIM_DIR: dir }, () => fn(dir));
+  } finally {
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function shimCalls(dir: string): { argv: string[]; stdin: string }[] {
+  return readdirSync(dir)
+    .filter((f) => f.startsWith("argv."))
+    .sort()
+    .map((f) => ({
+      argv: readFileSync(join(dir, f), "utf8").split("\n").filter((l) => l !== ""),
+      stdin: readFileSync(join(dir, f.replace("argv.", "stdin.")), "utf8"),
+    }));
+}
+
+test("http_sync", "every site that carries a secret keeps it off the curl command line", async () => {
+  const secret = {
+    slack: "SHIMSECRET-slack",
+    discord: "SHIMSECRET-discord",
+    telegram: "SHIMSECRET-telegram",
+    mcp: "SHIMSECRET-mcp",
+    code: "SHIMSECRET-code",
+    verifier: "SHIMSECRET-verifier",
+    client: "SHIMSECRET-client",
+  };
+  await withCurlShim(async (dir) => {
+    const event = { writeId: "pw_shim", target: "skill", action: "create", subject: "s", origin: "cron" };
+    await withEnvAsync(
+      {
+        SLACK_BOT_TOKEN: secret.slack,
+        CHAMBER_SLACK_OPS_CHANNEL: "C0OPS",
+        DISCORD_BOT_TOKEN: secret.discord,
+        CHAMBER_DISCORD_OPS_CHANNEL: "1234",
+        CHAMBER_MCP_ACCESS_TOKEN: secret.mcp,
+      },
+      async () => {
+        postPendingWriteToOps(event);
+        postPendingWriteToDiscordOps(event);
+        await new TelegramGateway(secret.telegram).send({ channel: "telegram", chatId: "42", text: 'say "hi"' });
+        await new DiscordGateway(secret.discord).send({ channel: "discord", chatId: "1234", text: "hi" });
+        await new SlackGateway(secret.slack).send({ channel: "slack", chatId: "C1", text: "hi" });
+        try {
+          mcpDiscover("http://127.0.0.1:9/mcp"); // the shim's {} is not a discover reply; only the call matters
+        } catch {
+          // expected
+        }
+        const db = freshDb();
+        try {
+          exchangeAuthorizationCode(db, {
+            tokenEndpoint: "http://127.0.0.1:9/token",
+            clientId: "client-id",
+            clientSecret: secret.client,
+            code: secret.code,
+            redirectUri: "http://127.0.0.1:8765/callback",
+            codeVerifier: secret.verifier,
+            resource: "http://127.0.0.1:9/mcp",
+            issuer: "http://127.0.0.1:9",
+          });
+        } catch {
+          // expected: the shim's {} carries no access_token
+        }
+        try {
+          fetchProtectedResourceMetadata(db, "http://127.0.0.1:9/mcp");
+        } catch {
+          // expected: the shim's {} names no authorization server
+        }
+      },
+    );
+    const calls = shimCalls(dir);
+    assert(calls.length >= 9, `expected a call from every site, saw ${calls.length}`);
+    for (const call of calls) {
+      assert(
+        call.argv.length === CURL_FIXED_ARGV.length && call.argv.every((a, i) => a === CURL_FIXED_ARGV[i]),
+        `argv must be exactly the fixed flags, got ${JSON.stringify(call.argv)}`,
+      );
+    }
+    const argvText = calls.map((c) => c.argv.join("\n")).join("\n");
+    const stdinText = calls.map((c) => c.stdin).join("\n");
+    for (const [site, value] of Object.entries(secret)) {
+      assert(!argvText.includes(value), `${site}: the secret is on the command line`);
+      assert(stdinText.includes(value), `${site}: no call carried this secret on stdin, so the site never ran`);
+    }
+  });
+});
+
+test("http_sync", "a line break, a NUL, a bad scheme or a bad header name is refused before curl runs", async () => {
+  await withCurlShim(async (dir) => {
+    const base = { url: "http://127.0.0.1:9/x", timeoutSec: 5 };
+    const cases: [string, Parameters<typeof httpSync>[0]][] = [
+      ["CRLF in a header value", { ...base, headers: { "X-A": "b\r\nX-Injected: yes" } }],
+      ["LF in a header value", { ...base, headers: { "X-A": "b\nc" } }],
+      ["CR in a header name", { ...base, headers: { "X-A\r": "b" } }],
+      ["LF in the URL", { ...base, url: "http://127.0.0.1:9/x\nHost: other" }],
+      ["NUL in the body", { ...base, method: "POST", body: "a\0b" }],
+      ["NUL in a header value", { ...base, headers: { "X-A": "a\0b" } }],
+      ["a header name that is not a token", { ...base, headers: { "Bad Name": "b" } }],
+      ["a header name with a colon", { ...base, headers: { "X:A": "b" } }],
+      ["a file: URL", { ...base, url: "file:///etc/hostname" }],
+      ["no timeout", { ...base, timeoutSec: 0 }],
+      ["a body on a GET", { ...base, method: "GET", body: "x" }],
+    ];
+    for (const [label, req] of cases) {
+      let message = "";
+      try {
+        httpSync(req);
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      assert(message.startsWith("http_sync:"), `${label}: expected a refusal, got ${JSON.stringify(message)}`);
+    }
+    // The refusal never repeats the value it refused.
+    let leaked = "";
+    try {
+      httpSync({ ...base, headers: { Authorization: "Bearer SHIMSECRET-leak\r\nX: y" } });
+    } catch (err) {
+      leaked = err instanceof Error ? err.message : String(err);
+    }
+    assert(leaked !== "" && !leaked.includes("SHIMSECRET-leak"), `the error must not echo the value: ${leaked}`);
+    assert(shimCalls(dir).length === 0, "a refused request must not start curl");
+  });
+});
+
+test("http_sync", "values are double-quoted with backslash, quote, LF, CR and TAB escaped", () => {
+  const { argv, config } = buildCurlInvocation({
+    url: "https://example.com/a?b=c",
+    method: "POST",
+    headers: { "X-Test": 'a"b\\c\td' },
+    body: 'x"y\\z\r\nq',
+    timeoutSec: 12,
+    followRedirects: true,
+  });
+  assert(JSON.stringify(argv) === '["-s","-K","-"]', `argv: ${JSON.stringify(argv)}`);
+  const expected = [
+    'url = "https://example.com/a?b=c"',
+    "globoff",
+    'max-time = "12"',
+    'write-out = "\\n%{http_code}"',
+    "location",
+    'request = "POST"',
+    'header = "X-Test: a\\"b\\\\c\\td"',
+    'data-raw = "x\\"y\\\\z\\r\\nq"',
+    "",
+  ].join("\n");
+  assert(config === expected, `config was:\n${config}\nwant:\n${expected}`);
+});
+
+/** A receiver in its own process, so the test can block on curl without blocking the receiver. */
+const HTTP_RECEIVER = `
+const http = require("node:http");
+const fs = require("node:fs");
+const out = process.argv[1];
+const server = http.createServer((req, res) => {
+  const chunks = [];
+  req.on("data", (d) => chunks.push(d));
+  req.on("end", () => {
+    if (req.url.startsWith("/hang")) {
+      // Never answers. It hangs up after 8 s so that a curl with no timeout
+      // fails the test below instead of hanging the suite.
+      setTimeout(() => req.socket.destroy(), 8000);
+      return;
+    }
+    fs.appendFileSync(out, JSON.stringify({
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body: Buffer.concat(chunks).toString("base64"),
+    }) + "\\n");
+    res.statusCode = 201;
+    res.setHeader("Content-Type", "application/json");
+    res.end('{"ok":true}');
+  });
+});
+server.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port));
+`;
+
+test("http_sync", "a header and a body with quotes, backslashes, newlines and non-ASCII arrive byte for byte", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-httpsync-"));
+  const outFile = join(dir, "received.jsonl");
+  const receiver = spawn(process.execPath, ["-e", HTTP_RECEIVER, outFile]);
+  try {
+    const port = await new Promise<number>((ok, fail) => {
+      let seen = "";
+      const timer = setTimeout(() => fail(new Error("receiver did not start")), 10_000);
+      receiver.stdout.on("data", (d: Buffer) => {
+        seen += d.toString();
+        const m = /PORT (\d+)/.exec(seen);
+        if (m) {
+          clearTimeout(timer);
+          ok(Number(m[1]));
+        }
+      });
+    });
+    const sent =
+      'He said "hi" \\ back\nline2\r\nline3\ttab é 漢字 😀 @/etc/hostname %{http_code} $HOME `x` ';
+    const authorization = 'Bearer tok"en\\x';
+    const r = httpSync({
+      url: `http://127.0.0.1:${port}/echo?x=[1]&y={a}`,
+      method: "POST",
+      headers: { Authorization: authorization, "Content-Type": "application/json" },
+      body: sent,
+      timeoutSec: 10,
+    });
+    assert(r.status === 201 && r.body === '{"ok":true}', `reply: ${r.status} ${JSON.stringify(r.body)}`);
+    const big = "x\n\"\\é".repeat(200_000); // about 1.4 MB
+    const r2 = httpSync({
+      url: `http://127.0.0.1:${port}/big`,
+      method: "POST",
+      body: big,
+      timeoutSec: 20,
+    });
+    assert(r2.status === 201, `a large body gave ${r2.status}`);
+    const lines = readFileSync(outFile, "utf8").trim().split("\n");
+    assert(lines.length === 2, `expected two requests, got ${lines.length}`);
+    const first = JSON.parse(lines[0]!) as { method: string; url: string; headers: Record<string, string>; body: string };
+    assert(first.method === "POST", `method: ${first.method}`);
+    assert(first.url === "/echo?x=[1]&y={a}", `URL: ${first.url}`);
+    assert(first.headers.authorization === authorization, `Authorization: ${first.headers.authorization}`);
+    assert(Buffer.from(first.body, "base64").equals(Buffer.from(sent, "utf8")), "the body changed on the way");
+    const second = JSON.parse(lines[1]!) as { body: string };
+    assert(Buffer.from(second.body, "base64").equals(Buffer.from(big, "utf8")), "the large body changed on the way");
+
+    // The timeout lives in the config now, so prove curl still honours it.
+    const started = Date.now();
+    const hung = httpSync({ url: `http://127.0.0.1:${port}/hang`, timeoutSec: 1 });
+    assert(hung.status === 0 && hung.exitStatus === 28, `a silent server: status ${hung.status}, curl exit ${hung.exitStatus}`);
+    assert(Date.now() - started < 5000, `the timeout took ${Date.now() - started} ms`);
+  } finally {
+    receiver.kill("SIGKILL");
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

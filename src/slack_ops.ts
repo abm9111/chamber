@@ -3,9 +3,9 @@
  * Authority stays in decideWrite / turn gates — this is transport glue only.
  */
 
-import { spawnSync } from "node:child_process";
 import type { DatabaseSync } from "node:sqlite";
 import { openConfiguredDb } from "./db.ts";
+import { httpSync } from "./http_sync.ts";
 import { newId, sha256 } from "./hash.ts";
 import { appendAudit } from "./audit.ts";
 import { startSession, appendMessage } from "./sessions.ts";
@@ -387,25 +387,18 @@ export function postPendingWriteToOps(event: {
     text: `Pending: ${event.writeId}`,
     blocks,
   });
-  const r = spawnSync(
-    "curl",
-    [
-      "-s",
-      "-m",
-      "10",
-      "-X",
-      "POST",
-      "https://slack.com/api/chat.postMessage",
-      "-H",
-      `Authorization: Bearer ${token}`,
-      "-H",
-      "Content-Type: application/json",
-      "-d",
-      payload,
-    ],
-    { encoding: "utf-8", maxBuffer: 1_000_000 },
-  );
-  const body = r.stdout || "";
+  const r = httpSync({
+    url: "https://slack.com/api/chat.postMessage",
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: payload,
+    timeoutSec: 10,
+    maxBytes: 1_000_000,
+  });
+  const body = r.body;
   try {
     const j = JSON.parse(body) as { ok?: boolean; error?: string };
     return !!j.ok;

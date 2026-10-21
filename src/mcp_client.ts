@@ -10,10 +10,10 @@
  * Not a full SDK; enough for gated interop.
  */
 
-import { spawnSync } from "node:child_process";
 import type { DatabaseSync } from "node:sqlite";
 import { appendAudit } from "./audit.ts";
 import { newId } from "./hash.ts";
+import { httpSync } from "./http_sync.ts";
 import {
   ensureAccessTokenDetailed,
   refreshAccessTokenWithRetry,
@@ -46,36 +46,19 @@ function httpPost(
   body: unknown,
   headers: Record<string, string> = {},
 ): { status: number; body: string } {
-  const headerArgs: string[] = [];
-  for (const [k, v] of Object.entries(headers)) {
-    headerArgs.push("-H", `${k}: ${v}`);
-  }
-  const r = spawnSync(
-    "curl",
-    [
-      "-s",
-      "-m",
-      "30",
-      "-w",
-      "\n%{http_code}",
-      "-X",
-      "POST",
-      url,
-      ...headerArgs,
-      "-H",
-      "Content-Type: application/json",
-      "-H",
-      `MCP-Protocol-Version: ${MCP_PROTOCOL_VERSION}`,
-      "-d",
-      JSON.stringify(body),
-    ],
-    { encoding: "utf-8", maxBuffer: 8 * 1024 * 1024 },
-  );
-  const out = r.stdout || "";
-  const nl = out.lastIndexOf("\n");
-  const status = Number(out.slice(nl + 1)) || 0;
-  const bodyText = nl >= 0 ? out.slice(0, nl) : out;
-  return { status, body: bodyText };
+  const r = httpSync({
+    url,
+    method: "POST",
+    headers: {
+      ...headers,
+      "Content-Type": "application/json",
+      "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+    },
+    body: JSON.stringify(body),
+    timeoutSec: 30,
+    maxBytes: 8 * 1024 * 1024,
+  });
+  return { status: r.status, body: r.body };
 }
 
 function rpc(

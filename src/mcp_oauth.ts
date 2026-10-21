@@ -17,6 +17,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { appendAudit } from "./audit.ts";
 import { canSealSecrets, sealSecret, openSecret } from "./secret_box.ts";
 import { isLoopbackBase } from "./config.ts";
+import { httpSync } from "./http_sync.ts";
 
 const META_TTL_MS = 60 * 60 * 1000;
 
@@ -69,16 +70,13 @@ export interface StoredToken {
 }
 
 function httpGet(url: string): { status: number; body: string } {
-  const r = spawnSync(
-    "curl",
-    ["-s", "-m", "15", "-w", "\n%{http_code}", "-L", url],
-    { encoding: "utf-8", maxBuffer: 2 * 1024 * 1024 },
-  );
-  const out = r.stdout || "";
-  const nl = out.lastIndexOf("\n");
-  const status = Number(out.slice(nl + 1)) || 0;
-  const body = nl >= 0 ? out.slice(0, nl) : out;
-  return { status, body };
+  const r = httpSync({
+    url,
+    timeoutSec: 15,
+    followRedirects: true,
+    maxBytes: 2 * 1024 * 1024,
+  });
+  return { status: r.status, body: r.body };
 }
 
 function httpPostForm(
@@ -90,29 +88,15 @@ function httpPostForm(
       ([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`,
     )
     .join("&");
-  const r = spawnSync(
-    "curl",
-    [
-      "-s",
-      "-m",
-      "20",
-      "-w",
-      "\n%{http_code}",
-      "-X",
-      "POST",
-      url,
-      "-H",
-      "Content-Type: application/x-www-form-urlencoded",
-      "-d",
-      data,
-    ],
-    { encoding: "utf-8", maxBuffer: 2 * 1024 * 1024 },
-  );
-  const out = r.stdout || "";
-  const nl = out.lastIndexOf("\n");
-  const status = Number(out.slice(nl + 1)) || 0;
-  const body = nl >= 0 ? out.slice(0, nl) : out;
-  return { status, body };
+  const r = httpSync({
+    url,
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: data,
+    timeoutSec: 20,
+    maxBytes: 2 * 1024 * 1024,
+  });
+  return { status: r.status, body: r.body };
 }
 
 /** Normalize resource URL for token key (strip trailing slash except root). */

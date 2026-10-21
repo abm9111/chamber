@@ -2,9 +2,9 @@
  * Discord ↔ Chamber ops. Same contract as Slack: transport only, gates decide.
  */
 
-import { spawnSync } from "node:child_process";
 import type { DatabaseSync } from "node:sqlite";
 import { openConfiguredDb } from "./db.ts";
+import { httpSync } from "./http_sync.ts";
 import { newId, sha256 } from "./hash.ts";
 import { appendAudit } from "./audit.ts";
 import { startSession, appendMessage } from "./sessions.ts";
@@ -424,26 +424,19 @@ export function postPendingWriteToDiscordOps(event: {
     components: pendingWriteDiscordComponents(event.writeId),
   });
 
-  const r = spawnSync(
-    "curl",
-    [
-      "-s",
-      "-m",
-      "10",
-      "-X",
-      "POST",
-      `https://discord.com/api/v10/channels/${channel}/messages`,
-      "-H",
-      `Authorization: Bot ${token}`,
-      "-H",
-      "Content-Type: application/json",
-      "-d",
-      payload,
-    ],
-    { encoding: "utf-8", maxBuffer: 1_000_000 },
-  );
+  const r = httpSync({
+    url: `https://discord.com/api/v10/channels/${channel}/messages`,
+    method: "POST",
+    headers: {
+      Authorization: `Bot ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: payload,
+    timeoutSec: 10,
+    maxBytes: 1_000_000,
+  });
   try {
-    const j = JSON.parse(r.stdout || "{}") as { id?: string; message?: string };
+    const j = JSON.parse(r.body || "{}") as { id?: string; message?: string };
     return !!j.id;
   } catch {
     return false;

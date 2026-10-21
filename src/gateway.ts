@@ -6,7 +6,7 @@
  * gateway only transports; it does not bypass debt/approvals/faculty.
  */
 
-import { spawnSync } from "node:child_process";
+import { httpSync } from "./http_sync.ts";
 
 export type GatewayChannel =
   | "cli"
@@ -69,27 +69,21 @@ export class TelegramGateway implements GatewayAdapter {
 
   private api(method: string, body?: Record<string, unknown>): unknown {
     if (!this.token) throw new Error("TELEGRAM_BOT_TOKEN not set");
+    // The bot token is part of the URL path, which is why this goes through
+    // `httpSync`: the URL is on curl's stdin, not on its command line.
     const url = `https://api.telegram.org/bot${this.token}/${method}`;
-    const res = spawnSync(
-      "curl",
-      [
-        "-s",
-        "-m",
-        "35",
-        "-X",
-        "POST",
-        url,
-        "-H",
-        "Content-Type: application/json",
-        "-d",
-        JSON.stringify(body ?? {}),
-      ],
-      { encoding: "utf-8", maxBuffer: 4 * 1024 * 1024 },
-    );
-    if (res.status !== 0) {
+    const res = httpSync({
+      url,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body ?? {}),
+      timeoutSec: 35,
+      maxBytes: 4 * 1024 * 1024,
+    });
+    if (res.exitStatus !== 0) {
       throw new Error(String(res.stderr || "telegram api failed"));
     }
-    return JSON.parse(res.stdout || "{}");
+    return JSON.parse(res.body || "{}");
   }
 
   async send(msg: OutboundMessage): Promise<void> {

@@ -87,8 +87,12 @@ history and the GitHub releases.
 - **MiniLM weights are checked before they load.** `scripts/embed_minilm.py`
   hashes `model_quantized.onnx` and compares it with `models/minilm/VERSION`;
   a mismatch, a missing `VERSION` or a missing `SHA-256:` line exits 3 in every
-  mode, before the model is imported. The TypeScript side treats it like any
-  other embedder failure.
+  mode, before the model is imported. The TypeScript side throws on it
+  (`MinilmIntegrityError`) in every mode, `auto` included, in `embedLocal`,
+  `embedLocalBatch` and `minilmAvailable()`, so `ingest`, `search` and `ask`
+  stop with the hash mismatch instead of writing or querying with
+  `local-hash-v1` vectors. A missing interpreter or dependency still degrades
+  with a warning, and `CHAMBER_EMBEDDER=hash` still chooses hash on purpose.
 - **One version everywhere.** `server.json` said 0.1.10 while the package said
   0.1.9, and the MCP server reported a third, hand-typed copy. The server now
   reads `package.json`, `server.json` agrees, and a test fails when any of

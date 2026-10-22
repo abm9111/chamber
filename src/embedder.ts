@@ -25,6 +25,29 @@ export const HASH_MODEL = "local-hash-v1";
 export const HASH_DIMS = 256;
 export const OLLAMA_MODEL_DEFAULT = "nomic-embed-text";
 
+/** The exit code `scripts/embed_minilm.py` uses when the weights fail their hash check. */
+export const MINILM_WEIGHTS_REFUSED_EXIT = 3;
+
+/**
+ * The MiniLM weights are on disk and were refused by their hash check
+ * (`scripts/embed_minilm.py` exit 3). That is not a machine without an
+ * embedder, which is entitled to hash vectors and a warning: it is weights that
+ * changed, and writing `local-hash-v1` vectors in their place is the silent
+ * downgrade this module exists to prevent. So this error is never turned into a
+ * fallback, in `auto` mode or any other.
+ */
+export class MinilmIntegrityError extends Error {
+  constructor(detail: string) {
+    super(
+      `embed_minilm failed (${MINILM_WEIGHTS_REFUSED_EXIT}): ${detail}. The MiniLM weights were refused, ` +
+        `and Chamber will not write hash vectors in their place: restore ` +
+        `models/minilm/model_quantized.onnx, or the SHA-256 line in models/minilm/VERSION. ` +
+        `To embed with something else on purpose, set CHAMBER_EMBEDDER=hash or ollama.`,
+    );
+    this.name = "MinilmIntegrityError";
+  }
+}
+
 /** Fallback hash embedder (no Python). Kept here to avoid cycle with vector.ts */
 function hashEmbed(text: string, dims = HASH_DIMS): Float32Array {
   const v = new Float32Array(dims);
@@ -103,7 +126,10 @@ export function minilmAvailable(): boolean {
   if (!minilmInstalled()) return false;
   const bin = pythonBin();
   const cached = minilmProbe.get(bin);
-  if (cached !== undefined) return cached.ok;
+  if (cached !== undefined) {
+    if (cached.err instanceof MinilmIntegrityError) throw cached.err;
+    return cached.ok;
+  }
 
   let ok = false;
   let err: unknown;
@@ -117,6 +143,8 @@ export function minilmAvailable(): boolean {
       timeout: 120_000,
     });
     if (r.error) err = r.error;
+    else if (r.status === MINILM_WEIGHTS_REFUSED_EXIT)
+      err = new MinilmIntegrityError((r.stderr || "").trim().slice(0, 300));
     else if (r.status !== 0)
       err = new Error(
         `probe exited ${r.status}: ${(r.stderr || "").trim().slice(0, 300)}`,
@@ -141,6 +169,10 @@ export function minilmAvailable(): boolean {
   // threw, and the catch in `embedLocal` warned. Answering honestly up front
   // removed that accident, so the warning has to be raised deliberately here
   // or the downgrade goes back to being silent — the whole defect.
+  // Refused weights are an answer, not an absence. Every caller that asks
+  // whether MiniLM is available, `defaultEmbedderKind` included, gets the
+  // refusal instead of a `false` that sends it on to hash vectors.
+  if (err instanceof MinilmIntegrityError) throw err;
   if (!ok) warnMinilmFallback(err);
   return ok;
 }
@@ -298,6 +330,7 @@ function spawnMinilmStdin(payload: string): number[][] {
     timeout: 180_000,
   });
   if (r.error) throw r.error;
+  if (r.status === MINILM_WEIGHTS_REFUSED_EXIT) throw new MinilmIntegrityError((r.stderr || "").trim().slice(0, 400));
   if (r.status !== 0) {
     throw new Error(
       `embed_minilm failed (${r.status}): ${(r.stderr || "").slice(0, 400)}`,
@@ -503,6 +536,10 @@ export function embedLocal(
         kind: "minilm",
       };
     } catch (err) {
+      // Weights that were refused are never a reason to write hash vectors, in
+      // auto mode least of all: the probe can pass and a later spawn still be
+      // refused if the file changes in between.
+      if (err instanceof MinilmIntegrityError) throw err;
       if (prefer === "minilm") {
         throw new Error(
           `minilm embed failed: ${err instanceof Error ? err.message : String(err)}`,

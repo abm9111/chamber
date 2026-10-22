@@ -107,6 +107,7 @@ import {
   chunkJsonStdin,
   embedMinilm,
   noteMinilmStderr,
+  MinilmIntegrityError,
 } from "../src/embedder.ts";
 import { CALIBRATED_THRESHOLDS } from "../src/commit_belief.ts";
 import {
@@ -13269,15 +13270,15 @@ test("config", "the real model directory passes the weights check", () => {
   }
 });
 
-test("config", "failed weights degrade embedLocal and make the batch path throw", () => {
+test("config", "refused MiniLM weights make every embed path throw, in auto mode as well as with minilm preferred, and never write hash vectors", () => {
   const dir = minilmDirWithVersion(tamperedVersion().text);
   const saved = process.env.CHAMBER_MINILM_DIR;
   const savedKind = process.env.CHAMBER_EMBEDDER;
   const savedWrite = process.stderr.write;
   process.env.CHAMBER_MINILM_DIR = dir;
   delete process.env.CHAMBER_EMBEDDER;
-  // The one-time fallback warning is the point of the behaviour, not noise to
-  // print into the test log.
+  // Anything the embedder announces on the way is captured, so the test can
+  // check that a refusal is not dressed up as a downgrade.
   let warned = "";
   process.stderr.write = ((chunk: string | Uint8Array): boolean => {
     warned += String(chunk);
@@ -13285,18 +13286,145 @@ test("config", "failed weights degrade embedLocal and make the batch path throw"
   }) as typeof process.stderr.write;
   resetMinilmProbe();
   try {
-    const single = embedLocal("a sentence", "auto");
-    assert(single.kind === "hash", `embedLocal did not degrade: ${single.kind}`);
-    assert(warned.includes("SHA-256"), `the degradation did not say why: ${warned}`);
-    let batch = "";
-    try {
-      embedLocalBatch(["a sentence"], "minilm");
-    } catch (e) {
-      batch = e instanceof Error ? e.message : String(e);
-    }
-    assert(batch.includes("embed_minilm failed (3)"), `the batch path did not throw the exit 3: ${batch}`);
+    const refusal = (label: string, run: () => unknown): void => {
+      let thrown: unknown;
+      try {
+        run();
+      } catch (e) {
+        thrown = e;
+      }
+      const said = thrown instanceof Error ? thrown.message : String(thrown);
+      assert(thrown instanceof MinilmIntegrityError, `${label}: expected the weights refusal, got: ${said}`);
+      assert(said.includes("embed_minilm failed (3)") && said.includes("SHA-256"), `${label}: the refusal does not say why: ${said}`);
+    };
+    // "auto" is what ingest (through its batch call) and commit_belief use, and
+    // what search and upsertDocument use for one text. The probe runs on the
+    // first call and is cached for the second, and both must refuse.
+    refusal("embedLocalBatch auto", () => embedLocalBatch(["a sentence"], "auto"));
+    refusal("embedLocalBatch auto, probe cached", () => embedLocalBatch(["a sentence"], "auto"));
+    refusal("embedLocal auto", () => embedLocal("a sentence", "auto"));
+    refusal("embedLocalBatch minilm", () => embedLocalBatch(["a sentence"], "minilm"));
+    refusal("embedLocal minilm", () => embedLocal("a sentence", "minilm"));
+    process.env.CHAMBER_EMBEDDER = "minilm";
+    resetMinilmProbe();
+    refusal("CHAMBER_EMBEDDER=minilm", () => embedLocalBatch(["a sentence"], "auto"));
+    delete process.env.CHAMBER_EMBEDDER;
+    assert(!warned.includes("hash vectors"), `a refusal was announced as a downgrade to hash vectors: ${warned}`);
+
+    // Choosing hash on purpose is the operator's decision and still works.
+    const chosen = embedLocalBatch(["a sentence"], "hash");
+    assert(chosen[0]?.kind === "hash", "an explicit hash request was refused");
   } finally {
     process.stderr.write = savedWrite;
+    if (saved === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = saved;
+    if (savedKind === undefined) delete process.env.CHAMBER_EMBEDDER;
+    else process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "weights swapped after the probe passed still throw from embedLocal auto instead of degrading", () => {
+  const good = minilmDirWithVersion(
+    readFileSync(fileURLToPath(new URL("../models/minilm/VERSION", import.meta.url)), "utf8"),
+  );
+  const bad = minilmDirWithVersion(tamperedVersion().text);
+  const saved = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = good;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    if (!minilmAvailable()) {
+      // No numpy or onnxruntime here: there is no passing probe to outlast.
+      assert(true, "no runnable embedder on this machine");
+      return;
+    }
+    process.env.CHAMBER_MINILM_DIR = bad;
+    let thrown: unknown;
+    try {
+      embedLocal("a sentence", "auto");
+    } catch (e) {
+      thrown = e;
+    }
+    assert(
+      thrown instanceof MinilmIntegrityError,
+      `embedLocal auto did not throw the refusal: ${thrown instanceof Error ? thrown.message : String(thrown)}`,
+    );
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = saved;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(good, { recursive: true, force: true });
+    rmSync(bad, { recursive: true, force: true });
+  }
+});
+
+test("config", "an ingest with refused MiniLM weights stops, writes no hash vectors, and a search stops too", () => {
+  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const notes = mkdtempSync(join(tmpdir(), "chamber-refused-notes-"));
+  writeFileSync(join(notes, "a.md"), "# Alpha\n\nA passage about refund windows.\n");
+  const db = freshDb();
+  const saved = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    let ingested = "";
+    try {
+      ingestDirectory(db, notes);
+    } catch (e) {
+      ingested = e instanceof Error ? e.message : String(e);
+    }
+    assert(ingested.includes("embed_minilm failed (3)"), `the ingest did not stop on the refusal: "${ingested}"`);
+    assert(count(db, `SELECT COUNT(*) AS c FROM vector_embedding`) === 0, "the ingest wrote vectors for a refused model");
+    let asked = "";
+    try {
+      searchVector(db, "refund windows");
+    } catch (e) {
+      asked = e instanceof Error ? e.message : String(e);
+    }
+    assert(asked.includes("embed_minilm failed (3)"), `a search embedded its query with something else: "${asked}"`);
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = saved;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(notes, { recursive: true, force: true });
+  }
+});
+
+test("gates", "refused MiniLM weights soften the debt check inside the commit's transaction and do not park the commit", () => {
+  // The paraphrase check embeds under BEGIN IMMEDIATE (FM-6: gate check and
+  // write are one transaction) and catches the embedder's throw right there.
+  // The refusal now throws where it used to return hash vectors, and it must
+  // land in that catch: the check is recorded as not run, the commit goes on.
+  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const db = freshDb();
+  const indebted = "The refund policy allows returns within 30 days.";
+  insertDebt(db, claimHash("belief", indebted), indebted);
+  const saved = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    const r = commitBelief(db, {
+      type: "belief",
+      text: "The office in Dubai opens at nine on weekdays.",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    assert(r.ok, `a refused embedder parked the commit: ${JSON.stringify(r)}`);
+    assert(r.ok && r.paraphraseCheck === "skipped", `the caller cannot see the check did not run: ${JSON.stringify(r)}`);
+    const degraded = count(db, `SELECT COUNT(*) AS c FROM audit_event WHERE action = 'debt:degraded'`);
+    assert(degraded >= 1, "the check that did not run left no durable record");
+  } finally {
     if (saved === undefined) delete process.env.CHAMBER_MINILM_DIR;
     else process.env.CHAMBER_MINILM_DIR = saved;
     if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;

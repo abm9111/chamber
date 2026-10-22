@@ -265,6 +265,10 @@ function paraphraseBlockingDebts(
   try {
     embeds = embedLocalBatch([text, ...candidates.map((r) => r.claim_text)]);
   } catch {
+    // Any throw lands here, inside the commit's transaction (FM-6), including a
+    // MinilmIntegrityError for weights that failed their hash check: the check
+    // is recorded as not run and the commit goes on. Letting it escape would
+    // reach the outer catch, roll back and park the commit. Do not rethrow.
     return { debts: [], semantic: false, attempted: true };
   }
   // A short or padded result would silently mis-pair claims with debts, since

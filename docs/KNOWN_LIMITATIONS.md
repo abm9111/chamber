@@ -827,6 +827,18 @@ between an interactive and a login shell; and `chamber ask` compares the
 query's model against the corpus's dominant model and says so in its note
 channel rather than returning an empty result with no cause.
 
+**Closed: weights that were refused never become hash vectors.**
+`scripts/embed_minilm.py` exits 3 when `model_quantized.onnx` does not match the
+SHA-256 in `models/minilm/VERSION`. That is not a machine without an embedder:
+the weights are there and were refused. `minilmAvailable()`, `embedLocal` and
+`embedLocalBatch` throw `MinilmIntegrityError` for it in every mode, `auto`
+included, so `ingest`, `search` and `ask` stop with the mismatch instead of
+writing or querying with `local-hash-v1`. A missing interpreter or dependency
+still degrades with the warning above, and `CHAMBER_EMBEDDER=hash` still chooses
+hash on purpose. In `commit_belief` the throw lands in the debt check's own
+catch inside the transaction: the check is recorded as not run, as for any
+embedder failure, and the commit is not parked.
+
 **Closed: one subprocess per passage.** `embedLocalBatch` is wired into
 `src/ingest.ts`, which was the path that took 75 minutes for 28,500 passages.
 `upsertDocument` still embeds singly for callers that hand it a body rather

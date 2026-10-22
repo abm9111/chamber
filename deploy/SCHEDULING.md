@@ -139,10 +139,14 @@ exits 0 even when a check inside it fails; `chamber verify` is the gate.
 
 The template runs the copy of the script inside the release checkout, so the
 report describes the release the 08:30 job ran. Its Drift and Corpus sections run
-that checkout's `bin/chamber.js`. If the checkout is missing, the report says
-`release checkout missing: run chamber pin <tag>` and does not fall back to the
-`chamber` on your `PATH`. The Ledger, Gates and Repository sections describe your
-development checkout (`CHAMBER_REPO`, default `~/Projects/chamber`).
+that checkout's `bin/chamber.js`. Its Ledger section opens the live database
+with that checkout's `src/db.ts`, the code the 08:30 job opens it with. Opening a
+database applies the opening code's schema to the file, so the Ledger never does
+it with a development branch. If the checkout is missing, the report says
+`release checkout missing: run chamber pin <tag>` in all three sections and does
+not fall back to the `chamber` on your `PATH` or to the development checkout.
+The Gates and Repository sections describe your development checkout
+(`CHAMBER_REPO`, default `~/Projects/chamber`).
 
 The Drift section opens with a `release: <tag>` line, which names the release the
 report ran. It is read with `git describe --tags --always` in the release

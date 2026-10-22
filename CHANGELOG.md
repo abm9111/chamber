@@ -117,8 +117,10 @@ history and the GitHub releases.
   credentials is refused, and a commented-out `ProgramArguments` block or a
   `Program` key no longer confuses the plist check.
 - **The daily snapshot reports what happened.** `verify exit code` was always
-  0 (it read `$?` after an `echo`); it now carries verify's status. Drift and
-  Corpus run the pinned release checkout, or say to run `chamber pin`, and the
+  0 (it read `$?` after an `echo`); it now carries verify's status. Drift,
+  Corpus and Ledger run the pinned release checkout (the Ledger opens the live
+  database with its `src/db.ts`, not the development checkout's, which used to
+  apply its schema to that file at 10:07), or say to run `chamber pin`, and the
   Drift section opens with `release: <tag>` (from `git describe --tags --always`
   in that checkout; `none` when it is missing, `unknown` when it is not a git
   checkout), so a report names the release it ran. The launchd template runs the

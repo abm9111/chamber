@@ -13138,6 +13138,21 @@ test("config", "CI pins its actions by SHA, installs Python by hash, scans both 
 
   // Dependency audit and a secret scan over the whole history.
   assert(ci.includes("npm audit --audit-level=high"), "no npm audit step");
+  // The audit job is a closed set: checkout, setup-node, then exactly `npm ci`
+  // and the audit, with nothing that lets the job pass when npm audit fails.
+  // A substring check on the command cannot see `|| true` after it.
+  const ciLines = ci.split("\n");
+  const auditAt = ciLines.indexOf("  audit:");
+  assert(auditAt >= 0, "the workflow has no audit job");
+  let auditEnd = auditAt + 1;
+  while (auditEnd < ciLines.length && !/^ {0,2}\S/.test(ciLines[auditEnd] ?? "")) auditEnd += 1;
+  const auditJob = ciLines.slice(auditAt, auditEnd).join("\n");
+  const auditRuns = [...auditJob.matchAll(/^\s*- run: (.+?)\s*$/gm)].map((m) => m[1]);
+  assert(
+    JSON.stringify(auditRuns) === JSON.stringify(["npm ci", "npm audit --audit-level=high"]),
+    `the audit job must run exactly npm ci and npm audit --audit-level=high, got ${JSON.stringify(auditRuns)}`,
+  );
+  assert(!/continue-on-error|^\s+if:/m.test(auditJob), "the audit job can pass when npm audit fails (continue-on-error or if:)");
   assert(/fetch-depth:\s*0/.test(ci), "the secret scan does not fetch the full history");
   assert(ci.includes("gitleaks git "), "no gitleaks history scan");
   assert(/GITLEAKS_SHA256:\s*[0-9a-f]{64}\b/.test(ci), "the gitleaks download is not checked against a SHA-256");
@@ -14107,7 +14122,11 @@ test("release", "a plist write that fails is a refusal, not a crash, and leaves 
  * probes. A `chamber` that announces itself is first on PATH, so a report that
  * contains its output was produced by the development command.
  */
-function runSnapshot(home: string, release: { verifyExit: number; tag?: string } | null): string {
+function runSnapshot(
+  home: string,
+  release: { verifyExit: number; tag?: string; ledger?: boolean } | null,
+  withDevCheckout = false,
+): string {
   const root = join(dirname(fileURLToPath(import.meta.url)), "..");
   const bin = join(home, "bin");
   mkdirSync(bin, { recursive: true });
@@ -14128,6 +14147,27 @@ function runSnapshot(home: string, release: { verifyExit: number; tag?: string }
         "",
       ].join("\n"),
     );
+    if (release.ledger === true) {
+      // Stand-ins for the two modules the Ledger section imports. They announce
+      // themselves, so a Ledger that ran this code can be told from one that ran
+      // any other.
+      const src = join(home, ".local", "share", "chamber-release", "src");
+      mkdirSync(src, { recursive: true });
+      writeFileSync(
+        join(src, "db.ts"),
+        [
+          "export function openChamberDb(path: string) {",
+          '  console.log("ledger code: release, opened " + path);',
+          "  return { prepare: () => ({ get: () => ({ c: 7 }) }) };",
+          "}",
+          "",
+        ].join("\n"),
+      );
+      writeFileSync(
+        join(src, "audit.ts"),
+        'export function verifyAuditChain() { return { ok: true, from: "release" }; }\n',
+      );
+    }
     if (release.tag !== undefined) {
       // The release checkout is a git clone that `chamber pin` checked out at a
       // tag. Built with plumbing, like every fixture repo here.
@@ -14138,6 +14178,29 @@ function runSnapshot(home: string, release: { verifyExit: number; tag?: string }
       fixtureGit(checkout, ["tag", release.tag, sha]);
     }
   }
+  const devRepo = join(home, "no-dev-checkout");
+  if (withDevCheckout) {
+    // A development checkout that exists, whose database modules leave a mark
+    // if anything imports them. npm, npx and timeout are stand-ins too, so the
+    // Gates section neither runs the suite nor reaches for the network.
+    mkdirSync(join(devRepo, "src"), { recursive: true });
+    writeFileSync(
+      join(devRepo, "src", "db.ts"),
+      [
+        'import { writeFileSync } from "node:fs";',
+        "export function openChamberDb(path: string) {",
+        '  writeFileSync(process.env.HOME + "/DEV_DB_OPENED", path);',
+        "  return { prepare: () => ({ get: () => ({ c: 1 }) }) };",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(devRepo, "src", "audit.ts"), "export function verifyAuditChain() { return { ok: true, from: \"dev\" }; }\n");
+    for (const name of ["npm", "npx", "timeout"]) {
+      writeFileSync(join(bin, name), "#!/bin/sh\nexit 0\n");
+      chmodSync(join(bin, name), 0o755);
+    }
+  }
   const r = spawnSync("sh", [join(root, "scripts", "daily-snapshot.sh")], {
     encoding: "utf8",
     timeout: 60_000,
@@ -14145,7 +14208,7 @@ function runSnapshot(home: string, release: { verifyExit: number; tag?: string }
       ...process.env,
       PATH: `${bin}:${process.env.PATH ?? ""}`,
       HOME: home,
-      CHAMBER_REPO: join(home, "no-dev-checkout"),
+      CHAMBER_REPO: devRepo,
       CHAMBER_REPORT_DIR: join(home, "reports"),
     },
   });
@@ -14174,10 +14237,26 @@ test("release", "the daily snapshot says the release checkout is missing instead
   try {
     const report = runSnapshot(home, null);
     const said = report.split("release checkout missing: run chamber pin <tag>").length - 1;
-    assert(said === 2, `expected the message in the Drift and Corpus sections, found it ${said} times:\n${report}`);
+    assert(said === 3, `expected the message in the Drift, Corpus and Ledger sections, found it ${said} times:\n${report}`);
     assert(/^verify exit code: n\/a$/m.test(report), `no exit status to report:\n${report}`);
     assert(/^release: none$/m.test(report), `no release ran, and the report must say so:\n${report}`);
     assert(!report.includes("DEV CHAMBER CALLED"), "the report ran the chamber on PATH");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("release", "the daily snapshot's Ledger opens the database with the release checkout's code, never the development checkout's", () => {
+  const home = mkdtempSync(join(tmpdir(), "chamber-snapshot-"));
+  try {
+    // Both checkouts have a src/db.ts. Only the release's may open the live file.
+    const report = runSnapshot(home, { verifyExit: 0, ledger: true }, true);
+    const live = join(home, ".local", "share", "chamber", "chamber.sqlite");
+    assert(report.includes(`ledger code: release, opened ${live}`), `the Ledger did not open the live database with the release's code:\n${report}`);
+    assert(/^beliefs \(total\)\s+7$/m.test(report), `the Ledger counts did not come from the release's database handle:\n${report}`);
+    assert(report.includes('"from":"release"'), `the audit chain was not verified by the release's code:\n${report}`);
+    assert(!existsSync(join(home, "DEV_DB_OPENED")), "the development checkout's src/db.ts opened the database");
+    assert(!report.includes('"from":"dev"'), "the development checkout's audit code ran");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -14280,6 +14359,10 @@ test("config", "the docs agree with the code: limitation count, sandbox claims, 
   }
   assert(sched.includes("This takes effect for a release tag that contains this script"), "the daily-snapshot effective-date note is missing");
   assert(sched.includes("`release: <tag>`"), "the daily-snapshot section does not mention the release line");
+  assert(
+    schedFlat.includes("Ledger section opens the live database with that checkout's `src/db.ts`"),
+    "the daily-snapshot section does not say which code opens the database",
+  );
 });
 
 // ─── cli process smoke tests ────────────────────────────────────────────────

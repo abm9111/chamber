@@ -14,11 +14,13 @@
 # Exit code is deliberately 0 even when checks fail: this is a recorder, not a
 # gate. `chamber verify` is the gate, and it runs separately at 08:30.
 #
-# Two checkouts are involved and they are not interchangeable. The Drift and
-# Corpus sections run the release checkout that `chamber pin <tag>` keeps, the
-# same code the 08:30 job ran, so the report describes what actually checked
-# the evidence. The Ledger, Gates and Repository sections describe the
-# development checkout (REPO) on purpose: they report on the work in progress.
+# Two checkouts are involved and they are not interchangeable. The Drift,
+# Corpus and Ledger sections run the release checkout that `chamber pin <tag>`
+# keeps, the same code the 08:30 job ran, so the report describes what actually
+# checked the evidence. The Ledger opens the live database, and opening it
+# applies the schema of the code that opens it, so that code must be a release.
+# The Gates and Repository sections describe the development checkout (REPO) on
+# purpose: they report on the work in progress.
 
 set -u
 
@@ -28,9 +30,9 @@ RELEASE_BIN="$RELEASE_DIR/bin/chamber.js"
 RELEASE_MISSING="release checkout missing: run chamber pin <tag>"
 # Exported because the inline node script below reads it from the environment.
 # It is single-quoted there so the shell leaves it alone, which means an
-# unexported REPO resolves to `undefined` and the import fails with
+# unexported RELEASE_DIR resolves to `undefined` and the import fails with
 # ERR_MODULE_NOT_FOUND — the whole Ledger section replaced by a stack trace.
-export REPO
+export RELEASE_DIR
 OUT_DIR="${CHAMBER_REPORT_DIR:-$HOME/Library/Logs/chamber-daily}"
 mkdir -p "$OUT_DIR"
 OUT="$OUT_DIR/$(date '+%Y-%m-%d').md"
@@ -116,26 +118,34 @@ probe_exit() {
   echo "## Ledger"
   echo
   echo '```'
-  node --experimental-strip-types --input-type=module -e '
-    const { openChamberDb } = await import(process.env.REPO + "/src/db.ts");
-    const db = openChamberDb(process.env.HOME + "/.local/share/chamber/chamber.sqlite");
-    const one = (label, sql, ...p) => {
-      try { console.log(label.padEnd(26) + db.prepare(sql).get(...p).c); }
-      catch (e) { console.log(label.padEnd(26) + "ERROR: " + e.message); }
-    };
-    const since = new Date(Date.now() - 864e5).toISOString();
-    one("beliefs (total)",        "SELECT COUNT(*) c FROM belief");
-    one("beliefs (24h)",          "SELECT COUNT(*) c FROM belief WHERE created_at > ?", since);
-    one("open citation debt",     "SELECT COUNT(*) c FROM citation_debt WHERE status IN (?,?)", "pending", "proposed_paid");
-    one("pending writes",         "SELECT COUNT(*) c FROM pending_write WHERE status = ?", "pending");
-    one("audit events (24h)",     "SELECT COUNT(*) c FROM audit_event WHERE created_at > ?", since);
-    one("gate events (24h)",      "SELECT COUNT(*) c FROM gate_event WHERE created_at > ?", since);
-    one("sessions (24h)",         "SELECT COUNT(*) c FROM session WHERE started_at > ?", since);
-    try {
-      const { verifyAuditChain } = await import(process.env.REPO + "/src/audit.ts");
-      console.log("audit chain".padEnd(26) + JSON.stringify(verifyAuditChain(db)));
-    } catch (e) { console.log("audit chain".padEnd(26) + "ERROR: " + e.message); }
-  ' 2>&1
+  # The release checkout's code, as for Drift and Corpus. Opening the database
+  # applies the schema of the code that opens it (src/db.ts, applySchemas), so
+  # the live file must only ever meet code it already belongs to, never the
+  # branch that happens to be checked out at 10:07.
+  if [ -f "$RELEASE_BIN" ]; then
+    node --experimental-strip-types --input-type=module -e '
+      const { openChamberDb } = await import(process.env.RELEASE_DIR + "/src/db.ts");
+      const db = openChamberDb(process.env.HOME + "/.local/share/chamber/chamber.sqlite");
+      const one = (label, sql, ...p) => {
+        try { console.log(label.padEnd(26) + db.prepare(sql).get(...p).c); }
+        catch (e) { console.log(label.padEnd(26) + "ERROR: " + e.message); }
+      };
+      const since = new Date(Date.now() - 864e5).toISOString();
+      one("beliefs (total)",        "SELECT COUNT(*) c FROM belief");
+      one("beliefs (24h)",          "SELECT COUNT(*) c FROM belief WHERE created_at > ?", since);
+      one("open citation debt",     "SELECT COUNT(*) c FROM citation_debt WHERE status IN (?,?)", "pending", "proposed_paid");
+      one("pending writes",         "SELECT COUNT(*) c FROM pending_write WHERE status = ?", "pending");
+      one("audit events (24h)",     "SELECT COUNT(*) c FROM audit_event WHERE created_at > ?", since);
+      one("gate events (24h)",      "SELECT COUNT(*) c FROM gate_event WHERE created_at > ?", since);
+      one("sessions (24h)",         "SELECT COUNT(*) c FROM session WHERE started_at > ?", since);
+      try {
+        const { verifyAuditChain } = await import(process.env.RELEASE_DIR + "/src/audit.ts");
+        console.log("audit chain".padEnd(26) + JSON.stringify(verifyAuditChain(db)));
+      } catch (e) { console.log("audit chain".padEnd(26) + "ERROR: " + e.message); }
+    ' 2>&1
+  else
+    echo "$RELEASE_MISSING"
+  fi
   echo '```'
   echo
 

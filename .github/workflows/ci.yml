@@ -239,7 +239,7 @@ jobs:
           {
             echo "### Image CVEs (${{ matrix.name }}), including those with no fix available"
             echo
-            echo 'The `image` job blocks only on CVEs with a fix. This is the'
+            echo "The \`image\` job blocks only on CVEs with a fix. This is the"
             echo 'full HIGH/CRITICAL set, unfixable included.'
             echo
             echo '```'

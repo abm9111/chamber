@@ -60,6 +60,7 @@ import { verifyBeliefSources } from "./pins.ts";
 import { corpusStats } from "./corpus.ts";
 import { checkClaims, formatCheck, type CheckInput } from "./check.ts";
 import { formatErrorChain } from "./error_chain.ts";
+import { readPackageVersion } from "./version.ts";
 
 // `console.error` already writes to stderr, so it is left alone and the rest
 // are aliased onto it: diagnostics still reach the host's MCP log, they just
@@ -85,7 +86,7 @@ if (!notes.ok) {
 const declaredFolders = notes.folders;
 
 const SERVER_NAME = "chamber";
-const SERVER_VERSION = "0.1.9";
+const SERVER_VERSION = readPackageVersion();
 const DEFAULT_PROTOCOL = "2025-06-18";
 
 interface JsonRpcRequest {

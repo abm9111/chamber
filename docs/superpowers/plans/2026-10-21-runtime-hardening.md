@@ -32,7 +32,7 @@ The spec was checked against the code and by experiment before this plan was wri
 
 Every task includes these. They are not repeated inside tasks.
 
-- **Where.** Work only in `/Users/shadow/Projects/chamber/.worktrees/runtime-hardening` (branch `feat/runtime-hardening`). Never `cd` into `/Users/shadow/Projects/chamber`. Run every command from the worktree root.
+- **Where.** Work only in `<repo>/.worktrees/runtime-hardening` (branch `feat/runtime-hardening`). Never `cd` into `<repo>`. Run every command from the worktree root.
 - **Node.** Node >= 23.6 (`engines` in `package.json`; type stripping is how every `.ts` file runs). TypeScript is `erasableSyntaxOnly`: no enums, namespaces or constructor parameter properties. Check with `node --version`.
 - **`node_modules`.** `npm run typecheck` and `npm run lint` need it. If `ls node_modules` shows nothing, run `npm ci` once. The tests and the server need nothing installed.
 - **`tests/harness.ts` is 17,000 lines and holds a fixture a secret scanner rejects. Never read it whole and never `cat` it.** Find places with `grep -n` and read bounded ranges with `Read` (`offset` and `limit`). Make every change with the find-and-replace text the step gives you. Each "find" text appears exactly once; `grep -n -F` on its first line shows where. The Edit tool refuses a file you have not read in this session, so first `Read` a short window of `tests/harness.ts` (say 20 lines starting at the line `grep -n` printed); that satisfies it.

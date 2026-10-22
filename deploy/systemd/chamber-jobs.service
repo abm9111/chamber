@@ -17,5 +17,17 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/chamber /tmp
+# The rest matches chamber.service. SystemCallFilter=@system-service would stop
+# bubblewrap, so it is safe on this unit only because `chamber jobs run` never
+# reaches the sandbox or starts a child process; tests/harness.ts checks that by
+# walking the imports of src/job_queue.ts. If jobs ever need either, drop the
+# filter from this unit rather than widening it.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 # Activated by chamber-jobs.timer; can also: systemctl start chamber-jobs.service

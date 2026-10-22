@@ -81,14 +81,28 @@ import {
   JOB_LABEL,
   PINNED_SCRIPT,
   RELEASE_COMMAND,
+  originCredentialRefusal,
   pinCheckout,
   pinJobPlist,
+  noPlistParser,
   pinRelease,
+  plutilParser,
   readJobPlist,
+  readJobPlistText,
+  redactUserinfo,
+  setGitTimeouts,
+  writeFileAtomic,
   type Launchctl,
   type LaunchctlResult,
   type PinOptions,
+  type PinOutcome,
+  type PlistParse,
+  type PlistParser,
 } from "../src/release_pin.ts";
+// What fix wave 5 adds is reached through a namespace, so that an export that is
+// missing fails the one test that needs it instead of stopping the whole run.
+import * as pinApi from "../src/release_pin.ts";
+import * as commitApi from "../src/commit_belief.ts";
 import {
   minilmAvailable,
   minilmInstalled,
@@ -102,6 +116,7 @@ import {
   chunkJsonStdin,
   embedMinilm,
   noteMinilmStderr,
+  MinilmIntegrityError,
 } from "../src/embedder.ts";
 import { CALIBRATED_THRESHOLDS } from "../src/commit_belief.ts";
 import {
@@ -278,6 +293,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -12235,10 +12251,18 @@ test(
 
 // ─── release pin ────────────────────────────────────────────────────────────
 
+// The fixture starts the way the shipped plist does. Its XML declaration and
+// DOCTYPE are read from that file, because the text reader accepts only that prolog.
+const SHIPPED_PLIST_TEXT = readFileSync(
+  fileURLToPath(new URL("../deploy/launchd/com.chamber.verify.plist", import.meta.url)),
+  "utf8",
+);
+const FIXTURE_PROLOG = SHIPPED_PLIST_TEXT.split("\n").slice(0, 3).join("\n");
+
 /** A job plist with only the parts pin reads. `script` is written as is. */
 function jobPlistXml(script: string): string {
   return [
-    `<?xml version="1.0" encoding="UTF-8"?>`,
+    FIXTURE_PROLOG,
     `<plist version="1.0">`,
     `<dict>`,
     `  <key>Label</key>`,
@@ -12389,6 +12413,24 @@ interface ReleaseFixture {
   v1: string;
   v2: string;
   nobin: string;
+  badexit: string;
+  wrongver: string;
+}
+
+/**
+ * The two files pin runs: a package.json with `version`, and a bin/chamber.js
+ * that prints `body`'s output for `--version` (by default, that same version).
+ * `label` is a comment on the first line so every tag's bin differs.
+ */
+function releaseTree(
+  label: string,
+  version: string,
+  body: string = `console.log(${JSON.stringify(version)});\n`,
+): Record<string, string> {
+  return {
+    "package.json": `${JSON.stringify({ name: "chamber-fixture", version })}\n`,
+    "bin/chamber.js": `// ${label}\n${body}`,
+  };
 }
 
 /**
@@ -12401,19 +12443,34 @@ function releaseFixture(): ReleaseFixture {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "chamber-pin-")));
   const origin = join(root, "origin");
   fixtureGit(root, ["init", "-q", "-b", "main", origin]);
-  const v1 = fixtureCommit(origin, { "bin/chamber.js": "// v1\n", "README.md": "one\n" }, "v1");
+  const v1 = fixtureCommit(origin, { ...releaseTree("v1", "1.0.1"), "README.md": "one\n" }, "v1");
   const v2 = fixtureCommit(
     origin,
-    { "bin/chamber.js": "// v2\n", "README.md": "two\n", "CHANGES.md": "two\n" },
+    { ...releaseTree("v2", "1.0.2"), "README.md": "two\n", "CHANGES.md": "two\n" },
     "v2",
     v1,
   );
   const nobin = fixtureCommit(origin, { "README.md": "three\n" }, "no bin", v2);
+  // Both check out cleanly and have a bin/chamber.js, and neither runs right.
+  const badexit = fixtureCommit(
+    origin,
+    { ...releaseTree("badexit", "1.0.3", 'process.stderr.write("boom\\n");\nprocess.exit(1);\n'), "README.md": "four\n" },
+    "bin exits non-zero",
+    v2,
+  );
+  const wrongver = fixtureCommit(
+    origin,
+    { ...releaseTree("wrongver", "1.0.4", 'console.log("9.9.9");\n'), "README.md": "five\n" },
+    "bin prints another version",
+    v2,
+  );
   fixtureGit(origin, ["update-ref", "refs/heads/main", nobin]);
   fixtureGit(origin, ["update-ref", "refs/heads/feature", v2]);
   fixtureGit(origin, ["tag", "v1", v1]);
   fixtureGit(origin, ["-c", "tag.gpgSign=false", "tag", "-a", "-m", "v2", "v2", v2]);
   fixtureGit(origin, ["tag", "nobin", nobin]);
+  fixtureGit(origin, ["tag", "badexit", badexit]);
+  fixtureGit(origin, ["tag", "wrongver", wrongver]);
   const source = join(root, "source");
   fixtureGit(root, ["init", "-q", "-b", "main", source]);
   fixtureGit(source, ["remote", "add", "origin", origin]);
@@ -12426,6 +12483,8 @@ function releaseFixture(): ReleaseFixture {
     v1,
     v2,
     nobin,
+    badexit,
+    wrongver,
   };
 }
 
@@ -12454,7 +12513,7 @@ test("release", "pin clones a tag into a new release directory, detached", () =>
     assert(headOf(fx.releaseDir) === fx.v1, "HEAD is not the v1 commit");
     assert(isDetachedHead(fx.releaseDir), "HEAD is attached to a branch");
     assert(
-      readFileSync(join(fx.releaseDir, "bin", "chamber.js"), "utf8") === "// v1\n",
+      readFileSync(join(fx.releaseDir, "bin", "chamber.js"), "utf8") === releaseTree("v1", "1.0.1")["bin/chamber.js"],
       "bin/chamber.js is not v1's",
     );
     assert(
@@ -12473,7 +12532,7 @@ test("release", "a second pin moves the checkout to another tag", () => {
     assert(headOf(fx.releaseDir) === fx.v2, "HEAD is not the v2 commit");
     assert(isDetachedHead(fx.releaseDir), "HEAD is attached to a branch");
     assert(
-      readFileSync(join(fx.releaseDir, "bin", "chamber.js"), "utf8") === "// v2\n",
+      readFileSync(join(fx.releaseDir, "bin", "chamber.js"), "utf8") === releaseTree("v2", "1.0.2")["bin/chamber.js"],
       "bin/chamber.js is not v2's",
     );
     assert(existsSync(join(fx.releaseDir, "CHANGES.md")), "v2's new file is missing");
@@ -12549,6 +12608,13 @@ test("release", "an untracked file the tag would overwrite stops pin with git's 
     assert(!r.ok && r.reason.includes("git checkout:") && r.reason.includes("CHANGES.md"), JSON.stringify(r));
     assert(headOf(fx.releaseDir) === fx.v1, "HEAD moved");
     assert(readFileSync(mine, "utf8") === "mine\n", "pin overwrote an untracked file");
+    // The refusal says how to finish the move, with this checkout's directory and
+    // this tag, and the command it prints works.
+    const hint = `git -C ${fx.releaseDir} checkout --force --detach v2`;
+    assert(!r.ok && r.reason.includes(hint), `no repair command in: ${JSON.stringify(r)}`);
+    const repaired = spawnSync("git", hint.split(" ").slice(1), { encoding: "utf8" });
+    assert(repaired.status === 0, `the printed repair failed: ${repaired.stderr}`);
+    assert(headOf(fx.releaseDir) === fx.v2, "the printed repair did not move the checkout to v2");
   });
 });
 
@@ -12710,8 +12776,28 @@ function fakeLaunchctl(start: {
   return { run, calls };
 }
 
+/**
+ * The environment pin's proof run gets. The job runs under `/bin/sh -lc`, and a
+ * login shell on Linux resets PATH from /etc/profile, which drops the directory
+ * `node` was found in on a CI runner. A throwaway HOME whose .profile puts this
+ * process's node back stands in for the profile a real user has.
+ */
+function loginEnv(fx: ReleaseFixture): NodeJS.ProcessEnv {
+  const home = join(fx.root, "home");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, ".profile"), `PATH="${dirname(process.execPath)}:$PATH"\nexport PATH\n`);
+  return { ...process.env, HOME: home };
+}
+
 function pinOpts(fx: ReleaseFixture, tag: string, launchctl: Launchctl): PinOptions {
-  return { tag, sourceRoot: fx.source, releaseDir: fx.releaseDir, plistPath: fx.plistPath, launchctl };
+  return {
+    tag,
+    sourceRoot: fx.source,
+    releaseDir: fx.releaseDir,
+    plistPath: fx.plistPath,
+    launchctl,
+    env: loginEnv(fx),
+  };
 }
 
 function writePlistFile(path: string, xml: string): void {
@@ -12977,6 +13063,2103 @@ test("release", "chamber pin refuses a flag-shaped tag before touching HOME", ()
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test("config", "package.json, server.json, the served MCP version and the changelog name one version", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version: string };
+  const registry = JSON.parse(readFileSync(join(root, "server.json"), "utf8")) as {
+    version: string;
+    packages: { version: string }[];
+  };
+  const released = /^## (?!Unreleased\b)(\S+)/m.exec(readFileSync(join(root, "CHANGELOG.md"), "utf8"));
+  assert(released !== null, "CHANGELOG.md has no released heading");
+
+  // The version the running server reports, not a constant read out of its
+  // source: a hand-typed copy and a reader of package.json look identical to a
+  // grep and differ only here.
+  const home = mkdtempSync(join(tmpdir(), "chamber-version-"));
+  try {
+    const initialize = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "version-test", version: "0" } },
+    };
+    const run = spawnSync(process.execPath, ["--experimental-strip-types", join(root, "src", "mcp_server.ts")], {
+      encoding: "utf8",
+      timeout: 30_000,
+      input: `${JSON.stringify(initialize)}\n`,
+      env: {
+        ...process.env,
+        HOME: home,
+        CHAMBER_DB: join(home, "never.sqlite"),
+        CHAMBER_CONFIG: join(home, "never.json"),
+      },
+    });
+    assert(run.error === undefined, `launch failed: ${run.error}`);
+    const line = (run.stdout ?? "").split("\n").find((l) => l.includes('"id":1'));
+    assert(line !== undefined, `no initialize reply: ${run.stdout} ${run.stderr}`);
+    const reply = JSON.parse(line) as { result?: { serverInfo?: { version?: string } } };
+    const seen: Record<string, string | undefined> = {
+      "package.json": pkg.version,
+      "server.json version": registry.version,
+      "server.json packages[0].version": registry.packages[0]?.version,
+      "CHANGELOG.md first released heading": released[1],
+      "mcp_server serverInfo.version": reply.result?.serverInfo?.version,
+    };
+    assert(new Set(Object.values(seen)).size === 1, `the version sites disagree: ${JSON.stringify(seen, null, 2)}`);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("config", "CI pins its actions by SHA, installs Python by hash, scans both images, audits and scans history", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const ci = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
+
+  // Every action is a full commit SHA. A tag is a pointer its owner can move.
+  const uses = [...ci.matchAll(/^\s*(?:-\s+)?uses:\s*(\S+)/gm)].map((m) => m[1] ?? "");
+  assert(uses.length >= 8, `expected the workflow's actions, found ${uses.length}`);
+  for (const u of uses) {
+    assert(/^[\w.-]+\/[\w./-]+@[0-9a-f]{40}$/.test(u), `action not pinned by a full commit SHA: ${u}`);
+  }
+
+  // Both Python installs read the hash-pinned file and refuse anything else.
+  const pips = ci.split("\n").filter((l) => /\bpip install\b/.test(l));
+  assert(pips.length === 2, `expected two pip install lines, found ${pips.length}`);
+  for (const l of pips) {
+    assert(
+      l.includes("--require-hashes") && l.includes("-r scripts/requirements-embed.txt"),
+      `pip install without --require-hashes from the pinned file: ${l.trim()}`,
+    );
+  }
+
+  // The lock itself: every requirement has a hash, and the command that made it
+  // is recorded in its first lines.
+  const lock = readFileSync(join(root, "scripts", "requirements-embed.txt"), "utf8");
+  assert(lock.split("\n").slice(0, 3).join("\n").includes("uv pip compile"), "the lock does not record its command");
+  let name: string | null = null;
+  const hashes = new Map<string, number>();
+  for (const line of lock.split("\n")) {
+    const req = /^([A-Za-z0-9][A-Za-z0-9._-]*)==\S+/.exec(line);
+    if (req !== null) {
+      name = req[1] ?? null;
+      hashes.set(name ?? "", 0);
+    } else if (name !== null && /^\s+--hash=sha256:[0-9a-f]{64}\b/.test(line)) {
+      hashes.set(name, (hashes.get(name) ?? 0) + 1);
+    }
+  }
+  for (const want of ["numpy", "onnxruntime", "tokenizers"]) {
+    assert(hashes.has(want), `${want} is not in the lock`);
+  }
+  for (const [pkg, n] of hashes) assert(n > 0, `${pkg} is pinned without a hash`);
+
+  // Both images are built and scanned under the same gate.
+  assert(/dockerfile:\s*Dockerfile\s*$/m.test(ci), "the image job does not build ./Dockerfile");
+  assert(/dockerfile:\s*deploy\/Dockerfile\s*$/m.test(ci), "the image job does not build deploy/Dockerfile");
+  assert((ci.match(/ignore-unfixed: true/g) ?? []).length === 1, "expected one fixable-only gate");
+  assert(ci.includes("exit-code: '1'") && ci.includes("severity: HIGH,CRITICAL"), "the image gate lost its severity or exit code");
+
+  // Dependency audit and a secret scan over the whole history.
+  assert(ci.includes("npm audit --audit-level=high"), "no npm audit step");
+  // The audit job is a closed set: checkout, setup-node, then exactly `npm ci`
+  // and the audit, with nothing that lets the job pass when npm audit fails.
+  // A substring check on the command cannot see `|| true` after it.
+  const ciLines = ci.split("\n");
+  const auditAt = ciLines.indexOf("  audit:");
+  assert(auditAt >= 0, "the workflow has no audit job");
+  let auditEnd = auditAt + 1;
+  while (auditEnd < ciLines.length && !/^ {0,2}\S/.test(ciLines[auditEnd] ?? "")) auditEnd += 1;
+  const auditJob = ciLines.slice(auditAt, auditEnd).join("\n");
+  const auditRuns = [...auditJob.matchAll(/^\s*- run: (.+?)\s*$/gm)].map((m) => m[1]);
+  assert(
+    JSON.stringify(auditRuns) === JSON.stringify(["npm ci", "npm audit --audit-level=high"]),
+    `the audit job must run exactly npm ci and npm audit --audit-level=high, got ${JSON.stringify(auditRuns)}`,
+  );
+  assert(!/continue-on-error|^\s+if:/m.test(auditJob), "the audit job can pass when npm audit fails (continue-on-error or if:)");
+  assert(/fetch-depth:\s*0/.test(ci), "the secret scan does not fetch the full history");
+  assert(ci.includes("gitleaks git "), "no gitleaks history scan");
+  assert(/GITLEAKS_SHA256:\s*[0-9a-f]{64}\b/.test(ci), "the gitleaks download is not checked against a SHA-256");
+
+  const bot = readFileSync(join(root, ".github", "dependabot.yml"), "utf8");
+  for (const [eco, dir] of [
+    ["npm", "/"],
+    ["github-actions", "/"],
+    ["docker", "/"],
+    ["docker", "/deploy"],
+  ] as const) {
+    const entry = new RegExp(`package-ecosystem:\\s*${eco}\\s*\\n\\s*directory:\\s*${dir.replace("/", "\\/")}\\s*\\n\\s*schedule:\\s*\\n\\s*interval:\\s*weekly`);
+    assert(entry.test(bot), `dependabot.yml has no weekly ${eco} entry for ${dir}`);
+  }
+});
+
+// ─── MiniLM weights are checked before they are loaded ──────────────────────
+
+/**
+ * A model directory the embedder can be pointed at with CHAMBER_MINILM_DIR.
+ * The weights and tokenizer are symlinks to the real files, so nothing is
+ * copied; VERSION is a real file. `version` is the text to write there, or
+ * null for no VERSION file at all.
+ */
+function minilmDirWithVersion(version: string | null): string {
+  const real = fileURLToPath(new URL("../models/minilm", import.meta.url));
+  const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-dir-"));
+  symlinkSync(join(real, "model_quantized.onnx"), join(dir, "model_quantized.onnx"));
+  symlinkSync(join(real, "tokenizer.json"), join(dir, "tokenizer.json"));
+  if (version !== null) writeFileSync(join(dir, "VERSION"), version);
+  return dir;
+}
+
+/** The real VERSION text with the first hex digit of its SHA-256 changed. */
+function tamperedVersion(): { text: string; expected: string; actualDigest: string } {
+  const real = readFileSync(fileURLToPath(new URL("../models/minilm/VERSION", import.meta.url)), "utf8");
+  const m = /^SHA-256:\s*([0-9a-f]{64})\s*$/m.exec(real);
+  assert(m !== null, "models/minilm/VERSION has no SHA-256 line");
+  const digest = m[1]!;
+  const wrong = (digest[0] === "0" ? "1" : "0") + digest.slice(1);
+  return { text: real.replace(digest, wrong), expected: wrong, actualDigest: digest };
+}
+
+const EMBED_SCRIPT = fileURLToPath(new URL("../scripts/embed_minilm.py", import.meta.url));
+
+function runEmbedScript(
+  dir: string,
+  args: readonly string[],
+  input?: string,
+  pythonFlags: readonly string[] = [],
+): { status: number | null; stdout: string; stderr: string } {
+  const r = spawnSync("python3", [...pythonFlags, EMBED_SCRIPT, ...args], {
+    encoding: "utf8",
+    input,
+    timeout: 120_000,
+    env: { ...process.env, CHAMBER_MINILM_DIR: dir },
+  });
+  assert(r.error === undefined, `python3 did not run: ${r.error}`);
+  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+}
+
+test("config", "weights that do not match VERSION exit 3 in every mode, naming both hashes", () => {
+  const bad = tamperedVersion();
+  const dir = minilmDirWithVersion(bad.text);
+  try {
+    for (const [label, args, input] of [
+      ["one-shot", ["a sentence"], undefined],
+      ["--json -", ["--json", "-"], '["a sentence"]'],
+      ["--serve", ["--serve"], '["a sentence"]\n'],
+    ] as const) {
+      const r = runEmbedScript(dir, args, input);
+      assert(r.status === 3, `${label}: exit ${r.status}, stderr ${r.stderr}`);
+      assert(r.stdout === "", `${label}: wrote a reply before refusing: ${r.stdout}`);
+      const lines = r.stderr.trim().split("\n");
+      assert(lines.length === 1, `${label}: expected one stderr line, got ${lines.length}: ${r.stderr}`);
+      assert(
+        lines[0]!.includes(bad.actualDigest) && lines[0]!.includes(bad.expected),
+        `${label}: the line must name both hashes: ${lines[0]}`,
+      );
+    }
+    // The hash is checked before numpy and onnxruntime are imported, so the
+    // refusal needs neither installed.
+    const traced = runEmbedScript(dir, ["a sentence"], undefined, ["-X", "importtime"]);
+    assert(traced.status === 3, `importtime run: exit ${traced.status}`);
+    assert(
+      !traced.stderr.includes("numpy") && !traced.stderr.includes("onnxruntime"),
+      "the script imported numpy or onnxruntime before checking the weights",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "a missing VERSION or a VERSION without a SHA-256 line also exits 3", () => {
+  for (const [label, version, want] of [
+    ["missing VERSION", null, "cannot read"],
+    ["no SHA-256 line", "File: model_quantized.onnx\nSize: 22972370 bytes\n", "no SHA-256 line"],
+    ["short digest", "SHA-256:  afdb6f1a0e45b715d0bb9b11772f032c\n", "no SHA-256 line"],
+  ] as const) {
+    const dir = minilmDirWithVersion(version);
+    try {
+      const r = runEmbedScript(dir, ["a sentence"]);
+      assert(r.status === 3, `${label}: exit ${r.status}, stderr ${r.stderr}`);
+      assert(r.stderr.includes(want) && r.stderr.includes("VERSION"), `${label}: ${r.stderr}`);
+      assert(r.stdout === "", `${label}: wrote a reply before refusing`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("config", "the real model directory passes the weights check", () => {
+  // Same files, VERSION untouched: the check lets it through. Where an
+  // embedder runs here it must also answer; where numpy or onnxruntime is
+  // missing the script fails later and differently, which is not exit 3.
+  const dir = minilmDirWithVersion(
+    readFileSync(fileURLToPath(new URL("../models/minilm/VERSION", import.meta.url)), "utf8"),
+  );
+  try {
+    const r = runEmbedScript(dir, ["a sentence"]);
+    assert(r.status !== 3 && !r.stderr.includes("SHA-256"), `refused the real weights: ${r.stderr}`);
+    if (minilmAvailable()) {
+      assert(r.status === 0, `exit ${r.status}: ${r.stderr}`);
+      assert((JSON.parse(r.stdout) as number[]).length === 384, "expected a 384-dimension vector");
+    }
+    const plain = spawnSync("python3", [EMBED_SCRIPT, "a sentence"], { encoding: "utf8", timeout: 120_000 });
+    assert(plain.status !== 3, `the default model directory was refused: ${plain.stderr}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "refused MiniLM weights make every embed path throw, in auto mode as well as with minilm preferred, and never write hash vectors", () => {
+  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const saved = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  const savedWrite = process.stderr.write;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  // Anything the embedder announces on the way is captured, so the test can
+  // check that a refusal is not dressed up as a downgrade.
+  let warned = "";
+  process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+    warned += String(chunk);
+    return true;
+  }) as typeof process.stderr.write;
+  resetMinilmProbe();
+  try {
+    const refusal = (label: string, run: () => unknown): void => {
+      let thrown: unknown;
+      try {
+        run();
+      } catch (e) {
+        thrown = e;
+      }
+      const said = thrown instanceof Error ? thrown.message : String(thrown);
+      assert(thrown instanceof MinilmIntegrityError, `${label}: expected the weights refusal, got: ${said}`);
+      assert(said.includes("embed_minilm failed (3)") && said.includes("SHA-256"), `${label}: the refusal does not say why: ${said}`);
+    };
+    // "auto" is what ingest (through its batch call) and commit_belief use, and
+    // what search and upsertDocument use for one text. The probe runs on the
+    // first call and is cached for the second, and both must refuse.
+    refusal("embedLocalBatch auto", () => embedLocalBatch(["a sentence"], "auto"));
+    refusal("embedLocalBatch auto, probe cached", () => embedLocalBatch(["a sentence"], "auto"));
+    refusal("embedLocal auto", () => embedLocal("a sentence", "auto"));
+    refusal("embedLocalBatch minilm", () => embedLocalBatch(["a sentence"], "minilm"));
+    refusal("embedLocal minilm", () => embedLocal("a sentence", "minilm"));
+    process.env.CHAMBER_EMBEDDER = "minilm";
+    resetMinilmProbe();
+    refusal("CHAMBER_EMBEDDER=minilm", () => embedLocalBatch(["a sentence"], "auto"));
+    delete process.env.CHAMBER_EMBEDDER;
+    assert(!warned.includes("hash vectors"), `a refusal was announced as a downgrade to hash vectors: ${warned}`);
+
+    // Choosing hash on purpose is the operator's decision and still works.
+    const chosen = embedLocalBatch(["a sentence"], "hash");
+    assert(chosen[0]?.kind === "hash", "an explicit hash request was refused");
+  } finally {
+    process.stderr.write = savedWrite;
+    if (saved === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = saved;
+    if (savedKind === undefined) delete process.env.CHAMBER_EMBEDDER;
+    else process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "weights swapped after the probe passed still throw from embedLocal auto instead of degrading", () => {
+  const good = minilmDirWithVersion(
+    readFileSync(fileURLToPath(new URL("../models/minilm/VERSION", import.meta.url)), "utf8"),
+  );
+  const bad = minilmDirWithVersion(tamperedVersion().text);
+  const saved = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = good;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    if (!minilmAvailable()) {
+      // No numpy or onnxruntime here: there is no passing probe to outlast.
+      assert(true, "no runnable embedder on this machine");
+      return;
+    }
+    process.env.CHAMBER_MINILM_DIR = bad;
+    let thrown: unknown;
+    try {
+      embedLocal("a sentence", "auto");
+    } catch (e) {
+      thrown = e;
+    }
+    assert(
+      thrown instanceof MinilmIntegrityError,
+      `embedLocal auto did not throw the refusal: ${thrown instanceof Error ? thrown.message : String(thrown)}`,
+    );
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = saved;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(good, { recursive: true, force: true });
+    rmSync(bad, { recursive: true, force: true });
+  }
+});
+
+test("config", "an ingest with refused MiniLM weights stops, writes no hash vectors, and a search stops too", () => {
+  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const notes = mkdtempSync(join(tmpdir(), "chamber-refused-notes-"));
+  writeFileSync(join(notes, "a.md"), "# Alpha\n\nA passage about refund windows.\n");
+  const db = freshDb();
+  const saved = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    let ingested = "";
+    try {
+      ingestDirectory(db, notes);
+    } catch (e) {
+      ingested = e instanceof Error ? e.message : String(e);
+    }
+    assert(ingested.includes("embed_minilm failed (3)"), `the ingest did not stop on the refusal: "${ingested}"`);
+    assert(count(db, `SELECT COUNT(*) AS c FROM vector_embedding`) === 0, "the ingest wrote vectors for a refused model");
+    let asked = "";
+    try {
+      searchVector(db, "refund windows");
+    } catch (e) {
+      asked = e instanceof Error ? e.message : String(e);
+    }
+    assert(asked.includes("embed_minilm failed (3)"), `a search embedded its query with something else: "${asked}"`);
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = saved;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(notes, { recursive: true, force: true });
+  }
+});
+
+test("gates", "refused MiniLM weights soften the debt check inside the commit's transaction and do not park the commit", () => {
+  // The paraphrase check embeds under BEGIN IMMEDIATE (FM-6: gate check and
+  // write are one transaction) and catches the embedder's throw right there.
+  // The refusal now throws where it used to return hash vectors, and it must
+  // land in that catch: the check is recorded as not run, the commit goes on.
+  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const db = freshDb();
+  const indebted = "The refund policy allows returns within 30 days.";
+  insertDebt(db, claimHash("belief", indebted), indebted);
+  const saved = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    // The commit now says why on stderr; keep that out of the suite's output.
+    const { value: r } = captureStderr(() =>
+      commitBelief(db, {
+        type: "belief",
+        text: "The office in Dubai opens at nine on weekdays.",
+        sources: [],
+        authorFamily: "test",
+        path: "deep",
+      }),
+    );
+    assert(r.ok, `a refused embedder parked the commit: ${JSON.stringify(r)}`);
+    assert(r.ok && r.paraphraseCheck === "skipped", `the caller cannot see the check did not run: ${JSON.stringify(r)}`);
+    const degraded = count(db, `SELECT COUNT(*) AS c FROM audit_event WHERE action = 'debt:degraded'`);
+    assert(degraded >= 1, "the check that did not run left no durable record");
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = saved;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("gates", "refused MiniLM weights are named in the debt:degraded record and on stderr, once per message", () => {
+  // The commit goes through (FM-6), so this record and this line are the only
+  // places an operator can learn that the paraphrase gate is off because the
+  // weights changed, and not because python is missing.
+  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const db = freshDb();
+  const indebted = "The refund policy allows returns within 30 days.";
+  insertDebt(db, claimHash("belief", indebted), indebted);
+  const savedDir = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  const savedPython = process.env.CHAMBER_PYTHON;
+  const commit = (text: string): ReturnType<typeof commitBelief> =>
+    commitBelief(db, { type: "belief", text, sources: [], authorFamily: "test", path: "deep" });
+  const reasons = (): string[] =>
+    (
+      db
+        .prepare(`SELECT detail_json FROM audit_event WHERE action = 'debt:degraded' ORDER BY seq`)
+        .all() as { detail_json: string | null }[]
+    ).map((row) => (JSON.parse(row.detail_json ?? "{}") as { reason?: string }).reason ?? "");
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    const first = captureStderr(() => commit("The office in Dubai opens at nine on weekdays."));
+    assert(first.value.ok && first.value.paraphraseCheck === "skipped", `the commit was parked or hid the skip: ${JSON.stringify(first.value)}`);
+    assert(
+      first.stderr.includes("MiniLM weights were refused") && first.stderr.includes("SHA-256"),
+      `the commit said nothing about the weights on stderr:\n${first.stderr}`,
+    );
+    const one = reasons();
+    assert(one.length === 1, `expected one debt:degraded record, found ${one.length}`);
+    assert(
+      one[0]!.includes("MinilmIntegrityError") && one[0]!.includes("SHA-256"),
+      `the record does not name the refusal: "${one[0]}"`,
+    );
+    assert(!one[0]!.includes("embedder unavailable"), `the record blames a missing embedder: "${one[0]}"`);
+
+    // The same refusal on the next commit is recorded again and not announced again.
+    const second = captureStderr(() => commit("The Abu Dhabi office closes at five on Fridays."));
+    assert(second.value.ok, `the second commit was parked: ${JSON.stringify(second.value)}`);
+    assert(!second.stderr.includes("MiniLM weights were refused"), `the same refusal was announced twice:\n${second.stderr}`);
+    const two = reasons();
+    assert(two.length === 2 && two[1] === one[0], `the second record differs: ${JSON.stringify(two)}`);
+
+    // Control: a failure that is not the weights keeps the old reason and says nothing about weights.
+    delete process.env.CHAMBER_MINILM_DIR;
+    process.env.CHAMBER_PYTHON = "/nonexistent/python-that-is-not-here";
+    resetMinilmProbe();
+    const third = captureStderr(() => commit("The Sharjah office opens at ten on Saturdays."));
+    assert(third.value.ok, `the third commit was parked: ${JSON.stringify(third.value)}`);
+    const three = reasons();
+    assert(
+      three.length === 3 && three[2] === "embedder unavailable or non-semantic; paraphrase check did not run",
+      `a missing python was recorded as: ${JSON.stringify(three[2])}`,
+    );
+    assert(!third.stderr.includes("MiniLM weights were refused"), `a missing python was reported as refused weights:\n${third.stderr}`);
+  } finally {
+    if (savedDir === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = savedDir;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    if (savedPython === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = savedPython;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the integrity refusal keeps the hash VERSION records, however long the model path is", () => {
+  const t = tamperedVersion();
+  const short = minilmDirWithVersion(t.text);
+  // The refusal is one line with two absolute paths in it, and the hash that
+  // matters is last. The 08:30 job's own path already put it past 300 characters.
+  const dir = `${short}-${"x".repeat(150)}`;
+  renameSync(short, dir);
+  const savedDir = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    let probed = "";
+    try {
+      minilmAvailable();
+    } catch (e) {
+      probed = e instanceof Error ? e.message : String(e);
+    }
+    assert(probed.includes("embed_minilm failed (3)"), `the probe did not refuse: "${probed}"`);
+    assert(probed.includes(t.expected), `the probe's message was cut before the hash VERSION records: "${probed}"`);
+    let embedded = "";
+    try {
+      embedMinilm("x");
+    } catch (e) {
+      embedded = e instanceof Error ? e.message : String(e);
+    }
+    assert(embedded.includes(t.expected), `the embed's message was cut before the hash VERSION records: "${embedded}"`);
+    // minilmAvailable() remembers a refusal for the life of the process.
+    assert(probed.includes("until it is restarted"), `the message does not say that a running process must be restarted: "${probed}"`);
+  } finally {
+    if (savedDir === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = savedDir;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "chamber-jobs.service keeps the hardening chamber.service has, and the jobs path cannot reach a sandbox", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const unit = readFileSync(join(root, "deploy", "systemd", "chamber-jobs.service"), "utf8");
+  const have = new Set(unit.split("\n").map((l) => l.trim()));
+  for (const want of [
+    "NoNewPrivileges=true",
+    "CapabilityBoundingSet=",
+    "AmbientCapabilities=",
+    "LockPersonality=true",
+    "RestrictRealtime=true",
+    "SystemCallFilter=@system-service",
+    "SystemCallErrorNumber=EPERM",
+  ]) {
+    assert(have.has(want), `chamber-jobs.service lacks ${want}`);
+  }
+
+  // SystemCallFilter=@system-service would stop bubblewrap (it needs unshare
+  // and mount), so it is only safe on this unit while `chamber jobs run` cannot
+  // reach the sandbox or start any child process. Walk the imports of the job
+  // queue, the module `jobs run` calls, and fail if that stops being true: the
+  // answer is then to revisit the filter, not to delete this test.
+  const seen = new Set<string>();
+  const stack = [join(root, "src", "job_queue.ts")];
+  while (stack.length > 0) {
+    const file = stack.pop()!;
+    if (seen.has(file)) continue;
+    seen.add(file);
+    const text = readFileSync(file, "utf8");
+    for (const m of text.matchAll(/(?:from\s+|import\s*\(\s*|import\s+)["'](\.[^"']+\.ts)["']/g)) {
+      stack.push(resolve(dirname(file), m[1]!));
+    }
+  }
+  const reached = [...seen].map((f) => relative(root, f)).sort();
+  for (const forbidden of ["src/sandbox.ts", "src/tools.ts", "src/mcp_bridge.ts"]) {
+    assert(!reached.includes(forbidden), `chamber jobs run now reaches ${forbidden}: ${reached.join(", ")}`);
+  }
+  // worker_threads is checked too: turn_pool.ts starts workers, and a worker
+  // is a thread the filter has to let through, not a process, but it is the
+  // other way a job path grows beyond a single plain thread.
+  for (const f of reached) {
+    const src = readFileSync(join(root, f), "utf8");
+    for (const mod of ["node:child_process", "node:worker_threads"]) {
+      assert(!src.includes(mod), `${f} imports ${mod} and is reachable from chamber jobs run`);
+    }
+  }
+});
+
+// ─── pin hardening: git environment, timeouts, URLs, atomic write ───────────
+
+/**
+ * A `git` that goes first on PATH, records how it was called (the prompt
+ * setting, the six variables that redirect git, and its arguments) and runs the
+ * real git. With SHIM_HANG=fetch it hangs on `fetch` instead, and with
+ * SHIM_FAIL=fetch it fails `fetch` with a message that quotes a URL carrying
+ * the userinfo in SHIM_USERINFO, the way git's own errors do.
+ */
+function gitShim(root: string): { dir: string; log: string; real: string } {
+  const dir = join(root, "shim");
+  mkdirSync(dir, { recursive: true });
+  const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  const log = join(root, "git-calls.log");
+  writeFileSync(
+    join(dir, "git"),
+    [
+      "#!/bin/sh",
+      'echo "${GIT_TERMINAL_PROMPT-unset}|${GIT_DIR-unset}|${GIT_WORK_TREE-unset}|${GIT_INDEX_FILE-unset}|${GIT_OBJECT_DIRECTORY-unset}|${GIT_ALTERNATE_OBJECT_DIRECTORIES-unset}|${GIT_COMMON_DIR-unset}|$*" >> "$SHIM_LOG"',
+      'if [ "$SHIM_HANG" = fetch ]; then for a in "$@"; do [ "$a" = fetch ] && exec sleep 30; done; fi',
+      `if [ "$SHIM_FAIL" = fetch ]; then for a in "$@"; do [ "$a" = fetch ] && { echo "fatal: unable to access 'https://$SHIM_USERINFO@example.invalid/x.git/': 401" >&2; exit 128; }; done; fi`,
+      'exec "$SHIM_REAL_GIT" "$@"',
+      "",
+    ].join("\n"),
+  );
+  chmodSync(join(dir, "git"), 0o755);
+  return { dir, log, real };
+}
+
+/** Run `fn` with these variables set in this process, then put every one back. */
+function withProcessEnv(vars: Record<string, string>, fn: () => void): void {
+  const saved = new Map<string, string | undefined>();
+  for (const [k, v] of Object.entries(vars)) {
+    saved.set(k, process.env[k]);
+    process.env[k] = v;
+  }
+  try {
+    fn();
+  } finally {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test("release", "every git call pin makes has prompts off and none of the variables that redirect git", () => {
+  withReleaseFixture((fx) => {
+    const shim = gitShim(fx.root);
+    withProcessEnv(
+      {
+        PATH: `${shim.dir}:${process.env.PATH ?? ""}`,
+        SHIM_LOG: shim.log,
+        SHIM_REAL_GIT: shim.real,
+        GIT_DIR: join(fx.root, "not-a-repo"),
+        GIT_WORK_TREE: join(fx.root, "not-a-tree"),
+        GIT_INDEX_FILE: join(fx.root, "not-an-index"),
+        GIT_OBJECT_DIRECTORY: join(fx.root, "not-objects"),
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: join(fx.root, "not-alternates"),
+        GIT_COMMON_DIR: join(fx.root, "not-a-common-dir"),
+        GIT_TERMINAL_PROMPT: "1",
+      },
+      () => {
+        const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+        assert(r.ok, `pin refused with GIT_DIR and friends set: ${JSON.stringify(r)}`);
+      },
+    );
+    const calls = readFileSync(shim.log, "utf8").trim().split("\n");
+    assert(calls.length >= 6, `expected pin's git calls to be logged, got ${calls.length}`);
+    for (const c of calls) {
+      // prompt off, then GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY,
+      // GIT_ALTERNATE_OBJECT_DIRECTORIES and GIT_COMMON_DIR, all unset.
+      assert(c.startsWith("0|unset|unset|unset|unset|unset|unset|"), `a git call inherited the environment: ${c}`);
+    }
+  });
+});
+
+test("release", "a git fetch that hangs is a refusal naming the command, and a first pin cleans up", () => {
+  withReleaseFixture((fx) => {
+    const shim = gitShim(fx.root);
+    const previous = setGitTimeouts({ fetchMs: 400, otherMs: 10_000 });
+    try {
+      withProcessEnv(
+        { PATH: `${shim.dir}:${process.env.PATH ?? ""}`, SHIM_LOG: shim.log, SHIM_REAL_GIT: shim.real, SHIM_HANG: "fetch" },
+        () => {
+          const started = Date.now();
+          const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+          assert(!r.ok && r.reason.includes("git fetch timed out after 0.4s"), JSON.stringify(r));
+          assert(Date.now() - started < 10_000, "the timeout did not stop the fetch");
+        },
+      );
+    } finally {
+      setGitTimeouts(previous);
+    }
+    assert(!existsSync(fx.releaseDir), "a first pin that timed out left its clone behind");
+    assert(
+      previous.fetchMs === 120_000 && previous.otherMs === 30_000,
+      `the default timeouts are 120 s for fetch and 30 s for the rest, got ${JSON.stringify(previous)}`,
+    );
+  });
+});
+
+test("release", "a URL in git's own error message has its userinfo redacted in the refusal", () => {
+  withReleaseFixture((fx) => {
+    const shim = gitShim(fx.root);
+    const userinfo = ["bob", "pw"].join(":");
+    withProcessEnv(
+      {
+        PATH: `${shim.dir}:${process.env.PATH ?? ""}`,
+        SHIM_LOG: shim.log,
+        SHIM_REAL_GIT: shim.real,
+        SHIM_FAIL: "fetch",
+        SHIM_USERINFO: userinfo,
+      },
+      () => {
+        const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+        assert(!r.ok && r.reason.includes("https://<redacted>@example.invalid/x.git/"), JSON.stringify(r));
+        assert(!r.reason.includes("bob") && !r.reason.includes("pw@"), `the refusal printed the userinfo: ${r.reason}`);
+      },
+    );
+  });
+});
+
+test("release", "an origin URL that starts with a dash is added as a URL, not read as an option", () => {
+  withReleaseFixture((fx) => {
+    fixtureGit(fx.source, ["config", "remote.origin.url", "-not-an-option"]);
+    const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+    assert(!r.ok, "a pin from a dash-named origin succeeded");
+    assert(
+      r.reason.startsWith("git fetch:"),
+      `the failure must come from the fetch, not from option parsing in remote add: ${r.reason}`,
+    );
+    assert(!existsSync(fx.releaseDir), "a failed first pin left its clone behind");
+  });
+});
+
+test("release", "an http(s) origin with credentials is refused before anything is created, and never echoed", () => {
+  withReleaseFixture((fx) => {
+    // Assembled here so no literal credential sits in this file.
+    const secret = ["hunter", "2"].join("");
+    for (const url of [
+      `https://alice:${secret}@example.invalid/chamber.git`,
+      `http://alice@example.invalid/chamber.git`,
+      `https://:${secret}@example.invalid/chamber.git`,
+    ]) {
+      fixtureGit(fx.source, ["config", "remote.origin.url", url]);
+      const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+      assert(
+        !r.ok && r.reason === "the origin URL carries credentials; use a credential helper instead",
+        `${JSON.stringify(r)}`,
+      );
+      assert(!r.reason.includes(secret) && !r.reason.includes("alice"), "the refusal echoed the URL");
+      assert(!existsSync(dirname(fx.releaseDir)), "a refused pin created a directory");
+    }
+  });
+  for (const [url, refused] of [
+    ["https://example.invalid/chamber.git", false],
+    ["https://@example.invalid/chamber.git", false],
+    ["http://example.invalid:8080/chamber.git", false],
+    ["https://alice@example.invalid/chamber.git", true],
+    ["http://alice:pw@example.invalid/chamber.git", true],
+    ["https://:pw@example.invalid/chamber.git", true],
+    ["ssh://git@example.invalid/chamber.git", false],
+    ["git@example.invalid:org/chamber.git", false],
+    ["user:pw@example.invalid:org/chamber.git", false],
+    ["/srv/git/chamber.git", false],
+    ["-not-an-option", false],
+  ] as const) {
+    assert((originCredentialRefusal(url) !== null) === refused, `${url}: expected ${refused ? "a refusal" : "no refusal"}`);
+  }
+});
+
+test("release", "a URL printed in a message has its userinfo redacted", () => {
+  const table: ReadonlyArray<readonly [string, string]> = [
+    ["fatal: unable to access 'https://u:p@host/x.git/': 401", "fatal: unable to access 'https://<redacted>@host/x.git/': 401"],
+    ["ssh://git@host/x.git", "ssh://<redacted>@host/x.git"],
+    ["https://a:b@c@host/x", "https://<redacted>@host/x"],
+    ["git@host:org/r.git", "git@host:org/r.git"],
+    ["https://host/x.git", "https://host/x.git"],
+    ["nothing to redact", "nothing to redact"],
+  ];
+  for (const [input, want] of table) assert(redactUserinfo(input) === want, `${input} -> ${redactUserinfo(input)}`);
+
+  withReleaseFixture((fx) => {
+    const secret = ["hunter", "2"].join("");
+    const opts = { sourceRoot: fx.source, releaseDir: fx.releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    fixtureGit(fx.releaseDir, ["remote", "set-url", "origin", `https://bob:${secret}@example.invalid/other.git`]);
+    const r = pinCheckout({ ...opts, tag: "v2" });
+    assert(!r.ok && r.reason.includes("https://<redacted>@example.invalid/other.git"), JSON.stringify(r));
+    assert(!r.reason.includes(secret) && !r.reason.includes("bob"), `the refusal printed the credentials: ${r.reason}`);
+  });
+});
+
+test("release", "a release directory that cannot be looked at is a refusal, not a crash", () => {
+  withReleaseFixture((fx) => {
+    const file = join(fx.root, "a-file");
+    writeFileSync(file, "not a directory\n");
+    const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: join(file, "release") });
+    assert(!r.ok && r.reason.includes("cannot look at") && r.reason.includes("ENOTDIR"), JSON.stringify(r));
+  });
+});
+
+test("release", "the job plist is replaced atomically with its mode kept, and a failed write leaves no temp file", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    chmodSync(fx.plistPath, 0o640);
+    const inodeBefore = lstatSync(fx.plistPath).ino;
+    const r = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run));
+    assert(r.code === 0, r.err.join("\n"));
+    const after = lstatSync(fx.plistPath);
+    assert(after.ino !== inodeBefore, "the plist was rewritten in place, not replaced by a rename");
+    assert((after.mode & 0o777) === 0o640, `the plist's mode changed to ${(after.mode & 0o777).toString(8)}`);
+    assert(!existsSync(`${fx.plistPath}.tmp-${process.pid}`), "a temp file was left beside the plist");
+    assert(plistForm(fx.plistPath) === "pinned", plistForm(fx.plistPath));
+
+    // A rename that fails: the original is intact and the temp file is gone.
+    const original = readFileSync(fx.plistPath, "utf8");
+    let threw = "";
+    try {
+      writeFileAtomic(fx.plistPath, "replacement\n", () => {
+        throw new Error("rename failed");
+      });
+    } catch (e) {
+      threw = e instanceof Error ? e.message : String(e);
+    }
+    assert(threw === "rename failed", `the failure was swallowed: "${threw}"`);
+    assert(readFileSync(fx.plistPath, "utf8") === original, "a failed write changed the plist");
+    assert(!existsSync(`${fx.plistPath}.tmp-${process.pid}`), "a failed write left its temp file");
+
+    // A symlinked plist keeps its link; the target is what is replaced.
+    const link = join(fx.root, "link.plist");
+    symlinkSync(fx.plistPath, link);
+    writeFileAtomic(link, "through the link\n");
+    assert(lstatSync(link).isSymbolicLink(), "the symlink was replaced by a regular file");
+    assert(readFileSync(fx.plistPath, "utf8") === "through the link\n", "the link's target was not written");
+  });
+});
+
+// ─── pin proves the release runs before it rewrites the job ─────────────────
+
+test("release", "a release whose bin exits non-zero is refused, and the plist and the job are untouched", () => {
+  withReleaseFixture((fx) => {
+    const bare = jobPlistXml(BARE_SCRIPT);
+    writePlistFile(fx.plistPath, bare);
+    const lc = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "badexit", lc.run));
+    assert(r.code === 1, "a release that exits 1 was pinned");
+    assert(
+      r.err.some(
+        (l) => l.startsWith("chamber pin: the release at badexit did not run: ") && l.includes("exited 1") && l.includes("boom"),
+      ),
+      r.err.join("\n"),
+    );
+    assert(readFileSync(fx.plistPath, "utf8") === bare, "the plist was rewritten for a release that does not run");
+    assert(lc.calls.length === 0, `launchctl was called: ${lc.calls.join(" | ")}`);
+    assert(!existsSync(fx.releaseDir), "a first pin that failed left a release checkout behind");
+  });
+});
+
+test("release", "a release that prints another version is refused, and the plist and the job are untouched", () => {
+  withReleaseFixture((fx) => {
+    const bare = jobPlistXml(BARE_SCRIPT);
+    writePlistFile(fx.plistPath, bare);
+    const lc = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "wrongver", lc.run));
+    assert(r.code === 1, "a release printing the wrong version was pinned");
+    assert(
+      r.err.some(
+        (l) => l.startsWith("chamber pin: the release at wrongver did not run: ") && l.includes('"9.9.9"') && l.includes('"1.0.4"'),
+      ),
+      r.err.join("\n"),
+    );
+    assert(readFileSync(fx.plistPath, "utf8") === bare, "the plist was rewritten");
+    assert(lc.calls.length === 0, `launchctl was called: ${lc.calls.join(" | ")}`);
+    assert(!existsSync(fx.releaseDir), "a first pin that failed left a release checkout behind");
+  });
+});
+
+test("release", "the release is run even when no job is installed", () => {
+  withReleaseFixture((fx) => {
+    const bad = pinRelease(pinOpts(fx, "badexit", fakeLaunchctl({ loaded: false }).run));
+    assert(bad.code === 1 && bad.err.some((l) => l.includes("did not run")), bad.err.join("\n"));
+    assert(!existsSync(fx.plistPath), "pin created a plist");
+    const good = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run));
+    assert(good.code === 0, good.err.join("\n"));
+    assert(good.out.some((l) => l.includes("the release runs")), good.out.join("\n"));
+  });
+});
+
+// ─── a pin tries the release in a throwaway clone and moves nothing until it passes ─────
+
+/**
+ * Add a tag whose bin, while it runs `--version`, writes a marker file with two
+ * facts: which commit the live release checkout (`fx.releaseDir`) is on at that
+ * moment (empty when it has none yet), and the directory the bin itself runs
+ * from. Then it behaves as `how` says: prints its version ("pass"), exits 1
+ * ("fail"), or waits 8 s before printing ("slow"). Returns the marker's path.
+ */
+function addWatchTag(fx: ReleaseFixture, name: string, how: "pass" | "fail" | "slow"): string {
+  const marker = join(fx.root, `${name}.marker.json`);
+  const ending =
+    how === "pass"
+      ? 'console.log("1.0.5");'
+      : how === "fail"
+        ? "process.exit(1);"
+        : 'setTimeout(() => console.log("1.0.5"), 8000);';
+  const body = [
+    'const { spawnSync } = require("node:child_process");',
+    'const fs = require("node:fs");',
+    `const head = spawnSync("git", ["-C", ${JSON.stringify(fx.releaseDir)}, "rev-parse", "--verify", "--quiet", "HEAD"], { encoding: "utf8" }).stdout.trim();`,
+    `fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ head, ranFrom: __dirname }));`,
+    ending,
+    "",
+  ].join("\n");
+  const sha = fixtureCommit(fx.origin, { ...releaseTree(name, "1.0.5", body), "README.md": `${name}\n` }, name, fx.v2);
+  fixtureGit(fx.origin, ["tag", name, sha]);
+  return marker;
+}
+
+function readMarker(path: string): { head: string; ranFrom: string } {
+  return JSON.parse(readFileSync(path, "utf8")) as { head: string; ranFrom: string };
+}
+
+test("release", "a pin whose release does not run never moves the live checkout, so a pinned job keeps running the old release", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const first = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: true }).run));
+    assert(first.code === 0, first.err.join("\n"));
+    assert(plistForm(fx.plistPath) === "pinned", "the first pin did not leave the job in the pinned form");
+    const pinned = readFileSync(fx.plistPath, "utf8");
+    const marker = addWatchTag(fx, "watchfail", "fail");
+    const work = join(fx.root, "work");
+
+    // The job is now in the form every later pin starts from, and its command
+    // is the release checkout's bin/chamber.js: moving the checkout moves the job.
+    const lc = fakeLaunchctl({ loaded: true });
+    const second = pinRelease({ ...pinOpts(fx, "watchfail", lc.run), workDir: work });
+    assert(second.code === 1, "a release that exits 1 was pinned");
+    assert(
+      second.err.some((l) => l.startsWith("chamber pin: the release at watchfail did not run: ") && l.includes("exited 1")),
+      second.err.join("\n"),
+    );
+    assert(
+      second.err.some((l) => l.includes(`${fx.releaseDir} was not moved: it is still at ${fx.v1.slice(0, 12)}`)),
+      second.err.join("\n"),
+    );
+
+    // What the release saw while it ran: the live checkout still on v1, and
+    // itself running somewhere else. Reading HEAD afterwards cannot tell "never
+    // moved" from "moved, then moved back".
+    const seen = readMarker(marker);
+    assert(seen.head === fx.v1, `the live checkout was on "${seen.head.slice(0, 12)}", not v1, while the release was being tried`);
+    assert(seen.ranFrom !== join(fx.releaseDir, "bin"), "the release was tried inside the live checkout");
+    assert(seen.ranFrom.startsWith(work), `the release ran from ${seen.ranFrom}, not under the scratch directory ${work}`);
+    assert(readdirSync(work).length === 0, `the throwaway clone was left behind: ${readdirSync(work).join(", ")}`);
+
+    assert(headOf(fx.releaseDir) === fx.v1, "the checkout is not on v1");
+    assert(isDetachedHead(fx.releaseDir), "the checkout is attached to a branch");
+    assert(readFileSync(join(fx.releaseDir, "README.md"), "utf8") === "one\n", "the working tree is not v1's");
+    assert(readFileSync(fx.plistPath, "utf8") === pinned, "the plist was rewritten");
+    assert(lc.calls.length === 0, `launchctl was called: ${lc.calls.join(" | ")}`);
+
+    // What the pinned job runs tomorrow: the same shell and command, against the checkout.
+    const job = spawnSync("/bin/sh", ["-lc", 'node "$1" --version', "sh", join(fx.releaseDir, "bin", "chamber.js")], {
+      encoding: "utf8",
+      env: loginEnv(fx),
+    });
+    assert(job.status === 0 && job.stdout.trim() === "1.0.1", `the pinned job no longer runs v1: ${job.status} ${job.stdout} ${job.stderr}`);
+  });
+});
+
+test("release", "a release that runs is tried in a throwaway clone first, and only then does the checkout move", () => {
+  withReleaseFixture((fx) => {
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin failed");
+    const marker = addWatchTag(fx, "watchok", "pass");
+    const work = join(fx.root, "work");
+    const r = pinRelease({ ...pinOpts(fx, "watchok", fakeLaunchctl({ loaded: false }).run), workDir: work });
+    assert(r.code === 0, r.err.join("\n"));
+    const seen = readMarker(marker);
+    assert(seen.head === fx.v1, `the checkout had already moved to "${seen.head.slice(0, 12)}" when the release was tried`);
+    assert(seen.ranFrom.startsWith(work), `the release ran from ${seen.ranFrom}, not under the scratch directory ${work}`);
+    assert(readdirSync(work).length === 0, `the throwaway clone was left behind: ${readdirSync(work).join(", ")}`);
+    assert(
+      headOf(fx.releaseDir) === fixtureGit(fx.origin, ["rev-parse", "watchok^{commit}"]),
+      "the checkout did not move to the tag after the release passed",
+    );
+    assert(r.out.some((l) => l.includes("the release runs") && l.includes("printed 1.0.5")), r.out.join("\n"));
+  });
+});
+
+test("release", "a first pin whose release does not run leaves no checkout behind", () => {
+  withReleaseFixture((fx) => {
+    const marker = addWatchTag(fx, "watchfail", "fail");
+    const r = pinRelease({ ...pinOpts(fx, "watchfail", fakeLaunchctl({ loaded: false }).run), workDir: join(fx.root, "work") });
+    assert(r.code === 1 && r.err.some((l) => l.includes("did not run")), r.err.join("\n"));
+    assert(
+      r.err.some((l) => l.includes(`no release checkout was left at ${fx.releaseDir}`)),
+      r.err.join("\n"),
+    );
+    assert(readMarker(marker).head === "", "the new checkout was already on a commit while the release was tried");
+    assert(!existsSync(fx.releaseDir), "a failed first pin left a release checkout");
+  });
+});
+
+test("release", "a release that does not finish in time is refused, and the live checkout is not moved", () => {
+  withReleaseFixture((fx) => {
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin failed");
+    addWatchTag(fx, "watchslow", "slow");
+    const work = join(fx.root, "work");
+    const r = pinRelease({ ...pinOpts(fx, "watchslow", fakeLaunchctl({ loaded: false }).run), workDir: work, proofTimeoutMs: 1500 });
+    assert(r.code === 1, "a release that did not finish was pinned");
+    assert(r.err.some((l) => l.includes("did not finish in 1.5s")), r.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "the checkout moved while the release was being tried");
+    assert(readdirSync(work).length === 0, `the throwaway clone was left behind: ${readdirSync(work).join(", ")}`);
+  });
+});
+
+test("release", "a pin killed while it tries the release leaves the live checkout on the release it was on", async () => {
+  const fx = releaseFixture();
+  try {
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin failed");
+    const marker = addWatchTag(fx, "watchslow", "slow");
+    const work = join(fx.root, "work");
+    // pinRelease in a process of its own, so that it can be interrupted the way
+    // an owner interrupts a pin that has gone quiet.
+    const driver = join(fx.root, "driver.mts");
+    writeFileSync(
+      driver,
+      [
+        `import { pinRelease } from ${JSON.stringify(new URL("../src/release_pin.ts", import.meta.url).href)};`,
+        "const [tag, sourceRoot, releaseDir, plistPath, workDir, home] = process.argv.slice(2);",
+        "const r = pinRelease({",
+        "  tag, sourceRoot, releaseDir, plistPath, workDir,",
+        '  launchctl: () => ({ status: 1, stdout: "", stderr: "" }),',
+        "  env: { ...process.env, HOME: home },",
+        "});",
+        "console.log(JSON.stringify(r));",
+        "",
+      ].join("\n"),
+    );
+    const child = spawn(
+      process.execPath,
+      ["--experimental-strip-types", driver, "watchslow", fx.source, fx.releaseDir, fx.plistPath, work, loginEnv(fx).HOME ?? ""],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let childErr = "";
+    child.stderr.on("data", (d: Buffer) => {
+      childErr += d.toString();
+    });
+    const exited = new Promise<NodeJS.Signals | null>((resolve) => {
+      child.on("exit", (_code, signal) => resolve(signal));
+    });
+    // The release writes the marker when it starts; it then waits 8 s.
+    const deadline = Date.now() + 30_000;
+    while (!existsSync(marker) && Date.now() < deadline) await new Promise<void>((r) => setTimeout(r, 50));
+    assert(existsSync(marker), `the release never started: ${childErr}`);
+    child.kill("SIGINT");
+    const signal = await exited;
+    assert(signal === "SIGINT", `the pin was not stopped by the signal: ${String(signal)} ${childErr}`);
+
+    assert(headOf(fx.releaseDir) === fx.v1, "the checkout moved before the release had passed");
+    assert(isDetachedHead(fx.releaseDir), "the checkout is attached to a branch");
+    assert(fixtureGit(fx.releaseDir, ["status", "--porcelain", "--untracked-files=no"]) === "", "the checkout has tracked changes");
+    assert(readFileSync(join(fx.releaseDir, "README.md"), "utf8") === "one\n", "the working tree is not v1's");
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test("release", "a checkout on a branch stays on that branch when the release does not run", () => {
+  withReleaseFixture((fx) => {
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin failed");
+    fixtureGit(fx.releaseDir, ["checkout", "--quiet", "-b", "keep"]);
+    const r = pinRelease(pinOpts(fx, "wrongver", fakeLaunchctl({ loaded: false }).run));
+    assert(r.code === 1 && r.err.some((l) => l.includes("did not run")), r.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "the checkout is not on v1");
+    assert(
+      fixtureGit(fx.releaseDir, ["symbolic-ref", "HEAD"]) === "refs/heads/keep",
+      "the checkout is no longer on the branch it was on",
+    );
+  });
+});
+
+test("release", "a checkout with tracked changes is refused, and the repair SCHEDULING prints clears them", () => {
+  withReleaseFixture((fx) => {
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin failed");
+    // What an interrupted `git checkout` can leave: tracked files that are not the tag's.
+    writeFileSync(join(fx.releaseDir, "README.md"), "half of another release\n");
+    const refused = pinRelease(pinOpts(fx, "v2", fakeLaunchctl({ loaded: false }).run));
+    assert(refused.code === 1 && refused.err.some((l) => l.includes("has tracked changes")), refused.err.join("\n"));
+
+    const sched = readFileSync(fileURLToPath(new URL("../deploy/SCHEDULING.md", import.meta.url)), "utf8").replace(/\s+/g, " ");
+    const printed = "git -C ~/.local/share/chamber-release checkout --force --detach <tag>";
+    assert(sched.includes(printed), "deploy/SCHEDULING.md does not print the repair command");
+    // The command as printed, with this fixture's directory and a tag it has.
+    const argv = printed.replace("~/.local/share/chamber-release", fx.releaseDir).replace("<tag>", "v1").split(" ").slice(1);
+    const fixed = spawnSync("git", argv, { encoding: "utf8" });
+    assert(fixed.status === 0, `the printed repair failed: ${fixed.stderr}`);
+    const again = pinRelease(pinOpts(fx, "v2", fakeLaunchctl({ loaded: false }).run));
+    assert(again.code === 0, `pin still refuses after the repair:\n${again.err.join("\n")}`);
+    assert(headOf(fx.releaseDir) === fx.v2, "the checkout is not on v2");
+  });
+});
+
+test("release", "the run proof goes through a login shell: a node only the profile can find is found", () => {
+  withReleaseFixture((fx) => {
+    // The shell starts with no node on PATH. The profile adds a directory that
+    // holds a link to this process's node, which is all /bin/sh -lc has to go on.
+    const home = join(fx.root, "profile-home");
+    const nodeDir = join(home, "node-bin");
+    mkdirSync(nodeDir, { recursive: true });
+    symlinkSync(process.execPath, join(nodeDir, "node"));
+    writeFileSync(join(home, ".profile"), `PATH="${nodeDir}:$PATH"\nexport PATH\n`);
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, PATH: "/nonexistent" };
+    // The fixture is only worth something if a plain `sh -c` cannot find node.
+    const plain = spawnSync("/bin/sh", ["-c", "command -v node"], { encoding: "utf8", env });
+    assert(plain.status !== 0, `node is visible without the profile (${plain.stdout.trim()}), so this cannot tell -c from -lc`);
+    const r = pinRelease({ ...pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run), env });
+    assert(r.code === 0, r.err.join("\n"));
+    assert(r.out.some((l) => l.includes("the release runs")), r.out.join("\n"));
+  });
+});
+
+test("release", "a login profile that prints does not make a release that runs look like one that does not", () => {
+  withReleaseFixture((fx) => {
+    // Its own HOME: pinOpts writes the plain login profile into fx.root/home.
+    const home = join(fx.root, "banner-home");
+    mkdirSync(home, { recursive: true });
+    writeFileSync(
+      join(home, ".profile"),
+      `PATH="${dirname(process.execPath)}:$PATH"\nexport PATH\necho "welcome back"\n`,
+    );
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home };
+    const r = pinRelease({ ...pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run), env });
+    assert(r.code === 0, r.err.join("\n"));
+    assert(r.out.some((l) => l.includes("printed 1.0.1")), r.out.join("\n"));
+  });
+});
+
+// ─── job plist: comments, the Program key, and the not-loaded hint ──────────
+
+/** The live job plist with `extra` placed above its <key>ProgramArguments</key>. */
+function jobPlistWith(extra: string, script: string = BARE_SCRIPT): string {
+  return jobPlistXml(script).replace("  <key>ProgramArguments</key>", `${extra}\n  <key>ProgramArguments</key>`);
+}
+
+const DEAD_BLOCK = [
+  `<!--`,
+  `  <key>ProgramArguments</key>`,
+  `  <array>`,
+  `    <string>/bin/sh</string>`,
+  `    <string>-lc</string>`,
+  `    <string>echo an older job</string>`,
+  `  </array>`,
+  `-->`,
+].join("\n");
+
+test("release", "a commented-out ProgramArguments block does not hide, or stand in for, the live one", () => {
+  // A dead block above a live one: the live one is read, and the live one is rewritten.
+  const both = jobPlistWith(DEAD_BLOCK);
+  const read = readJobPlist(both);
+  assert(read.ok && read.form === "bare", JSON.stringify(read));
+  const pinned = pinJobPlist(both);
+  const after = readJobPlist(pinned);
+  assert(after.ok && after.form === "pinned", JSON.stringify(after));
+  assert(pinned.includes(DEAD_BLOCK), "the commented-out block was changed");
+  assert(pinned.includes("echo an older job"), "the commented-out block lost its text");
+
+  // A dead block and nothing else is not a job.
+  const onlyDead = jobPlistXml(BARE_SCRIPT).replace(
+    /\s+<key>ProgramArguments<\/key>[\s\S]*?<\/array>/,
+    DEAD_BLOCK,
+  );
+  const refused = readJobPlistText(onlyDead);
+  assert(!refused.ok && refused.reason.includes("exactly once"), JSON.stringify(refused));
+  assert(!readJobPlist(onlyDead).ok, "a plist with only a commented-out job was accepted");
+
+  // A comment that merely mentions the key is not a second block either.
+  const mention = readJobPlist(jobPlistWith("<!-- see <key>ProgramArguments</key> below -->"));
+  assert(mention.ok && mention.form === "bare", JSON.stringify(mention));
+});
+
+test("release", "a Program key outside a comment is refused, because it overrides ProgramArguments[0]", () => {
+  const withProgram = jobPlistWith("  <key>Program</key>\n  <string>/usr/bin/true</string>");
+  const refused = readJobPlist(withProgram);
+  assert(!refused.ok && refused.reason.includes("Program key"), JSON.stringify(refused));
+  let threw = false;
+  try {
+    pinJobPlist(withProgram);
+  } catch {
+    threw = true;
+  }
+  assert(threw, "pinJobPlist rewrote a plist with a Program key");
+  const commented = readJobPlist(jobPlistWith("<!-- <key>Program</key> was here -->"));
+  assert(commented.ok, JSON.stringify(commented));
+  // ProgramArguments itself is not the Program key.
+  assert(readJobPlist(jobPlistXml(BARE_SCRIPT)).ok, "the plain job plist was refused");
+});
+
+test("release", "a load that exits 0 without loading the agent says the 08:30 job will not run and how to load it", () => {
+  withReleaseFixture((fx) => {
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const r = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false, load: "lies" }).run));
+    assert(r.code === 1, "an agent that never loaded was reported loaded");
+    assert(
+      r.err.some(
+        (l) =>
+          l.includes(`launchctl load exited 0 but ${JOB_LABEL} is not loaded`) &&
+          l.includes("the 08:30 job will not run") &&
+          l.includes(`load it with: launchctl load ${fx.plistPath}`),
+      ),
+      r.err.join("\n"),
+    );
+  });
+});
+
+// The comment stripper is a regex. These plists make it and launchd disagree, so
+// each is refused outright (and, being refused by readJobPlist, never rewritten).
+const HIDDEN_XML_REASON = "the job plist uses XML that Chamber does not read";
+
+/** The live job plist with `extra` placed just before its closing </dict>. */
+function jobPlistEnding(extra: string): string {
+  return jobPlistXml(BARE_SCRIPT).replace("</dict>", `${extra}\n</dict>`);
+}
+
+function assertNeverRead(xml: string, what: string): void {
+  // The text reader, which is the whole check where there is no plutil, names
+  // the XML it will not read.
+  const text = readJobPlistText(xml);
+  assert(!text.ok && text.reason.startsWith(HIDDEN_XML_REASON), `${what} was read by the text reader: ${JSON.stringify(text)}`);
+  // Whichever reader this machine uses (plutil on a Mac) refuses it too.
+  const read = readJobPlist(xml);
+  assert(!read.ok, `${what} was read: ${JSON.stringify(read)}`);
+  let threw = false;
+  try {
+    pinJobPlist(xml);
+  } catch {
+    threw = true;
+  }
+  assert(threw, `pinJobPlist rewrote a plist with ${what}`);
+}
+
+test("release", "a Program key hidden between two CDATA sections that hold comment markers is refused", () => {
+  // To the regex stripper everything from the first `<!--` to the last `-->` is
+  // one comment; to a parser the Program key between them is real.
+  const xml = jobPlistEnding(
+    [
+      `  <key>X</key><string><![CDATA[ <!-- ]]></string>`,
+      `  <key>Program</key><string>/usr/bin/true</string>`,
+      `  <key>Y</key><string><![CDATA[ --> ]]></string>`,
+    ].join("\n"),
+  );
+  assertNeverRead(xml, "a Program key between CDATA sections");
+});
+
+test("release", "an entity-encoded key is refused, because launchd decodes it to Program", () => {
+  const xml = jobPlistEnding("  <key>Progr&#97;m</key>\n  <string>/usr/bin/true</string>");
+  assertNeverRead(xml, "an entity-encoded key");
+});
+
+test("release", "an unterminated comment is refused, before or after the block, and plutil agrees it is not a plist", () => {
+  const before = jobPlistWith("<!-- never closed");
+  const after = jobPlistEnding("<!-- never closed");
+  assertNeverRead(before, "an unterminated comment before the block");
+  assertNeverRead(after, "an unterminated comment after the block");
+  // A comment that was closed, and one that has `--` inside it, are still plists.
+  assert(readJobPlist(jobPlistWith("<!-- closed -->")).ok, "a closed comment was refused");
+  const dashes = readJobPlist(jobPlistWith("<!-- a -- b --- c -->"));
+  assert(dashes.ok && dashes.form === "bare", `a comment containing -- was refused: ${JSON.stringify(dashes)}`);
+
+  if (!havePlutil()) {
+    process.stdout.write("      (plutil is not available: skipped the check that plutil -lint rejects the unterminated comment)\n");
+    return;
+  }
+  withReleaseFixture((fx) => {
+    const lintOf = (name: string, xml: string): number | null => {
+      const file = join(fx.root, name);
+      writeFileSync(file, xml);
+      return spawnSync(pinApi.PLUTIL_PATH, ["-lint", file], { encoding: "utf8" }).status;
+    };
+    assert(lintOf("ok.plist", jobPlistXml(BARE_SCRIPT)) === 0, "plutil -lint rejects the plain job plist; the control is broken");
+    assert(lintOf("before.plist", before) !== 0, "plutil -lint accepts a plist with an unterminated comment before the block");
+    assert(lintOf("after.plist", after) !== 0, "plutil -lint accepts a plist with an unterminated comment after the block");
+  });
+});
+
+/** Whether this machine has plutil, the parser launchd's own plist reader is built on. */
+function havePlutil(): boolean {
+  return plutilParser("").kind !== "unavailable";
+}
+
+/** What plutil makes of `xml`: its JSON, or null when it refuses or is absent. */
+function plutilJson(xml: string): string | null {
+  const parsed = plutilParser(xml);
+  return parsed.kind === "parsed" ? JSON.stringify(parsed.value) : null;
+}
+
+// Two shapes that hid a Program key from the text reader while plutil (and so
+// launchd) still saw it. Each is refused by the text reader on every machine and
+// by plutil's verdict on a Mac.
+const PI_HIDING_COMMENT = jobPlistEnding(
+  [
+    `  <?x <!-- ?>`,
+    `  <key>Program</key><string>/usr/bin/true</string>`,
+    `  <?y --> ?>`,
+  ].join("\n"),
+);
+
+const KEY_TAG_VARIANTS: ReadonlyArray<readonly [string, string]> = [
+  ["a space inside the opening tag", `  <key >Program</key><string>/usr/bin/true</string>`],
+  ["a newline inside the closing tag", `  <key>Program</key\n><string>/usr/bin/true</string>`],
+  ["an attribute on the opening tag", `  <key a="b">Program</key><string>/usr/bin/true</string>`],
+];
+
+test("release", "a processing instruction that holds comment markers cannot hide a Program key", () => {
+  assertNeverRead(PI_HIDING_COMMENT, "a Program key between processing instructions");
+  assert(!readJobPlist(PI_HIDING_COMMENT, noPlistParser).ok, "the fallback reader accepted it");
+  if (!havePlutil()) {
+    process.stdout.write("      (plutil is not available: skipped the check that plutil sees the Program key)\n");
+    return;
+  }
+  const seen = plutilJson(PI_HIDING_COMMENT);
+  assert(seen !== null && seen.includes('"Program"'), `the control is broken, plutil does not see a Program key: ${seen}`);
+  const read = readJobPlist(PI_HIDING_COMMENT);
+  assert(!read.ok && read.reason.includes("Program key"), `plutil's verdict was not a Program refusal: ${JSON.stringify(read)}`);
+});
+
+test("release", "a key tag with whitespace or an attribute cannot hide a Program key", () => {
+  for (const [what, key] of KEY_TAG_VARIANTS) {
+    const xml = jobPlistEnding(key);
+    assertNeverRead(xml, what);
+    assert(!readJobPlist(xml, noPlistParser).ok, `${what}: the fallback reader accepted it`);
+    if (!havePlutil()) continue;
+    const seen = plutilJson(xml);
+    assert(seen !== null && seen.includes('"Program"'), `${what}: plutil does not see a Program key: ${seen}`);
+    const read = readJobPlist(xml);
+    assert(!read.ok && read.reason.includes("Program key"), `${what}: plutil's verdict was ${JSON.stringify(read)}`);
+  }
+  if (!havePlutil()) {
+    process.stdout.write("      (plutil is not available: skipped the check that plutil sees the Program key)\n");
+  }
+});
+
+test("release", "where plutil exists its verdict decides, and a rewrite that changes nothing launchd runs is refused", () => {
+  if (!havePlutil()) {
+    process.stdout.write("      (plutil is not available: skipped the plutil verdict and rewrite checks)\n");
+    return;
+  }
+  // Two ProgramArguments: plutil keeps the last, the shipped script, so the
+  // plist is a bare job. The text reader refuses two keys outright.
+  const first = [
+    `  <key>ProgramArguments</key>`,
+    `  <array><string>/bin/sh</string><string>-lc</string><string>echo first</string></array>`,
+  ].join("\n");
+  const twice = jobPlistXml(BARE_SCRIPT).replace("  <key>ProgramArguments</key>", `${first}\n  <key>ProgramArguments</key>`);
+  assert(!readJobPlistText(twice).ok, "the text reader accepted two ProgramArguments");
+  const read = readJobPlist(twice);
+  assert(read.ok && read.form === "bare", `plutil's last-key-wins reading was not taken: ${JSON.stringify(read)}`);
+  // The splice would rewrite the first block; plutil, reading the rewrite, still
+  // sees the last one unchanged. The rewrite is checked, not the input.
+  let said = "";
+  try {
+    pinJobPlist(twice);
+  } catch (e) {
+    said = e instanceof Error ? e.message : String(e);
+  }
+  assert(said.includes("did not change the script launchd will run"), `pin rewrote a plist whose live script it did not change: "${said}"`);
+
+  // Valid, and equal to the shipped script, but not in the plain form the
+  // splice can rewrite: accepted by the reader, refused by the rewrite.
+  const cdata = jobPlistXml(`<![CDATA[${BARE_SCRIPT}]]>`);
+  const readCdata = readJobPlist(cdata);
+  assert(readCdata.ok && readCdata.form === "bare", `plutil's reading of a CDATA script: ${JSON.stringify(readCdata)}`);
+  let cdataSaid = "";
+  try {
+    pinJobPlist(cdata);
+  } catch (e) {
+    cdataSaid = e instanceof Error ? e.message : String(e);
+  }
+  assert(cdataSaid.includes("not in the plain form"), `pin did not explain why it could not rewrite: "${cdataSaid}"`);
+
+  // plutil's refusal is final. This plist is one the text reader would accept
+  // (a <data> value is just XML to it) and plutil cannot convert, so a pin that
+  // trusted the text over plutil would rewrite a file launchd may read differently.
+  const withData = jobPlistEnding("  <key>X</key>\n  <data>AAAA</data>");
+  assert(readJobPlistText(withData).ok, "the control is broken: the text reader refuses a plist with a data value");
+  const refusedData = readJobPlist(withData);
+  assert(!refusedData.ok && refusedData.reason.startsWith("plutil"), `plutil's refusal was not final: ${JSON.stringify(refusedData)}`);
+});
+
+test("release", "without plutil the text reader still reads and rewrites the shipped plist", () => {
+  const bare = jobPlistXml(BARE_SCRIPT);
+  const read = readJobPlist(bare, noPlistParser);
+  assert(read.ok && read.form === "bare", JSON.stringify(read));
+  const pinned = pinJobPlist(bare, noPlistParser);
+  const again = readJobPlist(pinned, noPlistParser);
+  assert(again.ok && again.form === "pinned", JSON.stringify(again));
+  assert(pinned.replace(PINNED_SCRIPT, "SCRIPT") === bare.replace(BARE_SCRIPT, "SCRIPT"), "pinning changed more than the script");
+  // plutil, where there is one, agrees about the same files.
+  if (havePlutil()) {
+    const a = readJobPlist(bare);
+    const b = readJobPlist(pinned);
+    assert(a.ok && a.form === "bare" && b.ok && b.form === "pinned", `plutil disagrees: ${JSON.stringify([a, b])}`);
+  }
+});
+
+test("release", "an http(s) origin the URL parser rejects is refused, not waved through, and never echoed", () => {
+  withReleaseFixture((fx) => {
+    // Assembled here so no literal credential sits in this file.
+    const secret = ["hunter", "2"].join("");
+    for (const url of [
+      `https://u:${secret}@host:99999/x`, // port out of range
+      `https://u:p#${secret}@host/x`, // a fragment hides the host from the parser
+      `HTTP://u:${secret}@[bad/x`, // unterminated IPv6 literal, scheme in capitals
+    ]) {
+      assert(originCredentialRefusal(url) !== null, `a rejected http(s) URL passed the check: ${url.replace(secret, "<s>")}`);
+      fixtureGit(fx.source, ["config", "remote.origin.url", url]);
+      const r = pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir });
+      assert(!r.ok && r.reason.includes("could not be parsed"), JSON.stringify(r));
+      assert(!r.reason.includes(secret) && !r.reason.includes("host"), "the refusal echoed the URL");
+      assert(!existsSync(dirname(fx.releaseDir)), "a refused pin created a directory");
+    }
+    // Not http(s): scp-like and ssh origins still go through to git.
+    for (const url of ["ssh://git@host:99999/x", "git@host:org/r.git", "ftp://u:p@host:99999/x"]) {
+      assert(originCredentialRefusal(url) === null, `${url} was refused`);
+    }
+  });
+});
+
+test("release", "a plist write that fails is a refusal, not a crash, and leaves the plist and no temp file", () => {
+  withReleaseFixture((fx) => {
+    const canTestPermissions = (process.getuid?.() ?? 0) !== 0;
+    assert(canTestPermissions, "this test needs a non-root user: root writes into a 0555 directory");
+    const bare = jobPlistXml(BARE_SCRIPT);
+    writePlistFile(fx.plistPath, bare);
+    // The release is already pinned, so pinRelease reaches pinAgent with a bare plist to rewrite.
+    assert(pinCheckout({ tag: "v1", sourceRoot: fx.source, releaseDir: fx.releaseDir }).ok, "v1 refused");
+    const plistDir = dirname(fx.plistPath);
+    const lc = fakeLaunchctl({ loaded: true });
+    let r: PinOutcome = { code: 0, out: [], err: [] };
+    let threw = "";
+    chmodSync(plistDir, 0o555);
+    try {
+      try {
+        r = pinRelease(pinOpts(fx, "v1", lc.run));
+      } catch (e) {
+        threw = e instanceof Error ? e.message : String(e);
+      }
+    } finally {
+      chmodSync(plistDir, 0o755);
+    }
+    assert(threw === "", `pinRelease threw: ${threw}`);
+    assert(r.code === 1, JSON.stringify(r));
+    assert(
+      r.err.some((l) => l.startsWith(`chamber pin: could not write ${fx.plistPath}: `) && l.includes("the job was not changed")),
+      r.err.join("\n"),
+    );
+    assert(readFileSync(fx.plistPath, "utf8") === bare, "the plist changed");
+    const stray = readdirSync(plistDir).filter((name) => name.includes(".tmp-"));
+    assert(stray.length === 0, `a temp file was left behind: ${stray.join(", ")}`);
+    assert(lc.calls.length === 0, `launchctl was called after a failed write: ${lc.calls.join(" | ")}`);
+  });
+});
+
+// ─── daily snapshot: release checkout, exit status, plist ───────────────────
+
+/**
+ * Run scripts/daily-snapshot.sh in a throwaway HOME and return the report it
+ * wrote. CHAMBER_REPO names a directory that does not exist, so the script's
+ * Gates section stops at its `cd` and the run needs no test suite and no
+ * probes. A `chamber` that announces itself is first on PATH, so a report that
+ * contains its output was produced by the development command.
+ */
+function runSnapshot(
+  home: string,
+  release: { verifyExit: number; tag?: string; ledger?: boolean } | null,
+  withDevCheckout = false,
+): string {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const bin = join(home, "bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "chamber"), '#!/bin/sh\necho "DEV CHAMBER CALLED: $*"\nexit 7\n');
+  chmodSync(join(bin, "chamber"), 0o755);
+  if (release !== null) {
+    const dir = join(home, ".local", "share", "chamber-release", "bin");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "chamber.js"),
+      [
+        "const cmd = process.argv[2];",
+        'if (cmd === "verify") {',
+        '  console.log("3 belief(s) checked, 1 with no verified support left, 0 with some support lost");',
+        `  process.exit(${release.verifyExit});`,
+        "}",
+        'if (cmd === "corpus") console.log("corpus from the release checkout");',
+        "",
+      ].join("\n"),
+    );
+    if (release.ledger === true) {
+      // Stand-ins for the two modules the Ledger section imports. They announce
+      // themselves, so a Ledger that ran this code can be told from one that ran
+      // any other.
+      const src = join(home, ".local", "share", "chamber-release", "src");
+      mkdirSync(src, { recursive: true });
+      writeFileSync(
+        join(src, "db.ts"),
+        [
+          "export function openChamberDb(path: string) {",
+          '  console.log("ledger code: release, opened " + path);',
+          "  return { prepare: () => ({ get: () => ({ c: 7 }) }) };",
+          "}",
+          "",
+        ].join("\n"),
+      );
+      writeFileSync(
+        join(src, "audit.ts"),
+        'export function verifyAuditChain() { return { ok: true, from: "release" }; }\n',
+      );
+    }
+    if (release.tag !== undefined) {
+      // The release checkout is a git clone that `chamber pin` checked out at a
+      // tag. Built with plumbing, like every fixture repo here.
+      const checkout = join(home, ".local", "share", "chamber-release");
+      fixtureGit(checkout, ["init", "--quiet"]);
+      const sha = fixtureCommit(checkout, { "README.md": "release\n" }, "release");
+      fixtureGit(checkout, ["update-ref", "HEAD", sha]);
+      fixtureGit(checkout, ["tag", release.tag, sha]);
+    }
+  }
+  const devRepo = join(home, "no-dev-checkout");
+  if (withDevCheckout) {
+    // A development checkout that exists, whose database modules leave a mark
+    // if anything imports them. npm, npx and timeout are stand-ins too, so the
+    // Gates section neither runs the suite nor reaches for the network.
+    mkdirSync(join(devRepo, "src"), { recursive: true });
+    writeFileSync(
+      join(devRepo, "src", "db.ts"),
+      [
+        'import { writeFileSync } from "node:fs";',
+        "export function openChamberDb(path: string) {",
+        '  writeFileSync(process.env.HOME + "/DEV_DB_OPENED", path);',
+        "  return { prepare: () => ({ get: () => ({ c: 1 }) }) };",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(devRepo, "src", "audit.ts"), "export function verifyAuditChain() { return { ok: true, from: \"dev\" }; }\n");
+    for (const name of ["npm", "npx", "timeout"]) {
+      writeFileSync(join(bin, name), "#!/bin/sh\nexit 0\n");
+      chmodSync(join(bin, name), 0o755);
+    }
+  }
+  const r = spawnSync("sh", [join(root, "scripts", "daily-snapshot.sh")], {
+    encoding: "utf8",
+    timeout: 60_000,
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      HOME: home,
+      CHAMBER_REPO: devRepo,
+      CHAMBER_REPORT_DIR: join(home, "reports"),
+    },
+  });
+  assert(r.error === undefined, `the script did not run: ${r.error}`);
+  const day = spawnSync("date", ["+%Y-%m-%d"], { encoding: "utf8" }).stdout.trim();
+  return readFileSync(join(home, "reports", `${day}.md`), "utf8");
+}
+
+test("release", "the daily snapshot records verify's own exit status from the release checkout", () => {
+  const home = mkdtempSync(join(tmpdir(), "chamber-snapshot-"));
+  try {
+    const report = runSnapshot(home, { verifyExit: 1, tag: "v9.9.9" });
+    assert(report.includes("3 belief(s) checked, 1 with no verified support left"), report);
+    assert(report.includes("corpus from the release checkout"), "the Corpus section did not run the release checkout");
+    assert(/^verify exit code: 1$/m.test(report), `the report must carry verify's exit status (1):\n${report}`);
+    assert(/^release: v9\.9\.9$/m.test(report), `the report must name the release that ran:\n${report}`);
+    assert(!report.includes("DEV CHAMBER CALLED"), "the report ran the chamber on PATH");
+    assert(!report.includes("release checkout missing"), "the release checkout was there");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("release", "the daily snapshot says the release checkout is missing instead of calling the dev chamber", () => {
+  const home = mkdtempSync(join(tmpdir(), "chamber-snapshot-"));
+  try {
+    const report = runSnapshot(home, null);
+    const said = report.split("release checkout missing: run chamber pin <tag>").length - 1;
+    assert(said === 3, `expected the message in the Drift, Corpus and Ledger sections, found it ${said} times:\n${report}`);
+    assert(/^verify exit code: n\/a$/m.test(report), `no exit status to report:\n${report}`);
+    assert(/^release: none$/m.test(report), `no release ran, and the report must say so:\n${report}`);
+    assert(!report.includes("DEV CHAMBER CALLED"), "the report ran the chamber on PATH");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("release", "the daily snapshot's Ledger opens the database with the release checkout's code, never the development checkout's", () => {
+  const home = mkdtempSync(join(tmpdir(), "chamber-snapshot-"));
+  try {
+    // Both checkouts have a src/db.ts. Only the release's may open the live file.
+    const report = runSnapshot(home, { verifyExit: 0, ledger: true }, true);
+    const live = join(home, ".local", "share", "chamber", "chamber.sqlite");
+    assert(report.includes(`ledger code: release, opened ${live}`), `the Ledger did not open the live database with the release's code:\n${report}`);
+    assert(/^beliefs \(total\)\s+7$/m.test(report), `the Ledger counts did not come from the release's database handle:\n${report}`);
+    assert(report.includes('"from":"release"'), `the audit chain was not verified by the release's code:\n${report}`);
+    assert(!existsSync(join(home, "DEV_DB_OPENED")), "the development checkout's src/db.ts opened the database");
+    assert(!report.includes('"from":"dev"'), "the development checkout's audit code ran");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("release", "the daily snapshot does not take the release name from a repository around HOME", () => {
+  const home = mkdtempSync(join(tmpdir(), "chamber-snapshot-"));
+  try {
+    // HOME itself is a tagged git repository, and the release checkout under
+    // it has chamber.js but no .git. Git run from the checkout would walk up
+    // and answer with HOME's tag.
+    fixtureGit(home, ["init", "--quiet"]);
+    const sha = fixtureCommit(home, { "README.md": "home\n" }, "home");
+    fixtureGit(home, ["update-ref", "HEAD", sha]);
+    fixtureGit(home, ["tag", "vHOME", sha]);
+    const report = runSnapshot(home, { verifyExit: 0 });
+    assert(/^release: unknown$/m.test(report), `a checkout without .git has no known release:\n${report}`);
+    assert(!report.includes("vHOME"), `the report named the tag of the repository around HOME:\n${report}`);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("release", "the daily snapshot has no stale labels, and its plist runs the release checkout's copy", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const script = readFileSync(join(root, "scripts", "daily-snapshot.sh"), "utf8");
+  assert(!script.includes("known-failing"), "a stale known-failing label is back");
+  const plist = readFileSync(join(root, "deploy", "launchd", "com.chamber.daily-snapshot.plist"), "utf8");
+  assert(
+    plist.includes("<string>$HOME/.local/share/chamber-release/scripts/daily-snapshot.sh</string>"),
+    "the plist does not run the release checkout's copy of the script",
+  );
+  assert(!plist.includes("Projects/chamber/scripts"), "the plist still names the development checkout");
+});
+
+test("config", "the docs agree with the code: limitation count, sandbox claims, backup pointer, verify samples", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const read = (...parts: string[]): string => readFileSync(join(root, ...parts), "utf8");
+
+  // README states how many limitations the file documents.
+  const limits = read("docs", "KNOWN_LIMITATIONS.md");
+  const entries = (limits.match(/^## /gm) ?? []).length;
+  const words = [
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
+    "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "twenty-one",
+    "twenty-two", "twenty-three", "twenty-four", "twenty-five", "twenty-six", "twenty-seven", "twenty-eight",
+    "twenty-nine", "thirty",
+  ];
+  const readme = read("README.md");
+  const said = /([A-Za-z]+(?:-[a-z]+)?) limitations are documented there/.exec(readme);
+  assert(said !== null, "README no longer says how many limitations are documented");
+  assert(
+    words.indexOf(said[1]!.toLowerCase()) === entries,
+    `README says "${said[1]}" limitations; docs/KNOWN_LIMITATIONS.md has ${entries} entries`,
+  );
+
+  // The sandbox is described as it is in src/sandbox.ts, everywhere it was described.
+  assert(!limits.includes("## 1. The sandbox does not isolate"), "entry 1 still has the old title");
+  const entry1 = limits.slice(limits.indexOf("\n## 1. "), limits.indexOf("\n## 2. "));
+  assert(entry1.length > 0, "KNOWN_LIMITATIONS has no entry 1 followed by an entry 2");
+  for (const needle of ["probes/sandbox_confines.ts", "ISOLATING_BACKENDS", "CHAMBER_SANDBOX_REQUIRED=0"]) {
+    assert(entry1.includes(needle), `entry 1 does not mention ${needle}`);
+  }
+  // The command is `tool-synth` (src/cli.ts); a doc that names another one sends the reader nowhere.
+  assert(read("src", "cli.ts").includes('case "tool-synth":'), "the CLI no longer has tool-synth; update this test");
+  for (const doc of [limits, readme, read("deploy", "SCHEDULING.md"), read("docs", "BACKUP.md")]) {
+    assert(!doc.includes("tool synth"), "a doc names `chamber tool synth`; the command is `tool-synth`");
+  }
+  assert(!readme.includes("does not fail closed"), "README still says CHAMBER_SANDBOX_REQUIRED does not fail closed");
+  assert(read("benchmarks", "BENCHMARK.md").includes("As of 2026-08-02 the sandbox did not isolate"), "BENCHMARK T1 row lost its date");
+  assert(!limits.includes("one was closed in deploy: `src/checkpoint_export.ts`"), "entry 3 still claims a scheduled export");
+
+  // Backups.
+  const pilot = read("deploy", "PILOT.md");
+  assert(!pilot.includes("cp chamber.sqlite chamber.sqlite.bak"), "PILOT.md still tells the operator to cp the database");
+  assert(pilot.includes("docs/BACKUP.md"), "PILOT.md does not point at docs/BACKUP.md");
+  const backup = read("docs", "BACKUP.md");
+  for (const needle of [
+    ".backup", "VACUUM INTO", "-wal", "-shm", "chamber config show", "chamber verify", "chamber checkpoint verify", "chmod 600",
+    // Restore must stop every process that opens the database, then prove none does.
+    "chamber-slack.service", "chamber-discord.service", "com.chamber.daily-snapshot.plist", "chamber mcp", 'lsof "$DB"',
+    // A backup leaks what the database holds, and its tokens open only under the key it does not hold.
+    "OAuth tokens", "CHAMBER_TOKEN_KEY", "CHAMBER_ALLOW_PLAINTEXT_SECRETS=1",
+  ]) {
+    assert(backup.includes(needle), `docs/BACKUP.md does not mention ${needle}`);
+  }
+
+  // Scheduling: samples as verify prints them now, and the two operator notes.
+  const sched = read("deploy", "SCHEDULING.md");
+  for (const line of sched.split("\n").filter((l) => l.includes("belief(s) checked"))) {
+    assert(line.endsWith("with some support lost"), `a sample verify line is missing the last count: ${line}`);
+  }
+  assert((sched.match(/^=== verify exit \d ===$/gm) ?? []).length >= 3, "the samples do not end with the job's exit line");
+  assert((sched.match(/^ {2}database = .*\[from default\]$/gm) ?? []).length >= 3, "the samples do not show the database line");
+  const schedFlat = sched.replace(/\s+/g, " ");
+  assert(schedFlat.includes("not over SSH") && schedFlat.includes("`unload` stops the job"), "the pin notes are missing");
+  // What pin does besides the checkout: the refusals it makes, the run proof, and what a failed proof leaves.
+  for (const needle of ["`Program` key", "username or password", "`node bin/chamber.js --version`", "throwaway clone"]) {
+    assert(schedFlat.includes(needle), `SCHEDULING.md does not describe pin's ${needle}`);
+  }
+  // Pin tries the release before it moves the checkout. The earlier text said it
+  // moved first and put the checkout back, which left a window nobody was told about.
+  const changelogFlat = read("CHANGELOG.md").replace(/\s+/g, " ");
+  assert(!schedFlat.includes("puts the checkout back"), "SCHEDULING.md still says pin puts the checkout back");
+  assert(!changelogFlat.includes("puts the checkout back"), "CHANGELOG.md still says pin puts the checkout back");
+  assert(changelogFlat.includes("throwaway clone"), "CHANGELOG.md does not say where pin tries the release");
+  // What is still open is named: the move itself, the repair, and the scratch clone of a killed pin.
+  for (const needle of ["neither the old release nor the new one", "checkout --force --detach <tag>", "chamber-pin-proof-"]) {
+    assert(schedFlat.includes(needle), `SCHEDULING.md does not name what is still open after the proof: ${needle}`);
+  }
+  assert(sched.includes("This takes effect for a release tag that contains this script"), "the daily-snapshot effective-date note is missing");
+  assert(sched.includes("`release: <tag>`"), "the daily-snapshot section does not mention the release line");
+
+  // Entry 13 is a claim about what the scheduled job's log shows. It went stale
+  // when the job began to log the database line and verify's exit status, and
+  // nothing noticed, so it is checked against the script that prints them.
+  assert(
+    BARE_SCRIPT.includes("config show 2>/dev/null | grep database") && BARE_SCRIPT.includes("=== verify exit $rc ==="),
+    "the job script no longer logs the database line and verify's exit status; rewrite KNOWN_LIMITATIONS entry 13",
+  );
+  assert(
+    read("src", "cli.ts").includes("JSON.stringify({ database: resolvedDbPath, ...vr }"),
+    "verify --json no longer prints the database; rewrite KNOWN_LIMITATIONS entry 13",
+  );
+  const entry13 = limits.slice(limits.indexOf("\n## 13. "), limits.indexOf("\n## 14. "));
+  assert(entry13.length > 0, "KNOWN_LIMITATIONS has no entry 13 followed by an entry 14");
+  const entry13Flat = entry13.replace(/\s+/g, " ");
+  for (const stale of ["names neither its database nor its exit status", "does not echo it", "states the path nowhere"]) {
+    assert(!entry13Flat.includes(stale), `entry 13 still says: "${stale}"`);
+  }
+  for (const needle of ["=== verify exit N ===", "config show", "!! ingest FAILED", "verify --json"]) {
+    assert(entry13Flat.includes(needle), `entry 13 does not mention ${needle}`);
+  }
+  // Line numbers rot: the ones this entry had pointed at a different function.
+  assert(!/src\/cli\.ts:\d/.test(entry13), "entry 13 cites src/cli.ts by line number");
+  assert(
+    schedFlat.includes("Ledger section opens the live database with that checkout's `src/db.ts`"),
+    "the daily-snapshot section does not say which code opens the database",
+  );
+});
+
+// ─── fix wave 5: the precheck rehearses the rewrite, the rewrite fails closed, the fallback reads one prolog ───
+
+/**
+ * Job plists the reader accepts as the bare job but that pin's text splice cannot
+ * rewrite in place. `said` is the part of pin's own refusal that names why.
+ */
+function unrewritablePlists(): ReadonlyArray<{ what: string; xml: string; said: string }> {
+  const firstBlock = [
+    `  <key>ProgramArguments</key>`,
+    `  <array><string>/bin/sh</string><string>-lc</string><string>echo first</string></array>`,
+  ].join("\n");
+  return [
+    { what: "a script in CDATA", xml: jobPlistXml(`<![CDATA[${BARE_SCRIPT}]]>`), said: "plain form" },
+    {
+      what: "a JSON plist",
+      xml: JSON.stringify({ Label: JOB_LABEL, ProgramArguments: ["/bin/sh", "-lc", BARE_SCRIPT] }),
+      said: "plain form",
+    },
+    {
+      what: "two ProgramArguments, the last one the shipped script",
+      xml: jobPlistXml(BARE_SCRIPT).replace("  <key>ProgramArguments</key>", `${firstBlock}\n  <key>ProgramArguments</key>`),
+      said: "did not change the script launchd will run",
+    },
+  ];
+}
+
+test("release", "a plist pin can read but not rewrite is refused before the fetch and the move", () => {
+  for (const { what, xml, said } of unrewritablePlists()) {
+    withReleaseFixture((fx) => {
+      assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, `${what}: the first pin failed`);
+      writePlistFile(fx.plistPath, xml);
+      const work = join(fx.root, "work");
+      const lc = fakeLaunchctl({ loaded: true });
+      const r = pinRelease({ ...pinOpts(fx, "v2", lc.run), workDir: work });
+      assert(r.code === 1, `${what}: pin went ahead: ${r.out.join(" | ")}`);
+      assert(
+        r.err.some((l) => l.includes(fx.plistPath) && l.endsWith("Nothing was moved.")),
+        `${what}: the refusal did not say nothing was moved:\n${r.err.join("\n")}`,
+      );
+      if (havePlutil()) {
+        // The control: the reader alone accepts this plist, so it is the rehearsal
+        // of the rewrite that refused it, and it says why.
+        const read = readJobPlist(xml);
+        assert(read.ok && read.form === "bare", `${what}: the reader no longer accepts it, so this proves nothing: ${JSON.stringify(read)}`);
+        assert(r.err.some((l) => l.includes(said)), `${what}: the refusal does not say why ("${said}"):\n${r.err.join("\n")}`);
+      }
+      assert(headOf(fx.releaseDir) === fx.v1, `${what}: the checkout moved`);
+      assert(readFileSync(join(fx.releaseDir, "README.md"), "utf8") === "one\n", `${what}: the working tree changed`);
+      assert(!existsSync(join(fx.releaseDir, "CHANGES.md")), `${what}: v2's file is on disk`);
+      assert(readFileSync(fx.plistPath, "utf8") === xml, `${what}: the plist was rewritten`);
+      assert(lc.calls.length === 0, `${what}: launchctl was called: ${lc.calls.join(" | ")}`);
+      assert(!existsSync(work), `${what}: a release was tried before the plist was refused`);
+    });
+  }
+  if (!havePlutil()) {
+    process.stdout.write("      (plutil is not available: the reader refuses these shapes itself, so this run did not exercise the rehearsal)\n");
+  }
+});
+
+test("release", "a rewrite the parser cannot compare with the original is refused", () => {
+  const bare = jobPlistXml(BARE_SCRIPT);
+  const dictWith = (script: string): PlistParse => ({
+    kind: "parsed",
+    value: { Label: JOB_LABEL, ProgramArguments: ["/bin/sh", "-lc", script] },
+  });
+  const gone: PlistParse = { kind: "unavailable" };
+  // A parser with one answer for the original text and another for anything else.
+  const answering = (original: PlistParse, rewrite: PlistParse): PlistParser => (xml) => (xml === bare ? original : rewrite);
+  const refusal = (parse: PlistParser): string => {
+    try {
+      pinJobPlist(bare, parse);
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+    return "";
+  };
+  // Parsed before, gone after; gone before, parsed after. Neither shows that only
+  // the script changed, so neither may be written.
+  const half1 = refusal(answering(dictWith(BARE_SCRIPT), gone));
+  assert(half1.includes("cannot be compared"), `a rewrite the parser would not parse was written: "${half1}"`);
+  const half2 = refusal(answering(gone, dictWith(PINNED_SCRIPT)));
+  assert(half2.includes("cannot be compared"), `an original the parser would not parse was written over: "${half2}"`);
+  // Controls: two parses that agree, and no parser at all (Linux, CI), still write.
+  assert(refusal(answering(dictWith(BARE_SCRIPT), dictWith(PINNED_SCRIPT))) === "", "two matching parses were refused");
+  assert(pinJobPlist(bare, answering(gone, gone)) === pinJobPlist(bare, noPlistParser), "no parser at all no longer falls back to the text reader");
+});
+
+test("release", "pinJobPlist parses the original once and the rewrite once", () => {
+  const bare = jobPlistXml(BARE_SCRIPT);
+  let parses = 0;
+  const counting: PlistParser = (xml) => {
+    parses += 1;
+    return plutilParser(xml);
+  };
+  pinJobPlist(bare, counting);
+  assert(parses === 2, `pinJobPlist parsed ${parses} times, not once for the original and once for the rewrite`);
+  parses = 0;
+  readJobPlist(bare, counting);
+  assert(parses === 1, `readJobPlist parsed ${parses} times`);
+});
+
+test("release", "the text reader reads one prolog, the shipped one, and nothing else", () => {
+  assert(
+    pinApi.SHIPPED_PROLOG === FIXTURE_PROLOG,
+    "SHIPPED_PROLOG is not the first three lines of deploy/launchd/com.chamber.verify.plist",
+  );
+  const template = readJobPlist(SHIPPED_PLIST_TEXT, noPlistParser);
+  assert(template.ok && template.form === "pinned", `the shipped plist does not read without plutil: ${JSON.stringify(template)}`);
+  const bare = jobPlistXml(BARE_SCRIPT);
+  assert(readJobPlistText(bare).ok, "the fixture does not read");
+  const body = bare.slice(FIXTURE_PROLOG.length);
+  const others: ReadonlyArray<readonly [string, string]> = [
+    ["no prolog at all", body.replace(/^\n/, "")],
+    ["a blank line before the declaration", `\n${bare}`],
+    ["no DOCTYPE", `<?xml version="1.0" encoding="UTF-8"?>${body}`],
+    // What Apple's own tools write.
+    ["the DOCTYPE on one line", FIXTURE_PROLOG.replace('EN"\n  "http', 'EN" "http') + body],
+    ["another encoding", FIXTURE_PROLOG.replace("UTF-8", "UTF-16") + body],
+    ["a second declaration", `${FIXTURE_PROLOG}\n<?xml version="1.0"?>${body}`],
+  ];
+  for (const [what, xml] of others) {
+    assert(xml !== bare, `${what}: the variant is the fixture, so it proves nothing`);
+    const read = readJobPlistText(xml);
+    assert(!read.ok && read.reason.startsWith(HIDDEN_XML_REASON), `${what} was read: ${JSON.stringify(read)}`);
+    assert(!readJobPlist(xml, noPlistParser).ok, `${what}: the fallback reader accepted it`);
+  }
+});
+
+// A Program key placed so that a comment opened in the prolog is closed after it.
+const HIDING_PROGRAM = [`  <key>Program</key><string>/usr/bin/true</string>`, `  <!-- closes what the prolog opened -->`].join("\n");
+
+/** The shipped prolog with one comment opener put into the declaration or the DOCTYPE. */
+function prologShapes(): ReadonlyArray<readonly [string, string]> {
+  const swap = (from: string, to: string): string => {
+    const prolog = FIXTURE_PROLOG.replace(from, to);
+    assert(prolog !== FIXTURE_PROLOG, `the prolog has no "${from}" to change`);
+    return prolog;
+  };
+  return [
+    ["an XML declaration that opens a comment", swap('encoding="UTF-8"?>', 'encoding="UTF-8" <!-- ?>')],
+    ["a DOCTYPE public id that ends in a comment opener", swap('1.0//EN"', '1.0//EN<!--"')],
+    ["a DOCTYPE system id that ends in a comment opener", swap('.dtd">', '.dtd<!--">')],
+  ];
+}
+
+function plistWithProlog(prolog: string): string {
+  return prolog + jobPlistWith(HIDING_PROGRAM).slice(FIXTURE_PROLOG.length);
+}
+
+test("release", "a comment opened in the XML declaration or the DOCTYPE cannot hide a Program key", () => {
+  for (const [what, prolog] of prologShapes()) {
+    const xml = plistWithProlog(prolog);
+    assertNeverRead(xml, what);
+    assert(!readJobPlist(xml, noPlistParser).ok, `${what}: the fallback reader accepted it`);
+    if (!havePlutil()) continue;
+    const seen = plutilJson(xml);
+    assert(seen !== null && seen.includes('"Program"'), `${what}: the control is broken, plutil does not see a Program key: ${seen}`);
+    const read = readJobPlist(xml);
+    assert(!read.ok && read.reason.includes("Program key"), `${what}: plutil's verdict was ${JSON.stringify(read)}`);
+  }
+  if (!havePlutil()) {
+    process.stdout.write("      (plutil is not available: skipped the check that plutil sees the Program key)\n");
+  }
+});
+
+test("release", "plutil is run by absolute path, so a plutil earlier on PATH is never asked", () => {
+  assert(pinApi.PLUTIL_PATH === "/usr/bin/plutil", `PLUTIL_PATH is ${pinApi.PLUTIL_PATH}`);
+  withReleaseFixture((fx) => {
+    const bin = join(fx.root, "fakebin");
+    mkdirSync(bin);
+    const marker = join(fx.root, "fake-plutil-ran");
+    const fake = join(bin, "plutil");
+    writeFileSync(fake, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\necho '{}'\n`);
+    chmodSync(fake, 0o755);
+    const hijacked = `${bin}:${process.env.PATH ?? ""}`;
+    // The control: asked for by name, with that PATH, the fake is what runs.
+    spawnSync("plutil", [], { env: { ...process.env, PATH: hijacked } });
+    assert(existsSync(marker), "the control is broken: the fake plutil does not run when it is asked for by name");
+    rmSync(marker);
+    const saved = process.env.PATH;
+    process.env.PATH = hijacked;
+    let answer: PlistParse;
+    try {
+      answer = plutilParser(jobPlistXml(BARE_SCRIPT));
+    } finally {
+      if (saved === undefined) delete process.env.PATH;
+      else process.env.PATH = saved;
+    }
+    assert(!existsSync(marker), "a plutil found on PATH was run");
+    if (havePlutil()) {
+      assert(answer.kind === "parsed" && JSON.stringify(answer.value).includes("ProgramArguments"), `the real plutil did not answer: ${JSON.stringify(answer)}`);
+    }
+  });
+});
+
+test("release", "where plutil is missing the parser says so and the text reader decides, whatever this machine has", () => {
+  const missing = pinApi.plutilParserAt(join(tmpdir(), `chamber-no-such-dir-${process.pid}`, "plutil"));
+  assert(missing("<plist/>").kind === "unavailable", "a plutil that is not there was not reported as unavailable");
+  const bare = jobPlistXml(BARE_SCRIPT);
+  const read = readJobPlist(bare, missing);
+  assert(read.ok && read.form === "bare", JSON.stringify(read));
+  const pinned = pinJobPlist(bare, missing);
+  const again = readJobPlist(pinned, missing);
+  assert(again.ok && again.form === "pinned", JSON.stringify(again));
+  assert(pinned.replace(PINNED_SCRIPT, "SCRIPT") === bare.replace(BARE_SCRIPT, "SCRIPT"), "pinning changed more than the script");
+  // The shapes plutil sees a Program key in are refused without it.
+  const shapes: ReadonlyArray<readonly [string, string]> = [
+    ["a processing instruction that holds comment markers", PI_HIDING_COMMENT],
+    ...prologShapes().map(([what, prolog]): readonly [string, string] => [what, plistWithProlog(prolog)]),
+  ];
+  for (const [what, xml] of shapes) {
+    assert(!readJobPlist(xml, missing).ok, `${what}: accepted when plutil is missing`);
+  }
+});
+
+test("release", "a throwaway clone that cannot be removed neither replaces the result nor skips the first-pin cleanup", () => {
+  if (process.getuid?.() === 0) {
+    process.stdout.write("      (running as root, which ignores file modes: skipped the check with a clone that cannot be removed)\n");
+    return;
+  }
+  withReleaseFixture((fx) => {
+    const work = join(fx.root, "work");
+    // A tag whose bin locks a directory inside its own clone, then ends as `ending` says.
+    const addLockTag = (name: string, ending: string): void => {
+      const body = [
+        'const fs = require("node:fs");',
+        'const path = require("node:path");',
+        'const dir = path.join(__dirname, "locked");',
+        "fs.mkdirSync(dir);",
+        'fs.writeFileSync(path.join(dir, "keep"), "x");',
+        "fs.chmodSync(dir, 0);",
+        ending,
+        "",
+      ].join("\n");
+      const sha = fixtureCommit(fx.origin, { ...releaseTree(name, "1.0.6", body), "README.md": `${name}\n` }, name, fx.v2);
+      fixtureGit(fx.origin, ["tag", name, sha]);
+    };
+    const leftovers = (): string[] => (existsSync(work) ? readdirSync(work).map((e) => join(work, e)) : []);
+    const unlock = (): void => {
+      for (const scratch of leftovers()) {
+        const locked = join(scratch, "release", "bin", "locked");
+        if (existsSync(locked)) chmodSync(locked, 0o755);
+      }
+    };
+    try {
+      addLockTag("lockfail", "process.exit(1);");
+      addLockTag("lockpass", 'console.log("1.0.6");');
+
+      // A first pin whose release does not run: the refusal is the proof's, and the
+      // directory the pin made is still removed.
+      const refused = captureStderr(() =>
+        pinRelease({ ...pinOpts(fx, "lockfail", fakeLaunchctl({ loaded: false }).run), workDir: work }),
+      );
+      assert(refused.value.code === 1 && refused.value.err.some((l) => l.includes("exited 1")), `the proof's refusal was replaced: ${refused.value.err.join(" | ")}`);
+      assert(!existsSync(fx.releaseDir), "a first pin that was refused left its release checkout behind");
+      const left = leftovers();
+      assert(left.length === 1, `expected one leftover clone, found ${left.length}`);
+      assert(
+        refused.stderr.includes("could not remove the throwaway clone") && refused.stderr.includes(left[0] as string),
+        `stderr does not name the directory that was left:\n${refused.stderr}`,
+      );
+      unlock();
+      rmSync(work, { recursive: true, force: true });
+
+      // A release that runs: the pin still succeeds and moves.
+      assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin of v1 failed");
+      const passed = captureStderr(() =>
+        pinRelease({ ...pinOpts(fx, "lockpass", fakeLaunchctl({ loaded: false }).run), workDir: work }),
+      );
+      assert(passed.value.code === 0, `a clone that could not be removed failed a release that ran: ${passed.value.err.join(" | ")}`);
+      assert(headOf(fx.releaseDir) === fixtureGit(fx.origin, ["rev-parse", "lockpass^{commit}"]), "the checkout did not move to the tag");
+      const leftAgain = leftovers();
+      assert(leftAgain.length === 1 && passed.stderr.includes(leftAgain[0] as string), `stderr does not name the directory that was left:\n${passed.stderr}`);
+    } finally {
+      unlock();
+    }
+  });
+});
+
+test("release", "a first pin killed while it tries the release leaves an empty git init, and the next pin finishes the job", async () => {
+  const fx = releaseFixture();
+  try {
+    const marker = addWatchTag(fx, "watchslow", "slow");
+    const work = join(fx.root, "work");
+    const driver = join(fx.root, "driver.mts");
+    writeFileSync(
+      driver,
+      [
+        `import { pinRelease } from ${JSON.stringify(new URL("../src/release_pin.ts", import.meta.url).href)};`,
+        "const [tag, sourceRoot, releaseDir, plistPath, workDir, home] = process.argv.slice(2);",
+        "const r = pinRelease({",
+        "  tag, sourceRoot, releaseDir, plistPath, workDir,",
+        '  launchctl: () => ({ status: 1, stdout: "", stderr: "" }),',
+        "  env: { ...process.env, HOME: home },",
+        "});",
+        "console.log(JSON.stringify(r));",
+        "",
+      ].join("\n"),
+    );
+    const child = spawn(
+      process.execPath,
+      ["--experimental-strip-types", driver, "watchslow", fx.source, fx.releaseDir, fx.plistPath, work, loginEnv(fx).HOME ?? ""],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let childErr = "";
+    child.stderr.on("data", (d: Buffer) => {
+      childErr += d.toString();
+    });
+    const exited = new Promise<NodeJS.Signals | null>((resolve) => {
+      child.on("exit", (_code, signal) => resolve(signal));
+    });
+    const deadline = Date.now() + 30_000;
+    while (!existsSync(marker) && Date.now() < deadline) await new Promise<void>((r) => setTimeout(r, 50));
+    assert(existsSync(marker), `the release never started: ${childErr}`);
+    child.kill("SIGINT");
+    const signal = await exited;
+    assert(signal === "SIGINT", `the pin was not stopped by the signal: ${String(signal)} ${childErr}`);
+
+    // What deploy/SCHEDULING.md and the CHANGELOG say is left: an empty git init,
+    // with origin set and the tag fetched, and no commit checked out.
+    assert(existsSync(fx.releaseDir), "a killed first pin left no release directory");
+    assert(JSON.stringify(readdirSync(fx.releaseDir)) === JSON.stringify([".git"]), `the directory holds more than .git: ${readdirSync(fx.releaseDir).join(", ")}`);
+    assert(fixtureGit(fx.releaseDir, ["remote", "get-url", "origin"]) === fx.origin, "origin is not set");
+    assert(spawnSync("git", ["-C", fx.releaseDir, "rev-parse", "--verify", "--quiet", "HEAD"]).status !== 0, "a commit is checked out");
+    assert(fixtureGit(fx.releaseDir, ["rev-parse", "--verify", "refs/tags/watchslow^{commit}"]) !== "", "the tag was not fetched");
+
+    // And the next pin accepts it and finishes the job.
+    const next = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run));
+    assert(next.code === 0, `the next pin refused the leftover directory:\n${next.err.join("\n")}`);
+    assert(headOf(fx.releaseDir) === fx.v1, "the checkout is not on v1");
+    assert(readFileSync(join(fx.releaseDir, "README.md"), "utf8") === "one\n", "the working tree is not v1's");
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test("gates", "the memory of refused-weights warnings is capped, and past the cap it warns instead of throwing", () => {
+  const cap = commitApi.MAX_ANNOUNCED_REFUSALS;
+  assert(Number.isInteger(cap) && cap >= 8 && cap <= 256, `the cap is ${String(cap)}`);
+  const memory = new Set<string>();
+  const total = cap + 10;
+  const times = (text: string): number => text.split("MiniLM weights were refused").length - 1;
+  const first = captureStderr(() => {
+    for (let i = 0; i < total; i++) commitApi.warnWeightsRefused(`refusal ${i}`, memory);
+  });
+  assert(times(first.stderr) === total, `each distinct message is warned about once, ${times(first.stderr)} of ${total} were`);
+  assert(memory.size === cap, `the memory grew to ${memory.size}, past the cap of ${cap}`);
+  // A remembered message is not repeated. One past the cap is not remembered, so
+  // it is warned about each time it occurs; nothing throws.
+  const again = captureStderr(() => {
+    commitApi.warnWeightsRefused("refusal 0", memory);
+    commitApi.warnWeightsRefused(`refusal ${total - 1}`, memory);
+  });
+  assert(times(again.stderr) === 1 && again.stderr.includes(`refusal ${total - 1}`), `unexpected repeats:\n${again.stderr}`);
+});
+
+test("config", "the pin docs say what is known about launchd's parser, what a killed first pin leaves, and what a refused commit logs", () => {
+  const flat = (...parts: string[]): string =>
+    readFileSync(fileURLToPath(new URL(`../${parts.join("/")}`, import.meta.url)), "utf8").replace(/\s+/g, " ");
+  const sched = flat("deploy", "SCHEDULING.md");
+  const changelog = flat("CHANGELOG.md");
+  const source = flat("src", "release_pin.ts");
+  // launchd's parser is not documented. The docs say "as far as we know" and
+  // name the check that is not an assumption.
+  for (const [what, text] of [["SCHEDULING.md", sched], ["CHANGELOG.md", changelog], ["src/release_pin.ts", source]] as const) {
+    assert(text.toLowerCase().includes("as far as we know"), `${what} does not hedge what launchd's parser is`);
+  }
+  assert(!sched.includes("so the plist it accepts is the plist launchd will run"), "SCHEDULING.md states launchd's parser as fact");
+  assert(!source.includes("launchd reads plists with the Core Foundation parser plutil is built on"), "release_pin.ts states launchd's parser as fact");
+  assert(sched.includes("`launchctl list com.chamber.verify`"), "SCHEDULING.md does not name launchctl list as the confirmation");
+  // What pin refuses.
+  for (const [what, text] of [["SCHEDULING.md", sched], ["CHANGELOG.md", changelog]] as const) {
+    assert(text.includes("`<data>`") && text.includes("`<date>`"), `${what} does not say a plist plutil cannot convert is refused`);
+    assert(text.includes("empty `git init`"), `${what} does not say what a killed first pin leaves`);
+  }
+  assert(changelog.includes("dry run") && changelog.includes("cannot be compared"), "CHANGELOG.md does not describe the dry run and the fail-closed comparison");
+  assert(sched.includes("before it fetches or moves anything"), "SCHEDULING.md does not say the rewrite is rehearsed before pin fetches");
+  assert(!sched.includes("Delete it; nothing else is left"), "SCHEDULING.md still says a killed pin leaves nothing else");
+  // The design spec names the reason a refused-weights commit logs and the warning.
+  const spec = flat("docs", "superpowers", "specs", "2026-10-21-supply-chain-and-pin-followups-design.md");
+  assert(spec.includes("MinilmIntegrityError") && spec.includes("per distinct message"), "the design spec does not say what a refused-weights commit logs and warns");
 });
 
 // ─── cli process smoke tests ────────────────────────────────────────────────

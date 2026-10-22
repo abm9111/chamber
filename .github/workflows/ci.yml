@@ -36,7 +36,13 @@ jobs:
       # embedder. Without numpy/onnxruntime the gate degrades, the rewording
       # commits, and the test fails for a missing interpreter rather than a
       # broken gate. The model is committed; only the runtime is not.
-      - run: python3 -m pip install --quiet --break-system-packages numpy onnxruntime tokenizers
+      #
+      # Installed from a hash-pinned file, not by name: three unpinned packages
+      # (and everything they pull in) were being fetched fresh on every run, and
+      # these are the packages that execute inside the embedder the gates call.
+      # --require-hashes makes pip refuse any file whose SHA-256 is not listed in
+      # scripts/requirements-embed.txt, and refuse an unpinned dependency.
+      - run: python3 -m pip install --quiet --break-system-packages --require-hashes -r scripts/requirements-embed.txt
       - run: npm run test
 
   lint:
@@ -81,7 +87,8 @@ jobs:
       # an escape — so a runner missing these packages fails the build for a
       # missing dependency while looking like a security regression. The model
       # itself is committed under models/minilm/; only the runtime is absent.
-      - run: python3 -m pip install --quiet --break-system-packages numpy onnxruntime tokenizers
+      # Hash-pinned for the same reason as in the `test` job.
+      - run: python3 -m pip install --quiet --break-system-packages --require-hashes -r scripts/requirements-embed.txt
       - run: python3 scripts/embed_minilm.py "smoke" > /dev/null && echo "embedder OK"
       # Runs every probe and fails if any of them fails. This chained with `;`
       # until 2026-08-05, so the suite's exit status was only the last probe's
@@ -106,18 +113,84 @@ jobs:
       # what the tool does is worse than no demo, so a failure is a red build.
       - run: npm run demos
 
+  # `npm audit` reads package-lock.json, so it covers the toolchain that
+  # `npm ci` installs (eslint, typescript, the Slack and Discord gateways).
+  # Runtime dependencies are deliberately empty, which is why this is a
+  # separate job from the image scan below: the two see different things.
+  # A new advisory published against an unchanged lockfile turns this red by
+  # itself. That is the job working, not flaking: fix it with `npm audit fix`.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: npm audit --audit-level=high
+
+  # Secret scan over the whole history, not the diff. A credential removed in a
+  # later commit is still in every clone, so the scan has to read what a clone
+  # reads. gitleaks reads .gitleaksignore from the repository root.
+  #
+  # The gitleaks binary is downloaded and checked against a SHA-256 that is
+  # written here, instead of using gitleaks/gitleaks-action. As of v3.0.0 that
+  # action scans only the commit range of the event (`--no-merges --first-parent
+  # base^..head`), not the history, and fetches gitleaks 8.24.3 at run time with
+  # no checksum. Neither is a scan of what a clone contains.
+  #
+  # To move to a newer gitleaks: download gitleaks_<version>_linux_x64.tar.gz and
+  # gitleaks_<version>_checksums.txt from the release, confirm the tarball's hash
+  # against that file, then update both values below together.
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks 8.30.1
+        env:
+          GITLEAKS_VERSION: '8.30.1'
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
+      - run: gitleaks version
+      # --exit-code 2 is gitleaks' own "leaks found"; 1 is "the tool failed".
+      # Both fail the job. Output is redacted: a CI log is not a safe place for
+      # the value that was just found.
+      - run: gitleaks git --redact --no-banner --verbose --exit-code 2 .
+
   # The image was the one part of this project nothing scanned. npm audit and
   # Dependabot read package.json, and runtime dependencies here are
   # deliberately empty -- so both reported a clean project while the base
   # carried 62 HIGH/CRITICAL CVEs. A dependency gate that cannot see the
   # operating system is not an image gate.
   image:
+    name: image (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      # Both images are always scanned: a red first image must not hide what is
+      # in the second.
+      fail-fast: false
+      matrix:
+        include:
+          # The stdio MCP image that directory checkers build and start.
+          - name: stdio
+            dockerfile: Dockerfile
+          # The HTTP runtime image.
+          - name: deploy
+            dockerfile: deploy/Dockerfile
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # Built locally and never pushed: the point is to scan what this
+      # Built locally and never pushed: the point is to scan what each
       # Dockerfile produces, not what a registry happens to hold.
-      - run: docker build -f deploy/Dockerfile -t chamber:ci .
+      - run: docker build -f "${{ matrix.dockerfile }}" -t "chamber:ci-${{ matrix.name }}" .
       # --ignore-unfixed is the whole policy, and it is a tradeoff worth naming.
       # The base carries 56 HIGH/CRITICAL with NO fix available upstream,
       # including 4 CRITICAL (zlib's is marked will_not_fix). Failing on those
@@ -133,7 +206,7 @@ jobs:
       # newly actionable appeared, not that the baseline drifted.
       - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: chamber:ci
+          image-ref: chamber:ci-${{ matrix.name }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: '1'
@@ -144,14 +217,14 @@ jobs:
       - if: always()
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: chamber:ci
+          image-ref: chamber:ci-${{ matrix.name }}
           severity: HIGH,CRITICAL
           # The inverse of the gate above: everything, fix or no fix. exit-code
           # 0 because this step reports, it does not judge.
           ignore-unfixed: false
           exit-code: '0'
           format: table
-          output: unfixed.txt
+          output: unfixed-${{ matrix.name }}.txt
       - if: always()
         run: |
           # A report step that publishes nothing still exits 0: `cat` of an
@@ -159,17 +232,17 @@ jobs:
           # failure would ever point at. So the step asserts its own output
           # exists and is non-empty -- without this, "the unfixable set stays
           # visible" is a claim the workflow never checks.
-          if [ ! -s unfixed.txt ]; then
-            echo "trivy wrote no report to unfixed.txt -- the image summary would have been empty" >&2
+          if [ ! -s unfixed-${{ matrix.name }}.txt ]; then
+            echo "trivy wrote no report to unfixed-${{ matrix.name }}.txt -- the image summary would have been empty" >&2
             exit 1
           fi
           {
-            echo '### Image CVEs, including those with no fix available'
+            echo "### Image CVEs (${{ matrix.name }}), including those with no fix available"
             echo
-            echo 'The `image` job blocks only on CVEs with a fix. This is the'
+            echo "The \`image\` job blocks only on CVEs with a fix. This is the"
             echo 'full HIGH/CRITICAL set, unfixable included.'
             echo
             echo '```'
-            cat unfixed.txt
+            cat unfixed-${{ matrix.name }}.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

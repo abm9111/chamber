@@ -12,12 +12,21 @@ Page text must not sit on the process command line, where `pgrep -f` copies it
 into a model transcript.
 
 Stdout: JSON float arrays. Stderr: logs.
+
+Exit status 3: the model weights were not loaded because they are not the ones
+models/minilm/VERSION records -- the SHA-256 differs, VERSION is missing, or it
+has no SHA-256 line. The check runs in every mode, before the first reply and
+before numpy or onnxruntime is imported.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 # Imported in _import_stack(), after the argv length check, so a long argument
 # is refused on a machine with no model installed.
@@ -26,7 +35,11 @@ ort = None
 Tokenizer = None
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL_DIR = ROOT / "models" / "minilm"
+# CHAMBER_MINILM_DIR exists so a test can point this script at a copy of the
+# model directory with a doctored VERSION. It is not a configuration surface:
+# whatever directory it names is held to the same rule, that the weights must
+# match the SHA-256 in that directory's own VERSION file.
+MODEL_DIR = Path(os.environ.get("CHAMBER_MINILM_DIR") or ROOT / "models" / "minilm")
 ONNX_PATH = MODEL_DIR / "model_quantized.onnx"
 TOK_PATH = MODEL_DIR / "tokenizer.json"
 
@@ -40,8 +53,58 @@ _tokenizer: Tokenizer | None = None
 _measurer: Tokenizer | None = None
 
 
+EXIT_WEIGHTS_REFUSED = 3
+VERSION_PATH = MODEL_DIR / "VERSION"
+# models/minilm/VERSION records the hash as `SHA-256:  <64 hex digits>`.
+_SHA256_LINE = re.compile(r"^SHA-256:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
+_weights_verified = False
+
+
+def _refuse_weights(reason: str) -> NoReturn:
+    print(f"embed_minilm: {reason}; not loading {ONNX_PATH.name}", file=sys.stderr)
+    sys.exit(EXIT_WEIGHTS_REFUSED)
+
+
+def verify_weights() -> None:
+    """Refuse to load model_quantized.onnx unless it matches VERSION's SHA-256.
+
+    These weights feed retrieval, which feeds the citation-pin path, and they
+    are a 23 MB binary that onnxruntime parses. VERSION has always recorded the
+    hash; nothing ever compared it. Streamed, so the file is not held in memory,
+    and done once per process.
+
+    Exit 3, one stderr line, and no model loaded when the hash differs, VERSION
+    is missing, or VERSION has no SHA-256 line. This runs before numpy and
+    onnxruntime are imported, so it needs neither.
+    """
+    global _weights_verified
+    if _weights_verified:
+        return
+    if not ONNX_PATH.is_file():
+        raise SystemExit(f"missing model: {ONNX_PATH}")
+    try:
+        version_text = VERSION_PATH.read_text(encoding="utf-8")
+    except OSError as e:
+        _refuse_weights(f"cannot read {VERSION_PATH} ({e.strerror or e})")
+    match = _SHA256_LINE.search(version_text)
+    if match is None:
+        _refuse_weights(f"{VERSION_PATH} has no SHA-256 line with 64 hex digits")
+    expected = match.group(1).lower()
+    digest = hashlib.sha256()
+    with ONNX_PATH.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    actual = digest.hexdigest()
+    if actual != expected:
+        _refuse_weights(
+            f"{ONNX_PATH} has SHA-256 {actual}, but {VERSION_PATH} records {expected}"
+        )
+    _weights_verified = True
+
+
 def _load() -> tuple[ort.InferenceSession, Tokenizer]:
     global _session, _tokenizer
+    verify_weights()
     if _session is None:
         if not ONNX_PATH.is_file():
             raise SystemExit(f"missing model: {ONNX_PATH}")
@@ -183,6 +246,7 @@ def _import_stack() -> None:
 
 def serve() -> None:
     """One model load, then one JSON reply per stdin line."""
+    verify_weights()
     _import_stack()
     while True:
         raw = sys.stdin.buffer.readline()
@@ -216,6 +280,7 @@ def main() -> None:
     if sys.argv[1] == "--serve":
         serve()
         return
+    verify_weights()
     _import_stack()
     if sys.argv[1] == "--json":
         if len(sys.argv) < 3:

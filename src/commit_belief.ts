@@ -18,7 +18,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { appendAudit } from "./audit.ts";
 import { claimHash, newId } from "./hash.ts";
 import { verifyPin, type BeliefSourceFailure } from "./pins.ts";
-import { embedLocalBatch } from "./embedder.ts";
+import { MinilmIntegrityError, embedLocalBatch } from "./embedder.ts";
 import { cosineSimilarity } from "./vector.ts";
 import { claimsDifferMaterially } from "./claim_asymmetry.ts";
 import type {
@@ -185,6 +185,31 @@ const MAX_PARAPHRASE_CANDIDATES = 32;
  */
 const CLAIM_TEXT_EMBED_LIMIT = 1000;
 
+// Refused weights are announced on stderr once per distinct message. Every
+// commit records the refusal in its audit row; a process that commits a
+// thousand times should not print a thousand copies of the same paragraph.
+const announcedRefusals = new Set<string>();
+
+/**
+ * How many distinct messages are remembered. A real process meets one or two
+ * (the message names the weights file and its two hashes), so the cap only
+ * bounds memory against a flood of different ones. Past it a message is
+ * announced every time it occurs instead of being remembered: a repeated
+ * warning is the lesser failure, and nothing here throws or parks a commit
+ * (FM-6), because the audit row carries the reason either way.
+ */
+export const MAX_ANNOUNCED_REFUSALS = 64;
+
+/** Exported for the cap test, which passes a set of its own. */
+export function warnWeightsRefused(detail: string, announced: Set<string> = announcedRefusals): void {
+  if (announced.has(detail)) return;
+  if (announced.size < MAX_ANNOUNCED_REFUSALS) announced.add(detail);
+  console.warn(
+    `chamber: WARNING - the MiniLM weights were refused, so the paraphrase debt check did not run ` +
+      `and commits are going through without it. ${detail}`,
+  );
+}
+
 /**
  * Open blocking debts whose claim says the same thing as `text` in different
  * words. `claim_hash` cannot find these — it is sha256 over normalised text,
@@ -201,7 +226,7 @@ function paraphraseBlockingDebts(
   db: DatabaseSync,
   text: string,
   excludeHash: string,
-): { debts: { id: string }[]; semantic: boolean; attempted: boolean } {
+): { debts: { id: string }[]; semantic: boolean; attempted: boolean; reason?: string } {
   const rows = db
     .prepare(
       `SELECT id, claim_text FROM citation_debt
@@ -264,7 +289,25 @@ function paraphraseBlockingDebts(
   let embeds;
   try {
     embeds = embedLocalBatch([text, ...candidates.map((r) => r.claim_text)]);
-  } catch {
+  } catch (err) {
+    // Any throw lands here, inside the commit's transaction (FM-6): the check
+    // is recorded as not run and the commit goes on. Letting it escape would
+    // reach the outer catch, roll back and park the commit. Do not rethrow.
+    //
+    // A MinilmIntegrityError is the one throw that says why, and this is the
+    // only place it can be heard: the commit is allowed through, so nothing
+    // else will fail. The weights changed, which is not a missing python, and
+    // an operator who reads "embedder unavailable" looks in the wrong place.
+    // So it is named in the audit row (the reason) and, once, on stderr.
+    if (err instanceof MinilmIntegrityError) {
+      warnWeightsRefused(err.message);
+      return {
+        debts: [],
+        semantic: false,
+        attempted: true,
+        reason: `MiniLM weights refused (MinilmIntegrityError); paraphrase check did not run: ${err.message}`,
+      };
+    }
     return { debts: [], semantic: false, attempted: true };
   }
   // A short or padded result would silently mis-pair claims with debts, since
@@ -604,6 +647,7 @@ export function commitBelief(
       paraphraseCheckState = paraphrase.semantic ? "ran" : "skipped";
       if (!paraphrase.semantic) {
         degradedReason =
+          paraphrase.reason ??
           "embedder unavailable or non-semantic; paraphrase check did not run";
       }
     }

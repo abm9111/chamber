@@ -70,6 +70,93 @@ history and the GitHub releases.
   freezing; see `docs/KNOWN_LIMITATIONS.md` entry 21. If a worker crashes, only
   the turns that worker was running fail; the others carry on.
 
+### Supply chain, CI, `chamber pin` and docs
+
+- **Dependency advisories.** `npm audit fix` moved `proxy-addr` (critical) and
+  `brace-expansion` (high) inside their ranges in `package-lock.json`;
+  `npm audit` now reports 0. CI fails on `npm audit --audit-level=high`.
+- **CI installs and scans.** The embedder's Python packages come from
+  `scripts/requirements-embed.txt`, pinned with hashes and installed with
+  `--require-hashes`. A new job runs gitleaks 8.30.1 (checked against a
+  SHA-256) over the whole history, and the image job now builds and scans both
+  `Dockerfile` and `deploy/Dockerfile` under the same trivy gate. Dependabot
+  opens weekly updates for npm, GitHub Actions and both Dockerfiles.
+- **The stdio image is cleaned like the deploy image.** The root `Dockerfile`
+  now runs `apt-get upgrade` and removes npm, npx and corepack; the image had
+  three fixable HIGH findings and now has none.
+- **MiniLM weights are checked before they load.** `scripts/embed_minilm.py`
+  hashes `model_quantized.onnx` and compares it with `models/minilm/VERSION`;
+  a mismatch, a missing `VERSION` or a missing `SHA-256:` line exits 3 in every
+  mode, before the model is imported. The TypeScript side throws on it
+  (`MinilmIntegrityError`) in every mode, `auto` included, in `embedLocal`,
+  `embedLocalBatch` and `minilmAvailable()`, so `ingest`, `search` and `ask`
+  stop with the hash mismatch instead of writing or querying with
+  `local-hash-v1` vectors. A missing interpreter or dependency still degrades
+  with a warning, and `CHAMBER_EMBEDDER=hash` still chooses hash on purpose.
+  A commit that meets refused weights still goes through (FM-6), but its
+  `debt:degraded` audit row now names `MinilmIntegrityError` and the hash
+  mismatch instead of a generic reason, stderr says so once, and the refusal
+  line keeps the hash `VERSION` records instead of cutting it at 300 characters.
+- **One version everywhere.** `server.json` said 0.1.10 while the package said
+  0.1.9, and the MCP server reported a third, hand-typed copy. The server now
+  reads `package.json`, `server.json` agrees, and a test fails when any of
+  them, or the newest CHANGELOG heading, disagree.
+- **`chamber-jobs.service` is hardened** with the directives
+  `chamber.service` already had, including a `@system-service` syscall filter.
+- **The bwrap sandbox unshares more.** `--unshare-pid`, `--unshare-ipc`,
+  `--unshare-uts` and `--new-session` join `--unshare-net`. A payload's `/proc`
+  used to list every host process. `probes/sandbox_confines.ts` checks the pid
+  namespace with a process needle that it first proves visible without the
+  sandbox.
+- **`chamber pin` runs the release before it moves anything.** Pin fetches the
+  tag, then runs `node bin/chamber.js --version` under `/bin/sh -lc` in a
+  throwaway clone of the release checkout; it must exit 0 and print the version
+  in `package.json` (as its last line, so a login profile that echoes does not
+  fail the pin). Only then does it move the checkout and write the plist. A
+  release that does not run, or a pin that is interrupted while it runs, leaves
+  the checkout, the plist and the loaded job as they were, so a job that was
+  already pinned keeps running the release it ran before and a first pin whose
+  release does not run leaves no checkout behind. (A first pin killed during its
+  fetch or its proof leaves an empty `git init` that the next pin accepts and
+  finishes.) What stays open is the move itself, a `git checkout` during which a
+  job that starts sees neither release; `deploy/SCHEDULING.md` names it and the
+  command that finishes an interrupted move, and pin prints that command when
+  its own `git checkout` fails. A throwaway clone that cannot be removed is
+  named on stderr and does not change the result. The job plist is read with
+  `/usr/bin/plutil -convert json` where that exists, as far as we know the
+  parser launchd's own reader is built on (a `Program` key is refused,
+  ProgramArguments must be exactly `/bin/sh -lc <shipped script>`, and a plist
+  plutil cannot convert, such as one with a `<data>` or `<date>` value, is
+  refused). Pin tries the rewrite as a dry run before it fetches or moves
+  anything, so a plist it accepts but cannot rewrite in place is refused with
+  nothing moved. Where plutil exists the same plist with only the script
+  changed is what gets written: the rewrite is parsed again and compared, and a
+  rewrite that cannot be compared with the original is refused. Where there is
+  no plutil the text reader decides: it requires exactly the XML declaration
+  and DOCTYPE of the shipped plist, refuses processing instructions and key
+  tags with extra characters, and checks only that the rewrite reads back as
+  pinned. The plist is replaced atomically, git runs with prompts off and
+  without inherited `GIT_DIR`, with timeouts, an http(s) origin carrying
+  credentials is refused, and a commented-out `ProgramArguments` block or a
+  `Program` key no longer confuses the plist check.
+- **The daily snapshot reports what happened.** `verify exit code` was always
+  0 (it read `$?` after an `echo`); it now carries verify's status. Drift,
+  Corpus and Ledger run the pinned release checkout (the Ledger opens the live
+  database with its `src/db.ts`, not the development checkout's, which used to
+  apply its schema to that file at 10:07), or say to run `chamber pin`, and the
+  Drift section opens with `release: <tag>` (from `git describe --tags --always`
+  in that checkout; `none` when it is missing, `unknown` when it is not a git
+  checkout), so a report names the release it ran. The launchd template runs the
+  release checkout's copy of the script, which takes effect for a tag that
+  contains it.
+- **Docs.** New `docs/BACKUP.md` (live backups with `.backup`, not `cp`;
+  restore; `chamber checkpoint verify` afterwards). `docs/KNOWN_LIMITATIONS.md`
+  entry 1 describes the sandbox as it is, entry 3 no longer claims a scheduled
+  export, entry 13 says what the scheduled job's log now shows (its database and
+  `=== verify exit N ===`) and what it still does not, and the README's count
+  matches. The sample outputs in
+  `deploy/SCHEDULING.md` match what `chamber verify` prints.
+
 ## 0.1.9 — 2026-10-03
 
 ### Changed

@@ -18,66 +18,83 @@ sequence is the argument for keeping this file honest: the gap survived as long 
 was undocumented.
 
 Two of these are not defects in the ordinary sense and should be read carefully rather
-than skimmed: the sandbox does not isolate, and a citation can be genuine and still be
-wrong. Neither is theoretical.
+than skimmed: the sandbox isolates only on Linux with bubblewrap, and a citation can be
+genuine and still be wrong. Neither is theoretical.
 
 ---
 
-## 1. The sandbox does not isolate
+## 1. The sandbox isolates only on Linux with bubblewrap, and nothing isolates on macOS
 
-> **Default changed, 2026-10-21.** `CHAMBER_SANDBOX_REQUIRED` now means
-> required when it is unset or empty. Without an isolating backend whose probe
-> confines (today only bubblewrap), `runInSandbox` refuses, and so does every
-> caller: `tool-run`, `tool-synth`, `sandbox-test` and `verifyMcpToolSource`.
-> The refusal ends with the way out, `Set CHAMBER_SANDBOX_REQUIRED=0 to run
-> tool code without isolation.` Only an explicit `0`, `false`, `no` or `off`
-> (any case) selects the unisolated subprocess that the rest of this entry
-> describes.
+`src/sandbox.ts` knows three backends, and only one of them isolates anything.
 
-`src/sandbox.ts` is named for containment it does not provide. Running
-`probes/sandbox_escape.ts` on the development machine, with
-`CHAMBER_SANDBOX_REQUIRED=1` set, produces this:
+- **`bwrap`** (Linux, with `bubblewrap` installed) runs the payload with a short
+  allowlist of read-only system directories (`/usr`, `/bin`, `/sbin`, `/lib`,
+  `/lib64` and the runtime's own prefix), a fresh `/dev` and `/proc`, a tmpfs
+  `/tmp`, and the work directory. It unshares the network, pid, ipc and uts
+  namespaces and starts a new terminal session. `$HOME`, `~/.ssh`, `~/.secrets`
+  and the Chamber database are simply not mounted. It is the only member of
+  `ISOLATING_BACKENDS`.
+- **`docker`** is reported when a `docker` binary is on `PATH`, but there is no
+  `runDocker`. A run on this backend is dispatched to the plain subprocess
+  runner and relabelled `"subprocess"` in the result, so it isolates nothing.
+- **`subprocess`** is a child process with a scrubbed environment and nothing
+  else. It reads `$HOME`, `~/.ssh` and `~/.secrets`, writes outside its working
+  directory and reaches the network. `probes/sandbox_escape.ts` reproduces that
+  when the flag below is off.
 
-```
-CHAMBER_SANDBOX_REQUIRED = 1
-detectSandboxBackend()   = docker
-backend reported: subprocess  ok: true
-{ "homeReadable": true, "sshExists": true, "secretsExists": true,
-  "wroteOutside": true, "net": "RESOLVED 104.20.23.154" }
+There is no macOS backend. `probes/seatbelt/` records what `sandbox-exec` can and
+cannot enforce (the workable profile still leaves `$HOME` readable) and nothing
+more, so on a Mac every run is the subprocess backend or a refusal.
 
->>> ESCAPE CONFIRMED — sandbox does not isolate
-```
+**What `CHAMBER_SANDBOX_REQUIRED` does.** Unset, it is on. Only `0`, `false`,
+`no` or `off` turn it off, and then `runInSandbox` runs the payload on whatever
+backend was detected, including the subprocess backend, as your user. While it
+is on, a run is refused unless the backend is in `ISOLATING_BACKENDS`
+(`sandbox required but docker does not isolate`) and the backend has first
+confined a probe of its own: a payload that must fail to read `/etc/passwd` and
+fail to connect to `1.1.1.1`. A `bwrap` that is a stub, or that cannot create a
+namespace, is refused with `did not confine a probe`. An unrecognised spelling
+counts as on, so a typo keeps the promise instead of dropping it.
 
-Three separate failures stack up. `detectSandboxBackend()` reports `docker`, but no
-`runDocker` function exists — the docker branch dispatches to `runSubprocess` and the
-result is relabelled `"subprocess"`. `CHAMBER_SANDBOX_REQUIRED=1` is a no-op: the
-refusal check at `src/sandbox.ts:204` is unreachable whenever a backend is detected, so
-the fail-closed switch never closes. And the code that runs reads `$HOME`, sees
-`~/.ssh` and `~/.secrets`, writes outside its working directory, and resolves DNS.
+**What proves it.** Two probes, and they answer different questions.
+`probes/sandbox_escape.ts` (part of `npm run probes`, run with the flag on)
+passes when the payload does not escape, and it passes on a Mac because nothing
+ran: a refusal and a contained run look the same to it. `probes/sandbox_confines.ts`
+(`npm run probes:isolation`) demands the other half. The payload must run, and it
+must fail to read `/etc/passwd`, fail to reach the network, and fail to see a
+host process (the probe starts a sleeping child with a random marker in its
+command line, checks that a scan of `/proc` finds it outside the sandbox, and
+then requires the scan inside to find nothing). It also requires the payload to
+sit in its own ipc and uts namespaces (the namespace ids under `/proc/self/ns`
+must differ from the probe's own) and to lead its own session (the session id in
+`/proc/self/stat` is not 0). Each reading is first taken outside the sandbox, and
+the probe reports `NOT PROVEN` and fails if `/proc` or the readings do not work
+there, so a difference inside means confinement and not a read that failed. It
+can only pass on Linux with a working `bwrap`, and CI runs it there. On a machine
+where it cannot pass, the sandbox has not been shown to confine anything.
 
-**What it costs.** Today, less than the probe suggests, and you should know exactly why.
-No path in the shipped code routes model-generated code into the sandbox — there is no
-agent loop, and `runTool`'s registry lookup queries a `skill` table that no schema
-creates, so only Chamber's own three built-in tools are reachable through it. But two
-paths do execute source that did not come from Chamber: `chamber tool synth` runs
-whatever text or file you hand it (`src/cli.ts:1406`), and `verifyMcpToolSource` runs
-the `source` field of a tool declared by an imported MCP manifest
-(`src/mcp_bridge.ts:91`). Both execute with your full user privileges. Anyone treating
-"it ran in the sandbox" as a safety statement is wrong.
+**What it does not cover.** The probe reads one file outside the allowlist
+(`/etc/passwd`) and tries one outbound connection; it does not try to write
+anywhere, so the read-only binds are not tested by it. Nothing limits memory, CPU
+or process count beyond a wall-clock timeout and an output cap. Every bind is
+read-only except the tmpfs `/tmp` and the work directory, which is deliberate,
+but a payload can still fill them.
 
-The larger cost is structural. Every capability level above L0 — the whole autonomy
-ladder Chamber is being built toward — is gated on this being real. Granting an agent
-more freedom on a sandbox that does not sandbox is precisely the failure the project
-exists to prevent.
+**What it costs.** Less than the old probe output suggested, and you should know
+why. No agent loop in the shipped code sends model-written code to the sandbox.
+Three paths run source that did not come from Chamber: `chamber tool-synth`
+(`synthesizeTool` in `src/tools.ts`), `runTool` for a registered tool, and
+`verifyMcpToolSource` in `src/mcp_bridge.ts` for a tool declared by an imported
+MCP manifest. On Linux with `bwrap` they are confined as above. Anywhere else
+they refuse by default, which is safe and means a Mac cannot run them at all.
+With `CHAMBER_SANDBOX_REQUIRED=0` they run with your full user privileges, and
+"it ran in the sandbox" is not a safety statement.
 
-**What would fix it.** Write a real `runDocker` (`docker run --rm --network none
---read-only --memory 512m --pids-limit 128`), remove the relabel-to-`subprocess`, make
-`SandboxResult` report the isolation it actually achieved rather than the backend it
-hoped for, and make `CHAMBER_SANDBOX_REQUIRED=1` refuse anything weaker than full
-isolation. Backends are not interchangeable: docker blocks `$HOME` reads, macOS
-seatbelt and Linux bwrap do not, so those two are a degraded tier and not a substitute.
-This is `docs/NEXT_LEVEL_PLAN.md` Phase 1.1, and `npm run check:sandbox` passing on the
-deployment machine is the stated entry criterion for any capability level above L0.
+**What would fix it.** A `runDocker` (`docker run --rm --network none --read-only
+--memory 512m --pids-limit 128`) would give macOS an isolating backend and give
+every backend resource limits, and the `docker` branch should stop relabelling
+itself `subprocess` in the meantime. Until then, treat a Mac as a machine with no
+sandbox. This is `docs/NEXT_LEVEL_PLAN.md` Phase 1.1.
 
 ## 2. A citation can be genuine and still be wrong
 
@@ -273,11 +290,15 @@ citation says it says," never as "this claim is true."
 
 ## 3. Checkpoints are manual, unsigned, and land in `/tmp`
 
-> **Correction, 2026-08-13.** Two of this entry's three claims have since been closed
-> in code and one was closed in deploy: `src/checkpoint_export.ts` now generates an
-> ed25519 keypair and signs receipts, the default output path is config-resolved
-> rather than `/tmp`, and `deploy/launchd/com.chamber.daily-snapshot.plist` runs the
-> export on a schedule. What still stands is the ceiling the last paragraph names:
+> **Correction, 2026-08-13, corrected again 2026-10-21.** Two of this entry's three
+> claims have since been closed in code: `src/checkpoint_export.ts` now generates an
+> ed25519 keypair and signs receipts, and the default output path is config-resolved
+> rather than `/tmp`. The 2026-08-13 version of this note said the third was closed
+> in deploy because `deploy/launchd/com.chamber.daily-snapshot.plist` "runs the export
+> on a schedule". It does not: that plist runs `scripts/daily-snapshot.sh`, which
+> writes a daily report and never calls `chamber checkpoint`, and nothing else in the
+> repository schedules one, so a checkpoint is still never taken automatically. What
+> also still stands is the ceiling the last paragraph names:
 > the anchor log lives on the same disk as the operator, so this is
 > tamper-evidence against corruption and casual edits, not against an attacker
 > with full write access to the machine. A limitations doc that overstates a
@@ -675,37 +696,42 @@ most load-bearing path.
 as a scored eval with a floor that fails the build. Fifty queries would catch most of
 what matters. Unplanned.
 
-## 13. The scheduled job's log names neither its database nor its exit status
+## 13. A failed ingest in the scheduled job reaches the log, not its exit status or its notification
 
-This entry has now been corrected twice, and both corrections narrowed it. The launchd
-job (`deploy/launchd/com.chamber.verify.plist`) *does* log ingest's exit code — the `||`
-branch prints `!! ingest FAILED (exit $?)` — and that chaining is deliberate and well
-reasoned, so that a missing root cannot silently disable the drift check.
+The scheduled job's log names its database and its exit status. The launchd job
+(`deploy/launchd/com.chamber.verify.plist`) logs a `database = <path>   [from <source>]`
+line, taken from `chamber config show`, right after its timestamp banner, and ends every run with `=== verify exit N ===`, which is
+`chamber verify`'s exit status. That status is non-zero when any pin has stopped
+verifying: a belief that lost all of its support and one that lost only some both exit 1
+(`0 with no verified support left, 1 with some support lost`). `chamber verify --json`
+prints the `database` it checked as well. A failed ingest is logged too, as
+`!! ingest FAILED (exit N)`, and that chaining is deliberate (see `deploy/SCHEDULING.md`):
+a missing root must not silently disable the drift check.
 
-The finding itself also reaches the log, which an earlier revision of this entry denied.
-`chamber verify` prints the belief id, its text, and a `hash_mismatch` or `not_found` line
-per failed pin, each with a paragraph saying what that reason means, and closes with a
-count (`src/cli.ts:1202-1250`). On a clean run that count is all there is — `0 belief(s)
-checked, 0 with no verified support left` — but a run that found drift does not look like
-one that did not.
+Two things are still true.
 
-Two things are genuinely missing. The job's exit status is `chamber verify`'s, non-zero
-exactly when a belief has no verified support left (`src/cli.ts:1250`); launchd does not
-write a job's exit status to its log, and the job does not echo it. And no run names the
-database it used: the banner that prints `db: <path>` belongs to `status`, `turn` and
-`queue` (`src/cli.ts:553,878,886`), and neither `ingest` nor `verify` calls it.
+**An ingest failure is not the job's failure.** The job runs `verify` whether or not
+`ingest` succeeded, and its exit status and its "evidence drift" notification are
+`verify`'s alone. A run whose ingest failed (a root on an unmounted volume, a config with
+no roots) can therefore end `=== verify exit 0 ===` and notify nobody; the only trace is
+the `!! ingest FAILED` line, in a log you open when you already suspect something. The
+verdict is then about the corpus as it stood before the failure, which may be stale.
 
-**What it costs.** Anything monitoring this job by exit status rather than by reading its
-prose has nothing to key on, and no run states which corpus it checked. The second one is
-not hypothetical: `chamber` is installed as a symlink into a working tree, so it runs
-whichever branch is checked out. A *redirect* would at least announce itself — a fallback
-to `/tmp` or `:memory:` writes two `chamber: WARNING —` lines naming both paths
-(`src/db.ts:212-215`, `src/cli.ts:215-221`), and this job points `StandardErrorPath` at
-the same file as `StandardOutPath`, so they land in this log — but the ordinary case
-states the path nowhere.
+**The database line is another process's answer.** It comes from `chamber config show
+2>/dev/null | grep database`, run before ingest. Neither `ingest` nor `verify` names its
+database in its prose output; only `verify --json` does. If the config cannot be loaded,
+`config show` fails with its message on the discarded stderr and the line is simply
+absent, so a missing `database =` line is the signal. A redirect while opening (a
+fallback to `/tmp` or `:memory:`) still announces itself with `chamber: WARNING —` lines
+naming both paths, and since the job points `StandardErrorPath` at the same file as
+`StandardOutPath`, they land in this log.
 
-**What would fix it.** Have `verify` print the resolved database path, and have the job
-echo verify's exit status after it returns. Unplanned.
+**What it costs.** A stale-corpus run looks like a clean one to anything that watches the
+exit status or the notification and not the prose.
+
+**What would fix it.** Raise a distinct notification (or a distinct exit status) when
+ingest failed, and have `verify` print the database it opened in its prose output too.
+Unplanned.
 
 ## 14. Citation debt is keyed on exact text; the paraphrase leg over it is weak
 
@@ -805,6 +831,18 @@ names the interpreter explicitly, because PATH is the thing that differs
 between an interactive and a login shell; and `chamber ask` compares the
 query's model against the corpus's dominant model and says so in its note
 channel rather than returning an empty result with no cause.
+
+**Closed: weights that were refused never become hash vectors.**
+`scripts/embed_minilm.py` exits 3 when `model_quantized.onnx` does not match the
+SHA-256 in `models/minilm/VERSION`. That is not a machine without an embedder:
+the weights are there and were refused. `minilmAvailable()`, `embedLocal` and
+`embedLocalBatch` throw `MinilmIntegrityError` for it in every mode, `auto`
+included, so `ingest`, `search` and `ask` stop with the mismatch instead of
+writing or querying with `local-hash-v1`. A missing interpreter or dependency
+still degrades with the warning above, and `CHAMBER_EMBEDDER=hash` still chooses
+hash on purpose. In `commit_belief` the throw lands in the debt check's own
+catch inside the transaction: the check is recorded as not run, as for any
+embedder failure, and the commit is not parked.
 
 **Closed: one subprocess per passage.** `embedLocalBatch` is wired into
 `src/ingest.ts`, which was the path that took 75 minutes for 28,500 passages.

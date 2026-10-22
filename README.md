@@ -348,7 +348,7 @@ source and misread it, and every layer here will pass it. That is a stated
 non-goal, it has been observed happening, and it is not solved.
 
 Read [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) before trusting
-any output. Eighteen limitations are documented there, including the two least
+any output. Twenty-one limitations are documented there, including the two least
 flattering. The sandbox is required by default, and the default refuses: tool
 code (`tool-run`, `tool-synth`, `sandbox-test`, MCP tool verification) runs only
 under bubblewrap, and only after a probe shows that bubblewrap confines. With no

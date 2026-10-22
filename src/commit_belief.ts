@@ -190,9 +190,20 @@ const CLAIM_TEXT_EMBED_LIMIT = 1000;
 // thousand times should not print a thousand copies of the same paragraph.
 const announcedRefusals = new Set<string>();
 
-function warnWeightsRefused(detail: string): void {
-  if (announcedRefusals.has(detail)) return;
-  announcedRefusals.add(detail);
+/**
+ * How many distinct messages are remembered. A real process meets one or two
+ * (the message names the weights file and its two hashes), so the cap only
+ * bounds memory against a flood of different ones. Past it a message is
+ * announced every time it occurs instead of being remembered: a repeated
+ * warning is the lesser failure, and nothing here throws or parks a commit
+ * (FM-6), because the audit row carries the reason either way.
+ */
+export const MAX_ANNOUNCED_REFUSALS = 64;
+
+/** Exported for the cap test, which passes a set of its own. */
+export function warnWeightsRefused(detail: string, announced: Set<string> = announcedRefusals): void {
+  if (announced.has(detail)) return;
+  if (announced.size < MAX_ANNOUNCED_REFUSALS) announced.add(detail);
   console.warn(
     `chamber: WARNING - the MiniLM weights were refused, so the paraphrase debt check did not run ` +
       `and commits are going through without it. ${detail}`,

@@ -115,16 +115,27 @@ history and the GitHub releases.
   fail the pin). Only then does it move the checkout and write the plist. A
   release that does not run, or a pin that is interrupted while it runs, leaves
   the checkout, the plist and the loaded job as they were, so a job that was
-  already pinned keeps running the release it ran before and a first pin leaves
-  no checkout behind. What stays open is the move itself, a `git checkout`
-  during which a job that starts sees neither release; `deploy/SCHEDULING.md`
-  names it and the command that finishes an interrupted move. The job plist is
-  read with `plutil -convert json` where plutil exists (a `Program` key is
-  refused and ProgramArguments must be exactly `/bin/sh -lc <shipped script>`),
-  the rewritten plist is parsed again and must be the same plist with only the
-  script changed, and the text reader, now also refusing processing
-  instructions and key tags with extra characters, is the fallback where there
-  is no plutil. The plist is replaced atomically, git runs with prompts off and
+  already pinned keeps running the release it ran before and a first pin whose
+  release does not run leaves no checkout behind. (A first pin killed during its
+  fetch or its proof leaves an empty `git init` that the next pin accepts and
+  finishes.) What stays open is the move itself, a `git checkout` during which a
+  job that starts sees neither release; `deploy/SCHEDULING.md` names it and the
+  command that finishes an interrupted move, and pin prints that command when
+  its own `git checkout` fails. A throwaway clone that cannot be removed is
+  named on stderr and does not change the result. The job plist is read with
+  `/usr/bin/plutil -convert json` where that exists, as far as we know the
+  parser launchd's own reader is built on (a `Program` key is refused,
+  ProgramArguments must be exactly `/bin/sh -lc <shipped script>`, and a plist
+  plutil cannot convert, such as one with a `<data>` or `<date>` value, is
+  refused). Pin tries the rewrite as a dry run before it fetches or moves
+  anything, so a plist it accepts but cannot rewrite in place is refused with
+  nothing moved. Where plutil exists the same plist with only the script
+  changed is what gets written: the rewrite is parsed again and compared, and a
+  rewrite that cannot be compared with the original is refused. Where there is
+  no plutil the text reader decides: it requires exactly the XML declaration
+  and DOCTYPE of the shipped plist, refuses processing instructions and key
+  tags with extra characters, and checks only that the rewrite reads back as
+  pinned. The plist is replaced atomically, git runs with prompts off and
   without inherited `GIT_DIR`, with timeouts, an http(s) origin carrying
   credentials is refused, and a commented-out `ProgramArguments` block or a
   `Program` key no longer confuses the plist check.

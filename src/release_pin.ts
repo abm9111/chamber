@@ -117,17 +117,23 @@ export type PlistParser = (xml: string) => PlistParse;
 
 const PLUTIL_TIMEOUT_MS = 15_000;
 
+/** Where plutil is. Run by absolute path, so a `plutil` earlier on PATH is never what decides. */
+export const PLUTIL_PATH = "/usr/bin/plutil";
+
 /**
- * `plutil -convert json` on stdin. launchd reads plists with the Core
- * Foundation parser plutil is built on, so what plutil prints is what launchd
- * will run: it removes the gap between a hand-written reader and the real one
- * (every shape that hid a `Program` key from the text reader was seen by plutil).
- * No plutil (Linux, CI) is "unavailable", not an error: the caller falls back to
- * the text reader. A plist plutil cannot turn into JSON (a `<data>` or `<date>`
- * value, say) is refused, and so is a plutil that fails to run.
+ * `plutil -convert json` on stdin. As far as we know launchd reads a plist with
+ * the same Core Foundation parser plutil is built on; Apple does not document
+ * that, and `launchctl list <label>` after a load, which pin checks, is what
+ * shows the script launchd actually holds. What plutil prints is therefore the
+ * best reading there is: every shape that hid a `Program` key from the text
+ * reader was seen by plutil. No file at `path` (Linux, CI) is "unavailable", not
+ * an error: the caller falls back to the text reader. A plist plutil cannot turn
+ * into JSON (a `<data>` or `<date>` value, say) is refused, and so is a plutil
+ * that fails to run.
  */
-export const plutilParser: PlistParser = (xml) => {
-  const r = spawnSync("plutil", ["-convert", "json", "-o", "-", "--", "-"], {
+function parseWithPlutil(path: string, xml: string): PlistParse {
+  if (!existsSync(path)) return { kind: "unavailable" };
+  const r = spawnSync(path, ["-convert", "json", "-o", "-", "--", "-"], {
     input: xml,
     encoding: "utf8",
     timeout: PLUTIL_TIMEOUT_MS,
@@ -147,7 +153,14 @@ export const plutilParser: PlistParser = (xml) => {
   } catch {
     return { kind: "rejected", reason: "plutil's output was not JSON" };
   }
-};
+}
+
+/** The parser for the plutil at `path`. Tests use it to stand in for a machine that has none. */
+export function plutilParserAt(path: string): PlistParser {
+  return (xml) => parseWithPlutil(path, xml);
+}
+
+export const plutilParser: PlistParser = plutilParserAt(PLUTIL_PATH);
 
 /** A parser that is never there: the text reader decides. For tests and for callers that must not run plutil. */
 export const noPlistParser: PlistParser = () => ({ kind: "unavailable" });
@@ -178,19 +191,53 @@ function judgeParsedPlist(value: unknown): JobPlistRead {
 }
 
 /**
- * Which shipped form an installed job plist holds, or why it holds neither.
- * Where plutil exists its reading decides. Without it, the text reader below
- * does, which is a regex over XML and refuses what it does not model.
+ * The verdict for a plist `parsed` is the result of parsing: the parser's own
+ * where it gave one, the text reader's where there was no parser. Taking the
+ * parse as an argument lets a caller that has already parsed `xml` not parse it
+ * again.
  */
-export function readJobPlist(xml: string, parse: PlistParser = plutilParser): JobPlistRead {
-  const parsed = parse(xml);
+function judgePlistParse(xml: string, parsed: PlistParse): JobPlistRead {
   if (parsed.kind === "rejected") return { ok: false, reason: parsed.reason };
   if (parsed.kind === "parsed") return judgeParsedPlist(parsed.value);
   return readJobPlistText(xml);
 }
 
+/**
+ * Which shipped form an installed job plist holds, or why it holds neither.
+ * Where plutil exists its reading decides. Without it, the text reader below
+ * does, which is a regex over XML and refuses what it does not model.
+ */
+export function readJobPlist(xml: string, parse: PlistParser = plutilParser): JobPlistRead {
+  return judgePlistParse(xml, parse(xml));
+}
+
+/**
+ * The first three lines of deploy/launchd/com.chamber.verify.plist, character
+ * for character: the XML declaration and the DOCTYPE. The text reader reads no
+ * other prolog. A test holds this equal to the shipped file.
+ */
+export const SHIPPED_PROLOG = [
+  `<?xml version="1.0" encoding="UTF-8"?>`,
+  `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"`,
+  `  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
+].join("\n");
+
 /** The text reader: the whole check where there is no plutil, and the way to find the block to rewrite. */
 export function readJobPlistText(xml: string): JobPlistRead {
+  // The prolog is a closed set: exactly the declaration and DOCTYPE the shipped
+  // plist has, with nothing before them. Both are markup this reader does not
+  // model, and a `<!--` in either (`<?xml version="1.0" encoding="UTF-8" <!-- ?>`,
+  // or a public id ending `<!--`) makes the comment stripper below pair it with
+  // a later `-->` and swallow a Program key that plutil still reads. A plist
+  // re-saved by a tool that writes the DOCTYPE on one line is refused here, and
+  // is read by plutil on a Mac.
+  if (!xml.startsWith(SHIPPED_PROLOG)) {
+    return {
+      ok: false,
+      reason:
+        "the job plist uses XML that Chamber does not read (an XML declaration or DOCTYPE other than the shipped one)",
+    };
+  }
   const live = stripXmlComments(xml);
   // The comment stripper is a regex, not an XML parser, so anything that could
   // make it and launchd disagree about what is a comment or what a key is named
@@ -206,11 +253,11 @@ export function readJobPlistText(xml: string): JobPlistRead {
   // Two more shapes plutil showed to hide a Program key from this reader. A
   // processing instruction can hold comment markers, so the stripper pairs the
   // `<!--` in one with the `-->` in another and swallows what lies between; the
-  // only one a plist has is the XML declaration, and it is not examined for
-  // markers here. And a key tag may carry whitespace or an attribute
-  // (`<key >`, `</key\n>`, `<key a="b">`), which the exact-text matches below
-  // do not see. Closed set again: refuse what is not modelled.
-  if (xml.replace(/^\s*<\?xml[^?]*\?>/, "").includes("<?") || /<\/?key(?!>)/.test(live)) {
+  // prolog is checked above, so any `<?` after it is such an instruction. And a
+  // key tag may carry whitespace or an attribute (`<key >`, `</key\n>`,
+  // `<key a="b">`), which the exact-text matches below do not see. Closed set
+  // again: refuse what is not modelled.
+  if (xml.slice(SHIPPED_PROLOG.length).includes("<?") || /<\/?key(?!>)/.test(live)) {
     return {
       ok: false,
       reason:
@@ -252,19 +299,27 @@ function canonicalJson(value: unknown): string {
  * plist the parser reads differently from the splice (a second ProgramArguments
  * block, one the regex mistook for the live one) can be rewritten without
  * changing what launchd will run. So the rewritten file is parsed again: it must
- * read as the pinned form, and, where there is a parser, be the same plist with
- * only the script changed.
+ * read as the pinned form and, where there is a parser, be the same plist with
+ * only the script changed. `was` is the parse of the original that pinJobPlist
+ * already made. If a parser answered for one text and not for the other, the
+ * comparison cannot be made, and the rewrite is refused instead of waved
+ * through. With no parser for either (Linux, CI) only the text reader's reading
+ * of the rewrite remains, and that is what is checked.
  */
-function checkRewrite(before: string, after: string, parse: PlistParser): void {
-  const read = readJobPlist(after, parse);
+function checkRewrite(was: PlistParse, after: string, parse: PlistParser): void {
+  const now = parse(after);
+  const read = judgePlistParse(after, now);
   if (!read.ok) throw new Error(`the rewritten plist is not accepted: ${read.reason}`);
   if (read.form !== "pinned") throw new Error("the rewrite did not change the script launchd will run");
-  const was = parse(before);
-  const now = parse(after);
-  if (was.kind === "parsed" && now.kind === "parsed") {
-    const expected = { ...(was.value as Record<string, unknown>), ProgramArguments: ["/bin/sh", "-lc", PINNED_SCRIPT] };
-    if (canonicalJson(expected) !== canonicalJson(now.value)) throw new Error("the rewrite changed more than the script");
+  if (was.kind === "unavailable" && now.kind === "unavailable") return;
+  if (was.kind !== "parsed" || now.kind !== "parsed") {
+    throw new Error(
+      "the plist parser read the original and the rewrite differently (one was parsed, the other was not), " +
+        "so the rewrite cannot be compared with the original",
+    );
   }
+  const expected = { ...(was.value as Record<string, unknown>), ProgramArguments: ["/bin/sh", "-lc", PINNED_SCRIPT] };
+  if (canonicalJson(expected) !== canonicalJson(now.value)) throw new Error("the rewrite changed more than the script");
 }
 
 /**
@@ -272,7 +327,8 @@ function checkRewrite(before: string, after: string, parse: PlistParser): void {
  * accepts it and the rewritten plist reads back as pinned.
  */
 export function pinJobPlist(xml: string, parse: PlistParser = plutilParser): string {
-  const read = readJobPlist(xml, parse);
+  const was = parse(xml);
+  const read = judgePlistParse(xml, was);
   if (!read.ok) throw new Error(read.reason);
   if (read.form === "pinned") return xml;
   const m = findProgramArguments(xml);
@@ -284,7 +340,7 @@ export function pinJobPlist(xml: string, parse: PlistParser = plutilParser): str
   const tail = m[5] ?? "";
   const rewritten =
     xml.slice(0, m.index) + head + encodeXmlText(PINNED_SCRIPT) + tail + xml.slice(m.index + m[0].length);
-  checkRewrite(xml, rewritten, parse);
+  checkRewrite(was, rewritten, parse);
   return rewritten;
 }
 
@@ -492,7 +548,15 @@ function moveCheckout(
   }
   if (!already) {
     const checkout = git(dir, ["checkout", "--quiet", "--detach", commit.out]);
-    if (!checkout.ok) return { ok: false, reason: `git checkout: ${checkout.message}` };
+    if (!checkout.ok) {
+      // A first pin's directory is removed by the caller, so there is nothing to
+      // repair there; an existing checkout may have been left half-moved.
+      const repair = created
+        ? ""
+        : `; if it left ${dir} half-moved, finish the move with: ` +
+          `git -C ${dir} checkout --force --detach ${tag} (--force overwrites changes in that checkout)`;
+      return { ok: false, reason: `git checkout: ${checkout.message}${repair}` };
+    }
   }
   const bin = join(dir, "bin", "chamber.js");
   if (!existsSync(bin)) return { ok: false, reason: `${bin} is not on disk after checkout` };
@@ -759,8 +823,10 @@ function proveReleaseRuns(releaseDir: string, env: NodeJS.ProcessEnv, timeoutMs:
  * checkout, so that nothing the release does while it runs can touch the
  * checkout the job uses. The clone comes from the checkout (the commit was
  * fetched into it a moment ago), not from origin, so it needs no network. It is
- * removed afterwards. A pin that is killed while the release runs cannot remove
- * it: it stays in `workDir`, named chamber-pin-proof-*, and costs disk space.
+ * removed afterwards; if it cannot be, pin says on stderr which directory it
+ * left and the result is the one the release earned. A pin that is killed while
+ * the release runs cannot remove it: it stays in `workDir`, named
+ * chamber-pin-proof-*, and costs disk space.
  */
 function proveInClone(
   releaseDir: string,
@@ -785,12 +851,25 @@ function proveInClone(
     if (!checkout.ok) return { ok: false, reason: `could not check the release out to try it: ${checkout.message}` };
     return proveReleaseRuns(clone, env, timeoutMs);
   } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    try {
+      rmSync(scratch, { recursive: true, force: true });
+    } catch (e) {
+      // The release has already run and its verdict is the result. A directory
+      // that will not go away (a release that locked a folder in its clone) must
+      // not replace that verdict with a thrown error, and must not skip the
+      // cleanup of a first pin's checkout, which runs after this returns.
+      const code = (e as NodeJS.ErrnoException).code ?? String(e);
+      process.stderr.write(
+        `chamber pin: could not remove the throwaway clone ${scratch} (${code}); it was left in place, delete it\n`,
+      );
+    }
   }
 }
 
 /**
- * `chamber pin <tag>`. The installed job is checked first. Then the tag is
+ * `chamber pin <tag>`. The installed job is checked first, rewrite included: the
+ * rewrite is done once as a dry run, so a plist pin can read but not rewrite is
+ * refused before anything is fetched or moved. Then the tag is
  * fetched into the release checkout (HEAD and the files stay) and the release
  * is run once, `--version` under the job's own login shell, in a throwaway
  * clone. Only if that passes does the release checkout move to the tag and the
@@ -804,9 +883,21 @@ export function pinRelease(opts: PinOptions): PinOutcome {
   const out: string[] = [];
   const err: string[] = [];
   if (existsSync(opts.plistPath)) {
-    const read = readJobPlist(readFileSync(opts.plistPath, "utf8"));
+    const xml = readFileSync(opts.plistPath, "utf8");
+    const read = readJobPlist(xml);
     if (!read.ok) {
       err.push(`chamber pin: ${opts.plistPath}: ${read.reason}. Nothing was moved.`);
+      return { code: 1, out, err };
+    }
+    // A plist can be one the reader accepts and the splice still cannot rewrite
+    // (the script in CDATA, a JSON plist, a second ProgramArguments the reader
+    // skips). That is only found by doing the rewrite, so it is done here as a
+    // dry run, with the same parser and the result thrown away. Found in pinAgent
+    // it would be found after the checkout had moved.
+    try {
+      pinJobPlist(xml);
+    } catch (e) {
+      err.push(`chamber pin: ${opts.plistPath}: ${e instanceof Error ? e.message : String(e)}. Nothing was moved.`);
       return { code: 1, out, err };
     }
   }

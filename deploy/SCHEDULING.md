@@ -28,13 +28,22 @@ morning until you pin another one. The release checkout sits beside
 If `~/Library/LaunchAgents/com.chamber.verify.plist` is installed, pin also
 checks its script, points its `config show`, `ingest` and `verify` commands at
 the release checkout, and loads or reloads it. On a Mac pin reads the plist with
-`plutil -convert json`, the parser launchd's own reader is built on, so the
-plist it accepts is the plist launchd will run; where there is no `plutil` it
-falls back to a stricter text reader. Pin refuses before it moves anything in
-these cases:
+`/usr/bin/plutil -convert json`. As far as we know that is the parser launchd's
+own reader is built on, but Apple does not document it, so the confirmation is
+`launchctl list com.chamber.verify`, which pin runs after it loads the job and
+which prints the script launchd actually holds. Where there is no
+`/usr/bin/plutil` (Linux) pin falls back to a stricter text reader, which also
+requires the plist to begin with exactly the XML declaration and DOCTYPE of
+`deploy/launchd/com.chamber.verify.plist`; a plist re-saved by a tool that
+writes the DOCTYPE on one line is refused there. Pin refuses before it fetches
+or moves anything in these cases:
 
 - the installed script is not the one Chamber ships, or the plist has a
   `Program` key, which launchd runs instead of the script
+- plutil cannot convert the plist to JSON (it has a `<data>` or `<date>` value,
+  say), or pin cannot rewrite it in place, which it finds by doing the rewrite
+  as a dry run first (the script in CDATA, a JSON or old-style plist, a second
+  `ProgramArguments`)
 - your clone's `origin` is an http(s) URL with a username or password in it
 - the release checkout has tracked changes or a `dist/` folder
 - the tag has no `bin/chamber.js`
@@ -45,9 +54,10 @@ clone of that checkout at the tag: `node bin/chamber.js --version` under
 version in the release's `package.json`. If it does not, pin exits 1 having
 changed nothing the job uses: the release checkout, the plist and the loaded job
 are as they were, so a job that was already pinned keeps running the release it
-ran yesterday, and a first pin leaves no checkout behind. (The fetch does add the
-tag's objects and ref to the checkout's `.git`; its files and `HEAD` stay.) Only
-a release that has run is moved to, and only then is the plist written.
+ran yesterday, and a first pin whose release does not run leaves no checkout
+behind. (The fetch does add the tag's objects and ref to the checkout's `.git`;
+its files and `HEAD` stay.) Only a release that has run is moved to, and only
+then is the plist written.
 
 What the proof does not cover:
 
@@ -58,9 +68,18 @@ What the proof does not cover:
   in progress: if `git -C ~/.local/share/chamber-release status` lists modified
   files after one, the move was cut short. The next pin refuses such a checkout;
   this finishes the move:
-  `git -C ~/.local/share/chamber-release checkout --force --detach <tag>`.
+  `git -C ~/.local/share/chamber-release checkout --force --detach <tag>`. Pin
+  prints that command, with the real directory and tag, when its own
+  `git checkout` fails.
 - A pin killed while the release runs leaves its throwaway clone in the system
-  temp directory, named `chamber-pin-proof-*`. Delete it; nothing else is left.
+  temp directory, named `chamber-pin-proof-*`. Delete it. If it was a first pin,
+  killed during the fetch or the proof, it also leaves
+  `~/.local/share/chamber-release` as an empty `git init`: `origin` set, the tag
+  fetched if the fetch had finished, no commit checked out. The next pin accepts
+  that directory and finishes the job; to start clean instead, delete it. A
+  throwaway clone that cannot be removed after a pin that returned (a release
+  that locked a folder in its clone) is left too: pin names it on stderr and the
+  pin's result is unchanged.
 - The release is tried in the clone, not at `~/.local/share/chamber-release`, so
   a failure that only exists at that path is found by the 08:30 run, not by pin.
 

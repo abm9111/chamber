@@ -17,7 +17,7 @@ Every task's requirements include everything in this section. Each task is imple
 **Step 0, before any task: rebase and re-check the anchors.** This PR is implemented after a separate runtime-hardening PR merges. That PR touches `src/sandbox.ts` (`sandboxRequired` default), `docs/KNOWN_LIMITATIONS.md` entry 4, `CHANGELOG.md` (Unreleased) and `tests/harness.ts`. This plan was written against `origin/main` at `ccdf148`.
 
 ```bash
-cd /Users/shadow/Projects/chamber/.worktrees/supply-chain
+cd <repo>/.worktrees/supply-chain
 git status --short                 # must print nothing
 git fetch origin
 git rebase origin/main
@@ -53,7 +53,7 @@ grep -c -F 'SQLite path backed up (`cp chamber.sqlite chamber.sqlite.bak`)' depl
 
 If the runtime-hardening PR changed `sandboxRequired()` in `src/sandbox.ts`, Task 5 does not care (it edits the argv list, not that function), and Task 9 picks the right text for `KNOWN_LIMITATIONS.md` entry 1 by running a command. Do not edit `sandboxRequired`, entry 4, or anything else that PR owns.
 
-**Working directory.** Work only in `/Users/shadow/Projects/chamber/.worktrees/supply-chain` (a git worktree on `feat/supply-chain-docs`). Never `cd` to `/Users/shadow/Projects/chamber`. Put scratch files (helper scripts, downloads) in a directory made with `mktemp -d`, outside the worktree, and delete it at the end of the task. Never commit a scratch file.
+**Working directory.** Work only in `<repo>/.worktrees/supply-chain` (a git worktree on `feat/supply-chain-docs`). Never `cd` to `<repo>`. Put scratch files (helper scripts, downloads) in a directory made with `mktemp -d`, outside the worktree, and delete it at the end of the task. Never commit a scratch file.
 
 **Node.** `package.json` `engines` is `node >= 23.6`; run `node --version` first and stop if it is older. The worktree has no `node_modules`: run `npm ci` once before the first gate.
 

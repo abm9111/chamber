@@ -54,6 +54,12 @@ chmod 600 "$DEST"
 Keep them in a directory only you can read (`chmod 700`). The `umask 077` above
 makes the backup file `0600` from the start.
 
+The OAuth tokens are sealed with `CHAMBER_TOKEN_KEY`, and the key is not in the
+database or the backup. A restored database opens its tokens only under the same
+key, so keep the key too, stored apart from the backups. Without it, connect
+each MCP server again after the restore. A token stored with
+`CHAMBER_ALLOW_PLAINTEXT_SECRETS=1` is in the backup in the clear.
+
 ## Restore
 
 1. Stop everything that opens the database, not only what writes to it. On a

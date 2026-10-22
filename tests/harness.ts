@@ -14719,8 +14719,8 @@ test("config", "the docs agree with the code: limitation count, sandbox claims, 
     ".backup", "VACUUM INTO", "-wal", "-shm", "chamber config show", "chamber verify", "chamber checkpoint verify", "chmod 600",
     // Restore must stop every process that opens the database, then prove none does.
     "chamber-slack.service", "chamber-discord.service", "com.chamber.daily-snapshot.plist", "chamber mcp", 'lsof "$DB"',
-    // A backup leaks what the database holds.
-    "OAuth tokens",
+    // A backup leaks what the database holds, and its tokens open only under the key it does not hold.
+    "OAuth tokens", "CHAMBER_TOKEN_KEY", "CHAMBER_ALLOW_PLAINTEXT_SECRETS=1",
   ]) {
     assert(backup.includes(needle), `docs/BACKUP.md does not mention ${needle}`);
   }

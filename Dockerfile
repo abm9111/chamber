@@ -7,7 +7,7 @@
 #
 # Node 24 satisfies the 23.6+ floor (built-in TypeScript type stripping).
 # There are zero runtime dependencies, so there is no npm install step.
-FROM node:24-slim
+FROM node:25-slim
 
 # The base's own packages carry security fixes the published tag predates, so
 # upgrade them here rather than waiting for a new tag. This is the same step

@@ -107,8 +107,90 @@ function encodeXmlText(text: string): string {
   return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;");
 }
 
-/** Which shipped form an installed job plist holds, or why it holds neither. */
-export function readJobPlist(xml: string): JobPlistRead {
+/** What a property-list parser made of a plist. */
+export type PlistParse =
+  | { kind: "unavailable" }
+  | { kind: "rejected"; reason: string }
+  | { kind: "parsed"; value: unknown };
+
+export type PlistParser = (xml: string) => PlistParse;
+
+const PLUTIL_TIMEOUT_MS = 15_000;
+
+/**
+ * `plutil -convert json` on stdin. launchd reads plists with the Core
+ * Foundation parser plutil is built on, so what plutil prints is what launchd
+ * will run: it removes the gap between a hand-written reader and the real one
+ * (every shape that hid a `Program` key from the text reader was seen by plutil).
+ * No plutil (Linux, CI) is "unavailable", not an error: the caller falls back to
+ * the text reader. A plist plutil cannot turn into JSON (a `<data>` or `<date>`
+ * value, say) is refused, and so is a plutil that fails to run.
+ */
+export const plutilParser: PlistParser = (xml) => {
+  const r = spawnSync("plutil", ["-convert", "json", "-o", "-", "--", "-"], {
+    input: xml,
+    encoding: "utf8",
+    timeout: PLUTIL_TIMEOUT_MS,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  if (r.error !== undefined) {
+    const code = (r.error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { kind: "unavailable" };
+    return { kind: "rejected", reason: `plutil did not run: ${code ?? String(r.error)}` };
+  }
+  if (r.status !== 0) {
+    const said = (r.stderr ?? "").trim().split("\n")[0] ?? "";
+    return { kind: "rejected", reason: `plutil does not accept the plist${said !== "" ? `: ${said.slice(0, 200)}` : ""}` };
+  }
+  try {
+    return { kind: "parsed", value: JSON.parse(r.stdout ?? "") as unknown };
+  } catch {
+    return { kind: "rejected", reason: "plutil's output was not JSON" };
+  }
+};
+
+/** A parser that is never there: the text reader decides. For tests and for callers that must not run plutil. */
+export const noPlistParser: PlistParser = () => ({ kind: "unavailable" });
+
+/**
+ * The verdict on a parsed plist: no `Program` key (launchd runs it instead of
+ * ProgramArguments[0]) and ProgramArguments exactly `/bin/sh`, `-lc`, one of the
+ * two scripts Chamber ships. Nothing here looks at the text.
+ */
+function judgeParsedPlist(value: unknown): JobPlistRead {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { ok: false, reason: "the plist is not a dictionary" };
+  }
+  const dict = value as Record<string, unknown>;
+  if (Object.hasOwn(dict, "Program")) {
+    return { ok: false, reason: "it has a Program key, which overrides ProgramArguments[0]" };
+  }
+  const args = dict["ProgramArguments"];
+  if (!Array.isArray(args) || args.length !== 3 || args[0] !== "/bin/sh" || args[1] !== "-lc" || typeof args[2] !== "string") {
+    return { ok: false, reason: "ProgramArguments is not /bin/sh -lc followed by one script" };
+  }
+  if (args[2] === BARE_SCRIPT) return { ok: true, form: "bare" };
+  if (args[2] === PINNED_SCRIPT) return { ok: true, form: "pinned" };
+  return {
+    ok: false,
+    reason: "its script is not the one Chamber ships, with bare chamber or with the release checkout",
+  };
+}
+
+/**
+ * Which shipped form an installed job plist holds, or why it holds neither.
+ * Where plutil exists its reading decides. Without it, the text reader below
+ * does, which is a regex over XML and refuses what it does not model.
+ */
+export function readJobPlist(xml: string, parse: PlistParser = plutilParser): JobPlistRead {
+  const parsed = parse(xml);
+  if (parsed.kind === "rejected") return { ok: false, reason: parsed.reason };
+  if (parsed.kind === "parsed") return judgeParsedPlist(parsed.value);
+  return readJobPlistText(xml);
+}
+
+/** The text reader: the whole check where there is no plutil, and the way to find the block to rewrite. */
+export function readJobPlistText(xml: string): JobPlistRead {
   const live = stripXmlComments(xml);
   // The comment stripper is a regex, not an XML parser, so anything that could
   // make it and launchd disagree about what is a comment or what a key is named
@@ -119,6 +201,20 @@ export function readJobPlist(xml: string): JobPlistRead {
     return {
       ok: false,
       reason: "the job plist uses XML that Chamber does not read (CDATA, an unterminated comment, or an encoded key)",
+    };
+  }
+  // Two more shapes plutil showed to hide a Program key from this reader. A
+  // processing instruction can hold comment markers, so the stripper pairs the
+  // `<!--` in one with the `-->` in another and swallows what lies between; the
+  // only one a plist has is the XML declaration, and it is not examined for
+  // markers here. And a key tag may carry whitespace or an attribute
+  // (`<key >`, `</key\n>`, `<key a="b">`), which the exact-text matches below
+  // do not see. Closed set again: refuse what is not modelled.
+  if (xml.replace(/^\s*<\?xml[^?]*\?>/, "").includes("<?") || /<\/?key(?!>)/.test(live)) {
+    return {
+      ok: false,
+      reason:
+        "the job plist uses XML that Chamber does not read (a processing instruction, or a key tag with extra characters)",
     };
   }
   if (live.split("<key>ProgramArguments</key>").length !== 2) {
@@ -142,21 +238,54 @@ export function readJobPlist(xml: string): JobPlistRead {
   };
 }
 
-/** The same plist with its script in the pinned form. Throws unless readJobPlist accepts it. */
-export function pinJobPlist(xml: string): string {
-  const read = readJobPlist(xml);
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * The rewrite is validated, not only the input. The splice works on text, so a
+ * plist the parser reads differently from the splice (a second ProgramArguments
+ * block, one the regex mistook for the live one) can be rewritten without
+ * changing what launchd will run. So the rewritten file is parsed again: it must
+ * read as the pinned form, and, where there is a parser, be the same plist with
+ * only the script changed.
+ */
+function checkRewrite(before: string, after: string, parse: PlistParser): void {
+  const read = readJobPlist(after, parse);
+  if (!read.ok) throw new Error(`the rewritten plist is not accepted: ${read.reason}`);
+  if (read.form !== "pinned") throw new Error("the rewrite did not change the script launchd will run");
+  const was = parse(before);
+  const now = parse(after);
+  if (was.kind === "parsed" && now.kind === "parsed") {
+    const expected = { ...(was.value as Record<string, unknown>), ProgramArguments: ["/bin/sh", "-lc", PINNED_SCRIPT] };
+    if (canonicalJson(expected) !== canonicalJson(now.value)) throw new Error("the rewrite changed more than the script");
+  }
+}
+
+/**
+ * The same plist with its script in the pinned form. Throws unless readJobPlist
+ * accepts it and the rewritten plist reads back as pinned.
+ */
+export function pinJobPlist(xml: string, parse: PlistParser = plutilParser): string {
+  const read = readJobPlist(xml, parse);
   if (!read.ok) throw new Error(read.reason);
   if (read.form === "pinned") return xml;
   const m = findProgramArguments(xml);
-  if (m === null) throw new Error("ProgramArguments vanished between the read and the rewrite");
+  if (m === null) throw new Error("ProgramArguments is valid, but not in the plain form Chamber rewrites in place");
   // Spliced by position, not with String.prototype.replace: the script is full
   // of `$`, which replace reads as a pattern, and the match to rewrite is the
   // live block, which need not be the first one in the text.
   const head = m[1] ?? "";
   const tail = m[5] ?? "";
-  return (
-    xml.slice(0, m.index) + head + encodeXmlText(PINNED_SCRIPT) + tail + xml.slice(m.index + m[0].length)
-  );
+  const rewritten =
+    xml.slice(0, m.index) + head + encodeXmlText(PINNED_SCRIPT) + tail + xml.slice(m.index + m[0].length);
+  checkRewrite(xml, rewritten, parse);
+  return rewritten;
 }
 
 export interface CheckoutOptions {

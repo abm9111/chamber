@@ -118,8 +118,13 @@ history and the GitHub releases.
   already pinned keeps running the release it ran before and a first pin leaves
   no checkout behind. What stays open is the move itself, a `git checkout`
   during which a job that starts sees neither release; `deploy/SCHEDULING.md`
-  names it and the command that finishes an interrupted move. The plist is
-  replaced atomically, git runs with prompts off and
+  names it and the command that finishes an interrupted move. The job plist is
+  read with `plutil -convert json` where plutil exists (a `Program` key is
+  refused and ProgramArguments must be exactly `/bin/sh -lc <shipped script>`),
+  the rewritten plist is parsed again and must be the same plist with only the
+  script changed, and the text reader, now also refusing processing
+  instructions and key tags with extra characters, is the fallback where there
+  is no plutil. The plist is replaced atomically, git runs with prompts off and
   without inherited `GIT_DIR`, with timeouts, an http(s) origin carrying
   credentials is refused, and a commented-out `ProgramArguments` block or a
   `Program` key no longer confuses the plist check.

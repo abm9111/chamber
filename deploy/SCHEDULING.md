@@ -27,7 +27,10 @@ morning until you pin another one. The release checkout sits beside
 
 If `~/Library/LaunchAgents/com.chamber.verify.plist` is installed, pin also
 checks its script, points its `config show`, `ingest` and `verify` commands at
-the release checkout, and loads or reloads it. Pin refuses before it moves anything in
+the release checkout, and loads or reloads it. On a Mac pin reads the plist with
+`plutil -convert json`, the parser launchd's own reader is built on, so the
+plist it accepts is the plist launchd will run; where there is no `plutil` it
+falls back to a stricter text reader. Pin refuses before it moves anything in
 these cases:
 
 - the installed script is not the one Chamber ships, or the plist has a

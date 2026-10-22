@@ -84,8 +84,11 @@ import {
   originCredentialRefusal,
   pinCheckout,
   pinJobPlist,
+  noPlistParser,
   pinRelease,
+  plutilParser,
   readJobPlist,
+  readJobPlistText,
   redactUserinfo,
   setGitTimeouts,
   writeFileAtomic,
@@ -14179,8 +14182,9 @@ test("release", "a commented-out ProgramArguments block does not hide, or stand 
     /\s+<key>ProgramArguments<\/key>[\s\S]*?<\/array>/,
     DEAD_BLOCK,
   );
-  const refused = readJobPlist(onlyDead);
+  const refused = readJobPlistText(onlyDead);
   assert(!refused.ok && refused.reason.includes("exactly once"), JSON.stringify(refused));
+  assert(!readJobPlist(onlyDead).ok, "a plist with only a commented-out job was accepted");
 
   // A comment that merely mentions the key is not a second block either.
   const mention = readJobPlist(jobPlistWith("<!-- see <key>ProgramArguments</key> below -->"));
@@ -14231,8 +14235,13 @@ function jobPlistEnding(extra: string): string {
 }
 
 function assertNeverRead(xml: string, what: string): void {
+  // The text reader, which is the whole check where there is no plutil, names
+  // the XML it will not read.
+  const text = readJobPlistText(xml);
+  assert(!text.ok && text.reason.startsWith(HIDDEN_XML_REASON), `${what} was read by the text reader: ${JSON.stringify(text)}`);
+  // Whichever reader this machine uses (plutil on a Mac) refuses it too.
   const read = readJobPlist(xml);
-  assert(!read.ok && read.reason.startsWith(HIDDEN_XML_REASON), `${what} was read: ${JSON.stringify(read)}`);
+  assert(!read.ok, `${what} was read: ${JSON.stringify(read)}`);
   let threw = false;
   try {
     pinJobPlist(xml);
@@ -14285,6 +14294,126 @@ test("release", "an unterminated comment is refused, before or after the block, 
     assert(lintOf("before.plist", before) !== 0, "plutil -lint accepts a plist with an unterminated comment before the block");
     assert(lintOf("after.plist", after) !== 0, "plutil -lint accepts a plist with an unterminated comment after the block");
   });
+});
+
+/** Whether this machine has plutil, the parser launchd's own plist reader is built on. */
+function havePlutil(): boolean {
+  return plutilParser("").kind !== "unavailable";
+}
+
+/** What plutil makes of `xml`: its JSON, or null when it refuses or is absent. */
+function plutilJson(xml: string): string | null {
+  const parsed = plutilParser(xml);
+  return parsed.kind === "parsed" ? JSON.stringify(parsed.value) : null;
+}
+
+// Two shapes that hid a Program key from the text reader while plutil (and so
+// launchd) still saw it. Each is refused by the text reader on every machine and
+// by plutil's verdict on a Mac.
+const PI_HIDING_COMMENT = jobPlistEnding(
+  [
+    `  <?x <!-- ?>`,
+    `  <key>Program</key><string>/usr/bin/true</string>`,
+    `  <?y --> ?>`,
+  ].join("\n"),
+);
+
+const KEY_TAG_VARIANTS: ReadonlyArray<readonly [string, string]> = [
+  ["a space inside the opening tag", `  <key >Program</key><string>/usr/bin/true</string>`],
+  ["a newline inside the closing tag", `  <key>Program</key\n><string>/usr/bin/true</string>`],
+  ["an attribute on the opening tag", `  <key a="b">Program</key><string>/usr/bin/true</string>`],
+];
+
+test("release", "a processing instruction that holds comment markers cannot hide a Program key", () => {
+  assertNeverRead(PI_HIDING_COMMENT, "a Program key between processing instructions");
+  assert(!readJobPlist(PI_HIDING_COMMENT, noPlistParser).ok, "the fallback reader accepted it");
+  if (!havePlutil()) {
+    process.stdout.write("      (plutil is not available: skipped the check that plutil sees the Program key)\n");
+    return;
+  }
+  const seen = plutilJson(PI_HIDING_COMMENT);
+  assert(seen !== null && seen.includes('"Program"'), `the control is broken, plutil does not see a Program key: ${seen}`);
+  const read = readJobPlist(PI_HIDING_COMMENT);
+  assert(!read.ok && read.reason.includes("Program key"), `plutil's verdict was not a Program refusal: ${JSON.stringify(read)}`);
+});
+
+test("release", "a key tag with whitespace or an attribute cannot hide a Program key", () => {
+  for (const [what, key] of KEY_TAG_VARIANTS) {
+    const xml = jobPlistEnding(key);
+    assertNeverRead(xml, what);
+    assert(!readJobPlist(xml, noPlistParser).ok, `${what}: the fallback reader accepted it`);
+    if (!havePlutil()) continue;
+    const seen = plutilJson(xml);
+    assert(seen !== null && seen.includes('"Program"'), `${what}: plutil does not see a Program key: ${seen}`);
+    const read = readJobPlist(xml);
+    assert(!read.ok && read.reason.includes("Program key"), `${what}: plutil's verdict was ${JSON.stringify(read)}`);
+  }
+  if (!havePlutil()) {
+    process.stdout.write("      (plutil is not available: skipped the check that plutil sees the Program key)\n");
+  }
+});
+
+test("release", "where plutil exists its verdict decides, and a rewrite that changes nothing launchd runs is refused", () => {
+  if (!havePlutil()) {
+    process.stdout.write("      (plutil is not available: skipped the plutil verdict and rewrite checks)\n");
+    return;
+  }
+  // Two ProgramArguments: plutil keeps the last, the shipped script, so the
+  // plist is a bare job. The text reader refuses two keys outright.
+  const first = [
+    `  <key>ProgramArguments</key>`,
+    `  <array><string>/bin/sh</string><string>-lc</string><string>echo first</string></array>`,
+  ].join("\n");
+  const twice = jobPlistXml(BARE_SCRIPT).replace("  <key>ProgramArguments</key>", `${first}\n  <key>ProgramArguments</key>`);
+  assert(!readJobPlistText(twice).ok, "the text reader accepted two ProgramArguments");
+  const read = readJobPlist(twice);
+  assert(read.ok && read.form === "bare", `plutil's last-key-wins reading was not taken: ${JSON.stringify(read)}`);
+  // The splice would rewrite the first block; plutil, reading the rewrite, still
+  // sees the last one unchanged. The rewrite is checked, not the input.
+  let said = "";
+  try {
+    pinJobPlist(twice);
+  } catch (e) {
+    said = e instanceof Error ? e.message : String(e);
+  }
+  assert(said.includes("did not change the script launchd will run"), `pin rewrote a plist whose live script it did not change: "${said}"`);
+
+  // Valid, and equal to the shipped script, but not in the plain form the
+  // splice can rewrite: accepted by the reader, refused by the rewrite.
+  const cdata = jobPlistXml(`<![CDATA[${BARE_SCRIPT}]]>`);
+  const readCdata = readJobPlist(cdata);
+  assert(readCdata.ok && readCdata.form === "bare", `plutil's reading of a CDATA script: ${JSON.stringify(readCdata)}`);
+  let cdataSaid = "";
+  try {
+    pinJobPlist(cdata);
+  } catch (e) {
+    cdataSaid = e instanceof Error ? e.message : String(e);
+  }
+  assert(cdataSaid.includes("not in the plain form"), `pin did not explain why it could not rewrite: "${cdataSaid}"`);
+
+  // plutil's refusal is final. This plist is one the text reader would accept
+  // (a <data> value is just XML to it) and plutil cannot convert, so a pin that
+  // trusted the text over plutil would rewrite a file launchd may read differently.
+  const withData = jobPlistEnding("  <key>X</key>\n  <data>AAAA</data>");
+  assert(readJobPlistText(withData).ok, "the control is broken: the text reader refuses a plist with a data value");
+  const refusedData = readJobPlist(withData);
+  assert(!refusedData.ok && refusedData.reason.startsWith("plutil"), `plutil's refusal was not final: ${JSON.stringify(refusedData)}`);
+});
+
+test("release", "without plutil the text reader still reads and rewrites the shipped plist", () => {
+  const bare = jobPlistXml(BARE_SCRIPT);
+  const read = readJobPlist(bare, noPlistParser);
+  assert(read.ok && read.form === "bare", JSON.stringify(read));
+  const pinned = pinJobPlist(bare, noPlistParser);
+  const again = readJobPlist(pinned, noPlistParser);
+  assert(again.ok && again.form === "pinned", JSON.stringify(again));
+  assert(pinned.replace(PINNED_SCRIPT, "SCRIPT") === bare.replace(BARE_SCRIPT, "SCRIPT"), "pinning changed more than the script");
+  // plutil, where there is one, agrees about the same files.
+  if (havePlutil()) {
+    const a = readJobPlist(bare);
+    const b = readJobPlist(pinned);
+    assert(a.ok && a.form === "bare" && b.ok && b.form === "pinned", `plutil disagrees: ${JSON.stringify([a, b])}`);
+  }
 });
 
 test("release", "an http(s) origin the URL parser rejects is refused, not waved through, and never echoed", () => {

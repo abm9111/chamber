@@ -9,6 +9,7 @@ export DISCORD_BOT_TOKEN=...
 export DISCORD_CLIENT_ID=...              # for slash registration
 export DISCORD_GUILD_ID=...               # optional: instant guild commands
 export CHAMBER_DISCORD_APPROVERS=123,456  # Discord user snowflakes; fail-closed if empty
+export CHAMBER_DISCORD_ALLOWED_USERS=123,456  # who may talk to the bot; empty = nobody
 export CHAMBER_DISCORD_OPS_CHANNEL=...    # channel id for pending cards
 export CHAMBER_DB=/var/lib/chamber/chamber.sqlite
 ```
@@ -51,7 +52,7 @@ sudo systemctl enable --now chamber-discord.service
 
 | Env | Effect |
 |-----|--------|
-| `CHAMBER_DISCORD_ALLOWED_USERS` | Restrict who can talk (empty = open) |
+| `CHAMBER_DISCORD_ALLOWED_USERS` | Who may talk to the bot. **Empty = nobody** (fail-closed; it used to mean everybody). The runner logs `chamber: CHAMBER_DISCORD_ALLOWED_USERS is empty, so nobody can talk to this bot` at startup. A user who is not listed and is refused at a mention, a DM or `/chamber` is told so; a message in a free-response channel that did not address the bot gets no reply. |
 | `CHAMBER_DISCORD_FREE_CHANNELS` | Channel IDs that work without @mention |
 | `CHAMBER_DISCORD_REACTION_APPROVE=1` | ✅/❌ on messages containing `pw_…` |
 | outbound | `@everyone` / `@here` neutralized; `allowedMentions.parse=[]` |

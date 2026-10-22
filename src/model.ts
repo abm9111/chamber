@@ -89,6 +89,52 @@ function stubComplete(input: CompleteInput): Omit<CompleteResult, "spendId"> {
   };
 }
 
+const DEFAULT_MODEL_TIMEOUT_MS = 180_000;
+
+/**
+ * `AbortSignal.timeout` takes a 32-bit signed millisecond count and does not
+ * refuse a larger one: it logs TimeoutOverflowWarning and fires after 1 ms.
+ * Measured on Node 26.10 — a 2147483648 ms timeout aborted within 300 ms. So the
+ * ceiling is enforced here, where the operator can be told, instead of being
+ * discovered as a model call that dies at once.
+ */
+const MAX_MODEL_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * How long one model request may take, from `CHAMBER_MODEL_TIMEOUT_MS`.
+ *
+ * Unset means the default. Any set value that is not a string of digits naming
+ * 1..2147483647 throws and names the variable — including the empty string and
+ * `0`. It is never replaced by the default: a typo that silently turned a
+ * 20 s budget into 180 s is the same defect as having no budget.
+ */
+export function modelTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.CHAMBER_MODEL_TIMEOUT_MS;
+  if (raw === undefined) return DEFAULT_MODEL_TIMEOUT_MS;
+  const ms = /^[0-9]+$/.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isSafeInteger(ms) || ms < 1 || ms > MAX_MODEL_TIMEOUT_MS) {
+    throw new Error(
+      `CHAMBER_MODEL_TIMEOUT_MS must be a whole number of milliseconds from 1 ` +
+        `to ${MAX_MODEL_TIMEOUT_MS}, got ${JSON.stringify(raw)}. Unset it to use ` +
+        `the ${DEFAULT_MODEL_TIMEOUT_MS} ms default.`,
+    );
+  }
+  return ms;
+}
+
+/** `ms` as seconds, to at most one decimal place: 200 -> "0.2", 180000 -> "180". */
+function secondsLabel(ms: number): string {
+  return String(Math.round(ms / 100) / 10);
+}
+
+function isTimeoutError(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { name?: unknown }).name === "TimeoutError"
+  );
+}
+
 async function openaiComplete(
   input: CompleteInput,
 ): Promise<Omit<CompleteResult, "spendId">> {
@@ -115,29 +161,50 @@ async function openaiComplete(
     );
   }
   const model = process.env.CHAMBER_API_MODEL ?? "gpt-4o-mini";
-  // Omitted entirely rather than sent as "Bearer undefined", which some local
-  // servers reject outright and others log as a credential.
-  const res = await fetch(`${base}/chat/completions`, {
-    method: "POST",
-    headers: {
-      ...(key ? { Authorization: `Bearer ${key}` } : {}),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      messages: input.messages,
-      temperature: 0.3,
-    }),
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`openai complete ${res.status}: ${body.slice(0, 300)}`);
-  }
-  const data = (await res.json()) as {
+  // Read before the request exists, so a bad value fails the call before any
+  // network traffic.
+  const timeoutMs = modelTimeoutMs();
+  // One signal for the whole exchange: connecting, waiting for headers and
+  // reading the body all run on this clock. A server that sends a status line
+  // and then stalls is abandoned exactly like one that never answers.
+  const signal = AbortSignal.timeout(timeoutMs);
+  type CompletionBody = {
     choices?: { message?: { content?: string; reasoning_content?: string } }[];
     usage?: { prompt_tokens?: number; completion_tokens?: number };
     model?: string;
   };
+  let data: CompletionBody;
+  try {
+    // Omitted entirely rather than sent as "Bearer undefined", which some local
+    // servers reject outright and others log as a credential.
+    const res = await fetch(`${base}/chat/completions`, {
+      method: "POST",
+      headers: {
+        ...(key ? { Authorization: `Bearer ${key}` } : {}),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: input.messages,
+        temperature: 0.3,
+      }),
+      signal,
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`openai complete ${res.status}: ${body.slice(0, 300)}`);
+    }
+    data = (await res.json()) as CompletionBody;
+  } catch (err) {
+    if (isTimeoutError(err)) {
+      throw new Error(
+        `model endpoint ${base} did not answer within ${secondsLabel(timeoutMs)} s ` +
+          `(CHAMBER_MODEL_TIMEOUT_MS)`,
+        { cause: err },
+      );
+    }
+    throw err;
+  }
   // Reasoning models (local and hosted) route their answer to reasoning_content
   // and leave content empty; treat a wholly empty reply as an error, not as "".
   const message = data.choices?.[0]?.message;

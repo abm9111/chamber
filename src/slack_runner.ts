@@ -4,6 +4,7 @@
  * Env:
  *   SLACK_BOT_TOKEN, SLACK_APP_TOKEN
  *   CHAMBER_DB, CHAMBER_SLACK_APPROVERS, CHAMBER_SLACK_OPS_CHANNEL
+ *   CHAMBER_SLACK_ALLOWED_USERS  (who may talk to the bot; empty = nobody)
  *
  * npm i @slack/bolt   (required)
  */
@@ -15,6 +16,9 @@ import {
   slackApprove,
   slackReject,
   canSlackApprove,
+  canSlackTalk,
+  slackTalkAllowlist,
+  SLACK_TALK_REFUSAL,
   registerSlackPendingHook,
 } from "./slack_ops.ts";
 import { listPendingQueue } from "./approvals.ts";
@@ -46,10 +50,19 @@ async function main(): Promise<void> {
 
   const db = openSlackDb();
   registerSlackPendingHook();
+  if (slackTalkAllowlist().size === 0) {
+    console.warn("chamber: CHAMBER_SLACK_ALLOWED_USERS is empty, so nobody can talk to this bot");
+  }
 
   // ── Mentions → gated turn ─────────────────────────────────────────
   app.event("app_mention", async ({ event, say }) => {
     if ((event as { bot_id?: string }).bot_id) return;
+    // Before anything is parsed or written. A mention is addressing the bot
+    // directly, so a refused user is told why.
+    if (!canSlackTalk(event.user ?? "unknown")) {
+      await say({ text: SLACK_TALK_REFUSAL, thread_ts: event.thread_ts ?? event.ts });
+      return;
+    }
     const text = (event.text ?? "").replace(/<@[^>]+>/g, "").trim();
     if (!text) return;
     try {
@@ -84,6 +97,10 @@ async function main(): Promise<void> {
     };
     if (m.channel_type !== "im") return;
     if (m.bot_id || m.subtype) return;
+    if (!canSlackTalk(m.user ?? "unknown")) {
+      await say({ text: SLACK_TALK_REFUSAL });
+      return;
+    }
     const text = (m.text ?? "").trim();
     if (!text) return;
     try {
@@ -100,6 +117,10 @@ async function main(): Promise<void> {
   // ── Slash /chamber ────────────────────────────────────────────────
   app.command("/chamber", async ({ command, ack, respond, client }) => {
     await ack();
+    if (!canSlackTalk(command.user_id)) {
+      await respond({ response_type: "ephemeral", text: SLACK_TALK_REFUSAL });
+      return;
+    }
     try {
       const result = handleChamberSlash(db, command.text ?? "", {
         userId: command.user_id,

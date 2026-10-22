@@ -25,6 +25,15 @@ wrong. Neither is theoretical.
 
 ## 1. The sandbox does not isolate
 
+> **Default changed, 2026-10-21.** `CHAMBER_SANDBOX_REQUIRED` now means
+> required when it is unset or empty. Without an isolating backend whose probe
+> confines (today only bubblewrap), `runInSandbox` refuses, and so does every
+> caller: `tool-run`, `tool-synth`, `sandbox-test` and `verifyMcpToolSource`.
+> The refusal ends with the way out, `Set CHAMBER_SANDBOX_REQUIRED=0 to run
+> tool code without isolation.` Only an explicit `0`, `false`, `no` or `off`
+> (any case) selects the unisolated subprocess that the rest of this entry
+> describes.
+
 `src/sandbox.ts` is named for containment it does not provide. Running
 `probes/sandbox_escape.ts` on the development machine, with
 `CHAMBER_SANDBOX_REQUIRED=1` set, produces this:
@@ -298,25 +307,27 @@ it on a schedule rather than on request. `docs/NEXT_LEVEL_PLAN.md` Phase 1.4 spe
 the signing work and flags it as net-new code that is droppable if the phase overruns —
 so it is planned, but it is the first thing scheduled to be cut.
 
-## 4. A stalled model endpoint hangs the process forever
+## 4. A stalled model endpoint is abandoned after 180 seconds, and nothing bounds the whole turn
 
-`src/model.ts:93-104` calls `fetch` with no `signal`, no `AbortController`, and no
-timeout. There is no `CHAMBER_TURN_DEADLINE_MS` or any other implemented deadline on the
-model path.
+`src/model.ts` gives every model request one `AbortSignal.timeout`. The signal covers
+connecting, waiting for headers and reading the body, so a server that sends a status
+line and then stalls is abandoned on the same clock as one that never answers. The
+default is 180 000 ms; `CHAMBER_MODEL_TIMEOUT_MS` sets it. A set value that is not a
+string of digits naming 1 to 2 147 483 647 is refused with an error that names the
+variable, including `0` and the empty string; it is never replaced by the default. The
+ceiling is the largest value `AbortSignal.timeout` honours: a larger one fires at once.
+On timeout the error reads `model endpoint <base> did not answer within <N> s
+(CHAMBER_MODEL_TIMEOUT_MS)`. The MCP server's serial queue moves on to the next call.
 
-**What it costs.** `chamber ask` routes through `complete()` and inherits this. A model
-server that accepts the connection and then stops responding — a local LM Studio that
-has wedged, a remote endpoint that black-holes the request — hangs the command
-indefinitely with no output and no error. Under the scheduled job this is worse than a
-crash: a hung run produces no log line at all, so the absence of a failure reads as
-success. Note the inconsistency, which is a useful signal that this is an oversight
-rather than a decision: MCP calls are bounded (`curl -m 30`, `src/mcp_client.ts:53-58`)
-and embedding subprocesses are bounded (`src/embedder.ts:140,163`). Only the model call
-is not.
+**What it still costs.** The bound is per request. There is no wall clock across a whole
+turn, which also spends time in retrieval and in the embedding subprocess (itself
+bounded at 180 s in `src/embedder.ts`). A turn is therefore bounded by the sum of its
+parts, not by one number. What changed is that a stalled model is now an error with a
+message, where it used to be a run that never finished and wrote nothing.
 
-**What would fix it.** An `AbortSignal.timeout` on the request plus a per-turn wall
-clock. Specified in `docs/NEXT_LEVEL_PLAN.md` Phase 2A, which calls out this exact line
-of code.
+**What would fix it.** A per-turn deadline that the model request, the embedder and the
+retrieval all draw from. Specified in `docs/NEXT_LEVEL_PLAN.md` Phase 2A; the model
+request is the part that is done.
 
 ## 5. The corpus has no notion of deletion
 
@@ -1099,3 +1110,51 @@ npm deletion made. Not done here because the embedder path's Python
 dependencies (`scripts/embed_minilm.py`, numpy/onnxruntime) are not yet proven
 on musl, and shipping an image whose semantic gate silently degrades to hash
 vectors would trade a scanner number for a correctness regression.
+
+## 21. While a turn waits on the embedder, only `/health` is certain to answer
+
+`POST /turn` runs on a worker thread (`src/turn_worker.ts`), on its own connection to the
+same database file, so a turn no longer stops the event loop. What it cannot stop is
+SQLite's single write lock. A turn that reaches the paraphrase check holds `BEGIN
+IMMEDIATE` across a Python embedding spawn, which can take up to 180 s, because the check
+and the write are one transaction (FM-6, `src/commit_belief.ts`) and that is not up for
+negotiation.
+
+**What it costs.** Measured against a real server with an embedder that takes 3 s:
+`/health` and `/checkpoint` answer in about 2 ms. `/status` and `/queue` answer `503
+{"error":"busy"}` with `Retry-After: 1` after about 290 ms, and log nothing, because both
+run the TTL sweep (`expireStalePending`), which is an `UPDATE` even when nothing has
+expired. `/approve` for a write that exists, and `/deliberate`, need the same lock and fail
+the same way (`/reject` makes the same `decideWrite` call). A second `POST /turn`
+waits behind the first. Before the worker, every one of those routes, `/health` included,
+froze for the whole wait; the main thread's connection now gives up after 250 ms
+(`MAIN_THREAD_BUSY_MS` in `src/server.ts`) instead of SQLite's default 5 s. The server
+recognises the refusal by SQLite's result code (`errcode` 5, `SQLITE_BUSY`), not by the
+message, and a client that gets the 503 is expected to retry. The same holds the other
+way round: a `POST /turn` whose worker waits out SQLite's 5 s for a lock that a route on
+this thread holds answers the same 503, flagged `busy` by the worker, which is where the
+error object exists.
+
+Three more things follow from the 250 ms limit.
+
+- It applies to any writer, not only the turn worker. A scheduled `chamber ingest` or
+  `chamber verify` in another process holds the same single write lock, and while it does
+  the routes above answer 503 `busy` just the same.
+- A 503 `busy` from `POST /turn` can come after the turn's session and opening rows have
+  committed (`runTurn` in `src/turn.ts` writes the session and the opening messages as
+  separate statements before the belief commit). A client that retries can therefore
+  create a second session for what the user sees as one message.
+- `POST /deliberate` is one transaction (`BEGIN IMMEDIATE` in `src/server.ts`), so a 503
+  there writes nothing and a failure part-way leaves nothing; a retry cannot double it.
+  The other callers of `openDeliberation` (the CLI, skill activation) are unchanged.
+
+Two smaller things follow from the turn living in another thread. The `/turn` rate-limit
+bucket is in memory in that thread, so a worker that dies and is restarted starts with a
+full bucket. And an in-memory database (`CHAMBER_DB=:memory:`, or the last-resort fallback
+`openChamberDb` announces on stderr) cannot be shared with a thread, so there the turn runs
+on the main thread as it always did, and blocks.
+
+**What would fix it.** Skip the TTL sweep when the lock is held (`decideWrite` already
+refuses an expired write by itself, so only the listing is momentarily stale), or run it
+from the worker. Not done here: it changes `src/approvals.ts`, which this change does not
+otherwise touch.

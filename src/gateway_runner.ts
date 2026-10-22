@@ -28,9 +28,9 @@ import { runExpiryJob } from "./expiry.ts";
 import { profileContext } from "./profiles.ts";
 import { matchSkills } from "./skills_registry.ts";
 import { sha256, newId } from "./hash.ts";
-import { spawnSync } from "node:child_process";
+import { httpSync } from "./http_sync.ts";
 
-class DiscordGateway implements GatewayAdapter {
+export class DiscordGateway implements GatewayAdapter {
   name = "discord" as const;
   private token: string;
   constructor(token = process.env.DISCORD_BOT_TOKEN ?? "") {
@@ -56,26 +56,22 @@ class DiscordGateway implements GatewayAdapter {
   }
   async send(msg: { channel: "discord"; chatId: string; text: string }): Promise<void> {
     if (!this.token) return;
-    spawnSync(
-      "curl",
-      [
-        "-s",
-        "-X",
-        "POST",
-        `https://discord.com/api/v10/channels/${msg.chatId}/messages`,
-        "-H",
-        `Authorization: Bot ${this.token}`,
-        "-H",
-        "Content-Type: application/json",
-        "-d",
-        JSON.stringify({ content: msg.text.slice(0, 1900) }),
-      ],
-      { encoding: "utf-8" },
-    );
+    // This call had no timeout at all; a stalled Discord would have held the
+    // runner's only thread indefinitely.
+    httpSync({
+      url: `https://discord.com/api/v10/channels/${msg.chatId}/messages`,
+      method: "POST",
+      headers: {
+        Authorization: `Bot ${this.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ content: msg.text.slice(0, 1900) }),
+      timeoutSec: 30,
+    });
   }
 }
 
-class SlackGateway implements GatewayAdapter {
+export class SlackGateway implements GatewayAdapter {
   name = "slack" as const;
   private token: string;
   constructor(token = process.env.SLACK_BOT_TOKEN ?? "") {
@@ -96,22 +92,16 @@ class SlackGateway implements GatewayAdapter {
   }
   async send(msg: { channel: "slack"; chatId: string; text: string }): Promise<void> {
     if (!this.token) return;
-    spawnSync(
-      "curl",
-      [
-        "-s",
-        "-X",
-        "POST",
-        "https://slack.com/api/chat.postMessage",
-        "-H",
-        `Authorization: Bearer ${this.token}`,
-        "-H",
-        "Content-Type: application/json",
-        "-d",
-        JSON.stringify({ channel: msg.chatId, text: msg.text.slice(0, 3900) }),
-      ],
-      { encoding: "utf-8" },
-    );
+    httpSync({
+      url: "https://slack.com/api/chat.postMessage",
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ channel: msg.chatId, text: msg.text.slice(0, 3900) }),
+      timeoutSec: 30,
+    });
   }
 }
 

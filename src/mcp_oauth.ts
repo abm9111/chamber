@@ -16,6 +16,8 @@ import { spawnSync } from "node:child_process";
 import type { DatabaseSync } from "node:sqlite";
 import { appendAudit } from "./audit.ts";
 import { canSealSecrets, sealSecret, openSecret } from "./secret_box.ts";
+import { isLoopbackBase } from "./config.ts";
+import { httpSync } from "./http_sync.ts";
 
 const META_TTL_MS = 60 * 60 * 1000;
 
@@ -68,16 +70,13 @@ export interface StoredToken {
 }
 
 function httpGet(url: string): { status: number; body: string } {
-  const r = spawnSync(
-    "curl",
-    ["-s", "-m", "15", "-w", "\n%{http_code}", "-L", url],
-    { encoding: "utf-8", maxBuffer: 2 * 1024 * 1024 },
-  );
-  const out = r.stdout || "";
-  const nl = out.lastIndexOf("\n");
-  const status = Number(out.slice(nl + 1)) || 0;
-  const body = nl >= 0 ? out.slice(0, nl) : out;
-  return { status, body };
+  const r = httpSync({
+    url,
+    timeoutSec: 15,
+    followRedirects: true,
+    maxBytes: 2 * 1024 * 1024,
+  });
+  return { status: r.status, body: r.body };
 }
 
 function httpPostForm(
@@ -89,29 +88,15 @@ function httpPostForm(
       ([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`,
     )
     .join("&");
-  const r = spawnSync(
-    "curl",
-    [
-      "-s",
-      "-m",
-      "20",
-      "-w",
-      "\n%{http_code}",
-      "-X",
-      "POST",
-      url,
-      "-H",
-      "Content-Type: application/x-www-form-urlencoded",
-      "-d",
-      data,
-    ],
-    { encoding: "utf-8", maxBuffer: 2 * 1024 * 1024 },
-  );
-  const out = r.stdout || "";
-  const nl = out.lastIndexOf("\n");
-  const status = Number(out.slice(nl + 1)) || 0;
-  const body = nl >= 0 ? out.slice(0, nl) : out;
-  return { status, body };
+  const r = httpSync({
+    url,
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: data,
+    timeoutSec: 20,
+    maxBytes: 2 * 1024 * 1024,
+  });
+  return { status: r.status, body: r.body };
 }
 
 /** Normalize resource URL for token key (strip trailing slash except root). */
@@ -121,9 +106,26 @@ export function normalizeResourceUrl(url: string): string {
   return `${u.origin}${path}`;
 }
 
-function requireHttps(url: string, label: string): void {
+/**
+ * Refuse to send OAuth traffic anywhere but TLS or this machine.
+ *
+ * This used to test the *string*: `startsWith("http://127.0.0.1")` accepts
+ * `http://127.0.0.1.attacker.invalid/x` and `http://127.0.0.1@attacker.invalid/x`,
+ * and a refresh token and client secret go to whatever host the URL really
+ * names. The decision is now made on the parsed URL. `https:` passes; `http:`
+ * passes only for the loopback hosts `isLoopbackBase` accepts; anything else,
+ * including a string that does not parse, is refused with the same message.
+ */
+export function requireHttps(url: string, label: string): void {
   if (process.env.CHAMBER_OAUTH_ALLOW_HTTP === "1") return;
-  if (!url.startsWith("https://") && !url.startsWith("http://127.0.0.1") && !url.startsWith("http://localhost")) {
+  let protocol = "";
+  try {
+    protocol = new URL(url).protocol;
+  } catch {
+    // Not a URL: protocol stays "" and the refusal below applies.
+  }
+  const ok = protocol === "https:" || (protocol === "http:" && isLoopbackBase(url));
+  if (!ok) {
     throw new Error(`${label} must be HTTPS (or set CHAMBER_OAUTH_ALLOW_HTTP=1 for lab)`);
   }
 }
@@ -329,6 +331,7 @@ export function exchangeAuthorizationCode(
   };
   if (opts.clientSecret) fields.client_secret = opts.clientSecret;
 
+  requireHttps(opts.tokenEndpoint, "token_endpoint");
   const res = httpPostForm(opts.tokenEndpoint, fields);
   if (res.status < 200 || res.status >= 300) {
     appendAudit(db, {
@@ -750,6 +753,7 @@ export function refreshAccessTokenDetailed(
 
   let res: { status: number; body: string };
   try {
+    requireHttps(tokenEndpoint, "token_endpoint");
     res = httpPostForm(tokenEndpoint, fields);
   } catch (e) {
     const err: RefreshResultErr = {

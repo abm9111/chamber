@@ -17,6 +17,59 @@ history and the GitHub releases.
   the shipped one, when the release checkout has tracked changes or `dist/`,
   or when the tag has no `bin/chamber.js`.
 
+### Changed (breaking)
+
+- **Tool code is refused unless something isolates it.** `CHAMBER_SANDBOX_REQUIRED`
+  unset or empty used to mean "run it in a plain subprocess". It now means
+  required: `tool-run`, `tool-synth`, `sandbox-test` and MCP tool verification
+  run only under bubblewrap, and only after a probe shows that it confines.
+  Anywhere without bubblewrap (macOS, most CI runners) they refuse, and the
+  refusal ends with `Set CHAMBER_SANDBOX_REQUIRED=0 to run tool code without
+  isolation.` `0`, `false`, `no` and `off` are the explicit opt-out.
+  `tool-run` and `sandbox-test` print that refusal and the opt-out (the
+  `sandbox-test` JSON carries it as `error`), and `tool-synth` exits 1 when a
+  synthesis is rejected.
+- **The talk allowlists fail closed.** An empty `CHAMBER_DISCORD_ALLOWED_USERS`
+  used to let every user talk to the Discord bot, and the Slack runner had no
+  talk gate at all. Both now answer nobody until their list is set, and
+  `CHAMBER_SLACK_ALLOWED_USERS` is new. Existing bots stop answering until the
+  variable is set. Each runner logs one line at startup when its list is empty.
+  Approver lists are unchanged.
+- `POST /approve` and `POST /reject` record `decided_by = 'http'`. The `actor`
+  field in the body is ignored; it used to be written as given, so a caller
+  could sign its approval as `human` or `slack:U123`.
+- A request body over 1 MiB is a 413, and a body that is not a JSON object is a
+  400 `invalid_json` (it was a 500 carrying the parser's message). The cap is
+  the `client_max_body_size 1m` that `deploy/nginx-chamber.conf` already sets in
+  front of the server.
+
+### Fixed
+
+- **A stalled model no longer hangs the process.** Every model request now has
+  a timeout: 180 s by default, `CHAMBER_MODEL_TIMEOUT_MS` to change it. A value
+  that is not a whole number of milliseconds from 1 to 2147483647 is refused by
+  name, never replaced by the default. The MCP server's queue moves on.
+- **The HTTP server refuses a foreign `Host` when no token is set**, closing DNS
+  rebinding against a loopback server. With a token set nothing changes.
+- **A server error no longer sends its text to the client.** The body is
+  `{"error":"internal_error","id":"..."}`; the cause and stack are on stderr
+  beside the same id.
+- **OAuth endpoints are checked on the parsed URL.** `http://127.0.0.1.evil.example`
+  and `http://127.0.0.1@evil.example` used to pass as loopback.
+- **The database file is `0600`.** A new one is created that way, in
+  directories made `0700`; an existing one owned by you with group or other
+  bits set is tightened, once, with a line on stderr. `-wal` and `-shm` follow.
+- **No token, secret or body on a curl command line.** The MCP client, the
+  OAuth client, and the Slack, Discord and Telegram calls pass the URL, headers
+  and body to curl on stdin (`src/http_sync.ts`). The two gateway-runner calls
+  that had no timeout now have 30 s.
+- **`POST /turn` no longer stops the server.** It runs on a worker thread with
+  its own connection to the same database, so `/health` answers while a turn
+  waits on the embedder. A route that needs the write lock the turn holds, and
+  `/turn` itself, now answers 503 `busy` with `Retry-After: 1` instead of
+  freezing; see `docs/KNOWN_LIMITATIONS.md` entry 21. If a worker crashes, only
+  the turns that worker was running fail; the others carry on.
+
 ## 0.1.9 — 2026-10-03
 
 ### Changed

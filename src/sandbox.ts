@@ -4,7 +4,8 @@
  * Levels (best available):
  *   1. bwrap / docker if present
  *   2. subprocess with timeout, scrubbed env, temp cwd, no network env hints
- *   3. fail-closed if CHAMBER_SANDBOX_REQUIRED=1 and no isolation
+ *   3. fail-closed unless CHAMBER_SANDBOX_REQUIRED is set to an explicit
+ *      "off" (0, false, no, off) and no isolation is proven
  *
  * Tools never write to Chamber DB directly — stdout/stderr captured as evidence.
  */
@@ -105,18 +106,27 @@ function absolutePathOf(cmd: string): string | null {
 const ISOLATING_BACKENDS = new Set<SandboxBackend>(["bwrap"]);
 
 /**
- * Is isolation being demanded? Any value that is not an explicit "off" counts.
+ * Is isolation being demanded? Yes, unless the operator has said otherwise.
  *
- * Testing `=== "1"` made `CHAMBER_SANDBOX_REQUIRED=true` — and `yes`, and a
- * trailing newline from a shell heredoc — run unisolated while the operator who
- * set it believed the opposite. That is the worst direction for a typo to
- * resolve: the flag exists to be a promise, so an unrecognised spelling must
- * keep the promise, not silently drop it.
+ * Unset and empty mean required. So does every value that is not an explicit
+ * "off" (`0`, `false`, `no`, `off`, any case, surrounding space ignored).
+ *
+ * Two earlier mistakes are why. Testing `=== "1"` made
+ * `CHAMBER_SANDBOX_REQUIRED=true` — and `yes`, and a trailing newline from a
+ * shell heredoc — run unisolated while the operator who set it believed the
+ * opposite. Fixing that left the *unset* case open: the default was "run it
+ * anyway", so every install that never heard of the variable executed
+ * model-authored and vendor-supplied code with the user's full privileges. A
+ * default is the setting most installs run with. Opting out has to be a
+ * decision someone typed, not the absence of one.
  */
 function sandboxRequired(): boolean {
   const v = (process.env.CHAMBER_SANDBOX_REQUIRED ?? "").trim().toLowerCase();
-  return !(v === "" || v === "0" || v === "false" || v === "no" || v === "off");
+  return !(v === "0" || v === "false" || v === "no" || v === "off");
 }
+
+/** The way out, appended to every refusal that required isolation caused. */
+const SANDBOX_OPT_OUT = "Set CHAMBER_SANDBOX_REQUIRED=0 to run tool code without isolation.";
 
 /**
  * Source that reports whether the thing running it is actually confined.
@@ -422,10 +432,12 @@ export function runInSandbox(req: SandboxRequest): SandboxResult {
         ? null
         : !ISOLATING_BACKENDS.has(backend)
           ? `sandbox required but ${backend} does not isolate ` +
-            `(isolating backends: ${[...ISOLATING_BACKENDS].join(", ")})`
+            `(isolating backends: ${[...ISOLATING_BACKENDS].join(", ")}). ` +
+            SANDBOX_OPT_OUT
           : !isolationHolds(backend)
             ? `sandbox required and ${backend} was selected, but it did not ` +
-              `confine a probe — treating the name as unproven`
+              `confine a probe — treating the name as unproven. ` +
+              SANDBOX_OPT_OUT
             : null;
   if (refusal) {
     return {

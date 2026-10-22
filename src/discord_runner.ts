@@ -5,7 +5,7 @@
  *   DISCORD_BOT_TOKEN (required)
  *   DISCORD_CLIENT_ID, DISCORD_GUILD_ID
  *   CHAMBER_DISCORD_APPROVERS | CHAMBER_SLACK_APPROVERS  (approve fail-closed)
- *   CHAMBER_DISCORD_ALLOWED_USERS | DISCORD_ALLOWED_USERS  (talk restrict; empty=open)
+ *   CHAMBER_DISCORD_ALLOWED_USERS | DISCORD_ALLOWED_USERS  (who may talk; empty = nobody)
  *   CHAMBER_DISCORD_FREE_CHANNELS   (comma channel ids — no @mention required)
  *   CHAMBER_DISCORD_OPS_CHANNEL
  *   CHAMBER_DISCORD_REACTION_APPROVE=1  (✅/❌ on ops messages)
@@ -22,6 +22,7 @@ import {
   registerDiscordPendingHook,
   canDiscordApprove,
   canDiscordTalk,
+  discordTalkAllowlist,
   isDiscordFreeResponseChannel,
   sanitizeDiscordOutbound,
   formatAttachmentMeta,
@@ -58,6 +59,9 @@ async function main(): Promise<void> {
 
   const db = openDiscordDb();
   registerDiscordPendingHook();
+  if (discordTalkAllowlist().size === 0) {
+    console.warn("chamber: CHAMBER_DISCORD_ALLOWED_USERS is empty, so nobody can talk to this bot");
+  }
 
   const client = new Client({
     intents: [

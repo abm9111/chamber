@@ -5,7 +5,12 @@
  *   npm test
  */
 
-import { openChamberDb } from "../src/db.ts";
+import { openChamberDb, secureDatabaseFile } from "../src/db.ts";
+import { CURL_FIXED_ARGV, buildCurlInvocation, httpSync } from "../src/http_sync.ts";
+import { TurnPool, TurnWorkerError } from "../src/turn_pool.ts";
+import { isSqliteBusy } from "../src/turn.ts";
+import { mcpDiscover } from "../src/mcp_client.ts";
+import { TelegramGateway } from "../src/gateway.ts";
 import { claimHash, newId, sha256 } from "../src/hash.ts";
 import { commitBelief } from "../src/commit_belief.ts";
 import {
@@ -110,7 +115,7 @@ import {
   verifyMmrInclusion,
   syncMerkleIncremental,
 } from "../src/merkle_inc.ts";
-import { completeSync } from "../src/model.ts";
+import { complete, completeSync, modelTimeoutMs } from "../src/model.ts";
 import {
   classifyClaims,
   enforceClaimContract,
@@ -179,6 +184,9 @@ import {
   refreshAccessTokenWithRetry,
   resetRefreshMockSequence,
   formatRefreshError,
+  requireHttps,
+  exchangeAuthorizationCode,
+  fetchProtectedResourceMetadata,
 } from "../src/mcp_oauth.ts";
 import { sealSecret, openSecret } from "../src/secret_box.ts";
 // Aliased because the v1-compatibility test has to rebuild the *old* sealed
@@ -204,6 +212,9 @@ import {
   slackApprove,
   slackScopeId,
   openSlackDb,
+  postPendingWriteToOps,
+  canSlackTalk,
+  SLACK_TALK_REFUSAL,
 } from "../src/slack_ops.ts";
 import {
   canDiscordApprove,
@@ -214,9 +225,10 @@ import {
   formatAttachmentMeta,
   chunkDiscordMessage,
   openDiscordDb,
+  postPendingWriteToDiscordOps,
 } from "../src/discord_ops.ts";
 // Importing this module must not start a gateway; see `invokedDirectly` there.
-import { openGatewayDb } from "../src/gateway_runner.ts";
+import { openGatewayDb, DiscordGateway, SlackGateway } from "../src/gateway_runner.ts";
 import {
   checkRateLimit,
   resetRateLimits,
@@ -252,9 +264,10 @@ import {
   explainConfig,
 } from "../src/config.ts";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync, spawn, execFileSync } from "node:child_process";
 import { isAsyncFunction } from "node:util/types";
+import type { AddressInfo } from "node:net";
 import {
   appendFileSync,
   chmodSync,
@@ -262,6 +275,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -293,6 +307,11 @@ type Suite =
   | "cli"
   | "config"
   | "release"
+  | "model"
+  | "db"
+  | "server"
+  | "http_sync"
+  | "turn_pool"
   | "all";
 
 interface TestResult {
@@ -404,6 +423,11 @@ function suiteFromArg(): Suite {
     "config",
     "daemon",
     "release",
+    "model",
+    "db",
+    "server",
+    "http_sync",
+    "turn_pool",
     "all",
   ].includes(v)
     ? v
@@ -6405,15 +6429,18 @@ test("phase1", "P1_debt_propose_from_corpus", () => {
   }
 });
 
+// The sandbox is required unless an operator opts out, so a test that needs
+// tool code to actually run says so: `required: "0"` is the opt-out, and these
+// hosts (macOS, a CI runner without bubblewrap) have nothing that isolates.
 test("tools", "T1_sandbox_self_test", () => {
-  const r = sandboxSelfTest();
+  const r = withSandboxEnv({ required: "0" }, () => sandboxSelfTest());
   assert(r.ok, `sandbox failed: ${r.stderr || r.error}`);
   assert(r.stdout.includes("ok"), r.stdout);
 });
 
 test("tools", "T2_allowlist_echo", () => {
   const db = freshDb();
-  const r = runTool(db, "echo", ["hello-chamber"]);
+  const r = withSandboxEnv({ required: "0" }, () => runTool(db, "echo", ["hello-chamber"]));
   assert(r.allowed, r.reason);
   assert(r.sandbox?.ok, r.sandbox?.stderr);
   assert(r.sandbox!.stdout.includes("hello-chamber"), r.sandbox!.stdout);
@@ -6427,12 +6454,14 @@ test("tools", "T3_unknown_tool_blocked", () => {
 
 test("tools", "T4_synth_pass_queues", () => {
   const db = freshDb();
-  const r = synthesizeTool(db, {
-    name: "double",
-    description: "double a number",
-    source: `const n = Number(process.argv[2]||1); console.log(n*2);`,
-    risk: ["compute"],
-  });
+  const r = withSandboxEnv({ required: "0" }, () =>
+    synthesizeTool(db, {
+      name: "double",
+      description: "double a number",
+      source: `const n = Number(process.argv[2]||1); console.log(n*2);`,
+      risk: ["compute"],
+    }),
+  );
   assert(r.sandbox.ok, r.sandbox.stderr);
   assert(r.status === "queued", r.reason);
   assert(!!r.writeId, "writeId required");
@@ -6440,13 +6469,18 @@ test("tools", "T4_synth_pass_queues", () => {
 
 test("tools", "T5_synth_fail_rejects", () => {
   const db = freshDb();
-  const r = synthesizeTool(db, {
-    name: "boom",
-    description: "fails",
-    source: `process.exit(2)`,
-    risk: ["compute"],
-  });
+  // With the opt-out, so that the rejection comes from the source failing and
+  // not from the default refusing to run anything.
+  const r = withSandboxEnv({ required: "0" }, () =>
+    synthesizeTool(db, {
+      name: "boom",
+      description: "fails",
+      source: `process.exit(2)`,
+      risk: ["compute"],
+    }),
+  );
   assert(!r.sandbox.ok, "expected sandbox fail");
+  assert(r.sandbox.exitCode === 2, `the source must have run and exited 2, got ${r.sandbox.exitCode}`);
   assert(r.status === "rejected", r.status);
 });
 
@@ -6583,12 +6617,63 @@ test("tools", "a sandbox requirement spelled other than \"1\" still binds", () =
   }
 });
 
-test("tools", "an unset sandbox requirement still runs the subprocess fallback", () => {
-  const r = withSandboxEnv({ backend: "subprocess" }, () =>
-    runInSandbox({ runtime: "node", source: `console.log("ran")`, timeoutMs: 5000 }),
+test("tools", "an unset or empty sandbox requirement refuses a backend that does not isolate, and nothing runs", () => {
+  // The default used to be "run it anyway". Now unset, empty and blank all mean
+  // required, and the refusal says how to opt out.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-sbx-default-"));
+  const marker = join(dir, "escaped");
+  try {
+    for (const backend of ["subprocess", "docker"]) {
+      for (const spelling of [undefined, "", "   "]) {
+        const r = withSandboxEnv({ required: spelling, backend }, () =>
+          runInSandbox({
+            runtime: "node",
+            source:
+              `import { writeFileSync } from "node:fs";\n` +
+              `writeFileSync(${JSON.stringify(marker)}, "x");\n` +
+              `console.log("ran");`,
+            timeoutMs: 5000,
+          }),
+        );
+        const label = `${backend} with CHAMBER_SANDBOX_REQUIRED ${spelling === undefined ? "unset" : JSON.stringify(spelling)}`;
+        assert(!r.ok, `${label}: must refuse`);
+        assert(!existsSync(marker), `${label}: refused, but the source still ran`);
+        assert(
+          r.error?.endsWith("Set CHAMBER_SANDBOX_REQUIRED=0 to run tool code without isolation.") === true,
+          `${label}: the refusal must end with the way out, got ${JSON.stringify(r.error)}`,
+        );
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tools", "with the requirement unset and no backend named, nothing runs unisolated", () => {
+  const r = withSandboxEnv({}, () =>
+    runInSandbox({ runtime: "node", source: `console.log("ran")`, timeoutMs: 8000 }),
   );
-  assert(r.ok, `fallback must still work when isolation is not required: ${r.error}`);
-  assert(r.stdout.includes("ran"), r.stdout);
+  const hasBwrap = spawnSync("which", ["bwrap"], { encoding: "utf8" }).status === 0;
+  if (!hasBwrap) {
+    // This host has nothing that isolates: the default must refuse, and the
+    // source must not have produced output.
+    assert(!r.ok && !r.stdout.includes("ran"), `a host without bwrap ran the source: ${JSON.stringify(r)}`);
+    assert(r.backend === "none", `a refusal ran on no backend, got ${r.backend}`);
+  } else {
+    // Where bwrap exists the answer depends on whether it confines here. Either
+    // outcome is acceptable except an unisolated run.
+    assert(r.backend !== "subprocess", `ran as a plain subprocess: ${JSON.stringify(r)}`);
+  }
+});
+
+test("tools", "an explicit opt-out, spelled 0 false no or off in any case, runs the subprocess backend", () => {
+  for (const spelling of ["0", "false", "no", "off", "OFF", " Off ", "False"]) {
+    const r = withSandboxEnv({ required: spelling, backend: "subprocess" }, () =>
+      runInSandbox({ runtime: "node", source: `console.log("ran")`, timeoutMs: 5000 }),
+    );
+    assert(r.ok && r.stdout.includes("ran"), `${JSON.stringify(spelling)} must opt out: ${JSON.stringify(r)}`);
+    assert(r.backend === "subprocess", `${JSON.stringify(spelling)}: backend ${r.backend}`);
+  }
 });
 
 test("memory", "M1_remember_working", () => {
@@ -8239,12 +8324,49 @@ test("discord", "D5_attachment_meta_only", () => {
 });
 
 test("discord", "D6_talk_allowlist", () => {
-  delete process.env.CHAMBER_DISCORD_ALLOWED_USERS;
-  assert(canDiscordTalk("anyone"));
-  process.env.CHAMBER_DISCORD_ALLOWED_USERS = "u1";
-  assert(canDiscordTalk("u1"));
-  assert(!canDiscordTalk("u2"));
-  delete process.env.CHAMBER_DISCORD_ALLOWED_USERS;
+  // Fail closed: an empty list used to mean "anyone may talk to the bot".
+  const savedPrimary = process.env.CHAMBER_DISCORD_ALLOWED_USERS;
+  const savedLegacy = process.env.DISCORD_ALLOWED_USERS;
+  try {
+    delete process.env.CHAMBER_DISCORD_ALLOWED_USERS;
+    delete process.env.DISCORD_ALLOWED_USERS;
+    assert(!canDiscordTalk("anyone"), "an unset list means nobody may talk");
+    process.env.CHAMBER_DISCORD_ALLOWED_USERS = "";
+    assert(!canDiscordTalk("anyone"), "an empty list means nobody may talk");
+    process.env.CHAMBER_DISCORD_ALLOWED_USERS = " , ";
+    assert(!canDiscordTalk("anyone"), "a list of blanks means nobody may talk");
+    process.env.CHAMBER_DISCORD_ALLOWED_USERS = "u1, u3 ,";
+    assert(canDiscordTalk("u1"), "a listed user may talk");
+    assert(canDiscordTalk("u3"), "entries are trimmed");
+    assert(!canDiscordTalk("u2"), "an unlisted user may not");
+    delete process.env.CHAMBER_DISCORD_ALLOWED_USERS;
+    process.env.DISCORD_ALLOWED_USERS = "legacy1";
+    assert(canDiscordTalk("legacy1"), "the legacy variable still works when the new one is unset");
+  } finally {
+    if (savedPrimary === undefined) delete process.env.CHAMBER_DISCORD_ALLOWED_USERS;
+    else process.env.CHAMBER_DISCORD_ALLOWED_USERS = savedPrimary;
+    if (savedLegacy === undefined) delete process.env.DISCORD_ALLOWED_USERS;
+    else process.env.DISCORD_ALLOWED_USERS = savedLegacy;
+  }
+});
+
+test("slack", "S_talk_allowlist_fails_closed", () => {
+  const saved = process.env.CHAMBER_SLACK_ALLOWED_USERS;
+  try {
+    delete process.env.CHAMBER_SLACK_ALLOWED_USERS;
+    assert(!canSlackTalk("U1"), "an unset list means nobody may talk");
+    process.env.CHAMBER_SLACK_ALLOWED_USERS = "";
+    assert(!canSlackTalk("U1"), "an empty list means nobody may talk");
+    process.env.CHAMBER_SLACK_ALLOWED_USERS = " , ";
+    assert(!canSlackTalk("U1"), "a list of blanks means nobody may talk");
+    process.env.CHAMBER_SLACK_ALLOWED_USERS = "U1, U3 ,";
+    assert(canSlackTalk("U1"), "a listed user may talk");
+    assert(canSlackTalk("U3"), "entries are trimmed");
+    assert(!canSlackTalk("U2"), "an unlisted user may not");
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_SLACK_ALLOWED_USERS;
+    else process.env.CHAMBER_SLACK_ALLOWED_USERS = saved;
+  }
 });
 
 test("discord", "D7_chunk", () => {
@@ -15642,6 +15764,1983 @@ test("pins", "a real model's answer carries no stub disclosure", () => {
     !!unknown && unknown.includes("UNKNOWN MODEL"),
     "an unrecorded provenance must disclose, not fall through to silence",
   );
+});
+
+// ─── MODEL TIMEOUT (src/model.ts, CHAMBER_MODEL_TIMEOUT_MS) ──────────────────
+
+type ModelStep = "silent" | "partial" | "answer";
+
+/**
+ * A fake OpenAI-compatible server whose behaviour is scripted per request.
+ *
+ * `silent` accepts the request and never answers. `partial` sends the status
+ * line and part of a JSON body and then stalls, which is a different failure:
+ * `fetch()` resolves, and only reading the body hangs. `answer` replies. A
+ * request past the end of the script gets `answer`.
+ */
+async function scriptedModel(
+  script: ModelStep[],
+  answerText = "scripted answer",
+): Promise<{ base: string; requests: () => number; close: () => void }> {
+  const { createServer } = await import("node:http");
+  let seen = 0;
+  const server = createServer((req, res) => {
+    const step: ModelStep = script[seen] ?? "answer";
+    seen++;
+    req.resume();
+    if (step === "silent") return;
+    req.on("end", () => {
+      if (step === "partial") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.write('{"choices":[{"message":{"content":"par');
+        return;
+      }
+      res.setHeader("Content-Type", "application/json");
+      res.end(
+        JSON.stringify({
+          choices: [{ message: { content: answerText } }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+          model: "fake",
+        }),
+      );
+    });
+  });
+  await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
+  const port = (server.address() as { port: number }).port;
+  return {
+    base: `http://127.0.0.1:${port}/v1`,
+    requests: () => seen,
+    close: () => {
+      server.closeAllConnections();
+      server.close();
+    },
+  };
+}
+
+/** Set environment variables for the duration of `fn`; `undefined` deletes. */
+async function withEnvAsync<T>(
+  vars: Record<string, string | undefined>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const saved = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(vars)) {
+    saved.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [key, prev] of saved) {
+      if (prev === undefined) delete process.env[key];
+      else process.env[key] = prev;
+    }
+  }
+}
+
+/**
+ * The error `p` rejects with, or a test failure if it is still pending after
+ * `ms` or resolves. The watchdog is what makes "hangs forever" a red test
+ * instead of a hung test run.
+ */
+async function rejectionWithin(p: Promise<unknown>, ms: number): Promise<Error> {
+  let timer: NodeJS.Timeout | undefined;
+  const outcome: unknown = await Promise.race([
+    p.then(
+      () => "resolved" as const,
+      (err: unknown) => err,
+    ),
+    new Promise<"pending">((ok) => {
+      timer = setTimeout(() => ok("pending"), ms);
+    }),
+  ]);
+  clearTimeout(timer);
+  assert(outcome !== "pending", `still pending after ${ms} ms`);
+  assert(outcome !== "resolved", "expected a rejection, but the call resolved");
+  assert(outcome instanceof Error, `expected an Error, got ${String(outcome)}`);
+  return outcome;
+}
+
+/** `p`'s value, or a test failure if it is still pending after `ms`. */
+async function resolvesWithin<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const watchdog = new Promise<never>((_, fail) => {
+    timer = setTimeout(() => fail(new Error(`${what}: still pending after ${ms} ms`)), ms);
+  });
+  try {
+    return await Promise.race([p, watchdog]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test("model", "a model endpoint that never answers is abandoned at CHAMBER_MODEL_TIMEOUT_MS", async () => {
+  const model = await scriptedModel(["silent"]);
+  const db = freshDb();
+  try {
+    const err = await withEnvAsync(
+      {
+        CHAMBER_MODEL: "openai",
+        CHAMBER_API_BASE: model.base,
+        CHAMBER_API_KEY: undefined,
+        CHAMBER_MODEL_TIMEOUT_MS: "200",
+      },
+      () =>
+        rejectionWithin(
+          complete(db, { messages: [{ role: "user", content: "hi" }] }),
+          2000,
+        ),
+    );
+    assert(
+      err.message ===
+        `model endpoint ${model.base} did not answer within 0.2 s (CHAMBER_MODEL_TIMEOUT_MS)`,
+      `wrong message: ${err.message}`,
+    );
+  } finally {
+    model.close();
+  }
+});
+
+test("model", "a body that stalls after the headers is bounded by the same timeout", async () => {
+  const model = await scriptedModel(["partial"]);
+  const db = freshDb();
+  try {
+    const err = await withEnvAsync(
+      {
+        CHAMBER_MODEL: "openai",
+        CHAMBER_API_BASE: model.base,
+        CHAMBER_API_KEY: undefined,
+        CHAMBER_MODEL_TIMEOUT_MS: "300",
+      },
+      () =>
+        rejectionWithin(
+          complete(db, { messages: [{ role: "user", content: "hi" }] }),
+          2000,
+        ),
+    );
+    assert(
+      err.message ===
+        `model endpoint ${model.base} did not answer within 0.3 s (CHAMBER_MODEL_TIMEOUT_MS)`,
+      `wrong message: ${err.message}`,
+    );
+  } finally {
+    model.close();
+  }
+});
+
+test("model", "an unusable CHAMBER_MODEL_TIMEOUT_MS is refused by name, never replaced by the default", async () => {
+  const db = freshDb();
+  for (const bad of ["", "abc", "0", "000", "-5", "1.5", " 200", "200 ", "2147483648"]) {
+    const model = await scriptedModel(["answer"]);
+    try {
+      const err = await withEnvAsync(
+        {
+          CHAMBER_MODEL: "openai",
+          CHAMBER_API_BASE: model.base,
+          CHAMBER_API_KEY: undefined,
+          CHAMBER_MODEL_TIMEOUT_MS: bad,
+        },
+        () =>
+          rejectionWithin(
+            complete(db, { messages: [{ role: "user", content: "hi" }] }),
+            1000,
+          ),
+      );
+      assert(
+        err.message.includes("CHAMBER_MODEL_TIMEOUT_MS") &&
+          err.message.includes(JSON.stringify(bad)),
+        `${JSON.stringify(bad)}: the refusal must name the variable and the value: ${err.message}`,
+      );
+      assert(
+        model.requests() === 0,
+        `${JSON.stringify(bad)}: refused, but a request still reached the model`,
+      );
+    } finally {
+      model.close();
+    }
+  }
+  assert(modelTimeoutMs({}) === 180_000, "unset means the 180000 ms default");
+  assert(
+    modelTimeoutMs({ CHAMBER_MODEL_TIMEOUT_MS: "2500" }) === 2500,
+    "a whole number of milliseconds is taken as written",
+  );
+});
+
+test("model", "a timed-out MCP call does not wedge the calls queued behind it", async () => {
+  const { env, dir } = stubAskFixture();
+  const model = await scriptedModel(["silent"], "SECOND The audit store is SQLite. [1]");
+  writeFileSync(
+    env.CHAMBER_CONFIG!,
+    `${JSON.stringify({ database: env.CHAMBER_DB, ingest: [], model: { base: model.base, name: "fake", mode: "openai" } })}\n`,
+  );
+  const s = mcpSession({ ...env, CHAMBER_MODEL_TIMEOUT_MS: "500" });
+  try {
+    // Both are sent before either is answered, so the second really is queued
+    // behind the first in the server's serial chain.
+    const first = s.ask("what is the audit store");
+    const second = s.ask("what is the audit store");
+    const [a, b] = await resolvesWithin(
+      Promise.all([first, second]),
+      15_000,
+      "both queued calls",
+    );
+    assert(
+      a.includes("did not answer within 0.5 s (CHAMBER_MODEL_TIMEOUT_MS)"),
+      `the first call must fail with the timeout:\n${a}`,
+    );
+    assert(b.includes("SECOND"), `the queued call must complete:\n${b}`);
+  } finally {
+    s.stop();
+    model.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── OAUTH ENDPOINTS: requireHttps parses the URL ───────────────────────────
+
+test("oauth", "requireHttps judges the parsed host, not a prefix of the string", () => {
+  // The old check was `startsWith("http://127.0.0.1")`, which accepts
+  // `http://127.0.0.1.attacker.invalid/x` and `http://127.0.0.1@attacker.invalid/x`
+  // (the host of that last one is attacker.invalid). It guards where a refresh
+  // token and a client secret are sent.
+  const saved = process.env.CHAMBER_OAUTH_ALLOW_HTTP;
+  delete process.env.CHAMBER_OAUTH_ALLOW_HTTP;
+  try {
+    const refused = [
+      "http://127.0.0.1.attacker.invalid/x",
+      "http://localhost.attacker.invalid/x",
+      "http://127.0.0.1@attacker.invalid/x",
+      "http://example.com/x",
+      "ftp://127.0.0.1/x",
+      "not a url",
+      "",
+    ];
+    for (const url of refused) {
+      let message = "";
+      try {
+        requireHttps(url, "resource");
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      assert(
+        message === "resource must be HTTPS (or set CHAMBER_OAUTH_ALLOW_HTTP=1 for lab)",
+        `${JSON.stringify(url)} must be refused with the existing message, got ${JSON.stringify(message)}`,
+      );
+    }
+    const accepted = [
+      "http://127.0.0.1:9/x",
+      "http://localhost/x",
+      "http://[::1]/x",
+      "https://example.com/x",
+    ];
+    for (const url of accepted) requireHttps(url, "resource");
+    process.env.CHAMBER_OAUTH_ALLOW_HTTP = "1";
+    requireHttps("http://example.com/x", "resource"); // the lab switch keeps its meaning
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_OAUTH_ALLOW_HTTP;
+    else process.env.CHAMBER_OAUTH_ALLOW_HTTP = saved;
+  }
+});
+
+// ─── DATABASE FILE PERMISSIONS (src/db.ts) ──────────────────────────────────
+
+/** Run `fn` and return what it wrote to stderr, without letting it through. */
+function captureStderr<T>(fn: () => T): { value: T; stderr: string } {
+  const original = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+    captured += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    return { value: fn(), stderr: captured };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
+/** The permission bits of `path`, e.g. 0o600. */
+function modeOf(path: string): number {
+  return lstatSync(path).mode & 0o777;
+}
+
+test("db", "an existing world-readable database is tightened to 0600 with one notice, once", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-dbmode-"));
+  try {
+    const path = join(dir, "c.sqlite");
+    openChamberDb(path).close();
+    // A closed WAL database has no sidecar files, so make the stale ones a
+    // crashed run would have left behind.
+    for (const file of [path, `${path}-wal`, `${path}-shm`]) {
+      if (!existsSync(file)) writeFileSync(file, "");
+      chmodSync(file, 0o644);
+    }
+    const first = captureStderr(() => openChamberDb(path));
+    try {
+      const lines = first.stderr.split("\n").filter((l) => l !== "");
+      assert(lines.length === 1, `exactly one notice expected, got ${JSON.stringify(lines)}`);
+      assert(
+        lines[0] ===
+          `chamber: tightened ${path} from 0644 to 0600 (it holds note text and tokens)`,
+        `wrong notice: ${lines[0]}`,
+      );
+      assert(modeOf(path) === 0o600, `database is ${modeOf(path).toString(8)}, want 600`);
+      for (const side of [`${path}-wal`, `${path}-shm`]) {
+        assert(modeOf(side) === 0o600, `${side} is ${modeOf(side).toString(8)}, want 600`);
+      }
+    } finally {
+      first.value.close();
+    }
+    const second = captureStderr(() => openChamberDb(path));
+    second.value.close();
+    assert(second.stderr === "", `a second open must print nothing, got ${JSON.stringify(second.stderr)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("db", "a database Chamber creates is 0600 from the start, in directories made 0700", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-dbnew-"));
+  // umask 0 is what makes this a test: without an explicit mode SQLite would
+  // create the file 0644 and mkdir would create 0777.
+  const previousUmask = process.umask(0);
+  try {
+    const path = join(dir, "a", "b", "c.sqlite");
+    const opened = captureStderr(() => openChamberDb(path));
+    try {
+      assert(opened.stderr === "", `a new database needs no notice, got ${JSON.stringify(opened.stderr)}`);
+      assert(modeOf(path) === 0o600, `database is ${modeOf(path).toString(8)}, want 600`);
+      for (const side of [`${path}-wal`, `${path}-shm`]) {
+        if (existsSync(side)) {
+          assert(modeOf(side) === 0o600, `${side} is ${modeOf(side).toString(8)}, want 600`);
+        }
+      }
+      for (const made of [join(dir, "a"), join(dir, "a", "b")]) {
+        assert(modeOf(made) === 0o700, `${made} is ${modeOf(made).toString(8)}, want 700`);
+      }
+    } finally {
+      opened.value.close();
+    }
+  } finally {
+    process.umask(previousUmask);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("db", "a loose database owned by someone else is left alone, with a notice", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-dbforeign-"));
+  try {
+    const path = join(dir, "c.sqlite");
+    openChamberDb(path).close();
+    chmodSync(path, 0o644);
+    // Another user is simulated by passing a uid that is not ours.
+    const { stderr } = captureStderr(() => secureDatabaseFile(path, process.getuid!() + 1));
+    assert(modeOf(path) === 0o644, `a foreign file must not be chmod-ed, now ${modeOf(path).toString(8)}`);
+    assert(/owned by another user/.test(stderr), `expected a notice, got ${JSON.stringify(stderr)}`);
+    assert(stderr.split("\n").filter((l) => l !== "").length === 1, "exactly one line");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("db", "an in-memory database touches no file and prints nothing", () => {
+  const { value, stderr } = captureStderr(() => openChamberDb(":memory:"));
+  value.close();
+  assert(stderr === "", `got ${JSON.stringify(stderr)}`);
+});
+
+// ─── LIVE SERVER FIXTURE (src/server.ts as a real process) ───────────────────
+
+/** A TCP port that was free a moment ago. */
+async function freePort(): Promise<number> {
+  const { createServer: createNetServer } = await import("node:net");
+  return new Promise<number>((ok, fail) => {
+    const probe = createNetServer();
+    probe.once("error", fail);
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address() as AddressInfo;
+      probe.close(() => ok(port));
+    });
+  });
+}
+
+interface LiveReply {
+  status: number;
+  headers: Record<string, string | string[] | undefined>;
+  text: string;
+  /** The body parsed as JSON, or null when it is not JSON. */
+  json: unknown;
+  /** Milliseconds from sending the request to the end of the response. */
+  ms: number;
+}
+
+interface LiveRequest {
+  method?: string;
+  path: string;
+  headers?: Record<string, string>;
+  body?: string | Buffer;
+}
+
+interface LiveServer {
+  port: number;
+  dbPath: string;
+  stdout: () => string;
+  stderr: () => string;
+  request: (req: LiveRequest) => Promise<LiveReply>;
+  stop: () => Promise<void>;
+}
+
+/**
+ * Start `src/server.ts` as its own process on a free port and wait for its
+ * "Chamber HTTP" line.
+ *
+ * It is a process, not an import, because the server opens its database and
+ * listens at module scope, and because these tests exist to catch what a stubbed
+ * handler cannot: the event loop, the socket and the response a client really
+ * sees. The database is a file in a temp directory (a worker thread cannot share
+ * `:memory:`). `setup` runs before the process starts and may seed that file.
+ * Config-deciding variables, any ambient token and the embedder selectors are
+ * removed first, so the developer's shell cannot change what a test proves.
+ */
+async function startLiveServer(
+  overrides: Record<string, string> = {},
+  setup?: (dbPath: string) => void,
+): Promise<LiveServer> {
+  const { request: httpRequest } = await import("node:http");
+  const dir = mkdtempSync(join(tmpdir(), "chamber-live-"));
+  const dbPath = join(dir, "live.sqlite");
+  setup?.(dbPath);
+  const port = await freePort();
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of CONFIG_ENV_KEYS) delete env[key];
+  delete env.CHAMBER_API_TOKEN;
+  delete env.CHAMBER_CORS_ORIGIN;
+  delete env.CHAMBER_EMBEDDER;
+  delete env.CHAMBER_PYTHON;
+  const child = spawn(process.execPath, ["--experimental-strip-types", SERVER_PATH], {
+    env: { ...env, PORT: String(port), CHAMBER_BIND: "127.0.0.1", CHAMBER_DB: dbPath, ...overrides },
+  });
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d: Buffer) => {
+    out += d.toString();
+  });
+  child.stderr.on("data", (d: Buffer) => {
+    err += d.toString();
+  });
+  const exited = new Promise<number | null>((ok) => child.once("exit", (code) => ok(code)));
+  await new Promise<void>((ok, fail) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      fail(new Error(`server did not start within 15 s:\n${out}${err}`));
+    }, 15_000);
+    const poll = setInterval(() => {
+      if (out.includes("Chamber HTTP")) {
+        clearInterval(poll);
+        clearTimeout(timer);
+        ok();
+      }
+    }, 25);
+    void exited.then((code) => {
+      clearInterval(poll);
+      clearTimeout(timer);
+      fail(new Error(`server exited ${code} before listening:\n${out}${err}`));
+    });
+  });
+  const request = (req: LiveRequest): Promise<LiveReply> =>
+    new Promise<LiveReply>((ok, fail) => {
+      const started = Date.now();
+      const payload =
+        req.body === undefined
+          ? undefined
+          : typeof req.body === "string"
+            ? Buffer.from(req.body, "utf8")
+            : req.body;
+      const headers: Record<string, string> = { ...(req.headers ?? {}) };
+      const chunked = Object.keys(headers).some((k) => k.toLowerCase() === "transfer-encoding");
+      if (payload !== undefined && !chunked) headers["Content-Length"] = String(payload.length);
+      const clientReq = httpRequest(
+        { host: "127.0.0.1", port, method: req.method ?? "GET", path: req.path, agent: false, headers },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString("utf8");
+            let parsed: unknown = null;
+            try {
+              parsed = JSON.parse(text);
+            } catch {
+              // Not JSON; `text` still carries it.
+            }
+            ok({
+              status: res.statusCode ?? 0,
+              headers: res.headers,
+              text,
+              json: parsed,
+              ms: Date.now() - started,
+            });
+          });
+        },
+      );
+      clientReq.on("error", fail);
+      clientReq.end(payload);
+    });
+  return {
+    port,
+    dbPath,
+    stdout: () => out,
+    stderr: () => err,
+    request,
+    stop: async () => {
+      child.kill("SIGTERM");
+      await exited;
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+// ─── SERVER: Host check, body limits, 500 shape, /approve actor ─────────────
+
+test("server", "with no token, a Host that is not loopback is refused on every path", async () => {
+  const s = await startLiveServer();
+  try {
+    for (const [method, path] of [["GET", "/status"], ["GET", "/health"], ["OPTIONS", "/approve"], ["POST", "/turn"]] as const) {
+      const r = await s.request({ method, path, headers: { Host: "attacker.example" }, body: method === "POST" ? "{}" : undefined });
+      assert(r.status === 403, `${method} ${path} with a foreign Host gave ${r.status}`);
+      assert(
+        JSON.stringify(r.json) === '{"error":"host_not_allowed"}',
+        `${method} ${path}: wrong body ${r.text}`,
+      );
+    }
+    // A name that merely starts like a loopback one is still foreign.
+    for (const host of ["127.0.0.1.attacker.example", "localhost.attacker.example:80", "127.0.0.1@attacker.example"]) {
+      const r = await s.request({ path: "/status", headers: { Host: host } });
+      assert(r.status === 403, `Host ${host} gave ${r.status}`);
+    }
+    for (const host of [`127.0.0.1:${s.port}`, `localhost:${s.port}`, `[::1]:${s.port}`, "LOCALHOST"]) {
+      const r = await s.request({ path: "/status", headers: { Host: host } });
+      assert(r.status === 200, `Host ${host} gave ${r.status}: ${r.text}`);
+    }
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "with a token, the Host header is not policed and the token still is", async () => {
+  const s = await startLiveServer({ CHAMBER_API_TOKEN: "test-token-value" });
+  try {
+    const ok = await s.request({
+      path: "/status",
+      headers: { Host: "chamber.example.com", Authorization: "Bearer test-token-value" },
+    });
+    assert(ok.status === 200, `a proxied Host with a valid token gave ${ok.status}: ${ok.text}`);
+    const noToken = await s.request({ path: "/status", headers: { Host: "chamber.example.com" } });
+    assert(noToken.status === 401, `no token gave ${noToken.status}`);
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "a request body over 1 MiB is refused with 413 and the server keeps serving", async () => {
+  const s = await startLiveServer();
+  try {
+    const two = Buffer.alloc(2 * 1024 * 1024, 97);
+    const declared = await s.request({ method: "POST", path: "/turn", body: two });
+    assert(declared.status === 413, `a 2 MiB Content-Length body gave ${declared.status}`);
+    assert(
+      JSON.stringify(declared.json) === '{"error":"payload_too_large","limit":1048576}',
+      `wrong 413 body: ${declared.text}`,
+    );
+    assert(
+      String(declared.headers.connection).toLowerCase() === "close",
+      `the 413 must say Connection: close, got ${String(declared.headers.connection)}`,
+    );
+    const chunked = await s.request({
+      method: "POST",
+      path: "/turn",
+      headers: { "Transfer-Encoding": "chunked" },
+      body: two,
+    });
+    assert(chunked.status === 413, `a 2 MiB chunked body gave ${chunked.status}`);
+    const after = await s.request({ path: "/health" });
+    assert(after.status === 200, `the server must answer the next request, got ${after.status}`);
+
+    // The boundary: exactly 1 MiB passes the size check, one byte more does not.
+    const shell = '{"writeId":"","pad":""}';
+    const atCap = Buffer.from(`{"writeId":"","pad":"${"a".repeat(1_048_576 - shell.length)}"}`);
+    assert(atCap.length === 1_048_576, `setup: ${atCap.length}`);
+    const exact = await s.request({ method: "POST", path: "/approve", body: atCap });
+    assert(exact.status === 400 && /writeId required/.test(exact.text), `exactly 1 MiB must be read: ${exact.status} ${exact.text.slice(0, 100)}`);
+    const over = await s.request({ method: "POST", path: "/approve", body: Buffer.concat([atCap, Buffer.from(" ")]) });
+    assert(over.status === 413, `1 MiB + 1 byte gave ${over.status}`);
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "a body that is not a JSON object is a 400 invalid_json, an empty body is {}", async () => {
+  const s = await startLiveServer();
+  try {
+    for (const body of ["{", "[]", '"text"', "5", "null", "not json"]) {
+      const r = await s.request({ method: "POST", path: "/approve", body });
+      assert(r.status === 400, `${JSON.stringify(body)} gave ${r.status}`);
+      assert(
+        JSON.stringify(r.json) === '{"error":"invalid_json"}',
+        `${JSON.stringify(body)}: wrong body ${r.text}`,
+      );
+    }
+    const empty = await s.request({ method: "POST", path: "/approve", body: "" });
+    assert(
+      empty.status === 400 && JSON.stringify(empty.json) === '{"error":"writeId required"}',
+      `an empty body is {}, which then fails on its own terms: ${empty.status} ${empty.text}`,
+    );
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "a handler error answers 500 internal_error with an id, and the detail goes to stderr", async () => {
+  // CHAMBER_MODEL=openai makes POST /turn throw "turn unavailable" before it
+  // writes anything: a real handler error through the real path.
+  const s = await startLiveServer({ CHAMBER_MODEL: "openai" });
+  try {
+    const r = await s.request({ method: "POST", path: "/turn", body: '{"message":"hello"}' });
+    assert(r.status === 500, `expected 500, got ${r.status}: ${r.text}`);
+    const body = r.json as { error?: string; id?: string } | null;
+    assert(body !== null && Object.keys(body).sort().join(",") === "error,id", `wrong shape: ${r.text}`);
+    assert(body.error === "internal_error", `wrong error: ${r.text}`);
+    assert(/^[0-9a-f]{8}$/.test(body.id ?? ""), `id must be 8 hex characters: ${r.text}`);
+    assert(!/turn unavailable/.test(r.text), `no error text may reach the client: ${r.text}`);
+    // stderr is a separate pipe; give it a moment to arrive.
+    const deadline = Date.now() + 3000;
+    while (!s.stderr().includes(`chamber server error ${body.id}:`) && Date.now() < deadline) {
+      await new Promise((ok) => setTimeout(ok, 25));
+    }
+    assert(
+      s.stderr().includes(`chamber server error ${body.id}: `) && /turn unavailable/.test(s.stderr()),
+      `stderr must carry the same id and the detail:\n${s.stderr()}`,
+    );
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "/approve and /reject record decided_by 'http' whatever actor the caller names", async () => {
+  const ids: string[] = [];
+  const s = await startLiveServer({}, (dbPath) => {
+    const seed = openChamberDb(dbPath);
+    for (const subject of ["approve-me", "reject-me"]) {
+      const q = proposeWrite(seed, {
+        target: "skill",
+        action: "create",
+        subject,
+        payload: { body: "x" },
+        origin: "background_review",
+        reason: "test",
+      });
+      assert(q.status === "queued", `setup: ${JSON.stringify(q)}`);
+      ids.push(q.writeId);
+    }
+    seed.close();
+  });
+  try {
+    const approved = await s.request({
+      method: "POST",
+      path: "/approve",
+      body: JSON.stringify({ writeId: ids[0], actor: "admin" }),
+    });
+    assert(approved.status === 200, `approve gave ${approved.status}: ${approved.text}`);
+    const rejected = await s.request({
+      method: "POST",
+      path: "/reject",
+      body: JSON.stringify({ writeId: ids[1], actor: "admin" }),
+    });
+    assert(rejected.status === 200, `reject gave ${rejected.status}: ${rejected.text}`);
+    const check = openChamberDb(s.dbPath);
+    try {
+      const rows = check
+        .prepare(`SELECT id, decided_by FROM pending_write WHERE id IN (?, ?) ORDER BY id`)
+        .all(ids[0]!, ids[1]!) as { id: string; decided_by: string }[];
+      assert(rows.length === 2, `setup: expected both rows, got ${rows.length}`);
+      for (const row of rows) {
+        assert(row.decided_by === "http", `${row.id} was decided by ${row.decided_by}, want http`);
+      }
+    } finally {
+      check.close();
+    }
+  } finally {
+    await s.stop();
+  }
+});
+
+// ─── NO SECRET ON A COMMAND LINE (src/http_sync.ts) ─────────────────────────
+
+/**
+ * Write a `curl` into `dir` that records how it was invoked and answers `{}`
+ * with status 200. It writes one `argv.<pid>` file (one argument per line) and
+ * one `stdin.<pid>` file per call into `$CHAMBER_SHIM_DIR`, which `shimCalls`
+ * reads back. `withCurlShim` also puts `dir` first on this process's PATH.
+ */
+function writeCurlShim(dir: string): void {
+  writeFileSync(
+    join(dir, "curl"),
+    `#!/bin/sh\n` +
+      `printf '%s\\n' "$@" > "$CHAMBER_SHIM_DIR/argv.$$"\n` +
+      `cat > "$CHAMBER_SHIM_DIR/stdin.$$"\n` +
+      `printf '{}\\n200'\n`,
+    { mode: 0o755 },
+  );
+}
+
+async function withCurlShim<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-curlshim-"));
+  writeCurlShim(dir);
+  const savedPath = process.env.PATH;
+  try {
+    process.env.PATH = `${dir}:${savedPath ?? ""}`;
+    return await withEnvAsync({ CHAMBER_SHIM_DIR: dir }, () => fn(dir));
+  } finally {
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function shimCalls(dir: string): { argv: string[]; stdin: string }[] {
+  return readdirSync(dir)
+    .filter((f) => f.startsWith("argv."))
+    .sort()
+    .map((f) => ({
+      argv: readFileSync(join(dir, f), "utf8").split("\n").filter((l) => l !== ""),
+      stdin: readFileSync(join(dir, f.replace("argv.", "stdin.")), "utf8"),
+    }));
+}
+
+test("http_sync", "every site that carries a secret keeps it off the curl command line", async () => {
+  const secret = {
+    slack: "SHIMSECRET-slack",
+    discord: "SHIMSECRET-discord",
+    telegram: "SHIMSECRET-telegram",
+    mcp: "SHIMSECRET-mcp",
+    code: "SHIMSECRET-code",
+    verifier: "SHIMSECRET-verifier",
+    client: "SHIMSECRET-client",
+  };
+  await withCurlShim(async (dir) => {
+    const event = { writeId: "pw_shim", target: "skill", action: "create", subject: "s", origin: "cron" };
+    await withEnvAsync(
+      {
+        SLACK_BOT_TOKEN: secret.slack,
+        CHAMBER_SLACK_OPS_CHANNEL: "C0OPS",
+        DISCORD_BOT_TOKEN: secret.discord,
+        CHAMBER_DISCORD_OPS_CHANNEL: "1234",
+        CHAMBER_MCP_ACCESS_TOKEN: secret.mcp,
+      },
+      async () => {
+        postPendingWriteToOps(event);
+        postPendingWriteToDiscordOps(event);
+        await new TelegramGateway(secret.telegram).send({ channel: "telegram", chatId: "42", text: 'say "hi"' });
+        await new DiscordGateway(secret.discord).send({ channel: "discord", chatId: "1234", text: "hi" });
+        await new SlackGateway(secret.slack).send({ channel: "slack", chatId: "C1", text: "hi" });
+        try {
+          mcpDiscover("http://127.0.0.1:9/mcp"); // the shim's {} is not a discover reply; only the call matters
+        } catch {
+          // expected
+        }
+        const db = freshDb();
+        try {
+          exchangeAuthorizationCode(db, {
+            tokenEndpoint: "http://127.0.0.1:9/token",
+            clientId: "client-id",
+            clientSecret: secret.client,
+            code: secret.code,
+            redirectUri: "http://127.0.0.1:8765/callback",
+            codeVerifier: secret.verifier,
+            resource: "http://127.0.0.1:9/mcp",
+            issuer: "http://127.0.0.1:9",
+          });
+        } catch {
+          // expected: the shim's {} carries no access_token
+        }
+        try {
+          fetchProtectedResourceMetadata(db, "http://127.0.0.1:9/mcp");
+        } catch {
+          // expected: the shim's {} names no authorization server
+        }
+      },
+    );
+    const calls = shimCalls(dir);
+    assert(calls.length >= 9, `expected a call from every site, saw ${calls.length}`);
+    for (const call of calls) {
+      assert(
+        call.argv.length === CURL_FIXED_ARGV.length && call.argv.every((a, i) => a === CURL_FIXED_ARGV[i]),
+        `argv must be exactly the fixed flags, got ${JSON.stringify(call.argv)}`,
+      );
+    }
+    const argvText = calls.map((c) => c.argv.join("\n")).join("\n");
+    const stdinText = calls.map((c) => c.stdin).join("\n");
+    for (const [site, value] of Object.entries(secret)) {
+      assert(!argvText.includes(value), `${site}: the secret is on the command line`);
+      assert(stdinText.includes(value), `${site}: no call carried this secret on stdin, so the site never ran`);
+    }
+  });
+});
+
+test("http_sync", "a line break, a NUL, a bad scheme or a bad header name is refused before curl runs", async () => {
+  await withCurlShim(async (dir) => {
+    const base = { url: "http://127.0.0.1:9/x", timeoutSec: 5 };
+    const cases: [string, Parameters<typeof httpSync>[0]][] = [
+      ["CRLF in a header value", { ...base, headers: { "X-A": "b\r\nX-Injected: yes" } }],
+      ["LF in a header value", { ...base, headers: { "X-A": "b\nc" } }],
+      ["CR in a header name", { ...base, headers: { "X-A\r": "b" } }],
+      ["LF in the URL", { ...base, url: "http://127.0.0.1:9/x\nHost: other" }],
+      ["NUL in the body", { ...base, method: "POST", body: "a\0b" }],
+      ["NUL in a header value", { ...base, headers: { "X-A": "a\0b" } }],
+      ["a header name that is not a token", { ...base, headers: { "Bad Name": "b" } }],
+      ["a header name with a colon", { ...base, headers: { "X:A": "b" } }],
+      ["a file: URL", { ...base, url: "file:///etc/hostname" }],
+      ["no timeout", { ...base, timeoutSec: 0 }],
+      ["a body on a GET", { ...base, method: "GET", body: "x" }],
+    ];
+    for (const [label, req] of cases) {
+      let message = "";
+      try {
+        httpSync(req);
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      assert(message.startsWith("http_sync:"), `${label}: expected a refusal, got ${JSON.stringify(message)}`);
+    }
+    // The refusal never repeats the value it refused.
+    let leaked = "";
+    try {
+      httpSync({ ...base, headers: { Authorization: "Bearer SHIMSECRET-leak\r\nX: y" } });
+    } catch (err) {
+      leaked = err instanceof Error ? err.message : String(err);
+    }
+    assert(leaked !== "" && !leaked.includes("SHIMSECRET-leak"), `the error must not echo the value: ${leaked}`);
+    assert(shimCalls(dir).length === 0, "a refused request must not start curl");
+  });
+});
+
+test("http_sync", "values are double-quoted with backslash, quote, LF, CR and TAB escaped", () => {
+  const { argv, config } = buildCurlInvocation({
+    url: "https://example.com/a?b=c",
+    method: "POST",
+    headers: { "X-Test": 'a"b\\c\td' },
+    body: 'x"y\\z\r\nq',
+    timeoutSec: 12,
+    followRedirects: true,
+  });
+  assert(JSON.stringify(argv) === '["-s","-K","-"]', `argv: ${JSON.stringify(argv)}`);
+  const expected = [
+    'url = "https://example.com/a?b=c"',
+    "globoff",
+    'max-time = "12"',
+    'write-out = "\\n%{http_code}"',
+    "location",
+    'request = "POST"',
+    'header = "X-Test: a\\"b\\\\c\\td"',
+    'data-raw = "x\\"y\\\\z\\r\\nq"',
+    "",
+  ].join("\n");
+  assert(config === expected, `config was:\n${config}\nwant:\n${expected}`);
+});
+
+/** A receiver in its own process, so the test can block on curl without blocking the receiver. */
+const HTTP_RECEIVER = `
+const http = require("node:http");
+const fs = require("node:fs");
+const out = process.argv[1];
+const server = http.createServer((req, res) => {
+  const chunks = [];
+  req.on("data", (d) => chunks.push(d));
+  req.on("end", () => {
+    if (req.url.startsWith("/hang")) {
+      // Never answers. It hangs up after 8 s so that a curl with no timeout
+      // fails the test below instead of hanging the suite.
+      setTimeout(() => req.socket.destroy(), 8000);
+      return;
+    }
+    fs.appendFileSync(out, JSON.stringify({
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body: Buffer.concat(chunks).toString("base64"),
+    }) + "\\n");
+    res.statusCode = 201;
+    res.setHeader("Content-Type", "application/json");
+    res.end('{"ok":true}');
+  });
+});
+server.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port));
+`;
+
+test("http_sync", "a header and a body with quotes, backslashes, newlines and non-ASCII arrive byte for byte", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-httpsync-"));
+  const outFile = join(dir, "received.jsonl");
+  const receiver = spawn(process.execPath, ["-e", HTTP_RECEIVER, outFile]);
+  try {
+    const port = await new Promise<number>((ok, fail) => {
+      let seen = "";
+      const timer = setTimeout(() => fail(new Error("receiver did not start")), 10_000);
+      receiver.stdout.on("data", (d: Buffer) => {
+        seen += d.toString();
+        const m = /PORT (\d+)/.exec(seen);
+        if (m) {
+          clearTimeout(timer);
+          ok(Number(m[1]));
+        }
+      });
+    });
+    const sent =
+      'He said "hi" \\ back\nline2\r\nline3\ttab é 漢字 😀 @/etc/hostname %{http_code} $HOME `x` ';
+    const authorization = 'Bearer tok"en\\x';
+    const r = httpSync({
+      url: `http://127.0.0.1:${port}/echo?x=[1]&y={a}`,
+      method: "POST",
+      headers: { Authorization: authorization, "Content-Type": "application/json" },
+      body: sent,
+      timeoutSec: 10,
+    });
+    assert(r.status === 201 && r.body === '{"ok":true}', `reply: ${r.status} ${JSON.stringify(r.body)}`);
+    const big = "x\n\"\\é".repeat(200_000); // about 1.4 MB
+    const r2 = httpSync({
+      url: `http://127.0.0.1:${port}/big`,
+      method: "POST",
+      body: big,
+      timeoutSec: 20,
+    });
+    assert(r2.status === 201, `a large body gave ${r2.status}`);
+    const lines = readFileSync(outFile, "utf8").trim().split("\n");
+    assert(lines.length === 2, `expected two requests, got ${lines.length}`);
+    const first = JSON.parse(lines[0]!) as { method: string; url: string; headers: Record<string, string>; body: string };
+    assert(first.method === "POST", `method: ${first.method}`);
+    assert(first.url === "/echo?x=[1]&y={a}", `URL: ${first.url}`);
+    assert(first.headers.authorization === authorization, `Authorization: ${first.headers.authorization}`);
+    assert(Buffer.from(first.body, "base64").equals(Buffer.from(sent, "utf8")), "the body changed on the way");
+    const second = JSON.parse(lines[1]!) as { body: string };
+    assert(Buffer.from(second.body, "base64").equals(Buffer.from(big, "utf8")), "the large body changed on the way");
+
+    // The timeout lives in the config now, so prove curl still honours it.
+    const started = Date.now();
+    const hung = httpSync({ url: `http://127.0.0.1:${port}/hang`, timeoutSec: 1 });
+    assert(hung.status === 0 && hung.exitStatus === 28, `a silent server: status ${hung.status}, curl exit ${hung.exitStatus}`);
+    assert(Date.now() - started < 5000, `the timeout took ${Date.now() - started} ms`);
+  } finally {
+    receiver.kill("SIGKILL");
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── THE URL CURL IS GIVEN IS THE URL THE CHECK PARSED ──────────────────────
+
+/** The unquoted value of the `url = "..."` line of a curl config. */
+function configUrl(config: string): string {
+  const line = config.split("\n")[0] ?? "";
+  assert(line.startsWith('url = "') && line.endsWith('"'), `not a url line: ${line}`);
+  return JSON.parse(line.slice("url = ".length)) as string;
+}
+
+test("http_sync", "curl is given the parsed href, so a backslash cannot move the host", () => {
+  // WHATWG URL reads `\` as `/` for http(s), so these name 127.0.0.1 and
+  // localhost. curl 8.7.1 reads the same bytes as userinfo and connects to
+  // evil.invalid. The config must carry what the check parsed.
+  const cases: [string, string][] = [
+    ["http://127.0.0.1\\@evil.invalid/x", 'url = "http://127.0.0.1/'],
+    ["http://localhost\\@evil.invalid/x", 'url = "http://localhost/'],
+  ];
+  for (const [raw, prefix] of cases) {
+    const { config } = buildCurlInvocation({ url: raw, timeoutSec: 5 });
+    const line = config.split("\n")[0] ?? "";
+    assert(line.startsWith(prefix), `${JSON.stringify(raw)}: url line was ${line}`);
+    assert(!line.includes("\\"), `${JSON.stringify(raw)}: a backslash survived into ${line}`);
+    assert(new URL(configUrl(config)).hostname === new URL(raw).hostname, `host differs for ${raw}`);
+    assert(new URL(configUrl(config)).hostname !== "evil.invalid", `curl would be sent to evil.invalid for ${raw}`);
+  }
+  const exact = buildCurlInvocation({ url: "http://127.0.0.1\\@evil.invalid/x", timeoutSec: 5 }).config;
+  assert(exact.split("\n")[0] === 'url = "http://127.0.0.1/@evil.invalid/x"', `href: ${exact.split("\n")[0]}`);
+});
+
+test("http_sync", "an ordinary URL with a query and a percent-encoding is written unchanged", () => {
+  const url = "https://example.com/a%20b/c?q=x%26y&r=%E6%BC%A2#frag";
+  const { config } = buildCurlInvocation({ url, timeoutSec: 5 });
+  assert(configUrl(config) === url, `round trip: ${configUrl(config)}`);
+  const withPort = "http://127.0.0.1:8080/p?x=[1]&y={a}";
+  assert(new URL(withPort).href === withPort, "precondition: this form is already normalised");
+  assert(configUrl(buildCurlInvocation({ url: withPort, timeoutSec: 5 }).config) === withPort, "query brackets changed");
+});
+
+test("http_sync", "a URL that does not parse is refused before curl runs", () => {
+  for (const url of ["http://", "http://[::1", "https://exa mple.com/"]) {
+    let message = "";
+    try {
+      buildCurlInvocation({ url, timeoutSec: 5 });
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    assert(message.startsWith("http_sync:"), `${JSON.stringify(url)}: expected a refusal, got ${JSON.stringify(message)}`);
+  }
+});
+
+test("oauth", "requireHttps and the curl config agree on the host for the backslash forms", () => {
+  const saved = process.env.CHAMBER_OAUTH_ALLOW_HTTP;
+  delete process.env.CHAMBER_OAUTH_ALLOW_HTTP;
+  try {
+    for (const raw of ["http://127.0.0.1\\@evil.invalid/x", "http://localhost\\@evil.invalid/x"]) {
+      requireHttps(raw, "token_endpoint"); // passes: the parsed host is loopback
+      const { config } = buildCurlInvocation({ url: raw, timeoutSec: 5 });
+      const sent = new URL(configUrl(config));
+      // Both sides parse with WHATWG URL, so only a string curl cannot read two ways agrees: no backslash, already normalised.
+      assert(!configUrl(config).includes("\\"), `a backslash reaches curl: ${configUrl(config)}`);
+      assert(sent.href === configUrl(config), `curl is given ${configUrl(config)}, which parses to ${sent.href}`);
+      assert(sent.hostname === new URL(raw).hostname, `the check saw ${new URL(raw).hostname}, curl is given ${sent.hostname}`);
+      assert(sent.hostname === "127.0.0.1" || sent.hostname === "localhost", `curl is given ${sent.hostname}`);
+      requireHttps(sent.href, "token_endpoint"); // and the string curl is given passes the same check
+    }
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_OAUTH_ALLOW_HTTP;
+    else process.env.CHAMBER_OAUTH_ALLOW_HTTP = saved;
+  }
+});
+
+test("oauth", "a token_endpoint that is not HTTPS or loopback is refused before any request is made", async () => {
+  await withCurlShim(async (dir) => {
+    await withEnvAsync({ CHAMBER_TOKEN_KEY: TEST_TOKEN_KEY, CHAMBER_OAUTH_ALLOW_HTTP: undefined }, async () => {
+      const db = freshDb();
+      const res = normalizeResourceUrl("https://mcp.example.com/mcp");
+      const seed = (tokenEndpoint: string): void => {
+        db.prepare(`DELETE FROM mcp_oauth_token`).run();
+        db.prepare(
+          `INSERT INTO mcp_oauth_token (
+             resource_url, issuer, client_id, access_token, refresh_token, expires_at
+           ) VALUES (?, ?, ?, ?, ?, ?)`,
+        ).run(res, "https://auth.example", "chamber-cli", "old", "RT-SECRET", new Date(Date.now() - 1).toISOString());
+        db.prepare(`DELETE FROM mcp_oauth_meta_cache`).run();
+        db.prepare(`INSERT INTO mcp_oauth_meta_cache (key, body_json, expires_at) VALUES (?, ?, ?)`).run(
+          "as:https://auth.example",
+          JSON.stringify({
+            issuer: "https://auth.example",
+            authorization_endpoint: "https://auth.example/authorize",
+            token_endpoint: tokenEndpoint,
+          }),
+          new Date(Date.now() + 60_000).toISOString(),
+        );
+      };
+
+      // Refresh, endpoint taken from the authorization server's metadata.
+      for (const bad of ["http://evil.invalid/token", "http://127.0.0.1.evil.invalid/token"]) {
+        seed(bad);
+        const r = refreshAccessTokenDetailed(db, res, { clientSecret: "CS-SECRET" });
+        assert(!r.ok, `refresh to ${bad} must fail: ${JSON.stringify(r)}`);
+        assert(shimCalls(dir).length === 0, `refresh to ${bad} started curl`);
+      }
+      // Refresh, endpoint passed in.
+      seed("https://auth.example/token");
+      const r2 = refreshAccessTokenDetailed(db, res, { tokenEndpoint: "http://evil.invalid/token", clientSecret: "CS-SECRET" });
+      assert(!r2.ok, `a passed-in endpoint must be checked too: ${JSON.stringify(r2)}`);
+      assert(shimCalls(dir).length === 0, "a passed-in http endpoint started curl");
+
+      // Authorization-code exchange.
+      let message = "";
+      try {
+        exchangeAuthorizationCode(db, {
+          tokenEndpoint: "http://evil.invalid/token",
+          clientId: "client-id",
+          clientSecret: "CS-SECRET",
+          code: "CODE-SECRET",
+          redirectUri: "http://127.0.0.1:8765/callback",
+          codeVerifier: "VERIFIER-SECRET",
+          resource: "https://mcp.example.com/mcp",
+          issuer: "https://auth.example",
+        });
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      assert(message === "token_endpoint must be HTTPS (or set CHAMBER_OAUTH_ALLOW_HTTP=1 for lab)", `exchange: ${JSON.stringify(message)}`);
+      assert(shimCalls(dir).length === 0, "the code exchange started curl");
+
+      // Loopback still works.
+      seed("http://127.0.0.1:9/token");
+      refreshAccessTokenDetailed(db, res, { clientSecret: "CS-SECRET" });
+      const calls = shimCalls(dir);
+      assert(calls.length === 1, `a loopback token endpoint must be used, saw ${calls.length} calls`);
+      assert(calls[0]!.stdin.includes('url = "http://127.0.0.1:9/token"'), `stdin: ${calls[0]!.stdin}`);
+    });
+  });
+});
+
+// ─── POST /turn OFF THE EVENT LOOP (src/turn_pool.ts, src/turn_worker.ts) ───
+
+/**
+ * Worker bodies for exercising the pool without a database. The pool hands each
+ * worker `{ dbPath }` as `workerData`; these treat that string as a marker file.
+ */
+const POOL_WORKER_CRASH_ONCE = `
+import { parentPort, workerData } from "node:worker_threads";
+import { existsSync, writeFileSync } from "node:fs";
+parentPort.on("message", (job) => {
+  if (!existsSync(workerData.dbPath)) {
+    writeFileSync(workerData.dbPath, "crashed once");
+    process.exit(3);
+  }
+  parentPort.postMessage({ id: job.id, ok: true, result: { echoed: job.message } });
+});
+`;
+
+const POOL_WORKER_THROWS = `
+import { parentPort } from "node:worker_threads";
+parentPort.on("message", () => {
+  setTimeout(() => { throw new Error("boom outside a turn"); }, 0);
+});
+`;
+
+const POOL_WORKER_FAILS = `
+import { parentPort } from "node:worker_threads";
+parentPort.on("message", (job) => {
+  parentPort.postMessage({
+    id: job.id,
+    ok: false,
+    chain: ["Error: first", "  caused by: Error: second"],
+    stack: "Error: first\\n    at fake (fake.ts:1:1)",
+  });
+});
+`;
+
+const POOL_WORKER_COUNTS = `
+import { parentPort } from "node:worker_threads";
+let seq = 0;
+parentPort.on("message", (job) => {
+  seq += 1;
+  parentPort.postMessage({ id: job.id, ok: true, result: { echoed: job.message, seq } });
+});
+`;
+
+/** A pool whose worker is `source`, run from a temp dir that is returned for cleanup. */
+function poolOf(source: string): { pool: TurnPool; dir: string } {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-pool-"));
+  const entry = join(dir, "worker.mjs");
+  writeFileSync(entry, source);
+  return { pool: new TurnPool(pathToFileURL(entry), join(dir, "marker")), dir };
+}
+
+test("turn_pool", "a worker that exits mid-turn fails that request, and the next request gets a fresh worker", async () => {
+  const { pool, dir } = poolOf(POOL_WORKER_CRASH_ONCE);
+  try {
+    const err = await rejectionWithin(pool.run("first"), 10_000);
+    assert(/exited/.test(err.message) && /3/.test(err.message), `wrong message: ${err.message}`);
+    const second = await resolvesWithin(pool.run("second"), 10_000, "the restarted worker");
+    assert(second.echoed === "second", `the restarted worker answered ${JSON.stringify(second)}`);
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("turn_pool", "a worker that throws outside a turn fails the request in flight with the thrown error", async () => {
+  const { pool, dir } = poolOf(POOL_WORKER_THROWS);
+  try {
+    const err = await rejectionWithin(pool.run("anything"), 10_000);
+    assert(/boom outside a turn/.test(err.message), `wrong message: ${err.message}`);
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("turn_pool", "a failure reply becomes a TurnWorkerError that keeps the chain and the stack", async () => {
+  const { pool, dir } = poolOf(POOL_WORKER_FAILS);
+  try {
+    const err = await rejectionWithin(pool.run("x"), 10_000);
+    assert(err instanceof TurnWorkerError, `expected a TurnWorkerError, got ${err.name}`);
+    assert(
+      JSON.stringify(err.chain) === JSON.stringify(["Error: first", "  caused by: Error: second"]),
+      `chain: ${JSON.stringify(err.chain)}`,
+    );
+    assert(/at fake/.test(err.stack ?? ""), `stack: ${err.stack}`);
+    assert(err.busy === false, `a failure reply without the flag must not read as busy: ${String(err.busy)}`);
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * First message: the worker throws outside any handler ('error', then 'exit').
+ * Later messages (the replacement worker): a slow but healthy answer.
+ */
+const POOL_WORKER_CRASH_THEN_SLOW = `
+import { parentPort, workerData } from "node:worker_threads";
+import { existsSync, writeFileSync } from "node:fs";
+parentPort.on("message", (job) => {
+  if (!existsSync(workerData.dbPath)) {
+    writeFileSync(workerData.dbPath, "crashed once");
+    setTimeout(() => { throw new Error("boom outside a turn"); }, 0);
+    return;
+  }
+  setTimeout(() => parentPort.postMessage({ id: job.id, ok: true, result: { echoed: job.message } }), 1000);
+});
+`;
+
+test("turn_pool", "a request that arrives between a crashed worker's 'error' and its 'exit' is answered by the new worker", async () => {
+  const { pool, dir } = poolOf(POOL_WORKER_CRASH_THEN_SLOW);
+  try {
+    const first = await rejectionWithin(pool.run("first"), 10_000);
+    assert(/boom outside a turn/.test(first.message), `wrong message: ${first.message}`);
+    // Issued from the first rejection: the old worker's 'error' has run and its
+    // 'exit' has not, so the replacement's job is in flight when 'exit' arrives.
+    const second = await resolvesWithin(pool.run("second"), 10_000, "the replacement worker's turn");
+    assert(second.echoed === "second", `the replacement answered ${JSON.stringify(second)}`);
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+const POOL_WORKER_BUSY = `
+import { parentPort } from "node:worker_threads";
+parentPort.on("message", (job) => {
+  parentPort.postMessage({
+    id: job.id,
+    ok: false,
+    busy: true,
+    chain: ["Error: database is locked"],
+    stack: "Error: database is locked\\n    at fake (fake.ts:1:1)",
+  });
+});
+`;
+
+test("turn_pool", "a failure reply flagged busy becomes a TurnWorkerError with busy set", async () => {
+  const { pool, dir } = poolOf(POOL_WORKER_BUSY);
+  try {
+    const err = await rejectionWithin(pool.run("x"), 10_000);
+    assert(err instanceof TurnWorkerError, `expected a TurnWorkerError, got ${err.name}`);
+    assert(err.busy === true, `busy was ${String(err.busy)}`);
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("turn_pool", "isSqliteBusy reads the error code, not the message, and follows a cause", async () => {
+  const withCode = (code: number, message: string, cause?: unknown): Error =>
+    Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { errcode: code });
+  assert(isSqliteBusy(withCode(5, "unrelated")), "errcode 5 with an unrelated message must be busy");
+  assert(isSqliteBusy({ errcode: 5, message: "unrelated" }), "a plain object carrying errcode 5 must be busy");
+  assert(isSqliteBusy({ errcode: 517 }), "a plain object carrying errcode 517 must be busy");
+  assert(isSqliteBusy(withCode(517, "snapshot")), "an extended BUSY code (517) must be busy");
+  assert(isSqliteBusy(new Error("wrapped", { cause: withCode(5, "inner") })), "a cause carrying errcode 5 must be busy");
+  assert(!isSqliteBusy(withCode(6, "database is locked")), "SQLITE_LOCKED (6) is not busy, whatever the message says");
+  assert(!isSqliteBusy(new Error("database is locked")), "a message without an errcode is not busy");
+  assert(!isSqliteBusy("database is locked"), "a string is not busy");
+});
+
+test("turn_pool", "the real worker refuses to run on a fallback database, and writes no turn to it", async () => {
+  // A directory as the database path: the open fails with the same code as an
+  // unwritable one (see the cli redirect test), and it fails as root too. The
+  // main thread of a live server would have redirected and handed the worker
+  // the fallback path; here the worker is handed the requested path, which is
+  // what happens when the location goes bad between the two opens.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-workerfallback-"));
+  const TMP_FALLBACK = "/tmp/chamber.sqlite";
+  const tmpFallbackPreexisted = existsSync(TMP_FALLBACK);
+  const sessionsIn = (path: string): number => {
+    if (!existsSync(path)) return 0;
+    const probe = openChamberDb(path);
+    try {
+      return count(probe, `SELECT COUNT(*) AS c FROM session`);
+    } finally {
+      probe.close();
+    }
+  };
+  const before = sessionsIn(TMP_FALLBACK);
+  const requested = join(dir, "iam-a-directory");
+  mkdirSync(requested);
+  const pool = new TurnPool(new URL("../src/turn_worker.ts", import.meta.url), requested);
+  try {
+    const err = await rejectionWithin(pool.run("hello"), 15_000);
+    const text = `${err.message}\n${(err as TurnWorkerError).chain?.join("\n") ?? ""}`;
+    assert(/turn worker refused/.test(text), `the worker should refuse by name, got: ${text}`);
+    assert(text.includes(requested), `the refusal must name the path asked for, got: ${text}`);
+    assert(text.includes(TMP_FALLBACK), `the refusal must name the fallback it found, got: ${text}`);
+    assert(
+      sessionsIn(TMP_FALLBACK) === before,
+      `the turn wrote ${sessionsIn(TMP_FALLBACK) - before} session row(s) to ${TMP_FALLBACK}`,
+    );
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+    if (!tmpFallbackPreexisted) rmSync(TMP_FALLBACK, { force: true });
+  }
+});
+
+test("turn_pool", "requests run one at a time, in the order they were made", async () => {
+  const { pool, dir } = poolOf(POOL_WORKER_COUNTS);
+  try {
+    const all = await resolvesWithin(
+      Promise.all([pool.run("a"), pool.run("b"), pool.run("c")]),
+      10_000,
+      "three queued runs",
+    );
+    assert(
+      all.map((r) => `${String(r.echoed)}${String(r.seq)}`).join(",") === "a1,b2,c3",
+      `got ${JSON.stringify(all)}`,
+    );
+  } finally {
+    await pool.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Stands in for the Python interpreter: answers the embedder's availability
+ * probe at once, and answers a real embedding request after 3 s, having first
+ * created `embedding` beside itself so the test knows the turn is waiting on it.
+ * Every vector is the same unit vector, so every comparison scores 1.0.
+ */
+const SLOW_PYTHON_JS = `const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+const vector = Array(384).fill(1 / Math.sqrt(384));
+if (args[1] === "--json") {
+  const texts = JSON.parse(fs.readFileSync(0, "utf8"));
+  fs.writeFileSync(path.join(__dirname, "embedding"), "waiting\\n");
+  setTimeout(() => {
+    process.stdout.write(JSON.stringify(texts.map(() => vector)) + "\\n");
+  }, 3000);
+} else {
+  process.stdout.write(JSON.stringify(vector) + "\\n");
+}
+`;
+
+test("server", "POST /turn runs off the event loop: /health answers while the paraphrase check waits on the embedder", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-slowpy-"));
+  // CHAMBER_PYTHON must be one executable, so a one-line shell wrapper runs the
+  // Node script with the Node that is running this harness.
+  const stub = join(dir, "slow-python");
+  writeFileSync(join(dir, "slow-python.js"), SLOW_PYTHON_JS);
+  writeFileSync(stub, `#!/bin/sh\nexec "${process.execPath}" "${join(dir, "slow-python.js")}" "$@"\n`, {
+    mode: 0o755,
+  });
+  const s = await startLiveServer({ CHAMBER_PYTHON: stub }, (dbPath) => {
+    // An open blocking debt is what makes the next assertion reach the
+    // embedder: the paraphrase check has something to compare against.
+    const seed = openChamberDb(dbPath);
+    commitBelief(seed, {
+      type: "belief",
+      text: "Customers may return goods within 30 days of purchase.",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    assert(listOpenDebts(seed, 5).length === 1, "setup: exactly one blocking debt must be open");
+    seed.close();
+  });
+  try {
+    const turn = s.request({
+      method: "POST",
+      path: "/turn",
+      body: JSON.stringify({ message: "believe: Customers may return goods within 14 days of purchase." }),
+    });
+    // If an assertion below fails first, this request is abandoned when the
+    // server is stopped. Without this line that rejection is unhandled and
+    // takes the whole harness down, hiding the failure that mattered.
+    void turn.catch(() => undefined);
+    const marker = join(dir, "embedding");
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(marker) && Date.now() < deadline) {
+      await new Promise((ok) => setTimeout(ok, 25));
+    }
+    assert(existsSync(marker), `setup: the turn never reached the embedder.\n${s.stderr()}`);
+
+    // The turn is now inside the 3 s embedder wait, holding the write lock.
+    const health = await s.request({ path: "/health" });
+    assert(health.status === 200, `/health gave ${health.status}`);
+    assert(health.ms < 500, `/health took ${health.ms} ms while a turn was running; the loop is blocked`);
+
+    // A route that writes needs the lock the turn holds. It must give up
+    // quickly (503 busy), not freeze the loop for SQLite's default 5 s.
+    const queue = await s.request({ path: "/queue" });
+    assert(queue.ms < 1500, `/queue took ${queue.ms} ms; the main connection waited on the turn's lock`);
+
+    const done = await turn;
+    assert(done.status === 200, `the turn gave ${done.status}: ${done.text.slice(0, 300)}`);
+    assert(done.ms >= 2500, `the turn took ${done.ms} ms, so the 3 s embedder wait never happened`);
+    const body = done.json as Record<string, unknown>;
+    for (const key of ["turnId", "sessionId", "observation", "assistant", "model", "contract", "spend", "queue", "debts"]) {
+      assert(key in body, `the turn reply lacks "${key}": ${done.text.slice(0, 300)}`);
+    }
+    const after = await s.request({ path: "/queue" });
+    assert(after.status === 200, `once the turn is over /queue must work: ${after.status} ${after.text.slice(0, 200)}`);
+  } finally {
+    await s.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("server", "a route that needs the write lock a turn holds answers 503 busy with Retry-After, not 500", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-busy-"));
+  const stub = join(dir, "slow-python");
+  writeFileSync(join(dir, "slow-python.js"), SLOW_PYTHON_JS);
+  writeFileSync(stub, `#!/bin/sh\nexec "${process.execPath}" "${join(dir, "slow-python.js")}" "$@"\n`, {
+    mode: 0o755,
+  });
+  const s = await startLiveServer({ CHAMBER_PYTHON: stub }, (dbPath) => {
+    const seed = openChamberDb(dbPath);
+    commitBelief(seed, {
+      type: "belief",
+      text: "Customers may return goods within 30 days of purchase.",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    seed.close();
+  });
+  try {
+    const turn = s.request({
+      method: "POST",
+      path: "/turn",
+      body: JSON.stringify({ message: "believe: Customers may return goods within 14 days of purchase." }),
+    });
+    void turn.catch(() => undefined);
+    const marker = join(dir, "embedding");
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(marker) && Date.now() < deadline) {
+      await new Promise((ok) => setTimeout(ok, 25));
+    }
+    assert(existsSync(marker), `setup: the turn never reached the embedder.\n${s.stderr()}`);
+
+    const status = await s.request({ path: "/status" });
+    assert(status.status === 503, `/status gave ${status.status} while a turn held the lock: ${status.text.slice(0, 200)}`);
+    assert(status.ms < 1500, `/status took ${status.ms} ms; the main connection waited on the turn's lock`);
+    assert(status.headers["retry-after"] === "1", `Retry-After was ${String(status.headers["retry-after"])}`);
+    assert(
+      JSON.stringify(status.json) === JSON.stringify({ error: "busy" }),
+      `body was ${status.text.slice(0, 200)}`,
+    );
+    assert(!/chamber server error/.test(s.stderr()), `a busy lock is not a server error, but stderr says:\n${s.stderr()}`);
+
+    const done = await turn;
+    assert(done.status === 200, `the turn gave ${done.status}: ${done.text.slice(0, 300)}`);
+  } finally {
+    await s.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Rows a deliberation leaves behind, read through a connection of the test's own. */
+function deliberationRows(dbPath: string): { del: number; votes: number; spend: number; audit: number } {
+  const db = openChamberDb(dbPath);
+  try {
+    return {
+      del: count(db, `SELECT COUNT(*) AS c FROM deliberation`),
+      votes: count(db, `SELECT COUNT(*) AS c FROM faculty_vote`),
+      spend: count(db, `SELECT COUNT(*) AS c FROM spend_event WHERE channel = 'faculty'`),
+      audit: count(db, `SELECT COUNT(*) AS c FROM audit_event WHERE action = 'faculty_deliberation'`),
+    };
+  } finally {
+    db.close();
+  }
+}
+
+test("server", "POST /deliberate while a turn holds the write lock answers 503 busy and writes nothing; the retry writes exactly one deliberation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-delib-busy-"));
+  const stub = join(dir, "slow-python");
+  writeFileSync(join(dir, "slow-python.js"), SLOW_PYTHON_JS);
+  writeFileSync(stub, `#!/bin/sh\nexec "${process.execPath}" "${join(dir, "slow-python.js")}" "$@"\n`, {
+    mode: 0o755,
+  });
+  const s = await startLiveServer({ CHAMBER_PYTHON: stub }, (dbPath) => {
+    const seed = openChamberDb(dbPath);
+    commitBelief(seed, {
+      type: "belief",
+      text: "Customers may return goods within 30 days of purchase.",
+      sources: [],
+      authorFamily: "test",
+      path: "deep",
+    });
+    seed.close();
+  });
+  try {
+    const before = deliberationRows(s.dbPath);
+    const turn = s.request({
+      method: "POST",
+      path: "/turn",
+      body: JSON.stringify({ message: "believe: Customers may return goods within 14 days of purchase." }),
+    });
+    void turn.catch(() => undefined);
+    const marker = join(dir, "embedding");
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(marker) && Date.now() < deadline) {
+      await new Promise((ok) => setTimeout(ok, 25));
+    }
+    assert(existsSync(marker), `setup: the turn never reached the embedder.\n${s.stderr()}`);
+
+    const refused = await s.request({
+      method: "POST",
+      path: "/deliberate",
+      body: JSON.stringify({ kind: "other", subjectId: "x", question: "May this proceed?" }),
+    });
+    assert(refused.status === 503, `/deliberate gave ${refused.status} while a turn held the lock: ${refused.text.slice(0, 200)}`);
+    assert(JSON.stringify(refused.json) === JSON.stringify({ error: "busy" }), `body was ${refused.text.slice(0, 200)}`);
+    assert(refused.headers["retry-after"] === "1", `Retry-After was ${String(refused.headers["retry-after"])}`);
+
+    const done = await turn;
+    assert(done.status === 200, `the turn gave ${done.status}: ${done.text.slice(0, 300)}`);
+    const after = deliberationRows(s.dbPath);
+    assert(
+      JSON.stringify(after) === JSON.stringify(before),
+      `a 503 must write nothing, but the rows went from ${JSON.stringify(before)} to ${JSON.stringify(after)}`,
+    );
+
+    // The client was told to retry. The retry must leave one deliberation, not
+    // two: nothing from the refused attempt may be left to add to it.
+    const retried = await s.request({
+      method: "POST",
+      path: "/deliberate",
+      body: JSON.stringify({ kind: "other", subjectId: "x", question: "May this proceed?" }),
+    });
+    assert(retried.status === 200, `the retry gave ${retried.status}: ${retried.text.slice(0, 200)}`);
+    const final = deliberationRows(s.dbPath);
+    assert(
+      final.del === before.del + 1 && final.votes === before.votes + 5 && final.spend === before.spend + 1 && final.audit === before.audit + 1,
+      `one deliberation should add 1 deliberation, 5 votes, 1 spend and 1 audit row to ${JSON.stringify(before)}, got ${JSON.stringify(final)}`,
+    );
+  } finally {
+    await s.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("server", "POST /deliberate that fails part-way leaves no deliberation, vote, spend or audit row behind", async () => {
+  // Plant the failure in the database: the third faculty's vote cannot be
+  // inserted. That is a stand-in for any failure after the first write (a full
+  // disk, a lock taken between two statements); only the rollback is under test.
+  const s = await startLiveServer({}, (dbPath) => {
+    const seed = openChamberDb(dbPath);
+    seed.exec(
+      `CREATE TRIGGER test_refuse_third_vote BEFORE INSERT ON faculty_vote
+       WHEN NEW.faculty = 'applied_ethics'
+       BEGIN SELECT RAISE(ABORT, 'planted failure'); END`,
+    );
+    seed.close();
+  });
+  try {
+    const before = deliberationRows(s.dbPath);
+    const r = await s.request({
+      method: "POST",
+      path: "/deliberate",
+      body: JSON.stringify({ kind: "other", subjectId: "x", question: "May this proceed?" }),
+    });
+    assert(r.status === 500, `the planted failure should reach the client as 500, got ${r.status}: ${r.text.slice(0, 200)}`);
+    assert(/planted failure/.test(s.stderr()), `the failure never happened, so nothing was tested:\n${s.stderr()}`);
+    const after = deliberationRows(s.dbPath);
+    assert(
+      JSON.stringify(after) === JSON.stringify(before),
+      `a failed deliberation must leave nothing, but the rows went from ${JSON.stringify(before)} to ${JSON.stringify(after)}`,
+    );
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "a turn whose worker cannot get the write lock answers 503 busy with Retry-After, with no server error line", async () => {
+  const s = await startLiveServer();
+  // The worker is started by the first turn. Without this one, the worker would
+  // fail while opening its connection, which is a different path (an uncaught
+  // 'error' event) from a turn that cannot get the lock.
+  const warm = await s.request({ method: "POST", path: "/turn", body: JSON.stringify({ message: "warm up" }) });
+  assert(warm.status === 200, `setup: the first turn gave ${warm.status}: ${warm.text.slice(0, 200)}`);
+  // Another connection holds the write lock for longer than the worker's 5 s wait.
+  const holder = openChamberDb(s.dbPath);
+  holder.exec("BEGIN IMMEDIATE");
+  try {
+    const r = await s.request({ method: "POST", path: "/turn", body: JSON.stringify({ message: "hello" }) });
+    assert(r.status === 503, `the turn gave ${r.status}: ${r.text.slice(0, 300)}\n${s.stderr()}`);
+    assert(r.headers["retry-after"] === "1", `Retry-After was ${String(r.headers["retry-after"])}`);
+    assert(JSON.stringify(r.json) === JSON.stringify({ error: "busy" }), `body was ${r.text.slice(0, 200)}`);
+    assert(!/chamber server error/.test(s.stderr()), `a busy lock is not a server error, but stderr says:\n${s.stderr()}`);
+  } finally {
+    holder.exec("ROLLBACK");
+    holder.close();
+    await s.stop();
+  }
+});
+
+test("server", "the /turn rate limit survives between turns, and the other thread sees what the worker wrote", async () => {
+  // capacity 1 and a one-hour refill: the second turn is refused only if the
+  // bucket from the first is still there, i.e. the worker is one long-lived thread.
+  const s = await startLiveServer({
+    CHAMBER_SURFACE_RATE_CAPACITY: "1",
+    CHAMBER_SURFACE_RATE_REFILL_MS: "3600000",
+  });
+  try {
+    const first = await s.request({
+      method: "POST",
+      path: "/turn",
+      body: JSON.stringify({ message: "believe: the audit store is SQLite" }),
+    });
+    assert(first.status === 200 && "turnId" in (first.json as object), `first turn: ${first.status} ${first.text.slice(0, 200)}`);
+    const second = await s.request({ method: "POST", path: "/turn", body: JSON.stringify({ message: "hello again" }) });
+    const refused = second.json as { ok?: boolean; error?: string };
+    assert(
+      second.status === 200 && refused.ok === false && /Rate limited/.test(refused.error ?? ""),
+      `second turn must be rate limited: ${second.status} ${second.text.slice(0, 200)}`,
+    );
+    // /status reads on the server's own connection; the belief was written on the worker's.
+    const status = await s.request({ path: "/status" });
+    assert(((status.json as { beliefs?: number }).beliefs ?? 0) >= 1, `main thread sees: ${status.text.slice(0, 200)}`);
+  } finally {
+    await s.stop();
+  }
+});
+
+test("server", "a turn run on the worker still posts its pending write to the Slack ops channel", async () => {
+  // registerSlackPendingHook() registers a listener in the module that holds it.
+  // proposeWrite now runs in the worker, so the worker has to register it too;
+  // the main thread's registration can no longer fire. Observed through a curl
+  // shim: the card is posted with the token on curl's stdin.
+  const dir = mkdtempSync(join(tmpdir(), "chamber-slackshim-"));
+  writeCurlShim(dir);
+  const s = await startLiveServer({
+    PATH: `${dir}:${process.env.PATH ?? ""}`,
+    CHAMBER_SHIM_DIR: dir,
+    SLACK_BOT_TOKEN: "SHIMSECRET-worker-slack",
+    CHAMBER_SLACK_OPS_CHANNEL: "C0OPS",
+  });
+  try {
+    const r = await s.request({
+      method: "POST",
+      path: "/turn",
+      body: JSON.stringify({ message: "please remember I prefer tea" }),
+    });
+    assert(r.status === 200, `turn: ${r.status} ${r.text.slice(0, 300)}`);
+    const calls = shimCalls(dir);
+    assert(
+      calls.some((c) => c.stdin.includes("chat.postMessage") && c.stdin.includes("SHIMSECRET-worker-slack")),
+      `no Slack card was posted; curl calls: ${JSON.stringify(calls.map((c) => c.argv))}\n${s.stderr()}`,
+    );
+  } finally {
+    await s.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("server", "with an in-memory database the turn runs inline, because a thread cannot share it", async () => {
+  const s = await startLiveServer({ CHAMBER_DB: ":memory:" });
+  try {
+    const r = await s.request({ method: "POST", path: "/turn", body: JSON.stringify({ message: "hello" }) });
+    assert(r.status === 200 && "turnId" in (r.json as object), `inline turn: ${r.status} ${r.text.slice(0, 300)}`);
+  } finally {
+    await s.stop();
+  }
+});
+
+test("tools", "the CLI shows the sandbox refusal with its opt-out, and tool-synth exits non-zero", () => {
+  // The refusal text lives in SandboxResult.error. A CLI that prints only
+  // ok/backend/exit leaves the operator with "ok=false" and no way out.
+  const hasBwrap = spawnSync("which", ["bwrap"], { encoding: "utf8" }).status === 0;
+  if (hasBwrap) {
+    console.log("  (skipped: bwrap is on PATH, so the default may not refuse here)");
+    return;
+  }
+  const way = "Set CHAMBER_SANDBOX_REQUIRED=0 to run tool code without isolation.";
+  const dir = mkdtempSync(join(tmpdir(), "chamber-cli-refusal-"));
+  try {
+    const env: NodeJS.ProcessEnv = { ...process.env, CHAMBER_DB: join(dir, "t.sqlite") };
+    delete env.CHAMBER_SANDBOX_REQUIRED;
+    delete env.CHAMBER_SANDBOX_BACKEND;
+    const cli = (args: string[]): ReturnType<typeof spawnSync> =>
+      spawnSync(process.execPath, ["--experimental-strip-types", CLI_PATH, ...args], {
+        encoding: "utf8",
+        timeout: 30_000,
+        env,
+      });
+
+    const run = cli(["tool-run", "sha256", "abc"]);
+    assert(run.error === undefined, `launch failed: ${run.error}`);
+    assert(run.status === 1, `tool-run: expected exit 1, got ${run.status}`);
+    assert(
+      String(run.stderr).split("\n").some((line) => line.startsWith("sandbox required") && line.endsWith(way)),
+      `tool-run: stderr must carry the refusal as its own line, got ${JSON.stringify(run.stderr)}`,
+    );
+
+    const st = cli(["sandbox-test"]);
+    assert(st.error === undefined, `launch failed: ${st.error}`);
+    assert(st.status === 1, `sandbox-test: expected exit 1, got ${st.status}`);
+    const parsed = JSON.parse(String(st.stdout)) as { ok?: boolean; error?: string };
+    assert(parsed.ok === false, `sandbox-test: ok must be false, got ${JSON.stringify(parsed)}`);
+    assert(
+      typeof parsed.error === "string" && parsed.error.endsWith(way),
+      `sandbox-test: JSON error must end with the way out, got ${JSON.stringify(parsed.error)}`,
+    );
+
+    const syn = cli(["tool-synth", "foo", "--", "console.log(1)"]);
+    assert(syn.error === undefined, `launch failed: ${syn.error}`);
+    assert(syn.status === 1, `tool-synth: a rejected synthesis must exit 1, got ${syn.status}`);
+    assert(String(syn.stdout).includes(way), `tool-synth: output must still carry the refusal, got ${JSON.stringify(syn.stdout)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── THE RUNNERS ENFORCE THE TALK ALLOWLIST (slack_runner.ts, discord_runner.ts)
+
+/*
+ * The predicates above can be right while a runner never calls them: that is
+ * how a guard written down is never reached. These tests run the real runner
+ * modules. Their two dependencies, @slack/bolt and discord.js, are replaced by
+ * stubs through a module-resolution hook (`--import` of a file that calls
+ * `module.register`), so no network and no token is involved: each stub only
+ * records the handlers the runner registers, and a driver script then calls
+ * those handlers with fake events and prints what the bot said.
+ */
+
+const RUNNER_HOOKS = `
+export async function resolve(specifier, context, nextResolve) {
+  if (specifier === "@slack/bolt") {
+    return { url: new URL("./bolt_stub.mjs", import.meta.url).href, shortCircuit: true };
+  }
+  if (specifier === "discord.js") {
+    return { url: new URL("./discord_stub.mjs", import.meta.url).href, shortCircuit: true };
+  }
+  return nextResolve(specifier, context);
+}
+`;
+
+const RUNNER_REGISTER = `
+import { register } from "node:module";
+register("./hooks.mjs", import.meta.url);
+`;
+
+const BOLT_STUB = `
+globalThis.__stub = { handlers: {} };
+export class App {
+  constructor(options) { globalThis.__stub.options = options; }
+  event(name, fn) { globalThis.__stub.handlers["event:" + name] = fn; }
+  message(fn) { globalThis.__stub.handlers.message = fn; }
+  command(name, fn) { globalThis.__stub.handlers["command:" + name] = fn; }
+  action(name, fn) { globalThis.__stub.handlers["action:" + name] = fn; }
+  async start() {}
+}
+`;
+
+const DISCORD_STUB = `
+globalThis.__stub = { handlers: {} };
+export const GatewayIntentBits = { Guilds: 1, GuildMessages: 2, GuildMessageReactions: 4, MessageContent: 8, DirectMessages: 16 };
+export const Partials = { Channel: "Channel", Message: "Message", Reaction: "Reaction" };
+export const Events = {
+  ClientReady: "ready", Error: "error", ShardReconnecting: "shardReconnecting", ShardResume: "shardResume",
+  MessageCreate: "messageCreate", InteractionCreate: "interactionCreate", MessageReactionAdd: "messageReactionAdd",
+};
+export const MessageFlags = { Ephemeral: 64 };
+export const ActivityType = { Watching: 3 };
+export const Routes = { applicationGuildCommands: () => "g", applicationCommands: () => "c" };
+export class REST { setToken() { return this; } async put() {} }
+export class SlashCommandBuilder {
+  setName() { return this; }
+  setDescription() { return this; }
+  addStringOption(build) {
+    build({ setName() { return this; }, setDescription() { return this; }, setRequired() { return this; } });
+    return this;
+  }
+  toJSON() { return {}; }
+}
+export class Client {
+  constructor() { this.user = { id: "UBOT", tag: "bot#0001" }; }
+  once() {}
+  on(event, fn) { globalThis.__stub.handlers[event] = fn; }
+  async login() {}
+}
+`;
+
+const SLACK_DRIVER = `
+await import(process.env.RUNNER);
+const deadline = Date.now() + 15000;
+while (!globalThis.__stub.handlers["command:/chamber"] && Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, 25));
+}
+const h = globalThis.__stub.handlers;
+const user = process.env.TEST_USER;
+const said = [];
+const say = async (m) => { said.push(m.text); };
+const responded = [];
+await h["event:app_mention"]({ event: { user, text: "<@UBOT> hello there", channel: "C1", ts: "1.1" }, say });
+await h.message({ message: { channel_type: "im", user, text: "hello there", channel: "D1" }, say });
+await h["command:/chamber"]({
+  command: { user_id: user, channel_id: "C1", text: "status" },
+  ack: async () => {},
+  respond: async (m) => { responded.push(m.text); },
+  client: { chat: { postMessage: async () => ({}) } },
+});
+console.log("DRIVE " + JSON.stringify({ said, responded }));
+process.exit(0);
+`;
+
+const DISCORD_DRIVER = `
+await import(process.env.RUNNER);
+const deadline = Date.now() + 15000;
+while (!globalThis.__stub.handlers.interactionCreate && Date.now() < deadline) {
+  await new Promise((r) => setTimeout(r, 25));
+}
+const h = globalThis.__stub.handlers;
+const user = process.env.TEST_USER;
+const out = [];
+const channel = (id) => ({ id, sendTyping: async () => {}, send: async (o) => { out.push(o.content); } });
+const message = (guild, channelId, mentioned) => ({
+  author: { bot: false, id: user }, webhookId: null, system: false, guild,
+  channel: channel(channelId), mentions: { has: () => mentioned },
+  content: "hello there", attachments: new Map(),
+  reply: async (o) => { out.push(o.content); },
+});
+await h.messageCreate(message(null, "D1", false));
+const dm = out.splice(0);
+await h.messageCreate(message({ id: "G1" }, "C1", true));
+const mention = out.splice(0);
+await h.messageCreate(message({ id: "G1" }, "C9", false));
+const free = out.splice(0);
+await h.interactionCreate({
+  isChatInputCommand: () => true, commandName: "chamber", user: { id: user },
+  options: { getString: () => "status" }, channelId: "C1", guild: null, channel: null,
+  isButton: () => false,
+  reply: async (o) => { out.push(o.content); },
+  deferReply: async () => {},
+  editReply: async (o) => { out.push(typeof o === "string" ? o : o.content); },
+});
+const slash = out.splice(0);
+console.log("DRIVE " + JSON.stringify({ dm, mention, free, slash }));
+process.exit(0);
+`;
+
+/** Run a real runner against the stubs; returns what the driver printed, stderr and how many sessions the database holds. */
+function driveRunner(
+  kind: "slack" | "discord",
+  env: Record<string, string>,
+  user: string,
+): { drive: Record<string, string[]>; stderr: string; sessions: number } {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-runner-"));
+  try {
+    writeFileSync(join(dir, "hooks.mjs"), RUNNER_HOOKS);
+    writeFileSync(join(dir, "register.mjs"), RUNNER_REGISTER);
+    writeFileSync(join(dir, "bolt_stub.mjs"), BOLT_STUB);
+    writeFileSync(join(dir, "discord_stub.mjs"), DISCORD_STUB);
+    const driver = join(dir, "driver.mjs");
+    writeFileSync(driver, kind === "slack" ? SLACK_DRIVER : DISCORD_DRIVER);
+    const dbPath = join(dir, "runner.sqlite");
+    const runner = pathToFileURL(
+      join(dirname(fileURLToPath(import.meta.url)), `../src/${kind}_runner.ts`),
+    ).href;
+    const base: Record<string, string | undefined> = { ...process.env };
+    for (const key of CONFIG_ENV_KEYS) delete base[key];
+    for (const key of [
+      "CHAMBER_SLACK_ALLOWED_USERS",
+      "CHAMBER_DISCORD_ALLOWED_USERS",
+      "DISCORD_ALLOWED_USERS",
+      "CHAMBER_DISCORD_FREE_CHANNELS",
+      "CHAMBER_SLACK_OPS_CHANNEL",
+      "CHAMBER_DISCORD_OPS_CHANNEL",
+    ]) {
+      delete base[key];
+    }
+    const r = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", "--import", pathToFileURL(join(dir, "register.mjs")).href, driver],
+      {
+        encoding: "utf8",
+        timeout: 60_000,
+        env: {
+          ...base,
+          CHAMBER_DB: dbPath,
+          SLACK_BOT_TOKEN: "stub-bot",
+          SLACK_APP_TOKEN: "stub-app",
+          DISCORD_BOT_TOKEN: "stub-bot",
+          RUNNER: runner,
+          TEST_USER: user,
+          ...env,
+        },
+      },
+    );
+    const line = (r.stdout ?? "").split("\n").find((l) => l.startsWith("DRIVE "));
+    assert(line !== undefined, `the driver printed no result (exit ${r.status}):\n${r.stdout}\n${r.stderr}`);
+    const db = openChamberDb(dbPath);
+    try {
+      const sessions = (db.prepare(`SELECT COUNT(*) AS c FROM session`).get() as { c: number }).c;
+      return {
+        drive: JSON.parse(line.slice("DRIVE ".length)) as Record<string, string[]>,
+        stderr: r.stderr ?? "",
+        sessions,
+      };
+    } finally {
+      db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("slack", "the Slack runner refuses a user who is not on CHAMBER_SLACK_ALLOWED_USERS at mentions, DMs and /chamber", () => {
+  const empty = driveRunner("slack", {}, "U_ANYONE");
+  assert(
+    /chamber: CHAMBER_SLACK_ALLOWED_USERS is empty, so nobody can talk to this bot/.test(empty.stderr),
+    `an empty list must be announced at startup:\n${empty.stderr}`,
+  );
+  const unlisted = driveRunner("slack", { CHAMBER_SLACK_ALLOWED_USERS: "U_OK" }, "U_BAD");
+  assert(
+    !/is empty, so nobody/.test(unlisted.stderr),
+    `a configured list must not print the empty-list warning:\n${unlisted.stderr}`,
+  );
+  for (const [label, run] of [["empty list", empty], ["unlisted user", unlisted]] as const) {
+    assert(
+      JSON.stringify(run.drive.said) === JSON.stringify([SLACK_TALK_REFUSAL, SLACK_TALK_REFUSAL]),
+      `${label}: mention and DM must each be refused, got ${JSON.stringify(run.drive.said)}`,
+    );
+    assert(
+      JSON.stringify(run.drive.responded) === JSON.stringify([SLACK_TALK_REFUSAL]),
+      `${label}: /chamber must be refused, got ${JSON.stringify(run.drive.responded)}`,
+    );
+    assert(run.sessions === 0, `${label}: a refused user must not start a turn, ${run.sessions} session(s) exist`);
+  }
+  const listed = driveRunner("slack", { CHAMBER_SLACK_ALLOWED_USERS: "U_OK" }, "U_OK");
+  assert(
+    listed.drive.said!.length === 2 && listed.drive.said!.every((t) => t !== SLACK_TALK_REFUSAL && t.length > 0),
+    `a listed user must be answered: ${JSON.stringify(listed.drive.said)}`,
+  );
+  assert(
+    listed.drive.responded!.length === 1 && listed.drive.responded![0] !== SLACK_TALK_REFUSAL,
+    `a listed user's /chamber must be answered: ${JSON.stringify(listed.drive.responded)}`,
+  );
+  assert(listed.sessions >= 1, "a listed user's mention must have run a turn");
+});
+
+test("discord", "the Discord runner refuses a user who is not on CHAMBER_DISCORD_ALLOWED_USERS at messages, mentions and /chamber", () => {
+  const refusal = "You are not on `CHAMBER_DISCORD_ALLOWED_USERS`.";
+  const env = { CHAMBER_DISCORD_FREE_CHANNELS: "C9" };
+  const empty = driveRunner("discord", env, "u_anyone");
+  assert(
+    /chamber: CHAMBER_DISCORD_ALLOWED_USERS is empty, so nobody can talk to this bot/.test(empty.stderr),
+    `an empty list must be announced at startup:\n${empty.stderr}`,
+  );
+  const unlisted = driveRunner("discord", { ...env, CHAMBER_DISCORD_ALLOWED_USERS: "u_ok" }, "u_bad");
+  assert(
+    !/is empty, so nobody/.test(unlisted.stderr),
+    `a configured list must not print the empty-list warning:\n${unlisted.stderr}`,
+  );
+  for (const [label, run] of [["empty list", empty], ["unlisted user", unlisted]] as const) {
+    assert(JSON.stringify(run.drive.dm) === JSON.stringify([refusal]), `${label}: DM got ${JSON.stringify(run.drive.dm)}`);
+    assert(JSON.stringify(run.drive.mention) === JSON.stringify([refusal]), `${label}: mention got ${JSON.stringify(run.drive.mention)}`);
+    assert(
+      run.drive.free!.length === 0,
+      `${label}: a free-channel message that did not address the bot must get no reply at all, got ${JSON.stringify(run.drive.free)}`,
+    );
+    assert(JSON.stringify(run.drive.slash) === JSON.stringify([refusal]), `${label}: /chamber got ${JSON.stringify(run.drive.slash)}`);
+    assert(run.sessions === 0, `${label}: a refused user must not start a turn, ${run.sessions} session(s) exist`);
+  }
+  const listed = driveRunner("discord", { ...env, CHAMBER_DISCORD_ALLOWED_USERS: "u_ok" }, "u_ok");
+  for (const key of ["dm", "mention", "free", "slash"] as const) {
+    const got = listed.drive[key]!;
+    assert(got.length >= 1 && got.every((t) => t !== refusal), `a listed user must be answered at ${key}: ${JSON.stringify(got)}`);
+  }
+  assert(listed.sessions >= 1, "a listed user's message must have run a turn");
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────

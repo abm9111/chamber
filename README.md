@@ -349,10 +349,15 @@ non-goal, it has been observed happening, and it is not solved.
 
 Read [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md) before trusting
 any output. Eighteen limitations are documented there, including the two least
-flattering. The sandbox does not isolate: a docker detection can relabel to a
-subprocess, `CHAMBER_SANDBOX_REQUIRED=1` does not fail closed, and a probed run
-read `$HOME` and resolved DNS (`docs/KNOWN_LIMITATIONS.md` §1). That path is off
-`chamber_check`. Do not read "sandbox" as containment. Citation debt blocks a
+flattering. The sandbox is required by default, and the default refuses: tool
+code (`tool-run`, `tool-synth`, `sandbox-test`, MCP tool verification) runs only
+under bubblewrap, and only after a probe shows that bubblewrap confines. With no
+such backend it refuses, and `CHAMBER_SANDBOX_REQUIRED=0` (or `false`, `no`,
+`off`) is the explicit opt-out that runs a plain subprocess with a scrubbed
+environment. That opt-out does not isolate: a probed run read `$HOME` and
+resolved DNS (`docs/KNOWN_LIMITATIONS.md` §1). Isolation cannot be tested on
+macOS, which has no bubblewrap. That path is off `chamber_check`. With the
+opt-out, do not read "sandbox" as containment. Citation debt blocks a
 verbatim repeat reliably, while the paraphrase leg over it is a heuristic:
 calibration found no cosine threshold that separates a restatement from a
 contradiction. A numeric and negation check now removes the worst of that — an

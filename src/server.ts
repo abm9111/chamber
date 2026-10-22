@@ -13,40 +13,35 @@
  *   GET  /status
  *   GET  /queue
  *   POST /turn          { "message": "..." }
- *   POST /approve       { "writeId": "..." }
+ *   POST /approve       { "writeId": "..." }   (decided_by is always "http")
  *   POST /reject        { "writeId": "...", "note": "..." }
  *   POST /deliberate    { "kind", "subjectId", "question", "stakes?" }
  *   GET  /checkpoint
  */
 
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { DatabaseSync } from "node:sqlite";
 import { openChamberDb } from "./db.ts";
 import { configPath, loadConfig } from "./config.ts";
 import { formatErrorChain } from "./error_chain.ts";
-import { sha256, newId } from "./hash.ts";
-import { commitBelief } from "./commit_belief.ts";
-import { completeSync, syncCompletionAvailable } from "./model.ts";
-import { enforceReplyContract } from "./contract.ts";
-import { runExpiryJob } from "./expiry.ts";
-import { spendLastHours, formatSpendFooter, assertSpendBudget } from "./spend.ts";
+import { spendLastHours, formatSpendFooter } from "./spend.ts";
 import {
-  proposeWrite,
   decideWrite,
   listPendingQueue,
   markApplied,
   expireStalePending,
 } from "./approvals.ts";
-import { evaluateWorkflows } from "./approval_workflows.ts";
-import { appendAudit } from "./audit.ts";
 import { openDeliberation, FACULTY_LABEL } from "./faculty.ts";
 import { buildCheckpointReceipt } from "./checkpoint_export.ts";
 import { listOpenDebts } from "./debt.ts";
 import { listMemory } from "./memory.ts";
-import { startSession, appendMessage } from "./sessions.ts";
 import { registerSlackPendingHook } from "./slack_ops.ts";
-import { quarantineUntrustedText, stripInvisibleNoise, checkRateLimit, surfaceRateKey } from "./surface_harden.ts";
+import { isSqliteBusy, runTurn } from "./turn.ts";
+import { TurnPool, TurnWorkerError } from "./turn_pool.ts";
 
+// Registered here for the one case where a turn still runs on this thread (an
+// in-memory database, see `turns` below). A turn on the worker registers its own.
 try { registerSlackPendingHook(); } catch { /* slack optional */ }
 const PORT = Number(process.env.PORT ?? process.env.CHAMBER_PORT ?? 8787);
 /** When set, all routes except GET /health require this bearer/token. */
@@ -115,6 +110,36 @@ function originAllowed(req: IncomingMessage): boolean {
   return CORS_ORIGINS.has(origin);
 }
 
+/** Hostnames a request may name when no token protects the port. */
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/**
+ * With no token set, does this request's `Host` header name this machine?
+ *
+ * Binding 127.0.0.1 keeps other machines out, but not a web page the operator
+ * is browsing: DNS rebinding points `attacker.example` at 127.0.0.1, the
+ * browser then treats `http://attacker.example:8787` as that page's own origin,
+ * and with no token nothing else stands in the way. The page's `Host` header is
+ * still `attacker.example`, so refusing every Host that is not loopback closes
+ * it. The hostname comes from parsing `http://<Host>`, which drops the port and
+ * any userinfo (`127.0.0.1@attacker.example` has the host `attacker.example`);
+ * a header that does not parse, or is missing, is refused.
+ *
+ * With a token the check is off: the token is the credential, and proxies that
+ * forward `Host: $host` must keep working. Every proxy deployment in `deploy/`
+ * sets one.
+ */
+function hostAllowed(req: IncomingMessage): boolean {
+  if (API_TOKEN) return true;
+  const header = req.headers.host;
+  if (typeof header !== "string" || header === "") return false;
+  try {
+    return LOOPBACK_HOSTS.has(new URL(`http://${header}`).hostname);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Refuse to serve an unauthenticated port to a network.
  *
@@ -172,6 +197,9 @@ function assertBindIsSafe(): void {
  */
 let dbPath = "";
 
+/** How long this thread's connection waits for the write lock the turn worker may hold. */
+const MAIN_THREAD_BUSY_MS = 250;
+
 /**
  * Open the configured database, or refuse to start.
  *
@@ -199,9 +227,18 @@ let dbPath = "";
 const db: DatabaseSync = ((): DatabaseSync => {
   try {
     dbPath = loadConfig().database;
-    return openChamberDb(dbPath, (actual) => {
+    const opened = openChamberDb(dbPath, (actual) => {
       dbPath = actual;
     });
+    // A turn on the worker holds SQLite's one write lock across an embedder
+    // spawn (FM-6: the check and the write are one transaction, and that is
+    // not negotiable). A route on this thread that writes would then wait on
+    // that lock, and `DatabaseSync` waits with the whole event loop stopped.
+    // `openChamberDb` leaves a 5 s wait, which is right for a command line and
+    // wrong here: keep it short, so a contended write fails fast with the 503
+    // below instead of freezing every other route. Reads are not affected (WAL).
+    opened.exec(`PRAGMA busy_timeout = ${MAIN_THREAD_BUSY_MS}`);
+    return opened;
   } catch (err) {
     process.stderr.write(
       `chamber-server: FATAL — cannot open Chamber's database: ` +
@@ -212,6 +249,29 @@ const db: DatabaseSync = ((): DatabaseSync => {
     process.exit(1);
   }
 })();
+
+/**
+ * Where `POST /turn` runs.
+ *
+ * On a worker thread, with its own connection to the same file, unless the
+ * database is `:memory:` (the dev and test mode, or the last-resort fallback
+ * `openChamberDb` announces on stderr): an in-memory database belongs to the
+ * connection that created it, so a second thread would see an empty one. There
+ * the turn runs on this thread, as it always did.
+ *
+ * `.ts` when this file is running as TypeScript, `.js` from the compiled npm
+ * package.
+ */
+const turns: TurnPool | null =
+  dbPath === ":memory:"
+    ? null
+    : new TurnPool(
+        new URL(
+          `./turn_worker${import.meta.url.endsWith(".ts") ? ".ts" : ".js"}`,
+          import.meta.url,
+        ),
+        dbPath,
+      );
 
 function extractToken(req: IncomingMessage): string {
   const auth = req.headers.authorization ?? "";
@@ -266,19 +326,110 @@ function requireAuth(
   return false;
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+/** Largest request body Chamber will read: the `client_max_body_size 1m` of deploy/nginx-chamber.conf. */
+const MAX_BODY_BYTES = 1_048_576;
+/** After a 413, how much more of the body is thrown away before the socket is closed. */
+const LINGER_BYTES = 8 * 1024 * 1024;
+/** After a 413, how long the client has to finish sending before the socket is closed. */
+const LINGER_MS = 2000;
+
+/**
+ * Answer 413 and close, without ever buffering the body.
+ *
+ * The response is written whole (it has a Content-Length, so the client has
+ * everything it needs) and `res.end()` is held back while the rest of the
+ * upload is read and discarded, up to LINGER_BYTES or LINGER_MS. Closing at
+ * once is what a naive refusal does, and measured here it loses the response
+ * more often than not: the client is still writing 2 MiB, the close resets the
+ * connection, and the 413 never arrives (22 of 40 tries saw no response at
+ * all). Discarding is not reading: nothing is kept.
+ */
+function refuseBody(req: IncomingMessage, res: ServerResponse): void {
+  const payload = JSON.stringify({ error: "payload_too_large", limit: MAX_BODY_BYTES }, null, 2);
+  res.writeHead(413, {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(payload),
+    Connection: "close",
+  });
+  res.write(payload);
+  let discarded = 0;
+  let finished = false;
+  const finish = (): void => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    res.end();
+  };
+  const timer = setTimeout(finish, LINGER_MS);
+  req.on("data", (c: Buffer) => {
+    discarded += c.length;
+    if (discarded > LINGER_BYTES) finish();
+  });
+  req.on("end", finish);
+  req.on("error", finish);
+  req.on("close", finish);
+}
+
+/**
+ * The request body as text, or null after answering 413 itself.
+ *
+ * A declared Content-Length over the cap is refused before a byte is read. A
+ * body with no Content-Length (chunked) is refused the moment the running total
+ * passes the cap, and what was buffered is dropped.
+ */
+function readBody(req: IncomingMessage, res: ServerResponse): Promise<string | null> {
+  const declared = Number(req.headers["content-length"]);
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+    refuseBody(req, res);
+    return Promise.resolve(null);
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    let total = 0;
+    let refused = false;
+    req.on("data", (c: Buffer) => {
+      if (refused) return;
+      total += c.length;
+      if (total > MAX_BODY_BYTES) {
+        refused = true;
+        chunks.length = 0;
+        refuseBody(req, res);
+        resolve(null);
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (!refused) resolve(Buffer.concat(chunks).toString("utf8"));
+    });
     req.on("error", reject);
   });
 }
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const raw = await readBody(req);
+/**
+ * The request body as a JSON object, or null after answering the request itself
+ * (413 for a body over the cap, 400 `invalid_json` for text that is not JSON or
+ * is JSON but not an object). An empty body is `{}`.
+ */
+async function readJson(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<Record<string, unknown> | null> {
+  const raw = await readBody(req, res);
+  if (raw === null) return null;
   if (!raw.trim()) return {};
-  return JSON.parse(raw) as Record<string, unknown>;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    json(res, 400, { error: "invalid_json" });
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    json(res, 400, { error: "invalid_json" });
+    return null;
+  }
+  return parsed as Record<string, unknown>;
 }
 
 // CORS is applied once per request with `res.setHeader` in the handler below,
@@ -294,147 +445,15 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(data);
 }
 
-function runTurn(message: string): Record<string, unknown> {
-  // Asked before anything is written. Every one of these surfaces commits an
-  // observation, opens a session and writes audit rows before it reaches
-  // completeSync, which refuses the openai mode by design — so the ledger gained
-  // rows and the caller gained an exception, in that order. Guarding only the
-  // CLI left four other surfaces reproducing the exact defect the guard was
-  // written to remove.
-  const model = syncCompletionAvailable();
-  if (!model.ok) throw new Error(`turn unavailable: ${model.reason}`);
-
-  const budget = assertSpendBudget(db);
-  if (!budget.ok) {
-    return {
-      ok: false,
-      error: budget.reason,
-      spend: formatSpendFooter(budget.report),
-    };
-  }
-  const rate = checkRateLimit(surfaceRateKey("http", "http", "turn"));
-  if (!rate.ok) {
-    return {
-      ok: false,
-      error: `Rate limited. Retry in ~${Math.ceil((rate.retryAfterMs ?? 60000) / 1000)}s.`,
-    };
-  }
-  const cleaned = stripInvisibleNoise(message);
-  const turnId = newId("trn");
-  const sessionId = startSession(db, { channel: "http", title: cleaned.slice(0, 48) });
-  appendMessage(db, sessionId, "user", cleaned, turnId);
-  runExpiryJob(db);
-
-  appendAudit(db, {
-    category: "session",
-    action: "turn_start",
-    actor: "human",
-    turnId,
-    sessionId,
-    detail: { message: cleaned.slice(0, 200) },
-  });
-
-  const obs = commitBelief(db, {
-    type: "observation",
-    text: `user said: ${cleaned.slice(0, 240)}`,
-    sources: [
-      {
-        kind: "transcript",
-        refId: turnId,
-        snapshotHash: sha256(cleaned),
-        provenance: "transcript",
-      },
-    ],
-    authorFamily: "http",
-    sessionId,
-    path: "fast",
-    turnId,
-  });
-
-  const wantsBelief =
-    /\b(believe|note that)\b/i.test(cleaned) || /\b(fact|commit)\s*:/i.test(cleaned);
-  let belief: unknown = null;
-  if (wantsBelief) {
-    const claim =
-      cleaned.replace(/^.*\b(believe|fact:|commit:)\s*/i, "").trim() || cleaned;
-    belief = commitBelief(db, {
-      type: "belief",
-      text: claim,
-      sources: [],
-      authorFamily: "http",
-      sessionId,
-      path: "deep",
-      turnId,
-    });
-  }
-
-  if (/\b(remember|prefer)\b/i.test(message)) {
-    const q = proposeWrite(db, {
-      target: "memory",
-      action: "add",
-      subject: "user_preference",
-      payload: { stakes: "routine", text: message.slice(0, 300) },
-      origin: "foreground",
-      authorFamily: "http",
-      reason: "http turn preference",
-    });
-    if (q.status === "queued") evaluateWorkflows(db, q.writeId);
-  }
-
-  const completion = completeSync(db, {
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are Chamber. Prefer observations over assertions. Mark uncertainty explicitly.",
-      },
-      { role: "user", content: quarantineUntrustedText(cleaned, "http") },
-    ],
-    channel: "chat",
-    turnId,
-    sessionId,
-    userText: message,
-  });
-
-  const contract = enforceReplyContract(db, completion.text, {
-    sessionId,
-    turnId,
-    strict: process.env.CHAMBER_STRICT_CONTRACT === "1",
-  });
-
-  appendAudit(db, {
-    category: "session",
-    action: "turn_end",
-    actor: "system",
-    turnId,
-    sessionId,
-  });
-
-  const spend = spendLastHours(db, 24);
-  expireStalePending(db);
-
-  appendMessage(db, sessionId, "assistant", completion.text, turnId);
-
-  return {
-    turnId,
-    sessionId,
-    observation: obs,
-    belief,
-    assistant: completion.text,
-    model: completion.model,
-    contract: contract.results.map((r, i) => ({
-      claim: contract.claims[i]?.kind,
-      status: r.status,
-      reason: r.reason,
-    })),
-    spend: formatSpendFooter(spend),
-    queue: listPendingQueue(db, 10),
-    debts: listOpenDebts(db, 10),
-  };
-}
-
 const server = createServer(async (req, res) => {
   try {
+    // First, before CORS headers, the OPTIONS branch, the Origin check and auth,
+    // and for every path including /health: see `hostAllowed`.
+    if (!hostAllowed(req)) {
+      json(res, 403, { error: "host_not_allowed" });
+      return;
+    }
+
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${PORT}`);
     const path = url.pathname;
     const method = req.method ?? "GET";
@@ -536,28 +555,33 @@ const server = createServer(async (req, res) => {
     }
 
     if (method === "POST" && path === "/turn") {
-      const body = await readJson(req);
+      const body = await readJson(req, res);
+      if (body === null) return;
       const message = String(body.message ?? body.text ?? "").trim();
       if (!message) {
         json(res, 400, { error: "message required" });
         return;
       }
-      json(res, 200, runTurn(message));
+      json(res, 200, turns === null ? runTurn(db, message) : await turns.run(message));
       return;
     }
 
     if (method === "POST" && path === "/approve") {
-      const body = await readJson(req);
+      const body = await readJson(req, res);
+      if (body === null) return;
       const writeId = String(body.writeId ?? "");
       if (!writeId) {
         json(res, 400, { error: "writeId required" });
         return;
       }
-      const actor = String(body.actor ?? "human");
+      // The decider is "http", always. `body.actor` used to be written into
+      // `pending_write.decided_by`, so a caller could sign its approval as
+      // `human` or `slack:U123`. A route that cannot tell who is calling must
+      // not let the caller say.
       const r = decideWrite(db, {
         writeId,
         decision: "approved",
-        decidedBy: actor,
+        decidedBy: "http",
       });
       let applied = null;
       if (r.ok && (r.status === "approved" || r.idempotent)) {
@@ -572,13 +596,13 @@ const server = createServer(async (req, res) => {
     }
 
     if (method === "POST" && path === "/reject") {
-      const body = await readJson(req);
+      const body = await readJson(req, res);
+      if (body === null) return;
       const writeId = String(body.writeId ?? "");
-      const actor = String(body.actor ?? "human");
       const r = decideWrite(db, {
         writeId,
         decision: "rejected",
-        decidedBy: actor,
+        decidedBy: "http",
         note: body.note ? String(body.note) : undefined,
       });
       const status = r.ok ? 200 : r.code === "not_found" ? 404
@@ -590,7 +614,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (method === "POST" && path === "/deliberate") {
-      const body = await readJson(req);
+      const body = await readJson(req, res);
+      if (body === null) return;
       const kind = String(body.kind ?? "other") as
         | "skill"
         | "belief"
@@ -603,20 +628,45 @@ const server = createServer(async (req, res) => {
         json(res, 400, { error: "question required" });
         return;
       }
-      const r = openDeliberation(db, {
-        subjectKind: kind,
-        subjectId,
-        question,
-        stakes: (body.stakes as "routine" | "elevated" | "consequential") ?? "routine",
-        context: {
-          openDebts: Number(body.openDebts ?? 0) || 0,
-          hasSources: body.hasSources === false ? false : undefined,
-          riskTags: Array.isArray(body.riskTags)
-            ? (body.riskTags as string[])
-            : undefined,
-          isSkillMutation: kind === "skill",
-        },
-      });
+      // One transaction, so a 503 `busy` writes nothing and a failure part-way
+      // leaves nothing. `openDeliberation` is a run of autocommit statements
+      // (the deliberation row, one vote per faculty, the tally, the audit row,
+      // the spend row); with this thread's 250 ms wait on the write lock
+      // (`MAIN_THREAD_BUSY_MS`) a turn on the worker can take the lock between
+      // two of them, and the client was told to retry a request that had half
+      // happened. It is safe to wrap because everything it calls is synchronous
+      // and local: `completeSync` is the stub (it throws on the openai mode and
+      // `openDeliberation` catches that), and `appendAudit` joins a transaction
+      // that is already open instead of starting its own. Nothing here awaits,
+      // so no other request runs on this connection between BEGIN and COMMIT.
+      db.exec("BEGIN IMMEDIATE");
+      let r: ReturnType<typeof openDeliberation>;
+      try {
+        r = openDeliberation(db, {
+          subjectKind: kind,
+          subjectId,
+          question,
+          stakes: (body.stakes as "routine" | "elevated" | "consequential") ?? "routine",
+          context: {
+            openDebts: Number(body.openDebts ?? 0) || 0,
+            hasSources: body.hasSources === false ? false : undefined,
+            riskTags: Array.isArray(body.riskTags)
+              ? (body.riskTags as string[])
+              : undefined,
+            isSkillMutation: kind === "skill",
+          },
+        });
+        db.exec("COMMIT");
+      } catch (e) {
+        // SQLite rolls some failures back by itself (a full disk, an I/O error);
+        // a ROLLBACK that then throws must not replace the error that matters.
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          /* already rolled back */
+        }
+        throw e;
+      }
       json(res, 200, {
         ...r,
         votes: r.votes.map((v) => ({
@@ -629,7 +679,28 @@ const server = createServer(async (req, res) => {
 
     json(res, 404, { error: "not found" });
   } catch (err) {
-    json(res, 500, { error: String(err) });
+    // The write lock is held by a turn on the worker (see `MAIN_THREAD_BUSY_MS`).
+    // That is a wait that ran out, not a fault: say so, tell the client when to
+    // come back, and log nothing, so no error id points an operator at a bug.
+    if (!res.headersSent && (isSqliteBusy(err) || (err instanceof TurnWorkerError && err.busy))) {
+      res.setHeader("Retry-After", "1");
+      json(res, 503, { error: "busy" });
+      return;
+    }
+    // The client learns that something failed and a number to quote; the cause
+    // goes to stderr beside the same number. `String(err)` used to be the body,
+    // which sent paths, SQL and module names to whoever asked.
+    const id = randomUUID().slice(0, 8);
+    process.stderr.write(
+      `chamber server error ${id}: ` +
+        `${(err instanceof TurnWorkerError ? err.chain : formatErrorChain(err)).join("; ")}\n` +
+        `${err instanceof Error && err.stack ? err.stack : ""}\n`,
+    );
+    if (res.headersSent) {
+      res.end();
+    } else {
+      json(res, 500, { error: "internal_error", id });
+    }
   }
 });
 

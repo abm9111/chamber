@@ -1,5 +1,13 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, readFileSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  statSync,
+  type Stats,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.ts";
@@ -235,6 +243,88 @@ function enableWal(db: DatabaseSync, path: string): void {
   }
 }
 
+/** Permission bits that grant anything to the group or to others. */
+const GROUP_AND_OTHER_BITS = 0o077;
+
+function modeLabel(mode: number): string {
+  return (mode & 0o777).toString(8).padStart(4, "0");
+}
+
+/**
+ * Make sure the database file is readable by its owner alone.
+ *
+ * The file holds note text and OAuth tokens. SQLite creates it with the
+ * process umask applied to 0644, and creates `-wal` and `-shm` with whatever
+ * mode the main file has, so the only moment to get this right for a new
+ * database is before SQLite opens it:
+ *
+ *  - Not there yet: create it empty with mode 0600 (`wx` fails if it appeared in
+ *    the meantime) and let SQLite open an existing file.
+ *  - There, owned by `uid`, with any group or other bit set: chmod 0600, say so
+ *    once on stderr, and give an existing `-wal` and `-shm` the same treatment
+ *    without further lines.
+ *  - There, loose, owned by someone else: leave it alone and say so once.
+ *
+ * `uid` is a parameter so a test can stand in for "someone else". Windows has no
+ * such bits and is skipped. A path that cannot be examined (a dangling symlink)
+ * is left to SQLite, which reports it the way it always did.
+ */
+export function secureDatabaseFile(
+  path: string,
+  uid: number | undefined = process.getuid?.(),
+): void {
+  if (process.platform === "win32" || uid === undefined) return;
+  try {
+    closeSync(openSync(path, "wx", 0o600));
+    return;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+  let info: Stats;
+  try {
+    info = statSync(path);
+  } catch {
+    return;
+  }
+  if (!info.isFile()) return;
+  const loose = (info.mode & GROUP_AND_OTHER_BITS) !== 0;
+  if (info.uid !== uid) {
+    if (loose) {
+      process.stderr.write(
+        `chamber: ${path} is readable by other users (${modeLabel(info.mode)}) and ` +
+          `owned by another user (uid ${info.uid}), so it was left as it is\n`,
+      );
+    }
+    return;
+  }
+  if (loose) {
+    try {
+      chmodSync(path, 0o600);
+      process.stderr.write(
+        `chamber: tightened ${path} from ${modeLabel(info.mode)} to 0600 ` +
+          `(it holds note text and tokens)\n`,
+      );
+    } catch (err) {
+      process.stderr.write(
+        `chamber: could not tighten ${path} from ${modeLabel(info.mode)}: ` +
+          `${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
+  }
+  for (const suffix of ["-wal", "-shm"]) {
+    const side = `${path}${suffix}`;
+    try {
+      const sideInfo = statSync(side);
+      if (sideInfo.uid === uid && (sideInfo.mode & GROUP_AND_OTHER_BITS) !== 0) {
+        chmodSync(side, 0o600);
+      }
+    } catch {
+      // No such sidecar, or one we cannot change: the main file is what holds
+      // the data and the notice above already covered it.
+    }
+  }
+}
+
 export function openChamberDb(
   path = ":memory:",
   onRedirect?: (actual: string) => void,
@@ -295,7 +385,13 @@ export function openChamberDb(
     try {
       // Not for `:memory:` — it names no file, and `dirname(":memory:")` is
       // the process's working directory, which has no business being touched.
-      if (p !== ":memory:") mkdirSync(dirname(p), { recursive: true });
+      // Directories Chamber creates are 0700; one that already exists is not
+      // changed. The file is secured before SQLite sees it (see
+      // `secureDatabaseFile`), so a new database is never briefly 0644.
+      if (p !== ":memory:") {
+        mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
+        secureDatabaseFile(p);
+      }
       const db = new DatabaseSync(p);
       enableWal(db, p);
       applySchemas(db);

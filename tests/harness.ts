@@ -14730,6 +14730,29 @@ test("config", "the docs agree with the code: limitation count, sandbox claims, 
   }
   assert(sched.includes("This takes effect for a release tag that contains this script"), "the daily-snapshot effective-date note is missing");
   assert(sched.includes("`release: <tag>`"), "the daily-snapshot section does not mention the release line");
+
+  // Entry 13 is a claim about what the scheduled job's log shows. It went stale
+  // when the job began to log the database line and verify's exit status, and
+  // nothing noticed, so it is checked against the script that prints them.
+  assert(
+    BARE_SCRIPT.includes("config show 2>/dev/null | grep database") && BARE_SCRIPT.includes("=== verify exit $rc ==="),
+    "the job script no longer logs the database line and verify's exit status; rewrite KNOWN_LIMITATIONS entry 13",
+  );
+  assert(
+    read("src", "cli.ts").includes("JSON.stringify({ database: resolvedDbPath, ...vr }"),
+    "verify --json no longer prints the database; rewrite KNOWN_LIMITATIONS entry 13",
+  );
+  const entry13 = limits.slice(limits.indexOf("\n## 13. "), limits.indexOf("\n## 14. "));
+  assert(entry13.length > 0, "KNOWN_LIMITATIONS has no entry 13 followed by an entry 14");
+  const entry13Flat = entry13.replace(/\s+/g, " ");
+  for (const stale of ["names neither its database nor its exit status", "does not echo it", "states the path nowhere"]) {
+    assert(!entry13Flat.includes(stale), `entry 13 still says: "${stale}"`);
+  }
+  for (const needle of ["=== verify exit N ===", "config show", "!! ingest FAILED", "verify --json"]) {
+    assert(entry13Flat.includes(needle), `entry 13 does not mention ${needle}`);
+  }
+  // Line numbers rot: the ones this entry had pointed at a different function.
+  assert(!/src\/cli\.ts:\d/.test(entry13), "entry 13 cites src/cli.ts by line number");
   assert(
     schedFlat.includes("Ledger section opens the live database with that checkout's `src/db.ts`"),
     "the daily-snapshot section does not say which code opens the database",

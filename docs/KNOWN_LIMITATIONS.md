@@ -696,37 +696,42 @@ most load-bearing path.
 as a scored eval with a floor that fails the build. Fifty queries would catch most of
 what matters. Unplanned.
 
-## 13. The scheduled job's log names neither its database nor its exit status
+## 13. A failed ingest in the scheduled job reaches the log, not its exit status or its notification
 
-This entry has now been corrected twice, and both corrections narrowed it. The launchd
-job (`deploy/launchd/com.chamber.verify.plist`) *does* log ingest's exit code — the `||`
-branch prints `!! ingest FAILED (exit $?)` — and that chaining is deliberate and well
-reasoned, so that a missing root cannot silently disable the drift check.
+The scheduled job's log names its database and its exit status. The launchd job
+(`deploy/launchd/com.chamber.verify.plist`) logs a `database = <path>   [from <source>]`
+line, taken from `chamber config show`, right after its timestamp banner, and ends every run with `=== verify exit N ===`, which is
+`chamber verify`'s exit status. That status is non-zero when any pin has stopped
+verifying: a belief that lost all of its support and one that lost only some both exit 1
+(`0 with no verified support left, 1 with some support lost`). `chamber verify --json`
+prints the `database` it checked as well. A failed ingest is logged too, as
+`!! ingest FAILED (exit N)`, and that chaining is deliberate (see `deploy/SCHEDULING.md`):
+a missing root must not silently disable the drift check.
 
-The finding itself also reaches the log, which an earlier revision of this entry denied.
-`chamber verify` prints the belief id, its text, and a `hash_mismatch` or `not_found` line
-per failed pin, each with a paragraph saying what that reason means, and closes with a
-count (`src/cli.ts:1202-1250`). On a clean run that count is all there is — `0 belief(s)
-checked, 0 with no verified support left` — but a run that found drift does not look like
-one that did not.
+Two things are still true.
 
-Two things are genuinely missing. The job's exit status is `chamber verify`'s, non-zero
-exactly when a belief has no verified support left (`src/cli.ts:1250`); launchd does not
-write a job's exit status to its log, and the job does not echo it. And no run names the
-database it used: the banner that prints `db: <path>` belongs to `status`, `turn` and
-`queue` (`src/cli.ts:553,878,886`), and neither `ingest` nor `verify` calls it.
+**An ingest failure is not the job's failure.** The job runs `verify` whether or not
+`ingest` succeeded, and its exit status and its "evidence drift" notification are
+`verify`'s alone. A run whose ingest failed (a root on an unmounted volume, a config with
+no roots) can therefore end `=== verify exit 0 ===` and notify nobody; the only trace is
+the `!! ingest FAILED` line, in a log you open when you already suspect something. The
+verdict is then about the corpus as it stood before the failure, which may be stale.
 
-**What it costs.** Anything monitoring this job by exit status rather than by reading its
-prose has nothing to key on, and no run states which corpus it checked. The second one is
-not hypothetical: `chamber` is installed as a symlink into a working tree, so it runs
-whichever branch is checked out. A *redirect* would at least announce itself — a fallback
-to `/tmp` or `:memory:` writes two `chamber: WARNING —` lines naming both paths
-(`src/db.ts:212-215`, `src/cli.ts:215-221`), and this job points `StandardErrorPath` at
-the same file as `StandardOutPath`, so they land in this log — but the ordinary case
-states the path nowhere.
+**The database line is another process's answer.** It comes from `chamber config show
+2>/dev/null | grep database`, run before ingest. Neither `ingest` nor `verify` names its
+database in its prose output; only `verify --json` does. If the config cannot be loaded,
+`config show` fails with its message on the discarded stderr and the line is simply
+absent, so a missing `database =` line is the signal. A redirect while opening (a
+fallback to `/tmp` or `:memory:`) still announces itself with `chamber: WARNING —` lines
+naming both paths, and since the job points `StandardErrorPath` at the same file as
+`StandardOutPath`, they land in this log.
 
-**What would fix it.** Have `verify` print the resolved database path, and have the job
-echo verify's exit status after it returns. Unplanned.
+**What it costs.** A stale-corpus run looks like a clean one to anything that watches the
+exit status or the notification and not the prose.
+
+**What would fix it.** Raise a distinct notification (or a distinct exit status) when
+ingest failed, and have `verify` print the database it opened in its prose output too.
+Unplanned.
 
 ## 14. Citation debt is keyed on exact text; the paraphrase leg over it is weak
 

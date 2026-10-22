@@ -141,7 +141,9 @@ history and the GitHub releases.
 - **Docs.** New `docs/BACKUP.md` (live backups with `.backup`, not `cp`;
   restore; `chamber checkpoint verify` afterwards). `docs/KNOWN_LIMITATIONS.md`
   entry 1 describes the sandbox as it is, entry 3 no longer claims a scheduled
-  export, and the README's count matches. The sample outputs in
+  export, entry 13 says what the scheduled job's log now shows (its database and
+  `=== verify exit N ===`) and what it still does not, and the README's count
+  matches. The sample outputs in
   `deploy/SCHEDULING.md` match what `chamber verify` prints.
 
 ## 0.1.9 — 2026-10-03

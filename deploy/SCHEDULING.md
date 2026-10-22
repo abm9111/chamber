@@ -36,16 +36,30 @@ these cases:
 - the release checkout has tracked changes or a `dist/` folder
 - the tag has no `bin/chamber.js`
 
-After the checkout moves, and before it touches the plist, pin runs the release
-once: `node bin/chamber.js --version` under `/bin/sh -lc`, the shell and `node`
-the job uses. It must exit 0 and print the version in the release's
-`package.json`. If it does not, pin exits 1, puts the checkout back on the commit
-it held before and prints that commit, and leaves the plist and the loaded job
-alone, so a job that was already pinned keeps running the release it ran
-yesterday. If pin cannot put the checkout back, it says so and prints the
-`git checkout` that does; until then the job runs the release that failed. A
-first pin has no earlier release to go back to: its checkout stays on the tag
-that failed, and a job still in its original form does not use that checkout.
+Before it moves the release checkout, pin runs the release once, in a throwaway
+clone of that checkout at the tag: `node bin/chamber.js --version` under
+`/bin/sh -lc`, the shell and `node` the job uses. It must exit 0 and print the
+version in the release's `package.json`. If it does not, pin exits 1 having
+changed nothing the job uses: the release checkout, the plist and the loaded job
+are as they were, so a job that was already pinned keeps running the release it
+ran yesterday, and a first pin leaves no checkout behind. (The fetch does add the
+tag's objects and ref to the checkout's `.git`; its files and `HEAD` stay.) Only
+a release that has run is moved to, and only then is the plist written.
+
+What the proof does not cover:
+
+- The move itself is a `git checkout`, normally well under a second. For that
+  moment the checkout is neither the old release nor the new one, and a job that
+  starts then can see a half-written tree. Pin when the job is not running. Pin
+  prints nothing until it finishes, so an interrupt cannot be told from a move
+  in progress: if `git -C ~/.local/share/chamber-release status` lists modified
+  files after one, the move was cut short. The next pin refuses such a checkout;
+  this finishes the move:
+  `git -C ~/.local/share/chamber-release checkout --force --detach <tag>`.
+- A pin killed while the release runs leaves its throwaway clone in the system
+  temp directory, named `chamber-pin-proof-*`. Delete it; nothing else is left.
+- The release is tried in the clone, not at `~/.local/share/chamber-release`, so
+  a failure that only exists at that path is found by the 08:30 run, not by pin.
 
 The job runs each command as
 `node "$HOME/.local/share/chamber-release/bin/chamber.js"`. It names `node`

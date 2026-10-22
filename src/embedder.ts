@@ -42,10 +42,23 @@ export class MinilmIntegrityError extends Error {
       `embed_minilm failed (${MINILM_WEIGHTS_REFUSED_EXIT}): ${detail}. The MiniLM weights were refused, ` +
         `and Chamber will not write hash vectors in their place: restore ` +
         `models/minilm/model_quantized.onnx, or the SHA-256 line in models/minilm/VERSION. ` +
-        `To embed with something else on purpose, set CHAMBER_EMBEDDER=hash or ollama.`,
+        `To embed with something else on purpose, set CHAMBER_EMBEDDER=hash or ollama. ` +
+        `A long-running chamber process (chamber mcp, a bridge) keeps this refusal until it is restarted.`,
     );
     this.name = "MinilmIntegrityError";
   }
+}
+
+/**
+ * The refusal is one stderr line with two absolute paths in it, and the part
+ * that matters most, the hash VERSION records, is last. Cutting it at 300 or
+ * 400 characters removed that hash for the path the 08:30 job uses. The cap
+ * only bounds a runaway stderr.
+ */
+const REFUSAL_DETAIL_MAX = 2000;
+
+function refusalDetail(stderr: string | null | undefined): string {
+  return (stderr ?? "").trim().slice(0, REFUSAL_DETAIL_MAX);
 }
 
 /** Fallback hash embedder (no Python). Kept here to avoid cycle with vector.ts */
@@ -144,7 +157,7 @@ export function minilmAvailable(): boolean {
     });
     if (r.error) err = r.error;
     else if (r.status === MINILM_WEIGHTS_REFUSED_EXIT)
-      err = new MinilmIntegrityError((r.stderr || "").trim().slice(0, 300));
+      err = new MinilmIntegrityError(refusalDetail(r.stderr));
     else if (r.status !== 0)
       err = new Error(
         `probe exited ${r.status}: ${(r.stderr || "").trim().slice(0, 300)}`,
@@ -330,7 +343,7 @@ function spawnMinilmStdin(payload: string): number[][] {
     timeout: 180_000,
   });
   if (r.error) throw r.error;
-  if (r.status === MINILM_WEIGHTS_REFUSED_EXIT) throw new MinilmIntegrityError((r.stderr || "").trim().slice(0, 400));
+  if (r.status === MINILM_WEIGHTS_REFUSED_EXIT) throw new MinilmIntegrityError(refusalDetail(r.stderr));
   if (r.status !== 0) {
     throw new Error(
       `embed_minilm failed (${r.status}): ${(r.stderr || "").slice(0, 400)}`,

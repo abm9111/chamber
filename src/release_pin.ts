@@ -20,6 +20,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -27,6 +28,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 export const JOB_LABEL = "com.chamber.verify";
@@ -163,18 +165,17 @@ export interface CheckoutOptions {
   releaseDir: string;
 }
 
-/** Where the release checkout's HEAD was before a pin moved it. */
-export interface PreviousCheckout {
-  commit: string;
-  /** The full ref HEAD was attached to (`refs/heads/x`), or null when it was detached. */
-  branch: string | null;
-}
+export type CheckoutResult = { ok: true; commit: string; already: boolean } | { ok: false; reason: string };
 
-export type CheckoutResult =
-  | { ok: true; commit: string; already: boolean; previous: PreviousCheckout | null }
-  | { ok: false; reason: string };
+/** What running a release once found. */
+export type RunProof = { ok: true; version: string } | { ok: false; reason: string };
 
-type CheckoutMoved = Extract<CheckoutResult, { ok: true }>;
+/**
+ * Called with the commit a pin is about to move to, after it is fetched and
+ * before anything is checked out. A failure ends the pin with the checkout
+ * exactly where it was.
+ */
+export type ProveBeforeMove = (commit: string) => RunProof;
 
 interface GitRun {
   ok: boolean;
@@ -309,7 +310,13 @@ function existingCheckoutRefusal(dir: string, originUrl: string): string | null 
   return null;
 }
 
-function moveCheckout(dir: string, created: boolean, originUrl: string, tag: string): CheckoutResult {
+function moveCheckout(
+  dir: string,
+  created: boolean,
+  originUrl: string,
+  tag: string,
+  prove: ProveBeforeMove | undefined,
+): CheckoutResult {
   if (created) {
     mkdirSync(dirname(dir), { recursive: true });
     const init = git(dirname(dir), ["init", "--quiet", dir]);
@@ -334,19 +341,33 @@ function moveCheckout(dir: string, created: boolean, originUrl: string, tag: str
   }
   const head = git(dir, ["rev-parse", "--verify", "--quiet", "HEAD"]);
   const attached = git(dir, ["symbolic-ref", "--quiet", "HEAD"]);
-  const detached = !attached.ok;
-  const already = head.ok && head.out === commit.out && detached;
-  // Remembered so that a release which turns out not to run can be left again.
-  const previous: PreviousCheckout | null = head.ok
-    ? { commit: head.out, branch: attached.ok ? attached.out : null }
-    : null;
+  const already = head.ok && head.out === commit.out && !attached.ok;
+  // The release is tried before the checkout moves. The job's command is this
+  // checkout's bin/chamber.js, so a checkout moved onto a release that turns
+  // out not to run is a job that does not run: for as long as the proof takes
+  // (up to a minute), and for good if the pin is interrupted meanwhile. A
+  // failed proof returns here, with HEAD and the files untouched.
+  if (prove !== undefined) {
+    const proof = prove(commit.out);
+    if (!proof.ok) {
+      const where = created
+        ? `no release checkout was left at ${dir}`
+        : head.ok
+          ? `${dir} was not moved: it is still at ${head.out.slice(0, 12)}`
+          : `${dir} was not moved`;
+      return {
+        ok: false,
+        reason: `the release at ${tag} did not run: ${proof.reason}; ${where}; the job and its plist were not changed`,
+      };
+    }
+  }
   if (!already) {
     const checkout = git(dir, ["checkout", "--quiet", "--detach", commit.out]);
     if (!checkout.ok) return { ok: false, reason: `git checkout: ${checkout.message}` };
   }
   const bin = join(dir, "bin", "chamber.js");
   if (!existsSync(bin)) return { ok: false, reason: `${bin} is not on disk after checkout` };
-  return { ok: true, commit: commit.out, already, previous };
+  return { ok: true, commit: commit.out, already };
 }
 
 /**
@@ -375,11 +396,12 @@ export function originCredentialRefusal(url: string): string | null {
 
 /**
  * Fetch `tag` from the source checkout's origin and leave `releaseDir`
- * detached at it. Every refusal before the checkout leaves an existing
- * release checkout exactly as it was. A directory this call created is
- * removed when the checkout fails to reach the tag.
+ * detached at it. Every refusal before the checkout, `prove`'s included,
+ * leaves an existing release checkout exactly as it was (the fetch adds the
+ * tag's objects and ref to its .git; HEAD and the files stay). A directory this
+ * call created is removed when the checkout fails to reach the tag.
  */
-export function pinCheckout(opts: CheckoutOptions): CheckoutResult {
+export function pinCheckout(opts: CheckoutOptions, prove?: ProveBeforeMove): CheckoutResult {
   const { tag, sourceRoot, releaseDir } = opts;
   const badName = tagNameRefusal(tag);
   if (badName !== null) return { ok: false, reason: badName };
@@ -412,7 +434,7 @@ export function pinCheckout(opts: CheckoutOptions): CheckoutResult {
     const kept = existingCheckoutRefusal(releaseDir, origin.out);
     if (kept !== null) return { ok: false, reason: kept };
   }
-  const moved = moveCheckout(releaseDir, created, origin.out, tag);
+  const moved = moveCheckout(releaseDir, created, origin.out, tag, prove);
   if (!moved.ok && created) rmSync(releaseDir, { recursive: true, force: true });
   return moved;
 }
@@ -466,6 +488,14 @@ export interface PinOptions extends CheckoutOptions {
    * the shell reads). Defaults to process.env.
    */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Where the throwaway clone the release is tried in is made (default: the
+   * system temp directory). A pin killed while the release runs leaves that
+   * clone here, named chamber-pin-proof-*.
+   */
+  workDir?: string;
+  /** How long the release may take to print its version, in ms (default 60 s). */
+  proofTimeoutMs?: number;
 }
 
 export interface PinOutcome {
@@ -551,56 +581,6 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
   return 0;
 }
 
-/**
- * Leave the release checkout where it was before this pin moved it: detached at
- * the commit it held, and attached again to the branch it was on, if any. The
- * result is read back from git rather than assumed, because a pin that says
- * "put back" about a checkout still on the failed release would repeat the
- * mistake this exists to fix.
- */
-function restoreCheckout(dir: string, previous: PreviousCheckout): { ok: true } | { ok: false; reason: string } {
-  const back = git(dir, ["checkout", "--quiet", "--detach", previous.commit]);
-  if (!back.ok) return { ok: false, reason: `git checkout: ${back.message}` };
-  if (previous.branch !== null) {
-    const attach = git(dir, ["symbolic-ref", "HEAD", previous.branch]);
-    if (!attach.ok) return { ok: false, reason: `git symbolic-ref: ${attach.message}` };
-  }
-  const now = git(dir, ["rev-parse", "--verify", "--quiet", "HEAD"]);
-  if (!now.ok || now.out !== previous.commit) {
-    return {
-      ok: false,
-      reason: `HEAD is ${now.ok ? now.out.slice(0, 12) : "unreadable"} afterwards, not ${previous.commit.slice(0, 12)}`,
-    };
-  }
-  return { ok: true };
-}
-
-/**
- * What a pin whose release did not run leaves behind, in words. The job's
- * command is the release checkout's bin/chamber.js, so once the checkout has
- * moved, a job already in the pinned form runs whatever is there. A failed pin
- * therefore goes back to the commit the checkout held, when there was one. A
- * checkout this pin created has nothing to go back to, and no job runs it yet.
- */
-function afterFailedProof(releaseDir: string, tag: string, moved: CheckoutMoved): string[] {
-  const unchanged = "the job and its plist were not changed";
-  const previous = moved.previous;
-  if (previous === null) return [`${releaseDir} stays on ${tag}; ${unchanged}`];
-  if (moved.already) {
-    return [
-      `${releaseDir} was already on ${tag} before this pin, so a job that runs it was already running a release that does not run; ${unchanged}`,
-    ];
-  }
-  const short = previous.commit.slice(0, 12);
-  const restored = restoreCheckout(releaseDir, previous);
-  if (restored.ok) return [`${releaseDir} is back on ${short}, where it was before this pin; ${unchanged}`];
-  return [
-    `${releaseDir} could not be put back on ${short}: ${restored.reason}`,
-    `${releaseDir} is still on ${tag}, which did not run, so a job that already runs it is running that release; ` +
-      `put it back with: git -C ${releaseDir} checkout --detach ${previous.commit}`,
-  ];
-}
-
 const RUN_PROOF_TIMEOUT_MS = 60_000;
 
 /**
@@ -610,9 +590,7 @@ const RUN_PROOF_TIMEOUT_MS = 60_000;
  * pin would rewrite the job to a release that cannot start, and the next
  * morning's check would not happen.
  */
-type RunProof = { ok: true; version: string } | { ok: false; reason: string };
-
-function proveReleaseRuns(releaseDir: string, env: NodeJS.ProcessEnv): RunProof {
+function proveReleaseRuns(releaseDir: string, env: NodeJS.ProcessEnv, timeoutMs: number): RunProof {
   const pkgPath = join(releaseDir, "package.json");
   let version: unknown;
   try {
@@ -625,11 +603,11 @@ function proveReleaseRuns(releaseDir: string, env: NodeJS.ProcessEnv): RunProof 
   const r = spawnSync("/bin/sh", ["-lc", 'node "$1" --version', "sh", join(releaseDir, "bin", "chamber.js")], {
     encoding: "utf8",
     env,
-    timeout: RUN_PROOF_TIMEOUT_MS,
+    timeout: timeoutMs,
   });
   if (r.error !== undefined) {
     const timedOut = (r.error as NodeJS.ErrnoException).code === "ETIMEDOUT";
-    return { ok: false, reason: timedOut ? `it did not finish in ${RUN_PROOF_TIMEOUT_MS / 1000}s` : String(r.error) };
+    return { ok: false, reason: timedOut ? `it did not finish in ${timeoutMs / 1000}s` : String(r.error) };
   }
   if (r.status !== 0) {
     const said = (r.stderr ?? "").trim().split("\n").slice(-3).join(" | ").slice(0, 300);
@@ -648,13 +626,50 @@ function proveReleaseRuns(releaseDir: string, env: NodeJS.ProcessEnv): RunProof 
 }
 
 /**
- * `chamber pin <tag>`. The installed job is checked before the checkout
- * moves, and written only after the checkout is on the tag with
- * bin/chamber.js on disk and after that release has run once, `--version`,
- * under the job's own login shell. When it does not run, an existing checkout
- * is put back on the commit it held, because a job already in the pinned form
- * runs whatever the checkout holds. With no job installed, the checkout is
- * still pinned and, if the release runs, the run exits 0.
+ * Try `commit` the way the job will run it, in a throwaway clone of the release
+ * checkout, so that nothing the release does while it runs can touch the
+ * checkout the job uses. The clone comes from the checkout (the commit was
+ * fetched into it a moment ago), not from origin, so it needs no network. It is
+ * removed afterwards. A pin that is killed while the release runs cannot remove
+ * it: it stays in `workDir`, named chamber-pin-proof-*, and costs disk space.
+ */
+function proveInClone(
+  releaseDir: string,
+  commit: string,
+  workDir: string,
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+): RunProof {
+  let scratch: string;
+  try {
+    mkdirSync(workDir, { recursive: true });
+    scratch = mkdtempSync(join(workDir, "chamber-pin-proof-"));
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code ?? String(e);
+    return { ok: false, reason: `cannot make a scratch directory in ${workDir}: ${code}` };
+  }
+  try {
+    const clone = join(scratch, "release");
+    const cloned = git(scratch, ["clone", "--quiet", "--no-checkout", "--", releaseDir, clone]);
+    if (!cloned.ok) return { ok: false, reason: `could not clone ${releaseDir} to try the release: ${cloned.message}` };
+    const checkout = git(clone, ["checkout", "--quiet", "--detach", commit]);
+    if (!checkout.ok) return { ok: false, reason: `could not check the release out to try it: ${checkout.message}` };
+    return proveReleaseRuns(clone, env, timeoutMs);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+/**
+ * `chamber pin <tag>`. The installed job is checked first. Then the tag is
+ * fetched into the release checkout (HEAD and the files stay) and the release
+ * is run once, `--version` under the job's own login shell, in a throwaway
+ * clone. Only if that passes does the release checkout move to the tag and the
+ * plist get written. A release that does not run therefore changes nothing the
+ * job uses, and neither does a pin that is interrupted while it runs. What is
+ * left open is the move itself: a `git checkout`, normally well under a second,
+ * during which a job that starts sees neither release. With no job installed,
+ * the checkout is still pinned and, if the release runs, the run exits 0.
  */
 export function pinRelease(opts: PinOptions): PinOutcome {
   const out: string[] = [];
@@ -666,7 +681,18 @@ export function pinRelease(opts: PinOptions): PinOutcome {
       return { code: 1, out, err };
     }
   }
-  const moved = pinCheckout(opts);
+  let version = "";
+  const moved = pinCheckout(opts, (commit) => {
+    const proof = proveInClone(
+      opts.releaseDir,
+      commit,
+      opts.workDir ?? tmpdir(),
+      opts.env ?? process.env,
+      opts.proofTimeoutMs ?? RUN_PROOF_TIMEOUT_MS,
+    );
+    if (proof.ok) version = proof.version;
+    return proof;
+  });
   if (!moved.ok) {
     err.push(`chamber pin: ${moved.reason}`);
     return { code: 1, out, err };
@@ -677,13 +703,7 @@ export function pinRelease(opts: PinOptions): PinOutcome {
       ? `${opts.releaseDir} is already on ${opts.tag} (${short})`
       : `${opts.releaseDir} is on ${opts.tag} (${short})`,
   );
-  const proof = proveReleaseRuns(opts.releaseDir, opts.env ?? process.env);
-  if (!proof.ok) {
-    err.push(`chamber pin: the release at ${opts.tag} did not run: ${proof.reason}`);
-    err.push(...afterFailedProof(opts.releaseDir, opts.tag, moved));
-    return { code: 1, out, err };
-  }
-  out.push(`the release runs: node bin/chamber.js --version printed ${proof.version}`);
+  out.push(`the release runs: node bin/chamber.js --version printed ${version} (tried in a throwaway clone before the checkout moved)`);
   if (!existsSync(opts.plistPath)) {
     out.push(`no LaunchAgent was installed at ${opts.plistPath}; nothing else was changed`);
     return { code: 0, out, err };

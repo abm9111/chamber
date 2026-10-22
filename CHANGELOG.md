@@ -93,6 +93,10 @@ history and the GitHub releases.
   stop with the hash mismatch instead of writing or querying with
   `local-hash-v1` vectors. A missing interpreter or dependency still degrades
   with a warning, and `CHAMBER_EMBEDDER=hash` still chooses hash on purpose.
+  A commit that meets refused weights still goes through (FM-6), but its
+  `debt:degraded` audit row now names `MinilmIntegrityError` and the hash
+  mismatch instead of a generic reason, stderr says so once, and the refusal
+  line keeps the hash `VERSION` records instead of cutting it at 300 characters.
 - **One version everywhere.** `server.json` said 0.1.10 while the package said
   0.1.9, and the MCP server reported a third, hand-typed copy. The server now
   reads `package.json`, `server.json` agrees, and a test fails when any of
@@ -104,15 +108,18 @@ history and the GitHub releases.
   used to list every host process. `probes/sandbox_confines.ts` checks the pid
   namespace with a process needle that it first proves visible without the
   sandbox.
-- **`chamber pin` runs the release before it rewrites the job.** After the
-  checkout, `node bin/chamber.js --version` must run under `/bin/sh -lc` and
-  print the version in `package.json` (as its last line, so a login profile that
-  echoes does not fail the pin); otherwise pin exits 1, puts the checkout back on
-  the commit it held, and leaves the plist and the loaded job alone, so a job
-  that was already pinned keeps running the release it ran before. If the
-  checkout cannot be put back, pin says so and prints the command that does. A
-  first pin has no earlier release, so its checkout stays on the tag that
-  failed. The plist is replaced atomically, git runs with prompts off and
+- **`chamber pin` runs the release before it moves anything.** Pin fetches the
+  tag, then runs `node bin/chamber.js --version` under `/bin/sh -lc` in a
+  throwaway clone of the release checkout; it must exit 0 and print the version
+  in `package.json` (as its last line, so a login profile that echoes does not
+  fail the pin). Only then does it move the checkout and write the plist. A
+  release that does not run, or a pin that is interrupted while it runs, leaves
+  the checkout, the plist and the loaded job as they were, so a job that was
+  already pinned keeps running the release it ran before and a first pin leaves
+  no checkout behind. What stays open is the move itself, a `git checkout`
+  during which a job that starts sees neither release; `deploy/SCHEDULING.md`
+  names it and the command that finishes an interrupted move. The plist is
+  replaced atomically, git runs with prompts off and
   without inherited `GIT_DIR`, with timeouts, an http(s) origin carrying
   credentials is refused, and a commented-out `ProgramArguments` block or a
   `Program` key no longer confuses the plist check.

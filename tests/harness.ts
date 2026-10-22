@@ -284,6 +284,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -13428,13 +13429,16 @@ test("gates", "refused MiniLM weights soften the debt check inside the commit's 
   delete process.env.CHAMBER_EMBEDDER;
   resetMinilmProbe();
   try {
-    const r = commitBelief(db, {
-      type: "belief",
-      text: "The office in Dubai opens at nine on weekdays.",
-      sources: [],
-      authorFamily: "test",
-      path: "deep",
-    });
+    // The commit now says why on stderr; keep that out of the suite's output.
+    const { value: r } = captureStderr(() =>
+      commitBelief(db, {
+        type: "belief",
+        text: "The office in Dubai opens at nine on weekdays.",
+        sources: [],
+        authorFamily: "test",
+        path: "deep",
+      }),
+    );
     assert(r.ok, `a refused embedder parked the commit: ${JSON.stringify(r)}`);
     assert(r.ok && r.paraphraseCheck === "skipped", `the caller cannot see the check did not run: ${JSON.stringify(r)}`);
     const degraded = count(db, `SELECT COUNT(*) AS c FROM audit_event WHERE action = 'debt:degraded'`);
@@ -13442,6 +13446,112 @@ test("gates", "refused MiniLM weights soften the debt check inside the commit's 
   } finally {
     if (saved === undefined) delete process.env.CHAMBER_MINILM_DIR;
     else process.env.CHAMBER_MINILM_DIR = saved;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("gates", "refused MiniLM weights are named in the debt:degraded record and on stderr, once per message", () => {
+  // The commit goes through (FM-6), so this record and this line are the only
+  // places an operator can learn that the paraphrase gate is off because the
+  // weights changed, and not because python is missing.
+  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const db = freshDb();
+  const indebted = "The refund policy allows returns within 30 days.";
+  insertDebt(db, claimHash("belief", indebted), indebted);
+  const savedDir = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  const savedPython = process.env.CHAMBER_PYTHON;
+  const commit = (text: string): ReturnType<typeof commitBelief> =>
+    commitBelief(db, { type: "belief", text, sources: [], authorFamily: "test", path: "deep" });
+  const reasons = (): string[] =>
+    (
+      db
+        .prepare(`SELECT detail_json FROM audit_event WHERE action = 'debt:degraded' ORDER BY seq`)
+        .all() as { detail_json: string | null }[]
+    ).map((row) => (JSON.parse(row.detail_json ?? "{}") as { reason?: string }).reason ?? "");
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    const first = captureStderr(() => commit("The office in Dubai opens at nine on weekdays."));
+    assert(first.value.ok && first.value.paraphraseCheck === "skipped", `the commit was parked or hid the skip: ${JSON.stringify(first.value)}`);
+    assert(
+      first.stderr.includes("MiniLM weights were refused") && first.stderr.includes("SHA-256"),
+      `the commit said nothing about the weights on stderr:\n${first.stderr}`,
+    );
+    const one = reasons();
+    assert(one.length === 1, `expected one debt:degraded record, found ${one.length}`);
+    assert(
+      one[0]!.includes("MinilmIntegrityError") && one[0]!.includes("SHA-256"),
+      `the record does not name the refusal: "${one[0]}"`,
+    );
+    assert(!one[0]!.includes("embedder unavailable"), `the record blames a missing embedder: "${one[0]}"`);
+
+    // The same refusal on the next commit is recorded again and not announced again.
+    const second = captureStderr(() => commit("The Abu Dhabi office closes at five on Fridays."));
+    assert(second.value.ok, `the second commit was parked: ${JSON.stringify(second.value)}`);
+    assert(!second.stderr.includes("MiniLM weights were refused"), `the same refusal was announced twice:\n${second.stderr}`);
+    const two = reasons();
+    assert(two.length === 2 && two[1] === one[0], `the second record differs: ${JSON.stringify(two)}`);
+
+    // Control: a failure that is not the weights keeps the old reason and says nothing about weights.
+    delete process.env.CHAMBER_MINILM_DIR;
+    process.env.CHAMBER_PYTHON = "/nonexistent/python-that-is-not-here";
+    resetMinilmProbe();
+    const third = captureStderr(() => commit("The Sharjah office opens at ten on Saturdays."));
+    assert(third.value.ok, `the third commit was parked: ${JSON.stringify(third.value)}`);
+    const three = reasons();
+    assert(
+      three.length === 3 && three[2] === "embedder unavailable or non-semantic; paraphrase check did not run",
+      `a missing python was recorded as: ${JSON.stringify(three[2])}`,
+    );
+    assert(!third.stderr.includes("MiniLM weights were refused"), `a missing python was reported as refused weights:\n${third.stderr}`);
+  } finally {
+    if (savedDir === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = savedDir;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    if (savedPython === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = savedPython;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the integrity refusal keeps the hash VERSION records, however long the model path is", () => {
+  const t = tamperedVersion();
+  const short = minilmDirWithVersion(t.text);
+  // The refusal is one line with two absolute paths in it, and the hash that
+  // matters is last. The 08:30 job's own path already put it past 300 characters.
+  const dir = `${short}-${"x".repeat(150)}`;
+  renameSync(short, dir);
+  const savedDir = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    let probed = "";
+    try {
+      minilmAvailable();
+    } catch (e) {
+      probed = e instanceof Error ? e.message : String(e);
+    }
+    assert(probed.includes("embed_minilm failed (3)"), `the probe did not refuse: "${probed}"`);
+    assert(probed.includes(t.expected), `the probe's message was cut before the hash VERSION records: "${probed}"`);
+    let embedded = "";
+    try {
+      embedMinilm("x");
+    } catch (e) {
+      embedded = e instanceof Error ? e.message : String(e);
+    }
+    assert(embedded.includes(t.expected), `the embed's message was cut before the hash VERSION records: "${embedded}"`);
+    // minilmAvailable() remembers a refusal for the life of the process.
+    assert(probed.includes("until it is restarted"), `the message does not say that a running process must be restarted: "${probed}"`);
+  } finally {
+    if (savedDir === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = savedDir;
     if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
     resetMinilmProbe();
     rmSync(dir, { recursive: true, force: true });
@@ -13751,7 +13861,7 @@ test("release", "a release whose bin exits non-zero is refused, and the plist an
     );
     assert(readFileSync(fx.plistPath, "utf8") === bare, "the plist was rewritten for a release that does not run");
     assert(lc.calls.length === 0, `launchctl was called: ${lc.calls.join(" | ")}`);
-    assert(headOf(fx.releaseDir) === fx.badexit, "the checkout must stay on the tag");
+    assert(!existsSync(fx.releaseDir), "a first pin that failed left a release checkout behind");
   });
 });
 
@@ -13770,7 +13880,7 @@ test("release", "a release that prints another version is refused, and the plist
     );
     assert(readFileSync(fx.plistPath, "utf8") === bare, "the plist was rewritten");
     assert(lc.calls.length === 0, `launchctl was called: ${lc.calls.join(" | ")}`);
-    assert(headOf(fx.releaseDir) === fx.wrongver, "the checkout must stay on the tag");
+    assert(!existsSync(fx.releaseDir), "a first pin that failed left a release checkout behind");
   });
 });
 
@@ -13785,31 +13895,74 @@ test("release", "the release is run even when no job is installed", () => {
   });
 });
 
-// ─── a pin whose release does not run leaves the checkout where it was ──────
+// ─── a pin tries the release in a throwaway clone and moves nothing until it passes ─────
 
-test("release", "a pin whose release does not run puts the checkout back, so a pinned job keeps running the old release", () => {
+/**
+ * Add a tag whose bin, while it runs `--version`, writes a marker file with two
+ * facts: which commit the live release checkout (`fx.releaseDir`) is on at that
+ * moment (empty when it has none yet), and the directory the bin itself runs
+ * from. Then it behaves as `how` says: prints its version ("pass"), exits 1
+ * ("fail"), or waits 8 s before printing ("slow"). Returns the marker's path.
+ */
+function addWatchTag(fx: ReleaseFixture, name: string, how: "pass" | "fail" | "slow"): string {
+  const marker = join(fx.root, `${name}.marker.json`);
+  const ending =
+    how === "pass"
+      ? 'console.log("1.0.5");'
+      : how === "fail"
+        ? "process.exit(1);"
+        : 'setTimeout(() => console.log("1.0.5"), 8000);';
+  const body = [
+    'const { spawnSync } = require("node:child_process");',
+    'const fs = require("node:fs");',
+    `const head = spawnSync("git", ["-C", ${JSON.stringify(fx.releaseDir)}, "rev-parse", "--verify", "--quiet", "HEAD"], { encoding: "utf8" }).stdout.trim();`,
+    `fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ head, ranFrom: __dirname }));`,
+    ending,
+    "",
+  ].join("\n");
+  const sha = fixtureCommit(fx.origin, { ...releaseTree(name, "1.0.5", body), "README.md": `${name}\n` }, name, fx.v2);
+  fixtureGit(fx.origin, ["tag", name, sha]);
+  return marker;
+}
+
+function readMarker(path: string): { head: string; ranFrom: string } {
+  return JSON.parse(readFileSync(path, "utf8")) as { head: string; ranFrom: string };
+}
+
+test("release", "a pin whose release does not run never moves the live checkout, so a pinned job keeps running the old release", () => {
   withReleaseFixture((fx) => {
     writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
     const first = pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: true }).run));
     assert(first.code === 0, first.err.join("\n"));
     assert(plistForm(fx.plistPath) === "pinned", "the first pin did not leave the job in the pinned form");
     const pinned = readFileSync(fx.plistPath, "utf8");
+    const marker = addWatchTag(fx, "watchfail", "fail");
+    const work = join(fx.root, "work");
 
     // The job is now in the form every later pin starts from, and its command
     // is the release checkout's bin/chamber.js: moving the checkout moves the job.
     const lc = fakeLaunchctl({ loaded: true });
-    const second = pinRelease(pinOpts(fx, "badexit", lc.run));
+    const second = pinRelease({ ...pinOpts(fx, "watchfail", lc.run), workDir: work });
     assert(second.code === 1, "a release that exits 1 was pinned");
     assert(
-      second.err.some((l) => l.startsWith("chamber pin: the release at badexit did not run: ") && l.includes("boom")),
+      second.err.some((l) => l.startsWith("chamber pin: the release at watchfail did not run: ") && l.includes("exited 1")),
       second.err.join("\n"),
     );
     assert(
-      second.err.some((l) => l.includes(`is back on ${fx.v1.slice(0, 12)}, where it was before this pin`)),
+      second.err.some((l) => l.includes(`${fx.releaseDir} was not moved: it is still at ${fx.v1.slice(0, 12)}`)),
       second.err.join("\n"),
     );
-    assert(!second.err.some((l) => l.includes("stays on badexit")), "the message still says the checkout stays on the failed tag");
-    assert(headOf(fx.releaseDir) === fx.v1, "the checkout was not put back on v1");
+
+    // What the release saw while it ran: the live checkout still on v1, and
+    // itself running somewhere else. Reading HEAD afterwards cannot tell "never
+    // moved" from "moved, then moved back".
+    const seen = readMarker(marker);
+    assert(seen.head === fx.v1, `the live checkout was on "${seen.head.slice(0, 12)}", not v1, while the release was being tried`);
+    assert(seen.ranFrom !== join(fx.releaseDir, "bin"), "the release was tried inside the live checkout");
+    assert(seen.ranFrom.startsWith(work), `the release ran from ${seen.ranFrom}, not under the scratch directory ${work}`);
+    assert(readdirSync(work).length === 0, `the throwaway clone was left behind: ${readdirSync(work).join(", ")}`);
+
+    assert(headOf(fx.releaseDir) === fx.v1, "the checkout is not on v1");
     assert(isDetachedHead(fx.releaseDir), "the checkout is attached to a branch");
     assert(readFileSync(join(fx.releaseDir, "README.md"), "utf8") === "one\n", "the working tree is not v1's");
     assert(readFileSync(fx.plistPath, "utf8") === pinned, "the plist was rewritten");
@@ -13824,13 +13977,111 @@ test("release", "a pin whose release does not run puts the checkout back, so a p
   });
 });
 
-test("release", "a checkout that was on a branch goes back onto that branch when the release does not run", () => {
+test("release", "a release that runs is tried in a throwaway clone first, and only then does the checkout move", () => {
+  withReleaseFixture((fx) => {
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin failed");
+    const marker = addWatchTag(fx, "watchok", "pass");
+    const work = join(fx.root, "work");
+    const r = pinRelease({ ...pinOpts(fx, "watchok", fakeLaunchctl({ loaded: false }).run), workDir: work });
+    assert(r.code === 0, r.err.join("\n"));
+    const seen = readMarker(marker);
+    assert(seen.head === fx.v1, `the checkout had already moved to "${seen.head.slice(0, 12)}" when the release was tried`);
+    assert(seen.ranFrom.startsWith(work), `the release ran from ${seen.ranFrom}, not under the scratch directory ${work}`);
+    assert(readdirSync(work).length === 0, `the throwaway clone was left behind: ${readdirSync(work).join(", ")}`);
+    assert(
+      headOf(fx.releaseDir) === fixtureGit(fx.origin, ["rev-parse", "watchok^{commit}"]),
+      "the checkout did not move to the tag after the release passed",
+    );
+    assert(r.out.some((l) => l.includes("the release runs") && l.includes("printed 1.0.5")), r.out.join("\n"));
+  });
+});
+
+test("release", "a first pin whose release does not run leaves no checkout behind", () => {
+  withReleaseFixture((fx) => {
+    const marker = addWatchTag(fx, "watchfail", "fail");
+    const r = pinRelease({ ...pinOpts(fx, "watchfail", fakeLaunchctl({ loaded: false }).run), workDir: join(fx.root, "work") });
+    assert(r.code === 1 && r.err.some((l) => l.includes("did not run")), r.err.join("\n"));
+    assert(
+      r.err.some((l) => l.includes(`no release checkout was left at ${fx.releaseDir}`)),
+      r.err.join("\n"),
+    );
+    assert(readMarker(marker).head === "", "the new checkout was already on a commit while the release was tried");
+    assert(!existsSync(fx.releaseDir), "a failed first pin left a release checkout");
+  });
+});
+
+test("release", "a release that does not finish in time is refused, and the live checkout is not moved", () => {
+  withReleaseFixture((fx) => {
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin failed");
+    addWatchTag(fx, "watchslow", "slow");
+    const work = join(fx.root, "work");
+    const r = pinRelease({ ...pinOpts(fx, "watchslow", fakeLaunchctl({ loaded: false }).run), workDir: work, proofTimeoutMs: 1500 });
+    assert(r.code === 1, "a release that did not finish was pinned");
+    assert(r.err.some((l) => l.includes("did not finish in 1.5s")), r.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "the checkout moved while the release was being tried");
+    assert(readdirSync(work).length === 0, `the throwaway clone was left behind: ${readdirSync(work).join(", ")}`);
+  });
+});
+
+test("release", "a pin killed while it tries the release leaves the live checkout on the release it was on", async () => {
+  const fx = releaseFixture();
+  try {
+    assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin failed");
+    const marker = addWatchTag(fx, "watchslow", "slow");
+    const work = join(fx.root, "work");
+    // pinRelease in a process of its own, so that it can be interrupted the way
+    // an owner interrupts a pin that has gone quiet.
+    const driver = join(fx.root, "driver.mts");
+    writeFileSync(
+      driver,
+      [
+        `import { pinRelease } from ${JSON.stringify(new URL("../src/release_pin.ts", import.meta.url).href)};`,
+        "const [tag, sourceRoot, releaseDir, plistPath, workDir, home] = process.argv.slice(2);",
+        "const r = pinRelease({",
+        "  tag, sourceRoot, releaseDir, plistPath, workDir,",
+        '  launchctl: () => ({ status: 1, stdout: "", stderr: "" }),',
+        "  env: { ...process.env, HOME: home },",
+        "});",
+        "console.log(JSON.stringify(r));",
+        "",
+      ].join("\n"),
+    );
+    const child = spawn(
+      process.execPath,
+      ["--experimental-strip-types", driver, "watchslow", fx.source, fx.releaseDir, fx.plistPath, work, loginEnv(fx).HOME ?? ""],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let childErr = "";
+    child.stderr.on("data", (d: Buffer) => {
+      childErr += d.toString();
+    });
+    const exited = new Promise<NodeJS.Signals | null>((resolve) => {
+      child.on("exit", (_code, signal) => resolve(signal));
+    });
+    // The release writes the marker when it starts; it then waits 8 s.
+    const deadline = Date.now() + 30_000;
+    while (!existsSync(marker) && Date.now() < deadline) await new Promise<void>((r) => setTimeout(r, 50));
+    assert(existsSync(marker), `the release never started: ${childErr}`);
+    child.kill("SIGINT");
+    const signal = await exited;
+    assert(signal === "SIGINT", `the pin was not stopped by the signal: ${String(signal)} ${childErr}`);
+
+    assert(headOf(fx.releaseDir) === fx.v1, "the checkout moved before the release had passed");
+    assert(isDetachedHead(fx.releaseDir), "the checkout is attached to a branch");
+    assert(fixtureGit(fx.releaseDir, ["status", "--porcelain", "--untracked-files=no"]) === "", "the checkout has tracked changes");
+    assert(readFileSync(join(fx.releaseDir, "README.md"), "utf8") === "one\n", "the working tree is not v1's");
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test("release", "a checkout on a branch stays on that branch when the release does not run", () => {
   withReleaseFixture((fx) => {
     assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin failed");
     fixtureGit(fx.releaseDir, ["checkout", "--quiet", "-b", "keep"]);
     const r = pinRelease(pinOpts(fx, "wrongver", fakeLaunchctl({ loaded: false }).run));
     assert(r.code === 1 && r.err.some((l) => l.includes("did not run")), r.err.join("\n"));
-    assert(headOf(fx.releaseDir) === fx.v1, "the checkout was not put back on v1");
+    assert(headOf(fx.releaseDir) === fx.v1, "the checkout is not on v1");
     assert(
       fixtureGit(fx.releaseDir, ["symbolic-ref", "HEAD"]) === "refs/heads/keep",
       "the checkout is no longer on the branch it was on",
@@ -13838,43 +14089,24 @@ test("release", "a checkout that was on a branch goes back onto that branch when
   });
 });
 
-test("release", "when the checkout cannot be put back, pin says the job is on the release that failed and how to fix it", () => {
+test("release", "a checkout with tracked changes is refused, and the repair SCHEDULING prints clears them", () => {
   withReleaseFixture((fx) => {
     assert(pinRelease(pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run)).code === 0, "the first pin failed");
-    // A git that lets the first `checkout` through (the move onto the failing
-    // tag) and refuses every later one (the move back).
-    const dir = join(fx.root, "checkout-shim");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      join(dir, "git"),
-      [
-        "#!/bin/sh",
-        'for a in "$@"; do',
-        '  if [ "$a" = checkout ]; then',
-        '    n=$(cat "$SHIM_COUNT" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$SHIM_COUNT"',
-        '    if [ "$n" -ge 2 ]; then echo "fatal: refusing to move the checkout back" >&2; exit 128; fi',
-        "  fi",
-        "done",
-        'exec "$SHIM_REAL_GIT" "$@"',
-        "",
-      ].join("\n"),
-    );
-    chmodSync(join(dir, "git"), 0o755);
-    const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
-    const outcomes: PinOutcome[] = [];
-    withProcessEnv(
-      { PATH: `${dir}:${process.env.PATH ?? ""}`, SHIM_COUNT: join(fx.root, "checkout-count"), SHIM_REAL_GIT: real },
-      () => {
-        outcomes.push(pinRelease(pinOpts(fx, "badexit", fakeLaunchctl({ loaded: false }).run)));
-      },
-    );
-    const outcome = outcomes[0];
-    assert(outcome !== undefined && outcome.code === 1, "a release that exits 1 was pinned");
-    const err = outcome === undefined ? "" : outcome.err.join("\n");
-    assert(err.includes("could not be put back on"), err);
-    assert(err.includes(`git -C ${fx.releaseDir} checkout --detach ${fx.v1}`), `the message does not give the command that fixes it:\n${err}`);
-    assert(!err.includes("is back on"), `pin claimed the checkout was put back:\n${err}`);
-    assert(headOf(fx.releaseDir) === fx.badexit, "the shim should have left the checkout on the failed tag");
+    // What an interrupted `git checkout` can leave: tracked files that are not the tag's.
+    writeFileSync(join(fx.releaseDir, "README.md"), "half of another release\n");
+    const refused = pinRelease(pinOpts(fx, "v2", fakeLaunchctl({ loaded: false }).run));
+    assert(refused.code === 1 && refused.err.some((l) => l.includes("has tracked changes")), refused.err.join("\n"));
+
+    const sched = readFileSync(fileURLToPath(new URL("../deploy/SCHEDULING.md", import.meta.url)), "utf8").replace(/\s+/g, " ");
+    const printed = "git -C ~/.local/share/chamber-release checkout --force --detach <tag>";
+    assert(sched.includes(printed), "deploy/SCHEDULING.md does not print the repair command");
+    // The command as printed, with this fixture's directory and a tag it has.
+    const argv = printed.replace("~/.local/share/chamber-release", fx.releaseDir).replace("<tag>", "v1").split(" ").slice(1);
+    const fixed = spawnSync("git", argv, { encoding: "utf8" });
+    assert(fixed.status === 0, `the printed repair failed: ${fixed.stderr}`);
+    const again = pinRelease(pinOpts(fx, "v2", fakeLaunchctl({ loaded: false }).run));
+    assert(again.code === 0, `pin still refuses after the repair:\n${again.err.join("\n")}`);
+    assert(headOf(fx.releaseDir) === fx.v2, "the checkout is not on v2");
   });
 });
 
@@ -14354,8 +14586,18 @@ test("config", "the docs agree with the code: limitation count, sandbox claims, 
   const schedFlat = sched.replace(/\s+/g, " ");
   assert(schedFlat.includes("not over SSH") && schedFlat.includes("`unload` stops the job"), "the pin notes are missing");
   // What pin does besides the checkout: the refusals it makes, the run proof, and what a failed proof leaves.
-  for (const needle of ["`Program` key", "username or password", "`node bin/chamber.js --version`", "puts the checkout back"]) {
+  for (const needle of ["`Program` key", "username or password", "`node bin/chamber.js --version`", "throwaway clone"]) {
     assert(schedFlat.includes(needle), `SCHEDULING.md does not describe pin's ${needle}`);
+  }
+  // Pin tries the release before it moves the checkout. The earlier text said it
+  // moved first and put the checkout back, which left a window nobody was told about.
+  const changelogFlat = read("CHANGELOG.md").replace(/\s+/g, " ");
+  assert(!schedFlat.includes("puts the checkout back"), "SCHEDULING.md still says pin puts the checkout back");
+  assert(!changelogFlat.includes("puts the checkout back"), "CHANGELOG.md still says pin puts the checkout back");
+  assert(changelogFlat.includes("throwaway clone"), "CHANGELOG.md does not say where pin tries the release");
+  // What is still open is named: the move itself, the repair, and the scratch clone of a killed pin.
+  for (const needle of ["neither the old release nor the new one", "checkout --force --detach <tag>", "chamber-pin-proof-"]) {
+    assert(schedFlat.includes(needle), `SCHEDULING.md does not name what is still open after the proof: ${needle}`);
   }
   assert(sched.includes("This takes effect for a release tag that contains this script"), "the daily-snapshot effective-date note is missing");
   assert(sched.includes("`release: <tag>`"), "the daily-snapshot section does not mention the release line");

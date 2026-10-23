@@ -3,7 +3,7 @@
 All notable changes to Chamber. Versions before 0.1.6 are described in the git
 history and the GitHub releases.
 
-## Unreleased
+## 0.2.0 — 2026-10-23
 
 ### Added
 
@@ -69,6 +69,31 @@ history and the GitHub releases.
   `/turn` itself, now answers 503 `busy` with `Retry-After: 1` instead of
   freezing; see `docs/KNOWN_LIMITATIONS.md` entry 21. If a worker crashes, only
   the turns that worker was running fail; the others carry on.
+
+### Ingest and `chamber_check`
+
+- **`chamber_check` reads a declared notes folder.** An absolute path under a
+  folder declared with `--notes` or a config ingest root is judged from the
+  file on disk, with no ingest and no database. The install line is
+  `npx -y @bu7umaid/chamber mcp --notes ~/Notes`. An edited indexed note is
+  judged from the new text and says the index is behind; `record` is refused
+  until the index matches the disk. A config that does not parse fails the
+  check. A root known only from indexed rows does not authorize reading a file
+  the index skipped, and every citation spelling, including a passage ref and a
+  `vdoc_` id, meets the same exclude refusal before the file is opened.
+- **Re-ingest skips unchanged passages.** A passage whose text, title and
+  source ref hash the same, and whose vector is a finite 384-dimension MiniLM
+  vector, is kept: no embedder call, no row rewrite. A hash vector or a changed
+  passage is embedded as before. The document row and its vector commit
+  together, so a failed vector write cannot leave a skippable hash on an old
+  vector. The log says how many passages were written and how many were kept.
+- **One MiniLM process per ingest.** `ingestDirectory` starts one
+  `embed_minilm.py --serve` process for the batches it embeds and closes it
+  before it returns, so the model loads once per root instead of once per
+  changed file. A root that skips every passage never starts it.
+- **MiniLM text goes on stdin.** Batches are split into groups of at most
+  12,288 UTF-8 bytes. The script refuses an argument longer than 2,048
+  characters before it imports the model.
 
 ### Supply chain, CI, `chamber pin` and docs
 

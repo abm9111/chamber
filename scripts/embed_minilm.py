@@ -18,6 +18,10 @@ package's own models/minilm/VERSION records -- the SHA-256 of
 model_quantized.onnx or of tokenizer.json differs, VERSION is missing or is not
 UTF-8, or it lacks exactly one line for either hash. The check runs in every
 mode, before the first reply and before numpy or onnxruntime is imported.
+
+The files are read once. The bytes that were hashed are the bytes the session
+and the tokenizers are built from, so a file replaced on disk after the check is
+not what loads.
 """
 from __future__ import annotations
 
@@ -56,6 +60,11 @@ MAX_TOKENS = 256
 _session: ort.InferenceSession | None = None
 _tokenizer: Tokenizer | None = None
 _measurer: Tokenizer | None = None
+# What verify_weights hashed, kept so that these bytes, and not whatever is at
+# the paths a moment later, are what the session and the tokenizers are built
+# from. The weights are dropped once the session holds its own copy.
+_onnx_bytes: bytes | None = None
+_tokenizer_json: str | None = None
 
 
 EXIT_WEIGHTS_REFUSED = 3
@@ -84,12 +93,16 @@ def _recorded_hash(text: str, pattern: re.Pattern[str], name: str) -> str:
     return found[0].lower()
 
 
-def _sha256_of(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def _read_hashed(path: Path, expected: str) -> bytes:
+    """The bytes of `path`, read once, if they hash to `expected`; a refusal if not."""
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        _refuse_weights(f"cannot read {path} ({e.strerror or e})")
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
+        _refuse_weights(f"{path} has SHA-256 {actual}, but {VERSION_PATH} records {expected}")
+    return data
 
 
 def verify_weights() -> None:
@@ -98,15 +111,17 @@ def verify_weights() -> None:
     model_quantized.onnx is a 23 MB binary that onnxruntime parses and
     tokenizer.json is parsed by the same process; both feed retrieval, which
     feeds the citation-pin path. VERSION is the package's own, never the one in
-    a CHAMBER_MINILM_DIR directory, and records one SHA-256 for each. Streamed,
-    so the weights are not held in memory, and done once per process.
+    a CHAMBER_MINILM_DIR directory, and records one SHA-256 for each. Each file
+    is read once into memory, hashed there, and kept: the session and the
+    tokenizers are built from these bytes and not from the paths, so a file
+    replaced after the check is not what loads. Done once per process.
 
     Exit 3, one stderr line, and no model loaded when either hash differs,
     VERSION is missing or is not UTF-8, or it has not exactly one line for
     either hash. This runs before numpy and onnxruntime are imported, so it
     needs neither.
     """
-    global _weights_verified
+    global _weights_verified, _onnx_bytes, _tokenizer_json
     if _weights_verified:
         return
     for path, what in ((ONNX_PATH, "model"), (TOK_PATH, "tokenizer")):
@@ -124,27 +139,36 @@ def verify_weights() -> None:
         (ONNX_PATH, _recorded_hash(version_text, _SHA256_LINE, "SHA-256")),
         (TOK_PATH, _recorded_hash(version_text, _VOCAB_SHA256_LINE, "Vocab-SHA-256")),
     )
-    for path, expected in recorded:
-        actual = _sha256_of(path)
-        if actual != expected:
-            _refuse_weights(f"{path} has SHA-256 {actual}, but {VERSION_PATH} records {expected}")
+    held = {path: _read_hashed(path, expected) for path, expected in recorded}
+    try:
+        tokenizer_text = held[TOK_PATH].decode("utf-8")
+    except UnicodeDecodeError:
+        # The hash matched, so VERSION records a tokenizer that is not UTF-8.
+        _refuse_weights(f"{TOK_PATH} is not UTF-8")
+    _onnx_bytes = held[ONNX_PATH]
+    _tokenizer_json = tokenizer_text
     _weights_verified = True
 
 
 def _load() -> tuple[ort.InferenceSession, Tokenizer]:
-    global _session, _tokenizer
+    global _session, _tokenizer, _onnx_bytes
     verify_weights()
     if _session is None:
-        if not ONNX_PATH.is_file():
-            raise SystemExit(f"missing model: {ONNX_PATH}")
+        if _onnx_bytes is None:
+            raise RuntimeError("verify_weights() kept no weights to load")
         so = ort.SessionOptions()
         so.inter_op_num_threads = 1
         so.intra_op_num_threads = 2
+        # From the bytes that were hashed, not from ONNX_PATH: a path would be
+        # opened again, and a file replaced since the hash would load unhashed.
         _session = ort.InferenceSession(
-            str(ONNX_PATH), sess_options=so, providers=["CPUExecutionProvider"]
+            _onnx_bytes, sess_options=so, providers=["CPUExecutionProvider"]
         )
+        _onnx_bytes = None
     if _tokenizer is None:
-        _tokenizer = Tokenizer.from_file(str(TOK_PATH))
+        if _tokenizer_json is None:
+            raise RuntimeError("verify_weights() kept no tokenizer to load")
+        _tokenizer = Tokenizer.from_str(_tokenizer_json)
         # 256 is all-MiniLM-L6-v2's own trained max_seq_length, not a number
         # picked here -- so this is the model's limit, not a cap worth raising.
         # It is set explicitly because tokenizer.json ships truncation at 128:
@@ -164,7 +188,9 @@ def _measuring_tokenizer() -> Tokenizer:
     """
     global _measurer
     if _measurer is None:
-        _measurer = Tokenizer.from_file(str(TOK_PATH))
+        if _tokenizer_json is None:
+            raise RuntimeError("verify_weights() kept no tokenizer to measure with")
+        _measurer = Tokenizer.from_str(_tokenizer_json)
         _measurer.no_truncation()
         _measurer.no_padding()
     return _measurer

@@ -15738,6 +15738,65 @@ test("release", "a clone with no snapshot template gets the warning and no comma
   });
 });
 
+// ─── the embedder loads the bytes it hashed ─────────────────────────────────
+
+/**
+ * Imports the script as a module and does what main() does, in its order, with
+ * one addition: both files are replaced after the check and before the load.
+ * argv[1] is the script. Prints the first vector as JSON.
+ */
+const REPLACE_AFTER_CHECK_DRIVER = [
+  "import importlib.util, json, sys",
+  "spec = importlib.util.spec_from_file_location('embed_minilm', sys.argv[1])",
+  "m = importlib.util.module_from_spec(spec)",
+  "spec.loader.exec_module(m)",
+  "m.verify_weights()",
+  "m._import_stack()",
+  "m.ONNX_PATH.write_bytes(b'replaced after the hash')",
+  "m.TOK_PATH.write_bytes(b'replaced after the hash')",
+  "vecs = m.embed_texts(['a sentence'])",
+  "m.embed_texts(['word ' * 400])  # fills the window, so the measuring tokenizer is built too",
+  "print(json.dumps(vecs[0]))",
+  "",
+].join("\n");
+
+test("config", "the model and tokenizer that load are the bytes that were hashed: files replaced after the check change nothing", () => {
+  if (!minilmAvailable()) {
+    // No numpy or onnxruntime here: there is no session to build.
+    assert(true, "no runnable embedder on this machine");
+    return;
+  }
+  const dir = minilmDirWith({ weights: "copy", tokenizer: "copy" });
+  const work = mkdtempSync(join(tmpdir(), "chamber-replace-driver-"));
+  try {
+    const driver = join(work, "driver.py");
+    writeFileSync(driver, REPLACE_AFTER_CHECK_DRIVER);
+    const python = process.env.CHAMBER_PYTHON?.trim() || "python3";
+    // -B: do not leave a __pycache__ next to the script in the repository. -I: nothing from the environment or the cwd on sys.path.
+    const r = spawnSync(python, ["-B", "-I", driver, EMBED_SCRIPT], {
+      encoding: "utf8",
+      timeout: 120_000,
+      env: { ...process.env, CHAMBER_MINILM_DIR: dir },
+    });
+    assert(r.error === undefined, `${python} did not run: ${r.error}`);
+    assert(
+      readFileSync(join(dir, "model_quantized.onnx"), "utf8") === "replaced after the hash" &&
+        readFileSync(join(dir, "tokenizer.json"), "utf8") === "replaced after the hash",
+      "the driver did not replace the files, so this run proves nothing",
+    );
+    assert(r.status === 0, `the embedder loaded what was on disk after the check (exit ${r.status}): ${(r.stderr ?? "").slice(-600)}`);
+    const got = JSON.parse((r.stdout ?? "").trim().split("\n").pop() ?? "[]") as number[];
+    const want = embedMinilm("a sentence");
+    assert(
+      got.length === want.length && got.every((v, i) => Math.abs(v - want[i]!) < 1e-6),
+      "the vector from the held bytes is not the shipped model's vector",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

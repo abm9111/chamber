@@ -118,6 +118,8 @@ import {
   noteMinilmStderr,
   MinilmIntegrityError,
 } from "../src/embedder.ts";
+// Reached through a namespace so that an export that is missing fails the one test that needs it.
+import * as embedderApi from "../src/embedder.ts";
 import { CALIBRATED_THRESHOLDS } from "../src/commit_belief.ts";
 import {
   claimsDifferMaterially,
@@ -296,6 +298,7 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -13845,8 +13848,14 @@ test("config", "the integrity refusal keeps the hash VERSION records, however lo
       embedded = e instanceof Error ? e.message : String(e);
     }
     assert(embedded.includes(t.expected), `the embed's message was cut before the hash VERSION records: "${embedded}"`);
-    // minilmAvailable() remembers a refusal for the life of the process.
-    assert(probed.includes("until it is restarted"), `the message does not say that a running process must be restarted: "${probed}"`);
+    // minilmAvailable() remembers a refusal and says when it stops remembering:
+    // not at a restart. The embed above remembers nothing, so it must not say it does.
+    assert(
+      probed.includes("remembers this refusal only until the weights, the tokenizer or VERSION change"),
+      `the probe's message does not say when it asks again: "${probed}"`,
+    );
+    assert(!probed.includes("restart"), `the probe's message still tells the owner to restart: "${probed}"`);
+    assert(!embedded.includes("remembers") && !embedded.includes("restart"), `an embed that caches nothing claims it does: "${embedded}"`);
   } finally {
     if (savedDir === undefined) delete process.env.CHAMBER_MINILM_DIR;
     else process.env.CHAMBER_MINILM_DIR = savedDir;
@@ -15794,6 +15803,145 @@ test("config", "the model and tokenizer that load are the bytes that were hashed
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(work, { recursive: true, force: true });
+  }
+});
+
+// ─── a remembered weights refusal is asked again when the files change ──────
+
+test("config", "weightsSignature changes when the weights, the tokenizer or VERSION is rewritten, replaced, grown or removed", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-signature-"));
+  try {
+    const files = {
+      weights: join(dir, "model_quantized.onnx"),
+      tokenizer: join(dir, "tokenizer.json"),
+      version: join(dir, "VERSION"),
+    };
+    // mtime is set by hand: two writes within one filesystem tick would share it.
+    let tick = 1_700_000_000;
+    const put = (file: string, text: string): void => {
+      writeFileSync(file, text);
+      tick += 10;
+      utimesSync(file, tick, tick);
+    };
+    for (const f of Object.values(files)) put(f, "one\n");
+    const sig = (): string => embedderApi.weightsSignature(dir, files.version);
+    assert(sig() === sig(), "the signature of unchanged files is not stable");
+    for (const [what, file] of Object.entries(files)) {
+      let last = sig();
+      const changed = (how: string): void => {
+        const now = sig();
+        assert(now !== last, `${what}: ${how} did not change the signature`);
+        last = now;
+      };
+      put(file, "two\n");
+      changed("rewriting it in place with the same size");
+      put(`${file}.new`, "two\n");
+      renameSync(`${file}.new`, file);
+      changed("replacing it with another file of the same size");
+      put(file, "a much longer text than before\n");
+      changed("growing it");
+      rmSync(file);
+      changed("removing it");
+      put(file, "one\n");
+      changed("putting it back");
+    }
+    // Another directory is another question, whatever the files in it look like.
+    const other = mkdtempSync(join(tmpdir(), "chamber-signature-other-"));
+    try {
+      assert(embedderApi.weightsSignature(other, files.version) !== sig(), "a different model directory has the same signature");
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "a weights refusal the probe remembers is asked again when the weights change, and only then", () => {
+  const dir = minilmDirWith({ weights: NOT_THE_WEIGHTS, tokenizer: "copy" });
+  const weights = join(dir, "model_quantized.onnx");
+  const savedDir = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  const refusal = (): MinilmIntegrityError => {
+    try {
+      minilmAvailable();
+    } catch (e) {
+      if (e instanceof MinilmIntegrityError) return e;
+      throw e;
+    }
+    throw new Error("minilmAvailable() did not refuse");
+  };
+  try {
+    const first = refusal();
+    assert(first.message.includes(sha256Hex(NOT_THE_WEIGHTS)), `the refusal does not name the file's hash: ${first.message}`);
+    assert(refusal() === first, "an unchanged refusal was asked again: it is not remembered at all");
+
+    // Three ways a file changes under a running process. Each must be asked again
+    // and must name the new file's hash, so it is a new answer and not the old one.
+    const other = Buffer.from("another file, of another size, entirely\n");
+    writeFileSync(weights, other);
+    const grown = refusal();
+    assert(grown !== first && grown.message.includes(sha256Hex(other)), "a weights file of another size was not asked again");
+
+    const sameSize = Buffer.from("X".repeat(other.length));
+    writeFileSync(`${weights}.new`, sameSize);
+    renameSync(`${weights}.new`, weights);
+    const replaced = refusal();
+    assert(replaced !== grown && replaced.message.includes(sha256Hex(sameSize)), "a weights file replaced by one of the same size was not asked again");
+
+    const again = Buffer.from("Y".repeat(other.length));
+    utimesSync(weights, 1_700_000_000, 1_700_000_000);
+    writeFileSync(weights, again);
+    const rewritten = refusal();
+    assert(rewritten !== replaced && rewritten.message.includes(sha256Hex(again)), "a weights file rewritten in place was not asked again");
+  } finally {
+    if (savedDir === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = savedDir;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "a tokenizer refusal the probe remembers is cleared by putting the tokenizer back", () => {
+  const dir = minilmDirWith({ weights: "copy", tokenizer: NOT_THE_TOKENIZER });
+  const savedDir = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    let first: unknown;
+    try {
+      minilmAvailable();
+    } catch (e) {
+      first = e;
+    }
+    assert(first instanceof MinilmIntegrityError && first.message.includes("tokenizer.json"), `no tokenizer refusal: ${String(first)}`);
+
+    // Only the tokenizer changes: the weights are the shipped ones throughout.
+    writeFileSync(join(dir, "tokenizer.json"), readFileSync(join(REAL_MODEL_DIR, "tokenizer.json")));
+    let after: unknown = null;
+    let available: boolean | null = null;
+    captureStderr(() => {
+      try {
+        available = minilmAvailable();
+      } catch (e) {
+        after = e;
+      }
+    });
+    assert(after === null, `the repaired install still gets a refusal: ${after instanceof Error ? after.message : String(after)}`);
+    // True where an embedder runs here; false, with a warning, where numpy or onnxruntime is missing.
+    assert(available === true || available === false, "minilmAvailable() did not answer");
+  } finally {
+    if (savedDir === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = savedDir;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

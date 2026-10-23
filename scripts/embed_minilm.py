@@ -70,6 +70,8 @@ _tokenizer_json: str | None = None
 
 
 EXIT_WEIGHTS_REFUSED = 3
+# Model files are read whole to be hashed; past this a file is refused, not held (the shipped ones are 23 MB and 0.7 MB).
+MAX_MODEL_FILE_BYTES = 256 * 1024 * 1024
 # models/minilm/VERSION records each hash on a line of its own, 64 hex digits:
 # `SHA-256:` for model_quantized.onnx (the original line, and still the weights)
 # and `Vocab-SHA-256:` for tokenizer.json. The patterns are anchored, so the
@@ -96,11 +98,18 @@ def _recorded_hash(text: str, pattern: re.Pattern[str], name: str) -> str:
 
 
 def _read_hashed(path: Path, expected: str) -> bytes:
-    """The bytes of `path`, read once, if they hash to `expected`; a refusal if not."""
+    """The bytes of `path`, read once, if they hash to `expected`; a refusal if not.
+
+    At most MAX_MODEL_FILE_BYTES + 1 bytes are read, from one open, so a file of
+    any size costs a bounded read and one over the cap is refused, not held.
+    """
     try:
-        data = path.read_bytes()
+        with path.open("rb") as f:
+            data = f.read(MAX_MODEL_FILE_BYTES + 1)
     except OSError as e:
         _refuse_weights(f"cannot read {path} ({e.strerror or e})")
+    if len(data) > MAX_MODEL_FILE_BYTES:
+        _refuse_weights(f"{path} is larger than {MAX_MODEL_FILE_BYTES} bytes")
     actual = hashlib.sha256(data).hexdigest()
     if actual != expected:
         _refuse_weights(f"{path} has SHA-256 {actual}, but {VERSION_PATH} records {expected}")

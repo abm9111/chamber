@@ -298,6 +298,7 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  truncateSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -16077,6 +16078,81 @@ test("config", "the docs and the changelog say a tokenizer.json missing next to 
   const changelog = read("CHANGELOG.md");
   const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.0"));
   assert(unreleased.includes(needle), "CHANGELOG.md Unreleased does not say it");
+});
+
+// ─── a model file over the size cap is refused, not read to the end ─────────
+
+/**
+ * Runs the script as __main__ with argv "a sentence" and prints its
+ * peak resident memory to stderr as PEAK_RSS=<bytes> (ru_maxrss is bytes on
+ * macOS and KiB on Linux). argv[1] is the script.
+ */
+const PEAK_MEMORY_DRIVER = [
+  "import resource, runpy, sys",
+  "script = sys.argv[1]",
+  "sys.argv = [script, 'a sentence']",
+  "code = 0",
+  "try:",
+  "    runpy.run_path(script, run_name='__main__')",
+  "except SystemExit as e:",
+  "    code = e.code",
+  "peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == 'darwin' else 1024)",
+  "print('PEAK_RSS=%d' % peak, file=sys.stderr)",
+  "sys.exit(code if isinstance(code, int) else 1)",
+].join("\n");
+
+test("config", "a model file one byte over the cap is refused with exit 3 before it is hashed, in every mode; a file exactly at the cap is hashed", () => {
+  const cap = 256 * 1024 * 1024;
+  assert(
+    readFileSync(EMBED_SCRIPT, "utf8").includes("MAX_MODEL_FILE_BYTES = 256 * 1024 * 1024"),
+    "scripts/embed_minilm.py does not define MAX_MODEL_FILE_BYTES as 256 MiB, which this test assumes",
+  );
+  // A sparse file costs no disk: truncate makes it any length of zeros.
+  const dir = minilmDirWith({ weights: Buffer.alloc(0) });
+  const weights = join(dir, "model_quantized.onnx");
+  try {
+    truncateSync(weights, cap + 1);
+    for (const [label, args, input] of [
+      ["one-shot", ["a sentence"], undefined],
+      ["--json -", ["--json", "-"], '["a sentence"]'],
+      ["--serve", ["--serve"], '["a sentence"]\n'],
+    ] as const) {
+      const r = runEmbedScript(dir, args, input);
+      assert(r.status === 3, `${label}: exit ${r.status}, stderr ${r.stderr}`);
+      assert(r.stdout === "", `${label}: wrote a reply before refusing: ${r.stdout}`);
+      const lines = r.stderr.trim().split("\n");
+      assert(lines.length === 1, `${label}: expected one stderr line, got ${lines.length}: ${r.stderr}`);
+      assert(
+        lines[0]!.includes("is larger than") && lines[0]!.includes(String(cap)),
+        `${label}: the line must say the file is over the cap: ${lines[0]}`,
+      );
+    }
+    // Far over the cap: 4 GiB of sparse zeros. Refusing it is not the point, any
+    // read that counts the bytes does that; the point is not holding it. The
+    // driver reports the script's peak memory, which stops near the cap if the
+    // read does and reaches 4 GiB if it does not.
+    truncateSync(weights, 4 * 1024 * 1024 * 1024);
+    const huge = spawnSync("python3", ["-c", PEAK_MEMORY_DRIVER, EMBED_SCRIPT], {
+      encoding: "utf8",
+      timeout: 120_000,
+      env: { ...process.env, CHAMBER_MINILM_DIR: dir },
+    });
+    assert(huge.status === 3 && huge.stderr.includes("is larger than"), `4 GiB: exit ${huge.status}, stderr ${huge.stderr}`);
+    const peak = /PEAK_RSS=(\d+)/.exec(huge.stderr);
+    assert(peak !== null, `the driver did not report its peak memory: ${huge.stderr}`);
+    assert(Number(peak[1]) < 1024 * 1024 * 1024, `refusing a 4 GiB file held ${peak[1]} bytes: the read is not bounded`);
+    // The boundary: exactly the cap is read whole and hashed, and it is not the
+    // weights, so it is refused for its hash and not for its size.
+    truncateSync(weights, cap);
+    const exact = runEmbedScript(dir, ["a sentence"]);
+    assert(exact.status === 3, `at the cap: exit ${exact.status}, stderr ${exact.stderr}`);
+    assert(
+      exact.stderr.includes("has SHA-256") && !exact.stderr.includes("is larger than"),
+      `a file exactly at the cap was refused for its size: ${exact.stderr}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ─── cli process smoke tests ────────────────────────────────────────────────

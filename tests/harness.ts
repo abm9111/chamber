@@ -15981,6 +15981,104 @@ test("config", "the docs and the changelog describe the pin and embedder follow-
   }
 });
 
+// ─── a tokenizer.json that is gone next to weights that exist is a refusal ───
+
+test("config", "weights that fail the hash exit 3 even when tokenizer.json is gone, good weights with no tokenizer.json exit 3 too, and no weights file stays exit 1", () => {
+  const bad = tamperedWeights();
+  const goodWeights = minilmDirWith({});
+  const noWeights = minilmDirWith({});
+  rmSync(join(bad.dir, "tokenizer.json"));
+  rmSync(join(goodWeights, "tokenizer.json"));
+  rmSync(join(noWeights, "model_quantized.onnx"));
+  try {
+    for (const [label, args, input] of [
+      ["one-shot", ["a sentence"], undefined],
+      ["--json -", ["--json", "-"], '["a sentence"]'],
+      ["--serve", ["--serve"], '["a sentence"]\n'],
+    ] as const) {
+      // Tampered weights and no tokenizer: the weights are hashed first and are
+      // what is reported. Before this, the missing tokenizer was an ordinary
+      // failure (exit 1) and `auto` ingest wrote hash vectors for it.
+      const tampered = runEmbedScript(bad.dir, args, input);
+      assert(tampered.status === 3, `${label}, tampered weights and no tokenizer: exit ${tampered.status}, stderr ${tampered.stderr}`);
+      assert(tampered.stdout === "", `${label}: wrote a reply before refusing: ${tampered.stdout}`);
+      const lines = tampered.stderr.trim().split("\n");
+      assert(lines.length === 1, `${label}: expected one stderr line, got ${lines.length}: ${tampered.stderr}`);
+      assert(
+        lines[0]!.includes(bad.actualDigest) && lines[0]!.includes(bad.expected),
+        `${label}: the line must name the weights' hashes: ${lines[0]}`,
+      );
+      // Good weights and no tokenizer: the tokenizer is read through the hashed
+      // reader, so its absence is a refusal and not a "missing" failure.
+      const gone = runEmbedScript(goodWeights, args, input);
+      assert(gone.status === 3, `${label}, good weights and no tokenizer: exit ${gone.status}, stderr ${gone.stderr}`);
+      assert(gone.stdout === "", `${label}: wrote a reply before refusing: ${gone.stdout}`);
+      assert(
+        gone.stderr.includes("tokenizer.json") && gone.stderr.includes("cannot read"),
+        `${label}: the refusal does not say the tokenizer cannot be read: ${gone.stderr}`,
+      );
+      // No weights file: there is no embedder, exit 1, as it always was.
+      const none = runEmbedScript(noWeights, args, input);
+      assert(none.status === 1, `${label}, no weights file: exit ${none.status}, stderr ${none.stderr}`);
+      assert(none.stderr.includes("missing model"), `${label}: ${none.stderr}`);
+    }
+  } finally {
+    rmSync(bad.dir, { recursive: true, force: true });
+    rmSync(goodWeights, { recursive: true, force: true });
+    rmSync(noWeights, { recursive: true, force: true });
+  }
+});
+
+test("config", "tampered weights with no tokenizer.json make every auto embed throw the refusal, and an ingest writes no hash vectors", () => {
+  const dir = tamperedWeights().dir;
+  rmSync(join(dir, "tokenizer.json"));
+  const notes = mkdtempSync(join(tmpdir(), "chamber-refused-notes-"));
+  writeFileSync(join(notes, "a.md"), "# Alpha\n\nA passage about refund windows.\n");
+  const db = freshDb();
+  const saved = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    const { stderr } = captureStderr(() => {
+      const refusal = (label: string, run: () => unknown): void => {
+        let thrown: unknown;
+        try {
+          run();
+        } catch (e) {
+          thrown = e;
+        }
+        const said = thrown instanceof Error ? thrown.message : String(thrown);
+        assert(thrown instanceof MinilmIntegrityError, `${label}: expected the weights refusal, got: ${said}`);
+        assert(said.includes("embed_minilm failed (3)") && said.includes("SHA-256"), `${label}: the refusal does not say why: ${said}`);
+      };
+      refusal("embedLocalBatch auto", () => embedLocalBatch(["a sentence"], "auto"));
+      refusal("embedLocal auto", () => embedLocal("a sentence", "auto"));
+      refusal("ingestDirectory", () => ingestDirectory(db, notes));
+    });
+    assert(count(db, `SELECT COUNT(*) AS c FROM vector_embedding`) === 0, "the ingest wrote vectors for refused weights");
+    assert(!stderr.includes("hash vectors"), `a refusal was announced as a downgrade to hash vectors: ${stderr}`);
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = saved;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(notes, { recursive: true, force: true });
+  }
+});
+
+test("config", "the docs and the changelog say a tokenizer.json missing next to existing weights is a refusal", () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const read = (...parts: string[]): string => readFileSync(join(root, ...parts), "utf8").replace(/\s+/g, " ");
+  const needle = "missing or unreadable while the weights file exists";
+  assert(read("docs", "KNOWN_LIMITATIONS.md").includes(needle), "KNOWN_LIMITATIONS.md does not say it");
+  const changelog = read("CHANGELOG.md");
+  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.0"));
+  assert(unreleased.includes(needle), "CHANGELOG.md Unreleased does not say it");
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

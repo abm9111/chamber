@@ -835,7 +835,9 @@ channel rather than returning an empty result with no cause.
 **Closed: weights that were refused never become hash vectors.**
 `scripts/embed_minilm.py` exits 3 when `model_quantized.onnx` or `tokenizer.json`
 does not match the SHA-256 that the package's own `models/minilm/VERSION`
-records for it. `CHAMBER_MINILM_DIR` moves those two files and never the VERSION
+records for it. A `tokenizer.json` that is missing or unreadable while the weights
+file exists is the same refusal (a missing weights file is exit 1: no embedder).
+`CHAMBER_MINILM_DIR` moves those two files and never the VERSION
 they are held to, and the bytes that are hashed are the bytes that load: each
 file is read once and the session and tokenizers are built from that copy. That
 is not a machine without an embedder: the weights are there and were refused.

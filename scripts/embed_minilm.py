@@ -16,8 +16,10 @@ Stdout: JSON float arrays. Stderr: logs.
 Exit status 3: the model files were not loaded because they are not the ones the
 package's own models/minilm/VERSION records -- the SHA-256 of
 model_quantized.onnx or of tokenizer.json differs, VERSION is missing or is not
-UTF-8, or it lacks exactly one line for either hash. The check runs in every
-mode, before the first reply and before numpy or onnxruntime is imported.
+UTF-8, it lacks exactly one line for either hash, or tokenizer.json cannot be
+read while the weights file exists (a missing weights file is exit 1: there is
+no embedder). The check runs in every mode, before the first reply and before
+numpy or onnxruntime is imported.
 
 The files are read once. The bytes that were hashed are the bytes the session
 and the tokenizers are built from, so a file replaced on disk after the check is
@@ -124,9 +126,14 @@ def verify_weights() -> None:
     global _weights_verified, _onnx_bytes, _tokenizer_json
     if _weights_verified:
         return
-    for path, what in ((ONNX_PATH, "model"), (TOK_PATH, "tokenizer")):
-        if not path.is_file():
-            raise SystemExit(f"missing {what}: {path}")
+    # No weights file is no embedder: exit 1, as it always was, and callers
+    # fall back with a warning. Once the weights exist every other failure is a
+    # refusal: they are hashed first, and tokenizer.json is read through the
+    # same hashed reader below, so a tokenizer that is missing or unreadable
+    # next to weights that exist is exit 3. As an ordinary failure it let a
+    # tampered model file with no tokenizer fall through to hash vectors.
+    if not ONNX_PATH.is_file():
+        raise SystemExit(f"missing model: {ONNX_PATH}")
     try:
         version_text = VERSION_PATH.read_text(encoding="utf-8")
     except OSError as e:
@@ -139,6 +146,9 @@ def verify_weights() -> None:
         (ONNX_PATH, _recorded_hash(version_text, _SHA256_LINE, "SHA-256")),
         (TOK_PATH, _recorded_hash(version_text, _VOCAB_SHA256_LINE, "Vocab-SHA-256")),
     )
+    # In `recorded` order: the weights are hashed before tokenizer.json is
+    # touched, so tampered weights are reported as themselves even when the
+    # tokenizer is also gone.
     held = {path: _read_hashed(path, expected) for path, expected in recorded}
     try:
         tokenizer_text = held[TOK_PATH].decode("utf-8")

@@ -59,7 +59,9 @@ history and the GitHub releases.
   the package it sits in and nowhere else: `CHAMBER_MINILM_DIR` moves the two
   files and no longer carries a VERSION of its own that could vouch for them. A
   VERSION that is not UTF-8, or has no line or two lines for either hash, is now a
-  refusal (exit 3) and not a crash.
+  refusal (exit 3) and not a crash, and so is a `tokenizer.json` that is
+  missing or unreadable while the weights file exists (a missing weights file is
+  still exit 1: no embedder).
 - **The embedder loads the bytes it hashed.** Each file is read once, hashed in
   memory and kept; the session is built from the bytes and the tokenizers from
   the text. Before, `onnxruntime` and the tokenizer opened the paths again after

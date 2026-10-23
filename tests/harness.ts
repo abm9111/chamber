@@ -16083,9 +16083,10 @@ test("config", "the docs and the changelog say a tokenizer.json missing next to 
 // ─── a model file over the size cap is refused, not read to the end ─────────
 
 /**
- * Runs the script as __main__ with argv "a sentence" and prints its
- * peak resident memory to stderr as PEAK_RSS=<bytes> (ru_maxrss is bytes on
- * macOS and KiB on Linux). argv[1] is the script.
+ * Runs the script as __main__ with argv "a sentence" and prints its peak
+ * resident memory and the interpreter that ran it to stderr as
+ * PEAK_RSS=<bytes> PYTHON=<sys.executable> (ru_maxrss is bytes on macOS and KiB
+ * on Linux). argv[1] is the script.
  */
 const PEAK_MEMORY_DRIVER = [
   "import resource, runpy, sys",
@@ -16097,7 +16098,7 @@ const PEAK_MEMORY_DRIVER = [
   "except SystemExit as e:",
   "    code = e.code",
   "peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == 'darwin' else 1024)",
-  "print('PEAK_RSS=%d' % peak, file=sys.stderr)",
+  "print('PEAK_RSS=%d PYTHON=%s' % (peak, sys.executable), file=sys.stderr)",
   "sys.exit(code if isinstance(code, int) else 1)",
 ].join("\n");
 
@@ -16132,15 +16133,21 @@ test("config", "a model file one byte over the cap is refused with exit 3 before
     // driver reports the script's peak memory, which stops near the cap if the
     // read does and reaches 4 GiB if it does not.
     truncateSync(weights, 4 * 1024 * 1024 * 1024);
-    const huge = spawnSync("python3", ["-c", PEAK_MEMORY_DRIVER, EMBED_SCRIPT], {
+    const huge = spawnSync(embedPython(), ["-c", PEAK_MEMORY_DRIVER, EMBED_SCRIPT], {
       encoding: "utf8",
       timeout: 120_000,
       env: { ...process.env, CHAMBER_MINILM_DIR: dir },
     });
     assert(huge.status === 3 && huge.stderr.includes("is larger than"), `4 GiB: exit ${huge.status}, stderr ${huge.stderr}`);
-    const peak = /PEAK_RSS=(\d+)/.exec(huge.stderr);
+    const peak = /PEAK_RSS=(\d+) PYTHON=(.+)/.exec(huge.stderr);
     assert(peak !== null, `the driver did not report its peak memory: ${huge.stderr}`);
     assert(Number(peak[1]) < 1024 * 1024 * 1024, `refusing a 4 GiB file held ${peak[1]} bytes: the read is not bounded`);
+    // It ran under the interpreter the suite was told to use, not whichever
+    // python3 comes first on PATH.
+    const named = (process.env.CHAMBER_PYTHON ?? "").trim();
+    if (named !== "") {
+      assert(realpathSync(peak[2]!) === realpathSync(named), `the 4 GiB case ran ${peak[2]}, not CHAMBER_PYTHON (${named})`);
+    }
     // The boundary: exactly the cap is read whole and hashed, and it is not the
     // weights, so it is refused for its hash and not for its size.
     truncateSync(weights, cap);

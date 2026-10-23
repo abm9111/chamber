@@ -8473,7 +8473,7 @@ test("telegram", "T2_the_poll_loop_never_hands_an_unlisted_sender_to_the_turn", 
   // Drives the real start() loop, which both the gateway runner and the
   // plugin use. The guard has to fire before onMessage: that callback is the
   // gated turn, and the turn writes an observation before it replies.
-  const update = (id: number, from: number | undefined, chatType: string) => ({
+  const update = (id: number, from: number | undefined, chatType: string): Record<string, unknown> => ({
     update_id: id,
     message: {
       message_id: id,

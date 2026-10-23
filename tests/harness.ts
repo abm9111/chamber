@@ -16240,6 +16240,29 @@ test("release", "what plutil says about a snapshot plist reaches the warning as 
   });
 });
 
+// ─── a pin that failed after the checkout moved says nothing about the snapshot job
+
+test("release", "a pin whose reload failed after the checkout moved says nothing about the snapshot job, and the same setup says it when the reload works", () => {
+  withReleaseFixture((fx) => {
+    // The 08:30 job is installed, the checkout will move, launchctl load fails,
+    // and a stale snapshot plist is there to be reported if pin were to look.
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const snap = writeSnapshotPlist(fx, "$HOME/Projects/chamber/scripts/daily-snapshot.sh");
+    const failed = pinRelease({ ...pinOpts(fx, "v1", fakeLaunchctl({ loaded: false, load: "fails" }).run), snapshotPlistPath: snap });
+    assert(failed.code === 1, `pin reported success: ${failed.out.join("\n")}`);
+    assert(failed.out.some((l) => l.includes("is on v1")), `the checkout did not move, so this is not the case under test:\n${failed.out.join("\n")}`);
+    assert(failed.err.some((l) => l.includes("launchctl load failed")), failed.err.join("\n"));
+    const said = [...failed.out, ...failed.err].filter((l) => l.toLowerCase().includes("snapshot"));
+    assert(said.length === 0, `a failed pin spoke about the snapshot job:\n${said.join("\n")}`);
+
+    // The control: the same plist, and a reload that works, is reported. Without
+    // this, "said nothing" could be a snapshot path nothing ever looks at.
+    const worked = pinRelease({ ...pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run), snapshotPlistPath: snap });
+    assert(worked.code === 0, worked.err.join("\n"));
+    assert(worked.out.some((l) => l.startsWith(SNAPSHOT_WARNING)), `the control did not warn:\n${worked.out.join("\n")}`);
+  });
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

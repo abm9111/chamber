@@ -12,7 +12,6 @@
       "name": "chamber",
       "source": "./",
       "description": "Checks that the numbers, capitalised names, and file names in a claim occur in the indexed note. Local, no model. It does not judge meaning.",
-      "version": "0.1.9",
       "category": "productivity",
       "homepage": "https://github.com/abm9111/chamber#readme"
     }

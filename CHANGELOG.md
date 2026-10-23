@@ -100,11 +100,11 @@ the first 0.2 release there. It includes everything under 0.2.0 below.
 
 - **Claude Code plugin.** `/plugin install chamber --marketplace abm9111/chamber`
   asks for the notes folder, then adds the MCP server and a `chamber-check`
-  skill. The plugin runs the published npm package pinned to 0.1.9, so a
-  release bumps three places: the version in `.claude-plugin/plugin.json`, the
-  version in `.claude-plugin/marketplace.json`, and the `@0.1.9` in the
-  plugin's npx args. The skill is also what `npx skills add abm9111/chamber`
-  installs.
+  skill. The plugin runs the npm package at the version its args pin, which
+  must be published before this reaches the default branch: 0.1.9 drops
+  `--notes` without a word and every check comes back NOT_FOUND. The version
+  test now covers `.claude-plugin/plugin.json` and the pin. The skill is also
+  what `npx skills add abm9111/chamber` installs.
 
 ### Changed (breaking)
 

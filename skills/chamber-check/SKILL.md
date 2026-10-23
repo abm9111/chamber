@@ -6,7 +6,7 @@ description: Use when an answer repeats numbers, names, dates, or file names tak
 # Check claims against the user's notes
 
 Chamber confirms that every number, capitalised name, domain, file name and
-count in a claim occurs in the note it came from. It runs on the user's
+count in a claim occurs in the note it came from. The check runs on the user's
 machine, with no model and no network.
 
 ## When
@@ -20,12 +20,16 @@ machine, with no model and no network.
 1. Split the answer into single factual claims. One claim per sentence.
 2. Call `chamber_check` with each claim and the note it came from: the absolute
    path you read, a `file.md#p3` ref, or a passage id.
-3. Report each result as Chamber returns it:
+3. Report each result by its label, and read the lines under it, which say why:
    - `SUPPORTED`: the recognised terms occur in that note.
-   - `TERMS_ABSENT`: say the note does not support it. Do not state the claim as fact.
-   - `NOT_FOUND`: say the note was not found under the declared folders.
-   - `not indexed yet` or `index is behind this file`: the check read the file
-     on disk; the index has not caught up with it.
+   - `TERMS_ABSENT`: the note lacks the terms listed. Do not state the claim as fact.
+   - `NO_TERMS`: the claim has nothing Chamber can check. Nothing was verified;
+     do not call it supported.
+   - `NOT_FOUND`: a cited source could not be read. The line under it says why:
+     outside the declared folders, excluded, too large, empty, or missing. Do
+     not tell the user the note does not exist unless that line says so.
+   - `STALE`: the note on disk no longer matches the index. Not judged.
+   - `NO_SOURCE`: you cited nothing. Cite the note and check again.
 
 ## What a pass does not prove
 
@@ -36,16 +40,13 @@ occur in the note.
 
 ## If the `chamber_check` tool is missing
 
-Chamber is not connected. Tell the user, and give them one of these:
+Chamber is not connected. Tell the user, and do not imitate the check by
+reading the note yourself and calling it verified.
 
-```
-/plugin install chamber --marketplace abm9111/chamber
-```
-
-or, without the plugin:
-
-```
-claude mcp add -s user chamber -- npx -y @bu7umaid/chamber mcp --notes ~/Notes
-```
-
-Do not imitate the check by reading the note yourself and calling it verified.
+- If the user has not installed it (Claude Code 2.1.275 or later):
+  `/plugin install chamber --marketplace abm9111/chamber`
+- If the plugin is installed, its server failed to start. Common causes: Node
+  older than 22.5 (Chamber needs `node:sqlite`), or no notes folder set; run
+  `/plugin configure chamber@chamber`. `/mcp` shows the server's error.
+- Outside Claude Code, any MCP host:
+  `npx -y @bu7umaid/chamber@0.2.0 mcp --notes /absolute/path/to/Notes`

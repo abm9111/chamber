@@ -27,7 +27,8 @@ server and a `chamber-check` skill:
 ```
 
 On Claude Code before 2.1.275, run `/plugin marketplace add abm9111/chamber`
-first, then `/plugin install chamber@chamber`.
+first, then `/plugin install chamber@chamber`. The plugin takes one folder and
+no `--exclude`; to keep part of a folder out, use the server line below.
 
 Or the server alone, in any MCP host:
 

@@ -13345,52 +13345,105 @@ test("config", "CI pins its actions by SHA, installs Python by hash, scans both 
 
 // ─── MiniLM weights are checked before they are loaded ──────────────────────
 
+const REAL_MODEL_DIR = fileURLToPath(new URL("../models/minilm", import.meta.url));
+
+function sha256Hex(bytes: Buffer): string {
+  return nodeCreateHash("sha256").update(bytes).digest("hex");
+}
+
+/** The two hashes the shipped models/minilm/VERSION records. */
+function recordedHashes(): { weights: string; tokenizer: string } {
+  const real = readFileSync(join(REAL_MODEL_DIR, "VERSION"), "utf8");
+  const w = /^SHA-256:\s*([0-9a-f]{64})\s*$/m.exec(real);
+  const t = /^Vocab-SHA-256:\s*([0-9a-f]{64})\s*$/m.exec(real);
+  assert(w !== null && t !== null, "models/minilm/VERSION lacks a SHA-256 or a Vocab-SHA-256 line");
+  return { weights: w[1]!, tokenizer: t[1]! };
+}
+
+/** What a file in a directory CHAMBER_MINILM_DIR names is: a link to the shipped one, a copy of it, or other bytes. */
+type ModelFile = "real" | "copy" | Buffer;
+
 /**
- * A model directory the embedder can be pointed at with CHAMBER_MINILM_DIR.
- * The weights and tokenizer are symlinks to the real files, so nothing is
- * copied; VERSION is a real file. `version` is the text to write there, or
- * null for no VERSION file at all.
+ * A directory CHAMBER_MINILM_DIR can name. "real" is a symlink to the shipped
+ * file, so nothing is copied and the file must only be read; "copy" is a private
+ * copy a test may overwrite; a Buffer is written as the file. `ownVersion`, when
+ * given, is written as the directory's own VERSION, which the embedder ignores.
  */
-function minilmDirWithVersion(version: string | null): string {
-  const real = fileURLToPath(new URL("../models/minilm", import.meta.url));
+function minilmDirWith(opts: { weights?: ModelFile; tokenizer?: ModelFile; ownVersion?: string }): string {
   const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-dir-"));
-  symlinkSync(join(real, "model_quantized.onnx"), join(dir, "model_quantized.onnx"));
-  symlinkSync(join(real, "tokenizer.json"), join(dir, "tokenizer.json"));
-  if (version !== null) writeFileSync(join(dir, "VERSION"), version);
+  for (const [name, what] of [
+    ["model_quantized.onnx", opts.weights ?? "real"],
+    ["tokenizer.json", opts.tokenizer ?? "real"],
+  ] as const) {
+    if (what === "real") symlinkSync(join(REAL_MODEL_DIR, name), join(dir, name));
+    else writeFileSync(join(dir, name), what === "copy" ? readFileSync(join(REAL_MODEL_DIR, name)) : what);
+  }
+  if (opts.ownVersion !== undefined) writeFileSync(join(dir, "VERSION"), opts.ownVersion);
   return dir;
 }
 
-/** The real VERSION text with the first hex digit of its SHA-256 changed. */
-function tamperedVersion(): { text: string; expected: string; actualDigest: string } {
-  const real = readFileSync(fileURLToPath(new URL("../models/minilm/VERSION", import.meta.url)), "utf8");
-  const m = /^SHA-256:\s*([0-9a-f]{64})\s*$/m.exec(real);
-  assert(m !== null, "models/minilm/VERSION has no SHA-256 line");
-  const digest = m[1]!;
-  const wrong = (digest[0] === "0" ? "1" : "0") + digest.slice(1);
-  return { text: real.replace(digest, wrong), expected: wrong, actualDigest: digest };
+const NOT_THE_WEIGHTS = Buffer.from("these are not the MiniLM weights\n");
+const NOT_THE_TOKENIZER = Buffer.from('{"not": "the MiniLM tokenizer"}\n');
+
+/**
+ * A directory whose weights are not the ones VERSION records. `expected` is the
+ * hash VERSION records, `actualDigest` is what the file in the directory hashes to.
+ */
+function tamperedWeights(): { dir: string; expected: string; actualDigest: string } {
+  return {
+    dir: minilmDirWith({ weights: NOT_THE_WEIGHTS }),
+    expected: recordedHashes().weights,
+    actualDigest: sha256Hex(NOT_THE_WEIGHTS),
+  };
+}
+
+/**
+ * A package root of its own: a copy of the script whose models/minilm/VERSION is
+ * `version` (null: no such file). The weights and the tokenizer are links to the
+ * shipped ones, so the files hash as they should and only VERSION varies.
+ */
+function fakePackage(version: string | Buffer | null): { root: string; script: string } {
+  const root = mkdtempSync(join(tmpdir(), "chamber-fake-package-"));
+  mkdirSync(join(root, "scripts"));
+  mkdirSync(join(root, "models", "minilm"), { recursive: true });
+  const script = join(root, "scripts", "embed_minilm.py");
+  writeFileSync(script, readFileSync(EMBED_SCRIPT));
+  for (const name of ["model_quantized.onnx", "tokenizer.json"]) {
+    symlinkSync(join(REAL_MODEL_DIR, name), join(root, "models", "minilm", name));
+  }
+  if (version !== null) writeFileSync(join(root, "models", "minilm", "VERSION"), version);
+  return { root, script };
 }
 
 const EMBED_SCRIPT = fileURLToPath(new URL("../scripts/embed_minilm.py", import.meta.url));
 
+/**
+ * Run the script with python3. `dir` is CHAMBER_MINILM_DIR (null: unset, so the
+ * shipped model); `script` is another copy of the script, as fakePackage makes.
+ */
 function runEmbedScript(
-  dir: string,
+  dir: string | null,
   args: readonly string[],
   input?: string,
   pythonFlags: readonly string[] = [],
+  script: string = EMBED_SCRIPT,
 ): { status: number | null; stdout: string; stderr: string } {
-  const r = spawnSync("python3", [...pythonFlags, EMBED_SCRIPT, ...args], {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (dir === null) delete env.CHAMBER_MINILM_DIR;
+  else env.CHAMBER_MINILM_DIR = dir;
+  const r = spawnSync("python3", [...pythonFlags, script, ...args], {
     encoding: "utf8",
     input,
     timeout: 120_000,
-    env: { ...process.env, CHAMBER_MINILM_DIR: dir },
+    env,
   });
   assert(r.error === undefined, `python3 did not run: ${r.error}`);
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
 test("config", "weights that do not match VERSION exit 3 in every mode, naming both hashes", () => {
-  const bad = tamperedVersion();
-  const dir = minilmDirWithVersion(bad.text);
+  const bad = tamperedWeights();
+  const dir = bad.dir;
   try {
     for (const [label, args, input] of [
       ["one-shot", ["a sentence"], undefined],
@@ -13420,31 +13473,105 @@ test("config", "weights that do not match VERSION exit 3 in every mode, naming b
   }
 });
 
-test("config", "a missing VERSION or a VERSION without a SHA-256 line also exits 3", () => {
+test("config", "a missing or unreadable VERSION, or one without exactly one of each hash, also exits 3", () => {
+  const { weights, tokenizer } = recordedHashes();
+  const both = `SHA-256:  ${weights}\nVocab-SHA-256:  ${tokenizer}\n`;
   for (const [label, version, want] of [
     ["missing VERSION", null, "cannot read"],
-    ["no SHA-256 line", "File: model_quantized.onnx\nSize: 22972370 bytes\n", "no SHA-256 line"],
-    ["short digest", "SHA-256:  afdb6f1a0e45b715d0bb9b11772f032c\n", "no SHA-256 line"],
+    ["not UTF-8", Buffer.from([0xff, 0xfe, 0xfd]), "is not UTF-8"],
+    ["no SHA-256 line", `File: model_quantized.onnx\nVocab-SHA-256:  ${tokenizer}\n`, "no SHA-256 line"],
+    ["short digest", `SHA-256:  afdb6f1a0e45b715d0bb9b11772f032c\nVocab-SHA-256:  ${tokenizer}\n`, "no SHA-256 line"],
+    ["a VERSION from before the tokenizer was hashed", `SHA-256:  ${weights}\n`, "no Vocab-SHA-256 line"],
+    ["two weights lines", `${both}SHA-256:  ${weights}\n`, "more than one SHA-256 line"],
+    ["two tokenizer lines", `${both}Vocab-SHA-256:  ${tokenizer}\n`, "more than one Vocab-SHA-256 line"],
   ] as const) {
-    const dir = minilmDirWithVersion(version);
+    // A package of its own, so this VERSION is the installed one.
+    const pkg = fakePackage(version);
     try {
-      const r = runEmbedScript(dir, ["a sentence"]);
+      const r = runEmbedScript(null, ["a sentence"], undefined, [], pkg.script);
       assert(r.status === 3, `${label}: exit ${r.status}, stderr ${r.stderr}`);
       assert(r.stderr.includes(want) && r.stderr.includes("VERSION"), `${label}: ${r.stderr}`);
       assert(r.stdout === "", `${label}: wrote a reply before refusing`);
+    } finally {
+      rmSync(pkg.root, { recursive: true, force: true });
+    }
+  }
+  // And the control: the same fake package with a VERSION that records both
+  // hashes is not refused, so the cases above fail for the VERSION and not for
+  // the copy. Where numpy and onnxruntime are missing the script fails later and
+  // differently, which is not exit 3.
+  const ok = fakePackage(both);
+  try {
+    const r = runEmbedScript(null, ["a sentence"], undefined, [], ok.script);
+    assert(r.status !== 3 && !r.stderr.includes("SHA-256"), `a good VERSION was refused: ${r.stderr}`);
+  } finally {
+    rmSync(ok.root, { recursive: true, force: true });
+  }
+});
+
+test("config", "a tokenizer that does not match VERSION exits 3 in every mode, naming both hashes", () => {
+  const dir = minilmDirWith({ tokenizer: NOT_THE_TOKENIZER });
+  try {
+    const want = recordedHashes().tokenizer;
+    const got = sha256Hex(NOT_THE_TOKENIZER);
+    for (const [label, args, input] of [
+      ["one-shot", ["a sentence"], undefined],
+      ["--json -", ["--json", "-"], '["a sentence"]'],
+      ["--serve", ["--serve"], '["a sentence"]\n'],
+    ] as const) {
+      const r = runEmbedScript(dir, args, input);
+      assert(r.status === 3, `${label}: exit ${r.status}, stderr ${r.stderr}`);
+      assert(r.stdout === "", `${label}: wrote a reply before refusing: ${r.stdout}`);
+      const lines = r.stderr.trim().split("\n");
+      assert(lines.length === 1, `${label}: expected one stderr line, got ${lines.length}: ${r.stderr}`);
+      assert(
+        lines[0]!.includes("tokenizer.json") && lines[0]!.includes(got) && lines[0]!.includes(want),
+        `${label}: the line must name the tokenizer and both hashes: ${lines[0]}`,
+      );
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "a directory CHAMBER_MINILM_DIR names cannot vouch for itself with a VERSION of its own", () => {
+  // Weights and tokenizer that are not the shipped ones, and a VERSION in the
+  // same directory that records exactly what they hash to. Before this rule that
+  // directory passed its own check.
+  const own = `SHA-256:  ${sha256Hex(NOT_THE_WEIGHTS)}\nVocab-SHA-256:  ${sha256Hex(NOT_THE_TOKENIZER)}\n`;
+  const recorded = recordedHashes();
+  for (const [label, opts, shipped] of [
+    ["weights", { weights: NOT_THE_WEIGHTS, ownVersion: own }, recorded.weights],
+    ["tokenizer", { tokenizer: NOT_THE_TOKENIZER, ownVersion: own }, recorded.tokenizer],
+  ] as const) {
+    const dir = minilmDirWith(opts);
+    try {
+      const r = runEmbedScript(dir, ["a sentence"]);
+      assert(r.status === 3, `${label}: the directory vouched for itself (exit ${r.status}): ${r.stderr}`);
+      assert(r.stderr.includes(shipped), `${label}: the refusal does not name the shipped hash: ${r.stderr}`);
+      assert(!r.stderr.includes(dir + "/VERSION"), `${label}: the directory's own VERSION was read: ${r.stderr}`);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   }
 });
 
+test("config", "models/minilm/VERSION records both hashes, and its original SHA-256 line is still the only one the original pattern reads", () => {
+  const real = readFileSync(join(REAL_MODEL_DIR, "VERSION"), "utf8");
+  // The pattern the script used before the tokenizer was hashed: a reader that
+  // only knows it must still find the weights' hash, and only that.
+  const original = [...real.matchAll(/^SHA-256:\s*([0-9a-fA-F]{64})\s*$/gm)];
+  const weightsHash = sha256Hex(readFileSync(join(REAL_MODEL_DIR, "model_quantized.onnx")));
+  assert(original.length === 1 && original[0]![1] === weightsHash, `the original pattern reads ${JSON.stringify(original.map((m) => m[1]))}`);
+  const tokenizerHash = sha256Hex(readFileSync(join(REAL_MODEL_DIR, "tokenizer.json")));
+  assert(recordedHashes().tokenizer === tokenizerHash, "VERSION's Vocab-SHA-256 is not the hash of models/minilm/tokenizer.json");
+});
+
 test("config", "the real model directory passes the weights check", () => {
-  // Same files, VERSION untouched: the check lets it through. Where an
-  // embedder runs here it must also answer; where numpy or onnxruntime is
-  // missing the script fails later and differently, which is not exit 3.
-  const dir = minilmDirWithVersion(
-    readFileSync(fileURLToPath(new URL("../models/minilm/VERSION", import.meta.url)), "utf8"),
-  );
+  // The shipped files, reached through CHAMBER_MINILM_DIR: the check lets them
+  // through. Where an embedder runs here it must also answer; where numpy or
+  // onnxruntime is missing the script fails later and differently, which is not exit 3.
+  const dir = minilmDirWith({});
   try {
     const r = runEmbedScript(dir, ["a sentence"]);
     assert(r.status !== 3 && !r.stderr.includes("SHA-256"), `refused the real weights: ${r.stderr}`);
@@ -13460,7 +13587,7 @@ test("config", "the real model directory passes the weights check", () => {
 });
 
 test("config", "refused MiniLM weights make every embed path throw, in auto mode as well as with minilm preferred, and never write hash vectors", () => {
-  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const dir = tamperedWeights().dir;
   const saved = process.env.CHAMBER_MINILM_DIR;
   const savedKind = process.env.CHAMBER_EMBEDDER;
   const savedWrite = process.stderr.write;
@@ -13515,10 +13642,8 @@ test("config", "refused MiniLM weights make every embed path throw, in auto mode
 });
 
 test("config", "weights swapped after the probe passed still throw from embedLocal auto instead of degrading", () => {
-  const good = minilmDirWithVersion(
-    readFileSync(fileURLToPath(new URL("../models/minilm/VERSION", import.meta.url)), "utf8"),
-  );
-  const bad = minilmDirWithVersion(tamperedVersion().text);
+  const good = minilmDirWith({});
+  const bad = tamperedWeights().dir;
   const saved = process.env.CHAMBER_MINILM_DIR;
   const savedKind = process.env.CHAMBER_EMBEDDER;
   process.env.CHAMBER_MINILM_DIR = good;
@@ -13552,7 +13677,7 @@ test("config", "weights swapped after the probe passed still throw from embedLoc
 });
 
 test("config", "an ingest with refused MiniLM weights stops, writes no hash vectors, and a search stops too", () => {
-  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const dir = tamperedWeights().dir;
   const notes = mkdtempSync(join(tmpdir(), "chamber-refused-notes-"));
   writeFileSync(join(notes, "a.md"), "# Alpha\n\nA passage about refund windows.\n");
   const db = freshDb();
@@ -13592,7 +13717,7 @@ test("gates", "refused MiniLM weights soften the debt check inside the commit's 
   // write are one transaction) and catches the embedder's throw right there.
   // The refusal now throws where it used to return hash vectors, and it must
   // land in that catch: the check is recorded as not run, the commit goes on.
-  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const dir = tamperedWeights().dir;
   const db = freshDb();
   const indebted = "The refund policy allows returns within 30 days.";
   insertDebt(db, claimHash("belief", indebted), indebted);
@@ -13629,7 +13754,7 @@ test("gates", "refused MiniLM weights are named in the debt:degraded record and 
   // The commit goes through (FM-6), so this record and this line are the only
   // places an operator can learn that the paraphrase gate is off because the
   // weights changed, and not because python is missing.
-  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const dir = tamperedWeights().dir;
   const db = freshDb();
   const indebted = "The refund policy allows returns within 30 days.";
   insertDebt(db, claimHash("belief", indebted), indebted);
@@ -13693,8 +13818,8 @@ test("gates", "refused MiniLM weights are named in the debt:degraded record and 
 });
 
 test("config", "the integrity refusal keeps the hash VERSION records, however long the model path is", () => {
-  const t = tamperedVersion();
-  const short = minilmDirWithVersion(t.text);
+  const t = tamperedWeights();
+  const short = t.dir;
   // The refusal is one line with two absolute paths in it, and the hash that
   // matters is last. The 08:30 job's own path already put it past 300 characters.
   const dir = `${short}-${"x".repeat(150)}`;

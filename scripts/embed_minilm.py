@@ -13,10 +13,11 @@ into a model transcript.
 
 Stdout: JSON float arrays. Stderr: logs.
 
-Exit status 3: the model weights were not loaded because they are not the ones
-models/minilm/VERSION records -- the SHA-256 differs, VERSION is missing, or it
-has no SHA-256 line. The check runs in every mode, before the first reply and
-before numpy or onnxruntime is imported.
+Exit status 3: the model files were not loaded because they are not the ones the
+package's own models/minilm/VERSION records -- the SHA-256 of
+model_quantized.onnx or of tokenizer.json differs, VERSION is missing or is not
+UTF-8, or it lacks exactly one line for either hash. The check runs in every
+mode, before the first reply and before numpy or onnxruntime is imported.
 """
 from __future__ import annotations
 
@@ -35,11 +36,15 @@ ort = None
 Tokenizer = None
 
 ROOT = Path(__file__).resolve().parents[1]
-# CHAMBER_MINILM_DIR exists so a test can point this script at a copy of the
-# model directory with a doctored VERSION. It is not a configuration surface:
-# whatever directory it names is held to the same rule, that the weights must
-# match the SHA-256 in that directory's own VERSION file.
-MODEL_DIR = Path(os.environ.get("CHAMBER_MINILM_DIR") or ROOT / "models" / "minilm")
+# What the files must be comes from the installed package, always: VERSION is
+# read from ROOT/models/minilm and from nowhere else. CHAMBER_MINILM_DIR moves
+# only the weights and the tokenizer, so a directory it names is held to the
+# package's hashes and cannot vouch for itself with a VERSION of its own. It
+# exists so a test can point this script at doctored files; it is not a
+# configuration surface.
+PACKAGE_MODEL_DIR = ROOT / "models" / "minilm"
+VERSION_PATH = PACKAGE_MODEL_DIR / "VERSION"
+MODEL_DIR = Path(os.environ.get("CHAMBER_MINILM_DIR") or PACKAGE_MODEL_DIR)
 ONNX_PATH = MODEL_DIR / "model_quantized.onnx"
 TOK_PATH = MODEL_DIR / "tokenizer.json"
 
@@ -54,51 +59,75 @@ _measurer: Tokenizer | None = None
 
 
 EXIT_WEIGHTS_REFUSED = 3
-VERSION_PATH = MODEL_DIR / "VERSION"
-# models/minilm/VERSION records the hash as `SHA-256:  <64 hex digits>`.
+# models/minilm/VERSION records each hash on a line of its own, 64 hex digits:
+# `SHA-256:` for model_quantized.onnx (the original line, and still the weights)
+# and `Vocab-SHA-256:` for tokenizer.json. The patterns are anchored, so the
+# second does not match the first: a reader that only knows `SHA-256:` still
+# reads this file.
 _SHA256_LINE = re.compile(r"^SHA-256:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
+_VOCAB_SHA256_LINE = re.compile(r"^Vocab-SHA-256:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
 _weights_verified = False
 
 
 def _refuse_weights(reason: str) -> NoReturn:
-    print(f"embed_minilm: {reason}; not loading {ONNX_PATH.name}", file=sys.stderr)
+    print(f"embed_minilm: {reason}; not loading the model", file=sys.stderr)
     sys.exit(EXIT_WEIGHTS_REFUSED)
 
 
+def _recorded_hash(text: str, pattern: re.Pattern[str], name: str) -> str:
+    """The one hash `pattern` finds in VERSION, or a refusal: none and several both refuse."""
+    found = pattern.findall(text)
+    if len(found) == 0:
+        _refuse_weights(f"{VERSION_PATH} has no {name} line with 64 hex digits")
+    if len(found) > 1:
+        _refuse_weights(f"{VERSION_PATH} has more than one {name} line")
+    return found[0].lower()
+
+
+def _sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def verify_weights() -> None:
-    """Refuse to load model_quantized.onnx unless it matches VERSION's SHA-256.
+    """Refuse to load the model files unless they match the package's VERSION.
 
-    These weights feed retrieval, which feeds the citation-pin path, and they
-    are a 23 MB binary that onnxruntime parses. VERSION has always recorded the
-    hash; nothing ever compared it. Streamed, so the file is not held in memory,
-    and done once per process.
+    model_quantized.onnx is a 23 MB binary that onnxruntime parses and
+    tokenizer.json is parsed by the same process; both feed retrieval, which
+    feeds the citation-pin path. VERSION is the package's own, never the one in
+    a CHAMBER_MINILM_DIR directory, and records one SHA-256 for each. Streamed,
+    so the weights are not held in memory, and done once per process.
 
-    Exit 3, one stderr line, and no model loaded when the hash differs, VERSION
-    is missing, or VERSION has no SHA-256 line. This runs before numpy and
-    onnxruntime are imported, so it needs neither.
+    Exit 3, one stderr line, and no model loaded when either hash differs,
+    VERSION is missing or is not UTF-8, or it has not exactly one line for
+    either hash. This runs before numpy and onnxruntime are imported, so it
+    needs neither.
     """
     global _weights_verified
     if _weights_verified:
         return
-    if not ONNX_PATH.is_file():
-        raise SystemExit(f"missing model: {ONNX_PATH}")
+    for path, what in ((ONNX_PATH, "model"), (TOK_PATH, "tokenizer")):
+        if not path.is_file():
+            raise SystemExit(f"missing {what}: {path}")
     try:
         version_text = VERSION_PATH.read_text(encoding="utf-8")
     except OSError as e:
         _refuse_weights(f"cannot read {VERSION_PATH} ({e.strerror or e})")
-    match = _SHA256_LINE.search(version_text)
-    if match is None:
-        _refuse_weights(f"{VERSION_PATH} has no SHA-256 line with 64 hex digits")
-    expected = match.group(1).lower()
-    digest = hashlib.sha256()
-    with ONNX_PATH.open("rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            digest.update(block)
-    actual = digest.hexdigest()
-    if actual != expected:
-        _refuse_weights(
-            f"{ONNX_PATH} has SHA-256 {actual}, but {VERSION_PATH} records {expected}"
-        )
+    except UnicodeDecodeError:
+        _refuse_weights(f"{VERSION_PATH} is not UTF-8")
+    # Both lines are read before anything is hashed, so a bad VERSION is
+    # reported as itself and not as a mismatch.
+    recorded = (
+        (ONNX_PATH, _recorded_hash(version_text, _SHA256_LINE, "SHA-256")),
+        (TOK_PATH, _recorded_hash(version_text, _VOCAB_SHA256_LINE, "Vocab-SHA-256")),
+    )
+    for path, expected in recorded:
+        actual = _sha256_of(path)
+        if actual != expected:
+            _refuse_weights(f"{path} has SHA-256 {actual}, but {VERSION_PATH} records {expected}")
     _weights_verified = True
 
 
@@ -115,8 +144,6 @@ def _load() -> tuple[ort.InferenceSession, Tokenizer]:
             str(ONNX_PATH), sess_options=so, providers=["CPUExecutionProvider"]
         )
     if _tokenizer is None:
-        if not TOK_PATH.is_file():
-            raise SystemExit(f"missing tokenizer: {TOK_PATH}")
         _tokenizer = Tokenizer.from_file(str(TOK_PATH))
         # 256 is all-MiniLM-L6-v2's own trained max_seq_length, not a number
         # picked here -- so this is the model's limit, not a cap worth raising.

@@ -4,6 +4,9 @@
  *
  *   TELEGRAM_BOT_TOKEN=... node --experimental-strip-types src/gateway_runner.ts
  *
+ * Telegram answers only the numeric user ids in CHAMBER_TELEGRAM_ALLOWED_USERS
+ * (empty = nobody); see `canTelegramTalk` in src/gateway.ts.
+ *
  * The database is whichever one Chamber's settings name (CHAMBER_DB, then the
  * config file, then the durable default) — see `openConfiguredDb` in src/db.ts.
  */

@@ -49,9 +49,34 @@ export class ConsoleGateway implements GatewayAdapter {
   }
 }
 
+/** What a sender who is not on `CHAMBER_TELEGRAM_ALLOWED_USERS` is told, in a private chat. */
+export const TELEGRAM_TALK_REFUSAL = "You are not on CHAMBER_TELEGRAM_ALLOWED_USERS.";
+
+/** The numeric user ids in `CHAMBER_TELEGRAM_ALLOWED_USERS`: a comma list, entries trimmed, blanks dropped. */
+export function telegramTalkAllowlist(): Set<string> {
+  return new Set(
+    (process.env.CHAMBER_TELEGRAM_ALLOWED_USERS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+}
+
+/**
+ * Who may talk to the bot. Fail-closed, like the Discord and Slack lists: an
+ * empty allowlist means nobody, and a message with no sender (a channel post)
+ * is nobody's. The gateway had no talk gate at all, so anyone who found the
+ * bot's handle could drive a turn, spend the model budget and write
+ * observations into the ledger.
+ */
+export function canTelegramTalk(userId: string | undefined): boolean {
+  return userId !== undefined && telegramTalkAllowlist().has(userId);
+}
+
 /**
  * Telegram long-poll adapter (optional).
  * Requires TELEGRAM_BOT_TOKEN. Soft-no-op if missing.
+ * Only senders on `CHAMBER_TELEGRAM_ALLOWED_USERS` reach `onMessage`.
  */
 export class TelegramGateway implements GatewayAdapter {
   name: GatewayChannel = "telegram";
@@ -67,7 +92,7 @@ export class TelegramGateway implements GatewayAdapter {
     return !!this.token;
   }
 
-  private api(method: string, body?: Record<string, unknown>): unknown {
+  protected api(method: string, body?: Record<string, unknown>): unknown {
     if (!this.token) throw new Error("TELEGRAM_BOT_TOKEN not set");
     // The bot token is part of the URL path, which is why this goes through
     // `httpSync`: the URL is on curl's stdin, not on its command line.
@@ -98,6 +123,9 @@ export class TelegramGateway implements GatewayAdapter {
       console.log("Telegram gateway: TELEGRAM_BOT_TOKEN not set — disabled");
       return;
     }
+    if (telegramTalkAllowlist().size === 0) {
+      console.warn("chamber: CHAMBER_TELEGRAM_ALLOWED_USERS is empty, so nobody can talk to this bot");
+    }
     this.running = true;
     console.log("Telegram gateway: long-poll started");
     while (this.running) {
@@ -112,7 +140,7 @@ export class TelegramGateway implements GatewayAdapter {
             message?: {
               message_id: number;
               text?: string;
-              chat: { id: number };
+              chat: { id: number; type?: string };
               from?: { id: number };
             };
           }[];
@@ -121,10 +149,21 @@ export class TelegramGateway implements GatewayAdapter {
           this.offset = u.update_id + 1;
           const m = u.message;
           if (!m?.text) continue;
+          const userId = m.from ? String(m.from.id) : undefined;
+          // Before onMessage: that callback is the gated turn, which writes an
+          // observation before it replies.
+          if (!canTelegramTalk(userId)) {
+            // Told only in a private chat; in a group the refusal would answer
+            // every member who is not listed.
+            if (m.chat.type === "private") {
+              await this.send({ channel: "telegram", chatId: String(m.chat.id), text: TELEGRAM_TALK_REFUSAL });
+            }
+            continue;
+          }
           const reply = await onMessage({
             channel: "telegram",
             chatId: String(m.chat.id),
-            userId: m.from ? String(m.from.id) : undefined,
+            userId,
             text: m.text,
             messageId: String(m.message_id),
           });

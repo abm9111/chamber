@@ -3,6 +3,29 @@
 All notable changes to Chamber. Versions before 0.1.6 are described in the git
 history and the GitHub releases.
 
+## Unreleased
+
+### Changed (breaking)
+
+- **The Telegram gateway answers only listed senders.** It had no talk gate:
+  anyone who found the bot could drive a turn, spend the model budget and
+  write observations. `CHAMBER_TELEGRAM_ALLOWED_USERS` is a comma list of
+  numeric Telegram user ids; empty or unset means nobody, like the Discord and
+  Slack lists, and the gateway says so at startup. The check runs before the
+  turn, so a refused message writes nothing. A refused sender is told so in a
+  private chat and ignored in a group, and a message with no sender is ignored.
+
+### Fixed
+
+- **The OAuth authorize URL is checked before it is opened.**
+  `authorization_endpoint` comes from the authorization server's metadata,
+  which the MCP server being connected to chooses, and the URL is passed to
+  `open` / `xdg-open`. It now has to be HTTPS, or http on a loopback host, the
+  rule the token endpoint already followed. `CHAMBER_OAUTH_ALLOW_HTTP=1` still
+  allows plain http to any host, but no longer any other scheme: it used to
+  skip the check entirely, so `file:`, `smb:` and application URL schemes
+  passed too.
+
 ## 0.2.0 — 2026-10-23
 
 ### Added

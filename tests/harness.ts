@@ -10,7 +10,7 @@ import { CURL_FIXED_ARGV, buildCurlInvocation, httpSync } from "../src/http_sync
 import { TurnPool, TurnWorkerError } from "../src/turn_pool.ts";
 import { isSqliteBusy } from "../src/turn.ts";
 import { mcpDiscover } from "../src/mcp_client.ts";
-import { TelegramGateway } from "../src/gateway.ts";
+import { TelegramGateway, canTelegramTalk, TELEGRAM_TALK_REFUSAL } from "../src/gateway.ts";
 import { claimHash, newId, sha256 } from "../src/hash.ts";
 import { commitBelief } from "../src/commit_belief.ts";
 import {
@@ -319,6 +319,7 @@ type Suite =
   | "qm"
   | "slack"
   | "discord"
+  | "telegram"
   | "pins"
   | "cli"
   | "config"
@@ -434,6 +435,7 @@ function suiteFromArg(): Suite {
     "qm",
     "slack",
     "discord",
+    "telegram",
     "pins",
     "cli",
     "config",
@@ -7676,6 +7678,61 @@ test("oauth", "O2_authorize_url_resource", () => {
   assert(url.includes("code_challenge_method=S256"), url);
 });
 
+test("oauth", "O2b_authorize_url_refuses_an_endpoint_the_browser_should_not_open", () => {
+  // authorization_endpoint comes from the authorization server's metadata,
+  // which the MCP server being connected to chooses. The URL is printed and
+  // handed to `open` / `xdg-open`, which launch whatever its scheme names.
+  const build = (authorizationEndpoint: string): string =>
+    buildAuthorizeUrl({
+      authorizationEndpoint,
+      clientId: "chamber-cli",
+      redirectUri: "http://127.0.0.1:8765/callback",
+      resource: "https://mcp.example/mcp",
+      state: "st",
+      codeChallenge: "ch",
+    });
+  const refusalOf = (endpoint: string): string => {
+    try {
+      build(endpoint);
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+    return "";
+  };
+  const hostile = [
+    "file:///Applications/Calculator.app",
+    "smb://attacker.invalid/share",
+    "x-man-page://ls",
+    "javascript:alert(1)",
+    "http://attacker.invalid/authorize",
+    "http://127.0.0.1.attacker.invalid/authorize",
+    "not a url",
+  ];
+  withEnv({ CHAMBER_OAUTH_ALLOW_HTTP: undefined }, () => {
+    for (const endpoint of hostile) {
+      const message = refusalOf(endpoint);
+      assert(
+        message === "authorization_endpoint must be HTTPS (or set CHAMBER_OAUTH_ALLOW_HTTP=1 for lab)",
+        `${JSON.stringify(endpoint)} must be refused, got ${JSON.stringify(message)}`,
+      );
+    }
+    assert(build("https://auth.example/authorize").startsWith("https://auth.example/authorize?"), "https passes");
+    assert(build("http://127.0.0.1:9/authorize").startsWith("http://127.0.0.1:9/authorize?"), "loopback http passes");
+  });
+  // The lab switch allows plain http to any host. It never allowed a URL the
+  // browser hands to another application.
+  withEnv({ CHAMBER_OAUTH_ALLOW_HTTP: "1" }, () => {
+    assert(build("http://lab.example/authorize").startsWith("http://lab.example/authorize?"), "lab http passes");
+    for (const endpoint of hostile.slice(0, 4)) {
+      const message = refusalOf(endpoint);
+      assert(
+        message === "authorization_endpoint must be an http or https URL",
+        `${JSON.stringify(endpoint)} must be refused under the lab switch, got ${JSON.stringify(message)}`,
+      );
+    }
+  });
+});
+
 test("oauth", "O3_token_store_roundtrip", () => {
   const db = freshDb();
   const res = normalizeResourceUrl("https://mcp.example.com/mcp/");
@@ -8364,6 +8421,98 @@ test("discord", "D6_talk_allowlist", () => {
     if (savedLegacy === undefined) delete process.env.DISCORD_ALLOWED_USERS;
     else process.env.DISCORD_ALLOWED_USERS = savedLegacy;
   }
+});
+
+test("telegram", "T1_talk_allowlist_fails_closed", () => {
+  // The Telegram gateway had no talk gate: anyone who found the bot could
+  // drive a turn, spend the model budget and write observations.
+  const saved = process.env.CHAMBER_TELEGRAM_ALLOWED_USERS;
+  try {
+    delete process.env.CHAMBER_TELEGRAM_ALLOWED_USERS;
+    assert(!canTelegramTalk("111"), "an unset list means nobody may talk");
+    process.env.CHAMBER_TELEGRAM_ALLOWED_USERS = "";
+    assert(!canTelegramTalk("111"), "an empty list means nobody may talk");
+    process.env.CHAMBER_TELEGRAM_ALLOWED_USERS = " , ";
+    assert(!canTelegramTalk("111"), "a list of blanks means nobody may talk");
+    process.env.CHAMBER_TELEGRAM_ALLOWED_USERS = "111, 333 ,";
+    assert(canTelegramTalk("111"), "a listed user may talk");
+    assert(canTelegramTalk("333"), "entries are trimmed");
+    assert(!canTelegramTalk("222"), "an unlisted user may not");
+    assert(!canTelegramTalk(undefined), "a message with no sender may not");
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_TELEGRAM_ALLOWED_USERS;
+    else process.env.CHAMBER_TELEGRAM_ALLOWED_USERS = saved;
+  }
+});
+
+/** A TelegramGateway whose Bot API is one canned batch of updates, then nothing. */
+class CannedTelegram extends TelegramGateway {
+  batch: unknown[];
+  polls = 0;
+  sent: { chatId: string; text: string }[] = [];
+  constructor(batch: unknown[]) {
+    super("TESTTOKEN-not-real");
+    this.batch = batch;
+  }
+  protected override api(method: string, body?: Record<string, unknown>): unknown {
+    if (method === "sendMessage") {
+      this.sent.push({ chatId: String(body?.chat_id), text: String(body?.text) });
+      return { ok: true };
+    }
+    if (method === "getUpdates") {
+      this.polls += 1;
+      if (this.polls === 1) return { ok: true, result: this.batch };
+      void this.stop();
+      return { ok: true, result: [] };
+    }
+    throw new Error(`unexpected Bot API method ${method}`);
+  }
+}
+
+test("telegram", "T2_the_poll_loop_never_hands_an_unlisted_sender_to_the_turn", async () => {
+  // Drives the real start() loop, which both the gateway runner and the
+  // plugin use. The guard has to fire before onMessage: that callback is the
+  // gated turn, and the turn writes an observation before it replies.
+  const update = (id: number, from: number | undefined, chatType: string) => ({
+    update_id: id,
+    message: {
+      message_id: id,
+      text: `hello ${id}`,
+      chat: { id: 9000 + id, type: chatType },
+      ...(from === undefined ? {} : { from: { id: from } }),
+    },
+  });
+  await withEnvAsync({ CHAMBER_TELEGRAM_ALLOWED_USERS: "111" }, async () => {
+    const gw = new CannedTelegram([
+      update(1, 111, "private"), // listed: reaches the turn
+      update(2, 222, "private"), // unlisted, private chat: refused, and told
+      update(3, 222, "group"), // unlisted, group: refused silently
+      update(4, undefined, "channel"), // no sender: refused silently
+    ]);
+    const turns: string[] = [];
+    await gw.start(async (msg) => {
+      turns.push(`${msg.userId}:${msg.text}`);
+      return "turn reply";
+    });
+    assert(JSON.stringify(turns) === JSON.stringify(["111:hello 1"]), `turns: ${JSON.stringify(turns)}`);
+    assert(
+      JSON.stringify(gw.sent) ===
+        JSON.stringify([
+          { chatId: "9001", text: "turn reply" },
+          { chatId: "9002", text: TELEGRAM_TALK_REFUSAL },
+        ]),
+      `sent: ${JSON.stringify(gw.sent)}`,
+    );
+  });
+  await withEnvAsync({ CHAMBER_TELEGRAM_ALLOWED_USERS: undefined }, async () => {
+    const gw = new CannedTelegram([update(5, 111, "private")]);
+    let reached = false;
+    await gw.start(async () => {
+      reached = true;
+      return "x";
+    });
+    assert(!reached, "with no list set, nobody reaches the turn");
+  });
 });
 
 test("slack", "S_talk_allowlist_fails_closed", () => {
@@ -17998,6 +18147,24 @@ async function scriptedModel(
       server.close();
     },
   };
+}
+
+/** Set environment variables for the duration of `fn`; `undefined` deletes. */
+function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T): T {
+  const saved = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(vars)) {
+    saved.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [key, prev] of saved) {
+      if (prev === undefined) delete process.env[key];
+      else process.env[key] = prev;
+    }
+  }
 }
 
 /** Set environment variables for the duration of `fn`; `undefined` deletes. */

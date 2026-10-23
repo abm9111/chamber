@@ -16263,6 +16263,78 @@ test("release", "a pin whose reload failed after the checkout moved says nothing
   });
 });
 
+// ─── a model file that is not a regular file is refused, not waited on ──────
+
+/** A FIFO at `path`. Nothing ever opens its other end. */
+function makeFifo(path: string): void {
+  const r = spawnSync("mkfifo", [path], { encoding: "utf8" });
+  assert(r.status === 0, `mkfifo ${path} failed: ${r.stderr}`);
+}
+
+/** The interpreter the embedder tests are told to use: CHAMBER_PYTHON when set, else python3 from PATH. */
+function embedPython(): string {
+  return (process.env.CHAMBER_PYTHON ?? "").trim() || "python3";
+}
+
+test("config", "a model file that is a FIFO or a directory is refused with exit 3 in every mode, without waiting, and a missing weights file stays exit 1", () => {
+  // A model directory whose one file is replaced by `make`'s result.
+  const dirWith = (name: "model_quantized.onnx" | "tokenizer.json", make: (path: string) => void): string => {
+    const dir = minilmDirWith({});
+    rmSync(join(dir, name));
+    make(join(dir, name));
+    return dir;
+  };
+  const fifoTokenizer = dirWith("tokenizer.json", makeFifo);
+  const dirTokenizer = dirWith("tokenizer.json", (p) => mkdirSync(p));
+  const fifoWeights = dirWith("model_quantized.onnx", makeFifo);
+  const noWeights = dirWith("model_quantized.onnx", () => undefined);
+  try {
+    for (const [label, args, input] of [
+      ["one-shot", ["a sentence"], undefined],
+      ["--json -", ["--json", "-"], '["a sentence"]'],
+      ["--serve", ["--serve"], '["a sentence"]\n'],
+    ] as const) {
+      for (const [what, dir] of [
+        ["a FIFO tokenizer.json", fifoTokenizer],
+        ["a directory as tokenizer.json", dirTokenizer],
+        ["a FIFO weights file", fifoWeights],
+      ] as const) {
+        // Bounded: a read that waits for a writer that never comes is killed
+        // after 10 s and fails here, instead of hanging the suite.
+        const r = spawnSync(embedPython(), [EMBED_SCRIPT, ...args], {
+          encoding: "utf8",
+          input,
+          timeout: 10_000,
+          env: { ...process.env, CHAMBER_MINILM_DIR: dir },
+        });
+        assert(r.error === undefined, `${label}, ${what}: the script did not finish within 10 s (${String(r.error)})`);
+        assert(r.status === 3, `${label}, ${what}: exit ${r.status}, stderr ${r.stderr}`);
+        assert(r.stdout === "", `${label}, ${what}: wrote a reply before refusing: ${r.stdout}`);
+        const lines = r.stderr.trim().split("\n");
+        assert(lines.length === 1, `${label}, ${what}: expected one stderr line, got ${lines.length}: ${r.stderr}`);
+        assert(lines[0]!.includes("is not a regular file"), `${label}, ${what}: the line does not say why: ${lines[0]}`);
+      }
+      // No weights file at all is still no embedder: exit 1, not a refusal.
+      const none = runEmbedScript(noWeights, args, input);
+      assert(none.status === 1 && none.stderr.includes("missing model"), `${label}, no weights file: exit ${none.status}, stderr ${none.stderr}`);
+    }
+  } finally {
+    for (const dir of [fifoTokenizer, dirTokenizer, fifoWeights, noWeights]) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the embedder's docstrings say a model file that cannot be read or is not a regular file is exit 3", () => {
+  const text = readFileSync(EMBED_SCRIPT, "utf8").replace(/\s+/g, " ");
+  const verify = text.slice(text.indexOf("def verify_weights"), text.indexOf("global _weights_verified"));
+  assert(verify.length > 0, "could not find verify_weights in scripts/embed_minilm.py");
+  assert(
+    verify.includes("a model file is not a regular file or cannot be read"),
+    "the verify_weights docstring does not say a non-regular or unreadable model file is exit 3",
+  );
+  const head = text.slice(0, text.indexOf("from __future__"));
+  assert(head.includes("a model file is not a regular file"), "the module docstring does not say a non-regular model file is exit 3");
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

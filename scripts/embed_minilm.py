@@ -16,10 +16,11 @@ Stdout: JSON float arrays. Stderr: logs.
 Exit status 3: the model files were not loaded because they are not the ones the
 package's own models/minilm/VERSION records -- the SHA-256 of
 model_quantized.onnx or of tokenizer.json differs, VERSION is missing or is not
-UTF-8, it lacks exactly one line for either hash, or tokenizer.json cannot be
-read while the weights file exists (a missing weights file is exit 1: there is
-no embedder). The check runs in every mode, before the first reply and before
-numpy or onnxruntime is imported.
+UTF-8, it lacks exactly one line for either hash, a model file is not a regular
+file (a FIFO or a directory; it is never opened for a blocking read), or
+tokenizer.json cannot be read while the weights file exists (a missing weights
+file is exit 1: there is no embedder). The check runs in every mode, before the
+first reply and before numpy or onnxruntime is imported.
 
 The files are read once. The bytes that were hashed are the bytes the session
 and the tokenizers are built from, so a file replaced on disk after the check is
@@ -31,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -102,9 +104,20 @@ def _read_hashed(path: Path, expected: str) -> bytes:
 
     At most MAX_MODEL_FILE_BYTES + 1 bytes are read, from one open, so a file of
     any size costs a bounded read and one over the cap is refused, not held.
+
+    The file is opened without blocking and it is the descriptor that was opened
+    that is checked with fstat and then read, so nothing can be swapped in
+    between the check and the read. A FIFO is refused as "not a regular file"
+    and not waited on: opening one for reading waits for a writer and reading it
+    waits for data, and either would stall every mode of this script with no
+    stderr line, where before this check it was exit 1.
     """
     try:
-        with path.open("rb") as f:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            _refuse_weights(f"{path} is not a regular file")
+        with os.fdopen(fd, "rb") as f:
             data = f.read(MAX_MODEL_FILE_BYTES + 1)
     except OSError as e:
         _refuse_weights(f"cannot read {path} ({e.strerror or e})")
@@ -128,9 +141,11 @@ def verify_weights() -> None:
     replaced after the check is not what loads. Done once per process.
 
     Exit 3, one stderr line, and no model loaded when either hash differs,
-    VERSION is missing or is not UTF-8, or it has not exactly one line for
-    either hash. This runs before numpy and onnxruntime are imported, so it
-    needs neither.
+    VERSION is missing or is not UTF-8, it has not exactly one line for either
+    hash, or a model file is not a regular file or cannot be read (a
+    tokenizer.json that is missing, unreadable, a FIFO or a directory included).
+    The weights file must exist: without it the exit is 1, no embedder. This
+    runs before numpy and onnxruntime are imported, so it needs neither.
     """
     global _weights_verified, _onnx_bytes, _tokenizer_json
     if _weights_verified:
@@ -141,7 +156,10 @@ def verify_weights() -> None:
     # same hashed reader below, so a tokenizer that is missing or unreadable
     # next to weights that exist is exit 3. As an ordinary failure it let a
     # tampered model file with no tokenizer fall through to hash vectors.
-    if not ONNX_PATH.is_file():
+    # `exists()`, not `is_file()`: a weights path that is there but is not a
+    # regular file (a FIFO, a directory) is not a missing file, and _read_hashed
+    # refuses it without a blocking read.
+    if not ONNX_PATH.exists():
         raise SystemExit(f"missing model: {ONNX_PATH}")
     try:
         version_text = VERSION_PATH.read_text(encoding="utf-8")

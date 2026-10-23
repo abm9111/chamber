@@ -15719,6 +15719,25 @@ test("release", "chamber pin gives pinRelease the snapshot job's plist path, and
   }
 });
 
+test("release", "a clone with no snapshot template gets the warning and no commands, so a printed sed cannot empty the job", () => {
+  withReleaseFixture((fx) => {
+    addSnapshotTag(fx, "withsnap");
+    // No putSnapshotTemplate: the clone pin runs from predates deploy/launchd.
+    const snap = writeSnapshotPlist(fx, "$HOME/Projects/chamber/scripts/daily-snapshot.sh");
+    const before = readFileSync(snap, "utf8");
+    const lc = fakeLaunchctl({ loaded: false });
+    const r = pinRelease({ ...pinOpts(fx, "withsnap", lc.run), snapshotPlistPath: snap });
+    assert(r.code === 0, r.err.join("\n"));
+    const at = r.out.findIndex((l) => l.startsWith(SNAPSHOT_WARNING));
+    assert(at >= 0 && r.out[at]!.includes("has no deploy/launchd/com.chamber.daily-snapshot.plist"), r.out.join("\n"));
+    assert(
+      !r.out.some((l) => l.includes("sed ") || l.includes("launchctl")),
+      `commands were printed with no template to build them from:\n${r.out.join("\n")}`,
+    );
+    assert(readFileSync(snap, "utf8") === before, "pin rewrote the snapshot plist");
+  });
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

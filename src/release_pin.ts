@@ -862,7 +862,7 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
  * The warning for a snapshot job that is not on the release, and the commands
  * that put it right. `problem` says what is wrong with it. A release with no
  * scripts/daily-snapshot.sh gets no commands: reinstalling the job would point
- * it at a file that is not there.
+ * it at a file that is not there. Nor does a clone with no template to copy.
  */
 function snapshotWarning(plistPath: string, sourceRoot: string, releaseDir: string, problem: string): string[] {
   const head =
@@ -874,8 +874,17 @@ function snapshotWarning(plistPath: string, sourceRoot: string, releaseDir: stri
         `then reinstall the job (see "Daily snapshot" in deploy/SCHEDULING.md).`,
     ];
   }
+  // The sed line truncates the plist before it reads the template, so a clone
+  // without one would leave the job empty: no template, no commands.
+  const templatePath = join(sourceRoot, "deploy", "launchd", `${SNAPSHOT_JOB_LABEL}.plist`);
+  if (!existsSync(templatePath)) {
+    return [
+      `${head} The clone pin ran from has no deploy/launchd/${SNAPSHOT_JOB_LABEL}.plist to reinstall it from: ` +
+        `run pin from a clone that has one (see "Daily snapshot" in deploy/SCHEDULING.md).`,
+    ];
+  }
   const plist = shellQuote(plistPath);
-  const template = shellQuote(join(sourceRoot, "deploy", "launchd", `${SNAPSHOT_JOB_LABEL}.plist`));
+  const template = shellQuote(templatePath);
   return [
     `${head} To reinstall it:`,
     `  launchctl unload ${plist}`,

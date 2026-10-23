@@ -232,7 +232,8 @@ installed, or it already runs the release checkout's script (written
 `$HOME/.local/share/chamber-release/scripts/daily-snapshot.sh`, or as the
 absolute path), pin prints nothing about it. If the release you pinned has no
 `scripts/daily-snapshot.sh`, the warning says so and prints no commands: pin a
-tag that has one first.
+tag that has one first. The same holds when the clone you ran pin from has no
+`deploy/launchd/com.chamber.daily-snapshot.plist`.
 
 **This takes effect for a release tag that contains this script.** v0.1.9's copy
 of `scripts/daily-snapshot.sh` has the old behaviour: it calls the `chamber` on

@@ -15782,8 +15782,9 @@ test("config", "the model and tokenizer that load are the bytes that were hashed
     const driver = join(work, "driver.py");
     writeFileSync(driver, REPLACE_AFTER_CHECK_DRIVER);
     const python = process.env.CHAMBER_PYTHON?.trim() || "python3";
-    // -B: do not leave a __pycache__ next to the script in the repository. -I: nothing from the environment or the cwd on sys.path.
-    const r = spawnSync(python, ["-B", "-I", driver, EMBED_SCRIPT], {
+    // -B: do not leave a __pycache__ next to the script in the repository. -E -P: no PYTHON* variables and
+    // not the script's directory on sys.path. Not -I: it also drops the user site, where CI's pip puts numpy.
+    const r = spawnSync(python, ["-B", "-E", "-P", driver, EMBED_SCRIPT], {
       encoding: "utf8",
       timeout: 120_000,
       env: { ...process.env, CHAMBER_MINILM_DIR: dir },
@@ -15792,7 +15793,7 @@ test("config", "the model and tokenizer that load are the bytes that were hashed
     assert(
       readFileSync(join(dir, "model_quantized.onnx"), "utf8") === "replaced after the hash" &&
         readFileSync(join(dir, "tokenizer.json"), "utf8") === "replaced after the hash",
-      "the driver did not replace the files, so this run proves nothing",
+      `the driver did not replace the files, so this run proves nothing (exit ${r.status}): ${(r.stderr ?? "").slice(-600)}`,
     );
     assert(r.status === 0, `the embedder loaded what was on disk after the check (exit ${r.status}): ${(r.stderr ?? "").slice(-600)}`);
     const got = JSON.parse((r.stdout ?? "").trim().split("\n").pop() ?? "[]") as number[];

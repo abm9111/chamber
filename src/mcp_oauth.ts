@@ -117,12 +117,18 @@ export function normalizeResourceUrl(url: string): string {
  * including a string that does not parse, is refused with the same message.
  */
 export function requireHttps(url: string, label: string): void {
-  if (process.env.CHAMBER_OAUTH_ALLOW_HTTP === "1") return;
   let protocol = "";
   try {
     protocol = new URL(url).protocol;
   } catch {
     // Not a URL: protocol stays "" and the refusal below applies.
+  }
+  if (process.env.CHAMBER_OAUTH_ALLOW_HTTP === "1") {
+    // The lab switch allows plain http to any host. It used to return before
+    // parsing, so it also allowed file:, smb: and any scheme an application
+    // registers, which `open` launches when handed an authorize URL.
+    if (protocol === "https:" || protocol === "http:") return;
+    throw new Error(`${label} must be an http or https URL`);
   }
   const ok = protocol === "https:" || (protocol === "http:" && isLoopbackBase(url));
   if (!ok) {
@@ -286,6 +292,10 @@ export function buildAuthorizeUrl(opts: {
   state: string;
   codeChallenge: string;
 }): string {
+  // The endpoint comes from the authorization server's metadata, which the MCP
+  // server being connected to chooses, and the result is printed and passed to
+  // `open` / `xdg-open`.
+  requireHttps(opts.authorizationEndpoint, "authorization_endpoint");
   const u = new URL(opts.authorizationEndpoint);
   u.searchParams.set("response_type", "code");
   u.searchParams.set("client_id", opts.clientId);

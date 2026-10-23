@@ -16,6 +16,7 @@ caddy run --config deploy/Caddyfile
 
 # 4. Optional Telegram daily driver
 export TELEGRAM_BOT_TOKEN=...
+export CHAMBER_TELEGRAM_ALLOWED_USERS=123456789   # numeric user ids; empty = nobody
 npm run gateway:telegram
 ```
 

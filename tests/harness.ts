@@ -16215,6 +16215,31 @@ test("release", "shellQuote quotes a word that starts with =, which zsh expands 
   }
 });
 
+// ─── what plutil says reaches the snapshot warning as a JSON string ─────────
+
+test("release", "what plutil says about a snapshot plist reaches the warning as a JSON string, with no raw control character", () => {
+  withReleaseFixture((fx) => {
+    // A plutil that refuses the plist and says so with an escape and a bell in
+    // the first line, as plutil does when it echoes the bytes it choked on.
+    const fake = join(fx.root, "fake-plutil");
+    writeFileSync(fake, "#!/bin/sh\ncat > /dev/null\nprintf 'bad \\033[31mRED \\007bell\\n' >&2\nexit 1\n");
+    chmodSync(fake, 0o755);
+    const snap = writeSnapshotPlist(fx, pinApi.SNAPSHOT_SCRIPT);
+    const lines = pinApi.snapshotJobNotice(snap, fx.source, fx.releaseDir, pinApi.plutilParserAt(fake));
+    const warning = lines.find((l) => l.startsWith(SNAPSHOT_WARNING));
+    assert(warning !== undefined && warning.includes("cannot be read as a job that runs one script"), lines.join("\n"));
+    assert(warning.includes("RED") && warning.includes("bell"), `the reason was dropped: ${warning}`);
+    const isControl = (ch: string): boolean => {
+      const c = ch.charCodeAt(0);
+      return c < 0x20 || (c >= 0x7f && c <= 0x9f);
+    };
+    for (const line of lines) {
+      assert(![...line].some(isControl), `a raw control character reached the output: ${JSON.stringify(line)}`);
+    }
+    assert(warning.includes("\\u001b[31mRED"), `the escape byte is not shown as a JSON escape: ${warning}`);
+  });
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

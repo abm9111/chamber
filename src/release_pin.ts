@@ -156,7 +156,12 @@ function parseWithPlutil(path: string, xml: string): PlistParse {
   }
   if (r.status !== 0) {
     const said = (r.stderr ?? "").trim().split("\n")[0] ?? "";
-    return { kind: "rejected", reason: `plutil does not accept the plist${said !== "" ? `: ${said.slice(0, 200)}` : ""}` };
+    // plutil echoes bytes of the plist, so what it says is data from a file, not
+    // text of ours: it goes out as a JSON string, as snapshotJobNotice's script does.
+    return {
+      kind: "rejected",
+      reason: `plutil does not accept the plist${said !== "" ? `: ${JSON.stringify(said.slice(0, 200))}` : ""}`,
+    };
   }
   try {
     return { kind: "parsed", value: JSON.parse(r.stdout ?? "") as unknown };

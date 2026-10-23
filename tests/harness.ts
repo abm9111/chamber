@@ -16219,10 +16219,11 @@ test("release", "shellQuote quotes a word that starts with =, which zsh expands 
 
 test("release", "what plutil says about a snapshot plist reaches the warning as a JSON string, with no raw control character", () => {
   withReleaseFixture((fx) => {
-    // A plutil that refuses the plist and says so with an escape and a bell in
-    // the first line, as plutil does when it echoes the bytes it choked on.
+    // A plutil that refuses the plist and says so with an escape, a bell, a CSI
+    // (U+009B, as UTF-8) and a DEL in the first line, as plutil does when it
+    // echoes the bytes it choked on.
     const fake = join(fx.root, "fake-plutil");
-    writeFileSync(fake, "#!/bin/sh\ncat > /dev/null\nprintf 'bad \\033[31mRED \\007bell\\n' >&2\nexit 1\n");
+    writeFileSync(fake, "#!/bin/sh\ncat > /dev/null\nprintf 'bad \\033[31mRED \\007bell \\302\\233csi \\177del\\n' >&2\nexit 1\n");
     chmodSync(fake, 0o755);
     const snap = writeSnapshotPlist(fx, pinApi.SNAPSHOT_SCRIPT);
     const lines = pinApi.snapshotJobNotice(snap, fx.source, fx.releaseDir, pinApi.plutilParserAt(fake));
@@ -16237,6 +16238,10 @@ test("release", "what plutil says about a snapshot plist reaches the warning as 
       assert(![...line].some(isControl), `a raw control character reached the output: ${JSON.stringify(line)}`);
     }
     assert(warning.includes("\\u001b[31mRED"), `the escape byte is not shown as a JSON escape: ${warning}`);
+    assert(
+      warning.includes("\\u009bcsi") && warning.includes("\\u007fdel"),
+      `the CSI and the DEL are not shown as escapes: ${warning}`,
+    );
   });
 });
 
@@ -16333,6 +16338,26 @@ test("config", "the embedder's docstrings say a model file that cannot be read o
   );
   const head = text.slice(0, text.indexOf("from __future__"));
   assert(head.includes("a model file is not a regular file"), "the module docstring does not say a non-regular model file is exit 3");
+});
+
+// ─── DEL and the C1 controls are escaped in what a file makes pin print ─────
+
+test("release", "jsonForTerminal escapes DEL and the C1 controls that JSON.stringify leaves raw, and the snapshot warning shows the plist's script that way", () => {
+  assert(pinApi.jsonForTerminal("a\u009bb\u007fc\u001bd") === '"a\\u009bb\\u007fc\\u001bd"', pinApi.jsonForTerminal("a\u009bb\u007fc\u001bd"));
+  assert(pinApi.jsonForTerminal('say "hi"\\') === JSON.stringify('say "hi"\\'), "an ordinary string is not what JSON.stringify makes");
+  assert(pinApi.jsonForTerminal("é ü 日本") === JSON.stringify("é ü 日本"), "printable non-ASCII was escaped");
+  withReleaseFixture((fx) => {
+    // The text reader hands the script through as written; it carries a CSI
+    // (U+009B) and a DEL, and shell syntax that must stay out of the commands.
+    const snap = writeSnapshotPlist(fx, "/x/daily-snapshot.sh\u009b\u007f; touch PWNED");
+    const lines = pinApi.snapshotJobNotice(snap, fx.source, fx.releaseDir, noPlistParser);
+    const warning = lines.find((l) => l.startsWith(SNAPSHOT_WARNING));
+    assert(warning !== undefined && warning.includes("it runs"), lines.join("\n"));
+    assert(warning.includes("\\u009b\\u007f"), `the script's CSI and DEL are not shown as escapes: ${warning}`);
+    for (const line of lines) {
+      assert(![...line].some((ch) => ch.charCodeAt(0) === 0x7f || (ch.charCodeAt(0) >= 0x80 && ch.charCodeAt(0) <= 0x9f)), `a raw DEL or C1 reached the output: ${JSON.stringify(line)}`);
+    }
+  });
 });
 
 // ─── cli process smoke tests ────────────────────────────────────────────────

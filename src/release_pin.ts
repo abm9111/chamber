@@ -125,6 +125,22 @@ export type PlistParse =
 
 export type PlistParser = (xml: string) => PlistParse;
 
+/**
+ * `text` as a JSON string, with DEL and the C1 controls written as \u00XX too.
+ * JSON.stringify escapes quotes, backslashes and the C0 controls but leaves U+007F
+ * and U+0080-U+009F raw, and a terminal acts on U+009B (the 8-bit CSI). For text
+ * that comes out of a file and goes to a terminal. A loop, not a regular
+ * expression: a control-character class is what the no-control-regex rule refuses.
+ */
+export function jsonForTerminal(text: string): string {
+  let out = "";
+  for (const ch of JSON.stringify(text)) {
+    const c = ch.codePointAt(0) ?? 0;
+    out += c === 0x7f || (c >= 0x80 && c <= 0x9f) ? `\\u${c.toString(16).padStart(4, "0")}` : ch;
+  }
+  return out;
+}
+
 const PLUTIL_TIMEOUT_MS = 15_000;
 
 /** Where plutil is. Run by absolute path, so a `plutil` earlier on PATH is never what decides. */
@@ -160,7 +176,7 @@ function parseWithPlutil(path: string, xml: string): PlistParse {
     // text of ours: it goes out as a JSON string, as snapshotJobNotice's script does.
     return {
       kind: "rejected",
-      reason: `plutil does not accept the plist${said !== "" ? `: ${JSON.stringify(said.slice(0, 200))}` : ""}`,
+      reason: `plutil does not accept the plist${said !== "" ? `: ${jsonForTerminal(said.slice(0, 200))}` : ""}`,
     };
   }
   try {
@@ -934,7 +950,7 @@ export function snapshotJobNotice(
     return snapshotWarning(plistPath, sourceRoot, releaseDir, `it cannot be read as a job that runs one script (${read.reason})`);
   }
   if (read.script === SNAPSHOT_SCRIPT || read.script === join(releaseDir, "scripts", "daily-snapshot.sh")) return [];
-  return snapshotWarning(plistPath, sourceRoot, releaseDir, `it runs ${JSON.stringify(read.script.slice(0, 200))}`);
+  return snapshotWarning(plistPath, sourceRoot, releaseDir, `it runs ${jsonForTerminal(read.script.slice(0, 200))}`);
 }
 
 const RUN_PROOF_TIMEOUT_MS = 60_000;

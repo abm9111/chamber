@@ -15311,6 +15311,41 @@ test("config", "the pin docs say what is known about launchd's parser, what a ki
   assert(spec.includes("MinilmIntegrityError") && spec.includes("per distinct message"), "the design spec does not say what a refused-weights commit logs and warns");
 });
 
+// ─── the repair command pin prints is quoted for a POSIX shell ──────────────
+
+test("release", "shellQuote leaves a plain word alone and single-quotes everything else", () => {
+  assert(pinApi.shellQuote("/home/ab/.local/share/chamber-release") === "/home/ab/.local/share/chamber-release", "a plain path was quoted");
+  assert(pinApi.shellQuote("v0.2.0-rc.1") === "v0.2.0-rc.1", "a plain tag was quoted");
+  assert(pinApi.shellQuote("") === "''", "the empty word must stay a word");
+  assert(pinApi.shellQuote("a b") === "'a b'", "a space was not quoted");
+  assert(pinApi.shellQuote("it's") === `'it'\\''s'`, `a quote was not escaped: ${pinApi.shellQuote("it's")}`);
+  assert(pinApi.shellQuote("$HOME;x") === "'$HOME;x'", "shell syntax was not quoted");
+});
+
+test("release", "the repair command pin prints runs as printed, for a directory and a tag that need quoting", () => {
+  withReleaseFixture((fx) => {
+    // A directory with a space and a quote in it, and a tag git accepts that
+    // carries shell syntax. Unquoted, the first breaks the command and the
+    // second is expanded by the shell.
+    const releaseDir = join(fx.root, "my dir's share", "chamber-release");
+    const tag = "it's;$HOME";
+    fixtureGit(fx.origin, ["tag", tag, fx.v2]);
+    const opts = { sourceRoot: fx.source, releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    // v2 adds CHANGES.md; an untracked file of that name makes git refuse the checkout.
+    writeFileSync(join(releaseDir, "CHANGES.md"), "mine\n");
+    const r = pinCheckout({ ...opts, tag });
+    assert(!r.ok && r.reason.includes("git checkout:"), JSON.stringify(r));
+    const marker = "finish the move with: ";
+    const at = r.ok ? -1 : r.reason.indexOf(marker);
+    assert(at >= 0, `no repair command in: ${JSON.stringify(r)}`);
+    const command = r.ok ? "" : r.reason.slice(at + marker.length);
+    const ran = spawnSync("/bin/sh", ["-c", command], { encoding: "utf8" });
+    assert(ran.status === 0, `the printed repair failed (${ran.status}): ${ran.stderr}\ncommand: ${command}`);
+    assert(headOf(releaseDir) === fx.v2, "the printed repair did not move the checkout to the tag");
+  });
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

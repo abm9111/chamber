@@ -428,6 +428,19 @@ function git(cwd: string, args: readonly string[], timeoutMs: number = gitTimeou
   };
 }
 
+/**
+ * `text` as one POSIX shell word. A word made only of characters the shell
+ * never treats specially is returned as it is; anything else, the empty string
+ * included, goes inside single quotes with each `'` written as `'\''`. Pin
+ * prints a command for the owner to paste, and both the directory (a home
+ * directory can hold a space or a quote) and the tag (git allows `$`, `;`, `&`
+ * and `'` in one) come from outside this file.
+ */
+export function shellQuote(text: string): string {
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(text)) return text;
+  return `'${text.replaceAll("'", `'\\''`)}'`;
+}
+
 function tagNameRefusal(tag: string): string | null {
   if (tag === "") return "the tag name is empty";
   if (tag.startsWith("-")) return `the tag name ${JSON.stringify(tag)} starts with "-"`;
@@ -551,10 +564,11 @@ function moveCheckout(
     if (!checkout.ok) {
       // A first pin's directory is removed by the caller, so there is nothing to
       // repair there; an existing checkout may have been left half-moved.
+      // The command goes last, so a line pasted whole into a shell is the command.
       const repair = created
         ? ""
-        : `; if it left ${dir} half-moved, finish the move with: ` +
-          `git -C ${dir} checkout --force --detach ${tag} (--force overwrites changes in that checkout)`;
+        : `; --force overwrites changes in that checkout; if the checkout left ${dir} half-moved, ` +
+          `finish the move with: git -C ${shellQuote(dir)} checkout --force --detach ${shellQuote(tag)}`;
       return { ok: false, reason: `git checkout: ${checkout.message}${repair}` };
     }
   }

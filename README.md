@@ -19,6 +19,18 @@ The note says `$240k`. The agent wrote `$420k`. Edit the note afterwards and
 the same check judges the new text, and the result adds `index is behind this
 file`, because the index still holds the old copy.
 
+In Claude Code, as a plugin. It asks for your notes folder and adds the
+server and a `chamber-check` skill:
+
+```
+/plugin install chamber --marketplace abm9111/chamber
+```
+
+On Claude Code before 2.1.275, run `/plugin marketplace add abm9111/chamber`
+first, then `/plugin install chamber@chamber`.
+
+Or the server alone, in any MCP host:
+
 ```bash
 claude mcp add -s user chamber -- npx -y @bu7umaid/chamber mcp --notes ~/Notes
 ```

@@ -96,6 +96,16 @@ history and the GitHub releases.
 0.2.0 was tagged but never published to npm or the MCP Registry, so this is
 the first 0.2 release there. It includes everything under 0.2.0 below.
 
+### Added
+
+- **Claude Code plugin.** `/plugin install chamber --marketplace abm9111/chamber`
+  asks for the notes folder, then adds the MCP server and a `chamber-check`
+  skill. The plugin runs the published npm package pinned to 0.1.9, so a
+  release bumps three places: the version in `.claude-plugin/plugin.json`, the
+  version in `.claude-plugin/marketplace.json`, and the `@0.1.9` in the
+  plugin's npx args. The skill is also what `npx skills add abm9111/chamber`
+  installs.
+
 ### Changed (breaking)
 
 - **The Telegram gateway answers only listed senders.** It had no talk gate:

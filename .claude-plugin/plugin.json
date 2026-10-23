@@ -1,0 +1,27 @@
+{
+  "name": "chamber",
+  "description": "Checks that the numbers, capitalised names, and file names in a claim occur in the indexed note. Local, no model. It does not judge meaning.",
+  "version": "0.1.9",
+  "author": {
+    "name": "abm9111",
+    "url": "https://github.com/abm9111"
+  },
+  "homepage": "https://github.com/abm9111/chamber#readme",
+  "repository": "https://github.com/abm9111/chamber",
+  "license": "MIT",
+  "keywords": ["mcp", "notes", "obsidian", "citations", "grounding", "verification", "local-first"],
+  "userConfig": {
+    "notes": {
+      "type": "directory",
+      "title": "Notes folder",
+      "description": "The folder of notes Chamber checks claims against, such as your Obsidian vault.",
+      "required": true
+    }
+  },
+  "mcpServers": {
+    "chamber": {
+      "command": "npx",
+      "args": ["-y", "@bu7umaid/chamber@0.1.9", "mcp", "--notes", "${user_config.notes}"]
+    }
+  }
+}

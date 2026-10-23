@@ -795,6 +795,9 @@ export interface PinOutcome {
  * failure exits 1.
  */
 function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: string[]): 0 | 1 {
+  // For the commands printed below: the path came from outside this file, and
+  // a home directory can hold a space or a quote.
+  const plist = shellQuote(plistPath);
   // Read again at the moment of writing, not trusted from the check made
   // before the checkout moved.
   const xml = readFileSync(plistPath, "utf8");
@@ -827,7 +830,7 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
     }
     if (launchctl(["list", JOB_LABEL]).status === 0) {
       err.push(`chamber pin: launchctl unload exited 0 but ${JOB_LABEL} is still loaded`);
-      err.push(`${plistPath} is pinned; reload it by hand: launchctl unload ${plistPath} && launchctl load ${plistPath}`);
+      err.push(`${plistPath} is pinned; reload it by hand: launchctl unload ${plist} && launchctl load ${plist}`);
       return 1;
     }
   }
@@ -836,7 +839,7 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
     err.push(`chamber pin: launchctl load failed (${load.status}): ${load.stderr.trim()}`);
     if (wasLoaded) {
       err.push(
-        `chamber pin: the agent is now unloaded and will not run at 08:30; load it with: launchctl load ${plistPath}`,
+        `chamber pin: the agent is now unloaded and will not run at 08:30; load it with: launchctl load ${plist}`,
       );
     }
     return 1;
@@ -845,13 +848,13 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
   if (listed.status !== 0) {
     err.push(
       `chamber pin: launchctl load exited 0 but ${JOB_LABEL} is not loaded, so the 08:30 job will not run; ` +
-        `load it with: launchctl load ${plistPath}`,
+        `load it with: launchctl load ${plist}`,
     );
     return 1;
   }
   if (!listed.stdout.includes(PINNED_SCRIPT)) {
     err.push(`chamber pin: ${JOB_LABEL} is loaded but launchd is not running the pinned script`);
-    err.push(`${plistPath} is pinned; reload it by hand: launchctl unload ${plistPath} && launchctl load ${plistPath}`);
+    err.push(`${plistPath} is pinned; reload it by hand: launchctl unload ${plist} && launchctl load ${plist}`);
     return 1;
   }
   out.push(`${wasLoaded ? "reloaded" : "loaded"} ${JOB_LABEL}`);

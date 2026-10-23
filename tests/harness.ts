@@ -16155,6 +16155,49 @@ test("config", "a model file one byte over the cap is refused with exit 3 before
   }
 });
 
+// ─── the launchctl commands pin prints on a failed reload are quoted ────────
+
+test("release", "the launchctl commands pin prints when a reload fails run as printed, for a plist path that needs quoting", () => {
+  type Case = { label: string; start: Parameters<typeof fakeLaunchctl>[0]; verbs: readonly string[] };
+  // One case for each place pin prints a launchctl command to paste.
+  const cases: Case[] = [
+    { label: "an unload that changed nothing", start: { loaded: true, unload: "lies" }, verbs: ["unload", "load"] },
+    { label: "a load that failed after the unload", start: { loaded: true, load: "fails" }, verbs: ["load"] },
+    { label: "a load that exited 0 without loading", start: { loaded: false, load: "lies" }, verbs: ["load"] },
+    { label: "a load that left the old script running", start: { loaded: true, script: BARE_SCRIPT, load: "stale" }, verbs: ["unload", "load"] },
+  ];
+  for (const c of cases) {
+    withReleaseFixture((fx) => {
+      // A directory with a space and a quote in its name: unquoted, the first
+      // splits the path into two arguments and the second never closes.
+      const plist = join(fx.root, "my dir's agents", "com.chamber.verify.plist");
+      writePlistFile(plist, jobPlistXml(BARE_SCRIPT));
+      const r = pinRelease({ ...pinOpts(fx, "v1", fakeLaunchctl(c.start).run), plistPath: plist });
+      assert(r.code === 1, `${c.label}: pin reported success: ${r.out.join("\n")}`);
+      const printed = r.err.map((l) => /(?:reload it by hand|load it with): (launchctl .*)$/.exec(l)).filter((m): m is RegExpExecArray => m !== null);
+      assert(printed.length === 1, `${c.label}: expected one printed command, got ${printed.length}:\n${r.err.join("\n")}`);
+
+      // A launchctl on PATH that records its arguments, one per line.
+      const bin = join(fx.root, "bin");
+      mkdirSync(bin);
+      writeFileSync(
+        join(bin, "launchctl"),
+        '#!/bin/sh\nprintf "CALL\\n" >> "$LAUNCHCTL_LOG"\nfor a in "$@"; do printf "ARG:%s\\n" "$a" >> "$LAUNCHCTL_LOG"; done\n',
+      );
+      chmodSync(join(bin, "launchctl"), 0o755);
+      const log = join(fx.root, "launchctl.log");
+      const ran = spawnSync("/bin/sh", ["-c", printed[0]![1]!], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, LAUNCHCTL_LOG: log },
+      });
+      assert(ran.status === 0, `${c.label}: the printed command failed (${ran.status}): ${ran.stderr}\n${printed[0]![1]!}`);
+      const want = c.verbs.map((v) => `CALL\nARG:${v}\nARG:${plist}\n`).join("");
+      const got = existsSync(log) ? readFileSync(log, "utf8") : "";
+      assert(got === want, `${c.label}: launchctl did not receive the path as one argument:\n${got}\nprinted: ${printed[0]![1]!}`);
+    });
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

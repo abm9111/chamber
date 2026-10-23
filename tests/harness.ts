@@ -16198,6 +16198,23 @@ test("release", "the launchctl commands pin prints when a reload fails run as pr
   }
 });
 
+// ─── shellQuote and a word that starts with = ───────────────────────────────
+
+test("release", "shellQuote quotes a word that starts with =, which zsh expands as a command lookup, and a quoted word round-trips through sh and zsh", () => {
+  assert(pinApi.shellQuote("=x") === "'=x'", `a leading = was not quoted: ${pinApi.shellQuote("=x")}`);
+  assert(pinApi.shellQuote("a=b") === "a=b", "an = inside a word was quoted");
+  assert(pinApi.shellQuote("v0.2.0-rc.1") === "v0.2.0-rc.1", "a plain tag was quoted");
+  const shells: Array<[string, string]> = [["/bin/sh", "-c"]];
+  // zsh is the owner's login shell and the one that expands =word. -f: no startup files.
+  if (existsSync("/bin/zsh")) shells.push(["/bin/zsh", "-fc"]);
+  for (const [shell, flag] of shells) {
+    for (const word of ["=x", "=ls", "==", "=", "x=y", "a b=c", "=it's"]) {
+      const r = spawnSync(shell, [flag, `printf %s ${pinApi.shellQuote(word)}`], { encoding: "utf8" });
+      assert(r.status === 0 && r.stdout === word, `${shell}: ${JSON.stringify(word)} came back as ${JSON.stringify(r.stdout)} (${r.status}): ${r.stderr}`);
+    }
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

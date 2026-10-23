@@ -471,10 +471,12 @@ function git(cwd: string, args: readonly string[], timeoutMs: number = gitTimeou
  * included, goes inside single quotes with each `'` written as `'\''`. Pin
  * prints a command for the owner to paste, and both the directory (a home
  * directory can hold a space or a quote) and the tag (git allows `$`, `;`, `&`
- * and `'` in one) come from outside this file.
+ * and `'` in one) come from outside this file. `=` is safe inside a word but
+ * not at the start of one: zsh, the owner's shell, expands `=x` to the path of
+ * the command `x`, so a leading `=` is quoted.
  */
 export function shellQuote(text: string): string {
-  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(text)) return text;
+  if (/^[A-Za-z0-9_@%+:,./-][A-Za-z0-9_@%+=:,./-]*$/.test(text)) return text;
   return `'${text.replaceAll("'", `'\\''`)}'`;
 }
 

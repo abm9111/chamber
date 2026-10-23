@@ -526,15 +526,40 @@ function moveCheckout(
   }
   // Only refs/tags/<tag>, so a branch or a raw commit is simply not found.
   // No `+`: a tag that moved on origin is git's refusal, not a silent move.
+  // Whether the tag was here before decides what a refusal below leaves behind.
+  const hadTag = git(dir, ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}`]).ok;
   const fetch = git(
     dir,
     ["fetch", "--quiet", "--no-tags", "origin", `refs/tags/${tag}:refs/tags/${tag}`],
     gitTimeouts.fetchMs,
   );
-  if (!fetch.ok) return { ok: false, reason: `git fetch: ${fetch.message}` };
+  if (!fetch.ok) {
+    // `--quiet` hides git's own "would clobber existing tag", so a tag that
+    // moved arrives here as "git fetch exited 1". Say what git did not, and how
+    // to accept the move on purpose.
+    const moved = hadTag
+      ? `; ${dir} already has a tag ${tag}, and git does not move a tag it has. ` +
+        `If ${tag} was moved on origin on purpose, delete the local one and pin again: ` +
+        `git -C ${shellQuote(dir)} tag -d ${shellQuote(tag)}`
+      : "";
+    return { ok: false, reason: `git fetch: ${fetch.message}${moved}` };
+  }
+  // A refusal from here to the checkout leaves HEAD and the files alone, and
+  // must leave the tag as it found it too. A ref this call added and then
+  // refused would stop a tag re-pointed on origin from ever being fetched
+  // again, because git will not move it. A tag that was here before stays. The
+  // checkout's own failure keeps the ref: its repair command needs it. Best
+  // effort: a ref that cannot be removed is met by the message above next time.
+  const forgetTag = (): void => {
+    if (!hadTag) git(dir, ["update-ref", "-d", `refs/tags/${tag}`]);
+  };
   const commit = git(dir, ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}^{commit}`]);
-  if (!commit.ok) return { ok: false, reason: `${tag} does not point at a commit` };
+  if (!commit.ok) {
+    forgetTag();
+    return { ok: false, reason: `${tag} does not point at a commit` };
+  }
   if (!git(dir, ["cat-file", "-e", `${commit.out}:bin/chamber.js`]).ok) {
+    forgetTag();
     return { ok: false, reason: `${tag} has no bin/chamber.js; left unpinned` };
   }
   const head = git(dir, ["rev-parse", "--verify", "--quiet", "HEAD"]);
@@ -548,6 +573,7 @@ function moveCheckout(
   if (prove !== undefined) {
     const proof = prove(commit.out);
     if (!proof.ok) {
+      forgetTag();
       const where = created
         ? `no release checkout was left at ${dir}`
         : head.ok
@@ -605,8 +631,9 @@ export function originCredentialRefusal(url: string): string | null {
  * Fetch `tag` from the source checkout's origin and leave `releaseDir`
  * detached at it. Every refusal before the checkout, `prove`'s included,
  * leaves an existing release checkout exactly as it was (the fetch adds the
- * tag's objects and ref to its .git; HEAD and the files stay). A directory this
- * call created is removed when the checkout fails to reach the tag.
+ * tag's objects to its .git, and the tag's ref too unless the tag was there
+ * already, in which case it is the same one; HEAD and the files stay). A
+ * directory this call created is removed when the checkout fails to reach the tag.
  */
 export function pinCheckout(opts: CheckoutOptions, prove?: ProveBeforeMove): CheckoutResult {
   const { tag, sourceRoot, releaseDir } = opts;

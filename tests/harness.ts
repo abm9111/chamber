@@ -15346,6 +15346,64 @@ test("release", "the repair command pin prints runs as printed, for a directory 
   });
 });
 
+// ─── a refused tag does not stay behind in the release checkout ─────────────
+
+test("release", "a refused release leaves no tag ref behind, so the tag can be re-pointed and pinned; a tag that was already there stays", () => {
+  withReleaseFixture((fx) => {
+    const lc = fakeLaunchctl({ loaded: false });
+    assert(pinRelease(pinOpts(fx, "v1", lc.run)).code === 0, "the first pin failed");
+    const hasRef = (tag: string): boolean =>
+      spawnSync("git", ["-C", fx.releaseDir, "rev-parse", "--verify", "--quiet", `refs/tags/${tag}`]).status === 0;
+
+    // A release that does not run is refused after its tag was fetched.
+    fixtureGit(fx.origin, ["tag", "fixme", fx.badexit]);
+    const refused = pinRelease(pinOpts(fx, "fixme", lc.run));
+    assert(refused.code === 1 && refused.err.some((l) => l.includes("did not run")), refused.err.join("\n"));
+    assert(!hasRef("fixme"), "the refused tag's ref stayed in the release checkout");
+    assert(headOf(fx.releaseDir) === fx.v1, "a refused pin moved HEAD");
+
+    // The maintainer fixes the release and moves the tag. Before this change git
+    // refused the second fetch with a bare "git fetch exited 1".
+    fixtureGit(fx.origin, ["tag", "-f", "fixme", fx.v2]);
+    const again = pinRelease(pinOpts(fx, "fixme", lc.run));
+    assert(again.code === 0, again.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v2, "the re-pointed tag was not pinned");
+
+    // A tag with no bin/chamber.js is refused after its fetch too.
+    const nobin = pinRelease(pinOpts(fx, "nobin", lc.run));
+    assert(nobin.code === 1 && nobin.err.some((l) => l.includes("has no bin/chamber.js")), nobin.err.join("\n"));
+    assert(!hasRef("nobin"), "a tag without bin/chamber.js stayed in the release checkout");
+
+    // A tag that was already in the checkout is not removed by a refusal: v1 was
+    // pinned first. A proof that cannot finish in a millisecond refuses it.
+    assert(hasRef("v1"), "the fixture lost v1");
+    const slow = pinRelease({ ...pinOpts(fx, "v1", lc.run), proofTimeoutMs: 1 });
+    assert(slow.code === 1 && slow.err.some((l) => l.includes("did not run")), slow.err.join("\n"));
+    assert(hasRef("v1"), "a refusal removed a tag that was in the checkout before the pin");
+    assert(headOf(fx.releaseDir) === fx.v2, "a refused pin moved HEAD");
+  });
+});
+
+test("release", "a tag that moved on origin after it was pinned is refused, with the command that clears the local tag", () => {
+  withReleaseFixture((fx) => {
+    const lc = fakeLaunchctl({ loaded: false });
+    assert(pinRelease(pinOpts(fx, "v1", lc.run)).code === 0, "the first pin failed");
+    fixtureGit(fx.origin, ["tag", "-f", "v1", fx.v2]);
+    const refused = pinRelease(pinOpts(fx, "v1", lc.run));
+    const line = refused.err.find((l) => l.startsWith("chamber pin: git fetch:")) ?? "";
+    assert(refused.code === 1 && line !== "", refused.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD followed a tag that moved on origin");
+    const marker = "pin again: ";
+    const at = line.indexOf(marker);
+    assert(at >= 0, `no command that clears the local tag in: ${line}`);
+    const ran = spawnSync("/bin/sh", ["-c", line.slice(at + marker.length)], { encoding: "utf8" });
+    assert(ran.status === 0, `the printed command failed (${ran.status}): ${ran.stderr}`);
+    const again = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(again.code === 0, again.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v2, "the moved tag was not pinned after the printed command");
+  });
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

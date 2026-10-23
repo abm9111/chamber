@@ -257,7 +257,7 @@ code or policy, `chamber verify --json` failing the build when the ground
 moves. One line in a workflow — this repo ships the action:
 
 ```yaml
-- uses: abm9111/chamber@v0.1.9
+- uses: abm9111/chamber@v0.2.0
 ```
 
 [`docs/CI_DRIFT_GATE.md`](docs/CI_DRIFT_GATE.md) is the one-page recipe;

@@ -6,12 +6,12 @@
     "url": "https://github.com/abm9111/chamber",
     "source": "github"
   },
-  "version": "0.1.9",
+  "version": "0.2.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@bu7umaid/chamber",
-      "version": "0.1.9",
+      "version": "0.2.0",
       "transport": {
         "type": "stdio"
       },

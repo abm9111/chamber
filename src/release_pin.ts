@@ -35,6 +35,13 @@ export const JOB_LABEL = "com.chamber.verify";
 export const RELEASE_SUBDIR = ".local/share/chamber-release";
 export const RELEASE_COMMAND = `node "$HOME/${RELEASE_SUBDIR}/bin/chamber.js"`;
 
+export const SNAPSHOT_JOB_LABEL = "com.chamber.daily-snapshot";
+/**
+ * The script the shipped snapshot plist runs, as the plist writes it: the job's
+ * login shell expands $HOME, so the file holds the variable and not a path.
+ */
+export const SNAPSHOT_SCRIPT = `$HOME/${RELEASE_SUBDIR}/scripts/daily-snapshot.sh`;
+
 /**
  * The shipped job script, with `chamber` standing for whatever runs Chamber.
  * The installed script is accepted only when it is exactly one of the two
@@ -65,6 +72,9 @@ export type JobScriptForm = "bare" | "pinned";
 export type JobPlistRead =
   | { ok: true; form: JobScriptForm }
   | { ok: false; reason: string };
+
+/** The script a plist's ProgramArguments runs, once the shape around it is accepted. */
+export type PlistScriptRead = { ok: true; script: string } | { ok: false; reason: string };
 
 // `/bin/sh`, `-lc`, then the script, and nothing else in the array. Groups:
 // 1 everything up to the script's opening tag, 2 the shell, 3 the flag,
@@ -165,12 +175,22 @@ export const plutilParser: PlistParser = plutilParserAt(PLUTIL_PATH);
 /** A parser that is never there: the text reader decides. For tests and for callers that must not run plutil. */
 export const noPlistParser: PlistParser = () => ({ kind: "unavailable" });
 
+/** The verdict on a script: one of the two Chamber ships for the 08:30 job, or why not. */
+function formOfScript(script: string): JobPlistRead {
+  if (script === BARE_SCRIPT) return { ok: true, form: "bare" };
+  if (script === PINNED_SCRIPT) return { ok: true, form: "pinned" };
+  return {
+    ok: false,
+    reason: "its script is not the one Chamber ships, with bare chamber or with the release checkout",
+  };
+}
+
 /**
- * The verdict on a parsed plist: no `Program` key (launchd runs it instead of
- * ProgramArguments[0]) and ProgramArguments exactly `/bin/sh`, `-lc`, one of the
- * two scripts Chamber ships. Nothing here looks at the text.
+ * The script of a parsed plist: no `Program` key (launchd runs it instead of
+ * ProgramArguments[0]) and ProgramArguments exactly `/bin/sh`, `-lc`, one
+ * script. Nothing here looks at the text.
  */
-function judgeParsedPlist(value: unknown): JobPlistRead {
+function scriptOfParsedPlist(value: unknown): PlistScriptRead {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return { ok: false, reason: "the plist is not a dictionary" };
   }
@@ -182,12 +202,13 @@ function judgeParsedPlist(value: unknown): JobPlistRead {
   if (!Array.isArray(args) || args.length !== 3 || args[0] !== "/bin/sh" || args[1] !== "-lc" || typeof args[2] !== "string") {
     return { ok: false, reason: "ProgramArguments is not /bin/sh -lc followed by one script" };
   }
-  if (args[2] === BARE_SCRIPT) return { ok: true, form: "bare" };
-  if (args[2] === PINNED_SCRIPT) return { ok: true, form: "pinned" };
-  return {
-    ok: false,
-    reason: "its script is not the one Chamber ships, with bare chamber or with the release checkout",
-  };
+  return { ok: true, script: args[2] };
+}
+
+/** The verdict on a parsed plist for the 08:30 job. */
+function judgeParsedPlist(value: unknown): JobPlistRead {
+  const s = scriptOfParsedPlist(value);
+  return s.ok ? formOfScript(s.script) : s;
 }
 
 /**
@@ -222,8 +243,12 @@ export const SHIPPED_PROLOG = [
   `  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
 ].join("\n");
 
-/** The text reader: the whole check where there is no plutil, and the way to find the block to rewrite. */
-export function readJobPlistText(xml: string): JobPlistRead {
+/**
+ * The text reader's half of the check: the script, once every shape it does not
+ * model has been refused. Where there is no plutil this decides, for the 08:30
+ * job and for the snapshot job alike.
+ */
+function scriptOfPlistText(xml: string): PlistScriptRead {
   // The prolog is a closed set: exactly the declaration and DOCTYPE the shipped
   // plist has, with nothing before them. Both are markup this reader does not
   // model, and a `<!--` in either (`<?xml version="1.0" encoding="UTF-8" <!-- ?>`,
@@ -276,13 +301,25 @@ export function readJobPlistText(xml: string): JobPlistRead {
   if (m === null || m[2] !== "/bin/sh" || m[3] !== "-lc" || m[4] === undefined) {
     return { ok: false, reason: "ProgramArguments is not /bin/sh -lc followed by one script" };
   }
-  const script = decodeXmlText(m[4]);
-  if (script === BARE_SCRIPT) return { ok: true, form: "bare" };
-  if (script === PINNED_SCRIPT) return { ok: true, form: "pinned" };
-  return {
-    ok: false,
-    reason: "its script is not the one Chamber ships, with bare chamber or with the release checkout",
-  };
+  return { ok: true, script: decodeXmlText(m[4]) };
+}
+
+/** The text reader: the whole check where there is no plutil, and the way to find the block to rewrite. */
+export function readJobPlistText(xml: string): JobPlistRead {
+  const s = scriptOfPlistText(xml);
+  return s.ok ? formOfScript(s.script) : s;
+}
+
+/**
+ * The script a job plist runs, read the way readJobPlist reads it: plutil's
+ * reading where there is plutil, the strict text reader where there is not. It
+ * says nothing about whether the script is a good one; that is the caller's.
+ */
+export function readPlistScript(xml: string, parse: PlistParser = plutilParser): PlistScriptRead {
+  const parsed = parse(xml);
+  if (parsed.kind === "rejected") return { ok: false, reason: parsed.reason };
+  if (parsed.kind === "parsed") return scriptOfParsedPlist(parsed.value);
+  return scriptOfPlistText(xml);
 }
 
 function canonicalJson(value: unknown): string {
@@ -730,6 +767,12 @@ export interface PinOptions extends CheckoutOptions {
   workDir?: string;
   /** How long the release may take to print its version, in ms (default 60 s). */
   proofTimeoutMs?: number;
+  /**
+   * Where the daily snapshot job's plist would be. When set, a pin that worked
+   * says if that job does not run the release checkout's script. Pin never
+   * changes that plist. Left unset, pin does not look.
+   */
+  snapshotPlistPath?: string;
 }
 
 export interface PinOutcome {
@@ -813,6 +856,66 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
   }
   out.push(`${wasLoaded ? "reloaded" : "loaded"} ${JOB_LABEL}`);
   return 0;
+}
+
+/**
+ * The warning for a snapshot job that is not on the release, and the commands
+ * that put it right. `problem` says what is wrong with it. A release with no
+ * scripts/daily-snapshot.sh gets no commands: reinstalling the job would point
+ * it at a file that is not there.
+ */
+function snapshotWarning(plistPath: string, sourceRoot: string, releaseDir: string, problem: string): string[] {
+  const head =
+    `chamber pin: warning: the daily snapshot job (${plistPath}) does not run the release checkout's ` +
+    `scripts/daily-snapshot.sh: ${problem}. Pin did not change it.`;
+  if (!existsSync(join(releaseDir, "scripts", "daily-snapshot.sh"))) {
+    return [
+      `${head} This release has no scripts/daily-snapshot.sh either: pin a tag that has one, ` +
+        `then reinstall the job (see "Daily snapshot" in deploy/SCHEDULING.md).`,
+    ];
+  }
+  const plist = shellQuote(plistPath);
+  const template = shellQuote(join(sourceRoot, "deploy", "launchd", `${SNAPSHOT_JOB_LABEL}.plist`));
+  return [
+    `${head} To reinstall it:`,
+    `  launchctl unload ${plist}`,
+    `  sed "s|REPLACE_WITH_HOME|$HOME|g" ${template} > ${plist}`,
+    `  launchctl load ${plist}`,
+  ];
+}
+
+/**
+ * What pin has to say about the daily snapshot job after a pin that worked:
+ * nothing when no snapshot plist is installed or when it already runs the
+ * release checkout's scripts/daily-snapshot.sh (as the shipped plist writes it,
+ * or as an absolute path), a warning and the commands that fix it otherwise.
+ * Pin never rewrites or loads this plist: it is a second job with its own
+ * schedule and log, and what it reports on is the owner's call.
+ *
+ * The plist is read with readPlistScript. Its contents appear only inside a JSON
+ * string in the warning line; the commands are built from the paths pin was
+ * given, quoted, and never from the plist.
+ */
+export function snapshotJobNotice(
+  plistPath: string,
+  sourceRoot: string,
+  releaseDir: string,
+  parse: PlistParser = plutilParser,
+): string[] {
+  let xml: string;
+  try {
+    xml = readFileSync(plistPath, "utf8");
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return [];
+    return snapshotWarning(plistPath, sourceRoot, releaseDir, `it cannot be read (${code ?? String(e)})`);
+  }
+  const read = readPlistScript(xml, parse);
+  if (!read.ok) {
+    return snapshotWarning(plistPath, sourceRoot, releaseDir, `it cannot be read as a job that runs one script (${read.reason})`);
+  }
+  if (read.script === SNAPSHOT_SCRIPT || read.script === join(releaseDir, "scripts", "daily-snapshot.sh")) return [];
+  return snapshotWarning(plistPath, sourceRoot, releaseDir, `it runs ${JSON.stringify(read.script.slice(0, 200))}`);
 }
 
 const RUN_PROOF_TIMEOUT_MS = 60_000;
@@ -965,9 +1068,19 @@ export function pinRelease(opts: PinOptions): PinOutcome {
       : `${opts.releaseDir} is on ${opts.tag} (${short})`,
   );
   out.push(`the release runs: node bin/chamber.js --version printed ${version} (tried in a throwaway clone before the checkout moved)`);
+  // A pin that worked says if the snapshot job is not on this release. A pin
+  // that failed says nothing about it: the checkout may not have moved.
+  const noteSnapshot = (): void => {
+    if (opts.snapshotPlistPath !== undefined) {
+      out.push(...snapshotJobNotice(opts.snapshotPlistPath, opts.sourceRoot, opts.releaseDir));
+    }
+  };
   if (!existsSync(opts.plistPath)) {
     out.push(`no LaunchAgent was installed at ${opts.plistPath}; nothing else was changed`);
+    noteSnapshot();
     return { code: 0, out, err };
   }
-  return { code: pinAgent(opts.plistPath, opts.launchctl, out, err), out, err };
+  const code = pinAgent(opts.plistPath, opts.launchctl, out, err);
+  if (code === 0) noteSnapshot();
+  return { code, out, err };
 }

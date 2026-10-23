@@ -213,6 +213,27 @@ sed "s|REPLACE_WITH_HOME|$HOME|g" \
 launchctl load ~/Library/LaunchAgents/com.chamber.daily-snapshot.plist
 ```
 
+`chamber pin` does not rewrite or load the snapshot job's plist. After a pin
+that worked it reads `~/Library/LaunchAgents/com.chamber.daily-snapshot.plist`
+if there is one, and if that job does not run `scripts/daily-snapshot.sh` from
+the release checkout (a plist from before the template ran the release, or one
+pin cannot read) it prints one warning line and the commands that reinstall it,
+with the real paths quoted for a POSIX shell:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.chamber.daily-snapshot.plist
+sed "s|REPLACE_WITH_HOME|$HOME|g" deploy/launchd/com.chamber.daily-snapshot.plist \
+  > ~/Library/LaunchAgents/com.chamber.daily-snapshot.plist
+launchctl load ~/Library/LaunchAgents/com.chamber.daily-snapshot.plist
+```
+
+The template is the one in the clone you ran pin from. When no snapshot plist is
+installed, or it already runs the release checkout's script (written
+`$HOME/.local/share/chamber-release/scripts/daily-snapshot.sh`, or as the
+absolute path), pin prints nothing about it. If the release you pinned has no
+`scripts/daily-snapshot.sh`, the warning says so and prints no commands: pin a
+tag that has one first.
+
 **This takes effect for a release tag that contains this script.** v0.1.9's copy
 of `scripts/daily-snapshot.sh` has the old behaviour: it calls the `chamber` on
 `PATH` and prints `verify exit code: 0` whatever `verify` returned. Pin a newer

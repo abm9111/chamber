@@ -15428,6 +15428,172 @@ test("release", "SCHEDULING.md puts the missing-bin refusal after the fetch, and
   }
 });
 
+// ─── pin says if the daily snapshot job is not on the release ───────────────
+
+const SNAPSHOT_TEMPLATE_PATH = fileURLToPath(new URL("../deploy/launchd/com.chamber.daily-snapshot.plist", import.meta.url));
+
+/** A tag, a child of v2, whose tree has scripts/daily-snapshot.sh, as a release that ships the snapshot job does. */
+function addSnapshotTag(fx: ReleaseFixture, name: string): void {
+  const commit = fixtureCommit(
+    fx.origin,
+    { ...releaseTree(name, "1.0.5"), "scripts/daily-snapshot.sh": "#!/bin/sh\nexit 0\n" },
+    "has scripts/daily-snapshot.sh",
+    fx.v2,
+  );
+  fixtureGit(fx.origin, ["tag", name, commit]);
+}
+
+/** The template the printed `sed` reads, put where pin looks for it: under the clone pin runs from. */
+function putSnapshotTemplate(fx: ReleaseFixture): string {
+  const template = join(fx.source, "deploy", "launchd", "com.chamber.daily-snapshot.plist");
+  mkdirSync(dirname(template), { recursive: true });
+  writeFileSync(template, readFileSync(SNAPSHOT_TEMPLATE_PATH, "utf8"));
+  return template;
+}
+
+/** A snapshot plist running `script`, at a path that needs quoting. Returns the path. */
+function writeSnapshotPlist(fx: ReleaseFixture, script: string): string {
+  const path = join(fx.root, "Library dir's", "LaunchAgents", "com.chamber.daily-snapshot.plist");
+  writePlistFile(path, jobPlistXml(script).replace("com.chamber.verify", "com.chamber.daily-snapshot"));
+  return path;
+}
+
+const SNAPSHOT_WARNING = "chamber pin: warning: the daily snapshot job";
+
+test("release", "the shipped snapshot plist runs SNAPSHOT_SCRIPT, as plutil reads it and as the text reader reads it", () => {
+  const xml = readFileSync(SNAPSHOT_TEMPLATE_PATH, "utf8");
+  for (const [label, parse] of [
+    ["plutil", plutilParser],
+    ["text reader", noPlistParser],
+  ] as const) {
+    const read = pinApi.readPlistScript(xml, parse);
+    assert(read.ok && read.script === pinApi.SNAPSHOT_SCRIPT, `${label}: ${JSON.stringify(read)}`);
+  }
+  assert(pinApi.SNAPSHOT_JOB_LABEL === "com.chamber.daily-snapshot", pinApi.SNAPSHOT_JOB_LABEL);
+});
+
+test("release", "a pin that worked warns when the snapshot job runs something else, prints quoted reinstall commands, and changes nothing", () => {
+  withReleaseFixture((fx) => {
+    addSnapshotTag(fx, "withsnap");
+    const template = putSnapshotTemplate(fx);
+    // Shell syntax in the script: it may appear in the warning, never in a command.
+    const stale = "$HOME/Projects/chamber/scripts/daily-snapshot.sh; touch PWNED";
+    const snap = writeSnapshotPlist(fx, stale);
+    const before = readFileSync(snap, "utf8");
+    // The 08:30 job is installed and loaded, so this pin reloads it.
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const lc = fakeLaunchctl({ loaded: true });
+    const r = pinRelease({ ...pinOpts(fx, "withsnap", lc.run), snapshotPlistPath: snap });
+    assert(r.code === 0, r.err.join("\n"));
+    assert(
+      JSON.stringify(lc.calls) ===
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `list ${JOB_LABEL}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+      `pin touched launchd for something other than the verify job: ${lc.calls.join(" | ")}`,
+    );
+    assert(readFileSync(snap, "utf8") === before, "pin rewrote the snapshot plist");
+
+    const at = r.out.findIndex((l) => l.startsWith(SNAPSHOT_WARNING));
+    assert(at >= 0, r.out.join("\n"));
+    assert(r.out[at]!.includes(JSON.stringify(stale)), `the warning does not show what the job runs: ${r.out[at]}`);
+    const commands = r.out.slice(at + 1);
+    const q = pinApi.shellQuote;
+    assert(
+      JSON.stringify(commands) ===
+        JSON.stringify([
+          `  launchctl unload ${q(snap)}`,
+          `  sed "s|REPLACE_WITH_HOME|$HOME|g" ${q(template)} > ${q(snap)}`,
+          `  launchctl load ${q(snap)}`,
+        ]),
+      `the reinstall commands are not the quoted ones:\n${commands.join("\n")}`,
+    );
+    assert(!commands.join("\n").includes("PWNED"), "the plist's contents reached a command");
+
+    // Run the sed line as printed (the other two talk to launchd and are not run
+    // here) with a throwaway HOME: the job is now what the template says.
+    const home = join(fx.root, "home");
+    const ran = spawnSync("/bin/sh", ["-c", commands[1]!.trim()], { encoding: "utf8", env: { ...process.env, HOME: home } });
+    assert(ran.status === 0, `the printed sed failed (${ran.status}): ${ran.stderr}`);
+    const installed = readFileSync(snap, "utf8");
+    const read = pinApi.readPlistScript(installed);
+    assert(read.ok && read.script === pinApi.SNAPSHOT_SCRIPT, JSON.stringify(read));
+    assert(installed.includes(`${home}/Library/Logs/chamber-daily-snapshot.log`), "REPLACE_WITH_HOME was not substituted");
+    assert(pinApi.snapshotJobNotice(snap, fx.source, fx.releaseDir).length === 0, "the notice stays after the printed commands were applied");
+  });
+});
+
+test("release", "the snapshot warning is printed when no 08:30 job is installed too", () => {
+  withReleaseFixture((fx) => {
+    addSnapshotTag(fx, "withsnap");
+    const snap = writeSnapshotPlist(fx, "$HOME/Projects/chamber/scripts/daily-snapshot.sh");
+    const r = pinRelease({ ...pinOpts(fx, "withsnap", fakeLaunchctl({ loaded: false }).run), snapshotPlistPath: snap });
+    assert(r.code === 0 && r.out.some((l) => l.includes("no LaunchAgent was installed")), r.out.join("\n"));
+    assert(r.out.some((l) => l.startsWith(SNAPSHOT_WARNING)), r.out.join("\n"));
+  });
+});
+
+test("release", "a pin says nothing about a snapshot job that is absent, already on the release, or not asked about", () => {
+  withReleaseFixture((fx) => {
+    addSnapshotTag(fx, "withsnap");
+    const lc = fakeLaunchctl({ loaded: false });
+    const quiet = (label: string, snapshotPlistPath: string | undefined): void => {
+      const r = pinRelease({ ...pinOpts(fx, "withsnap", lc.run), snapshotPlistPath });
+      assert(r.code === 0, `${label}: ${r.err.join("\n")}`);
+      assert(!r.out.some((l) => l.includes("snapshot")), `${label}: ${r.out.join("\n")}`);
+    };
+    quiet("absent", join(fx.root, "nowhere", "com.chamber.daily-snapshot.plist"));
+    quiet("as shipped", writeSnapshotPlist(fx, pinApi.SNAPSHOT_SCRIPT));
+    quiet("as an absolute path", writeSnapshotPlist(fx, join(fx.releaseDir, "scripts", "daily-snapshot.sh")));
+    // Not asked: a stale plist exists and pin was not given its path.
+    writeSnapshotPlist(fx, "$HOME/Projects/chamber/scripts/daily-snapshot.sh");
+    quiet("not asked", undefined);
+  });
+});
+
+test("release", "an unreadable snapshot plist is a warning, a release without the script gets no commands, and a refused pin says nothing", () => {
+  withReleaseFixture((fx) => {
+    addSnapshotTag(fx, "withsnap");
+    const lc = fakeLaunchctl({ loaded: false });
+    const snap = writeSnapshotPlist(fx, pinApi.SNAPSHOT_SCRIPT);
+    writeFileSync(snap, "this is not a property list\n");
+    const unreadable = pinRelease({ ...pinOpts(fx, "withsnap", lc.run), snapshotPlistPath: snap });
+    assert(
+      unreadable.code === 0 && unreadable.out.some((l) => l.startsWith(SNAPSHOT_WARNING) && l.includes("cannot be read")),
+      unreadable.out.join("\n"),
+    );
+
+    // v2 has no scripts/daily-snapshot.sh: a stale job gets the warning and no reinstall commands.
+    writeSnapshotPlist(fx, "$HOME/Projects/chamber/scripts/daily-snapshot.sh");
+    const noScript = pinRelease({ ...pinOpts(fx, "v2", lc.run), snapshotPlistPath: snap });
+    assert(
+      noScript.code === 0 && noScript.out.some((l) => l.startsWith(SNAPSHOT_WARNING) && l.includes("has no scripts/daily-snapshot.sh")),
+      noScript.out.join("\n"),
+    );
+    assert(!noScript.out.some((l) => l.includes("launchctl")), `commands were printed for a release without the script:\n${noScript.out.join("\n")}`);
+
+    // A pin that failed says nothing about the snapshot job.
+    const refused = pinRelease({ ...pinOpts(fx, "badexit", lc.run), snapshotPlistPath: snap });
+    assert(refused.code === 1 && !refused.out.some((l) => l.includes("snapshot")), refused.out.join("\n"));
+  });
+});
+
+test("release", "chamber pin gives pinRelease the snapshot job's plist path, and SCHEDULING.md describes the notice", () => {
+  const cli = readFileSync(fileURLToPath(new URL("../src/cli.ts", import.meta.url)), "utf8");
+  assert(
+    cli.includes('snapshotPlistPath: join(homedir(), "Library", "LaunchAgents", `${SNAPSHOT_JOB_LABEL}.plist`),'),
+    "cmdPin does not pass the snapshot plist path, so the notice never runs",
+  );
+  const sched = readFileSync(fileURLToPath(new URL("../deploy/SCHEDULING.md", import.meta.url)), "utf8").replace(/\s+/g, " ");
+  for (const needle of [
+    "`chamber pin` does not rewrite or load the snapshot job's plist",
+    "prints one warning line and the commands that reinstall it",
+    "launchctl unload ~/Library/LaunchAgents/com.chamber.daily-snapshot.plist",
+    "pin prints nothing about it",
+    "prints no commands",
+  ]) {
+    assert(sched.includes(needle), `SCHEDULING.md does not say: ${needle}`);
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

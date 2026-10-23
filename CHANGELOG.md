@@ -74,7 +74,8 @@ history and the GitHub releases.
 
 - **`chamber_check` reads a declared notes folder.** An absolute path under a
   folder declared with `--notes` or a config ingest root is judged from the
-  file on disk, with no ingest and no database. The install line is
+  file on disk, with no ingest; no database is needed, and an existing one is
+  opened to say whether the index is behind. The install line is
   `npx -y @bu7umaid/chamber mcp --notes ~/Notes`. An edited indexed note is
   judged from the new text and says the index is behind; `record` is refused
   until the index matches the disk. A config that does not parse fails the
@@ -88,8 +89,8 @@ history and the GitHub releases.
   together, so a failed vector write cannot leave a skippable hash on an old
   vector. The log says how many passages were written and how many were kept.
 - **One MiniLM process per ingest.** `ingestDirectory` starts one
-  `embed_minilm.py --serve` process for the batches it embeds and closes it
-  before it returns, so the model loads once per root instead of once per
+  `embed_minilm.py --serve` process for the batches it embeds (restarted at
+  most once after a failure) and closes it before it returns, so the model loads once per root instead of once per
   changed file. A root that skips every passage never starts it.
 - **MiniLM text goes on stdin.** Batches are split into groups of at most
   12,288 UTF-8 bytes. The script refuses an argument longer than 2,048

@@ -15404,6 +15404,30 @@ test("release", "a tag that moved on origin after it was pinned is refused, with
   });
 });
 
+// ─── SCHEDULING.md says what pin does about the order of its checks and its repair command ──
+
+test("release", "SCHEDULING.md puts the missing-bin refusal after the fetch, and says the repair command is for an existing checkout", () => {
+  const sched = readFileSync(fileURLToPath(new URL("../deploy/SCHEDULING.md", import.meta.url)), "utf8").replace(/\s+/g, " ");
+  const first = sched.indexOf("Pin refuses before it fetches or moves anything in these cases:");
+  const after = sched.indexOf("Two refusals can only come after the fetch");
+  assert(first >= 0 && after > first, "the before-the-fetch list or the after-the-fetch paragraph is missing");
+  // The check reads bin/chamber.js out of the fetched commit, so it cannot come first.
+  assert(
+    !sched.slice(first, after).includes("bin/chamber.js"),
+    "SCHEDULING.md lists a bin/chamber.js refusal among those made before the fetch; the code makes it after",
+  );
+  for (const needle of [
+    "a tag with no `bin/chamber.js`",
+    "a tag the checkout did not have before is removed again",
+    "git -C <dir> tag -d <tag>",
+    "quoted for a POSIX shell",
+    "in a release checkout that already existed",
+    "so there is nothing to repair and pin prints no command",
+  ]) {
+    assert(sched.includes(needle), `SCHEDULING.md does not say: ${needle}`);
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

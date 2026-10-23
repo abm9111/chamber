@@ -46,7 +46,20 @@ or moves anything in these cases:
   `ProgramArguments`)
 - your clone's `origin` is an http(s) URL with a username or password in it
 - the release checkout has tracked changes or a `dist/` folder
-- the tag has no `bin/chamber.js`
+
+Two refusals can only come after the fetch, because they need the tag's commit:
+a tag with no `bin/chamber.js`, and a release that does not run (below). Both
+leave the release checkout's files and `HEAD` as they were, and neither leaves
+the tag behind: a tag the checkout did not have before is removed again, so a
+release you fix and re-point on origin can be pinned by running `chamber pin`
+again.
+
+A tag the checkout already had, because you pinned it earlier, and that has
+since moved on origin is refused. Git does not move a tag it has, and pin does
+not follow a tag that changed under a name you already ran. Pin says so and
+prints the command that deletes the local tag, `git -C <dir> tag -d <tag>`, with
+the directory and the tag quoted for a POSIX shell. If the move was on purpose,
+run it and pin again.
 
 Before it moves the release checkout, pin runs the release once, in a throwaway
 clone of that checkout at the tag: `node bin/chamber.js --version` under
@@ -55,9 +68,9 @@ version in the release's `package.json`. If it does not, pin exits 1 having
 changed nothing the job uses: the release checkout, the plist and the loaded job
 are as they were, so a job that was already pinned keeps running the release it
 ran yesterday, and a first pin whose release does not run leaves no checkout
-behind. (The fetch does add the tag's objects and ref to the checkout's `.git`;
-its files and `HEAD` stay.) Only a release that has run is moved to, and only
-then is the plist written.
+behind. (The fetch does add the tag's objects to the checkout's `.git`; its
+files and `HEAD` stay, and the tag's ref is removed again as described above.)
+Only a release that has run is moved to, and only then is the plist written.
 
 What the proof does not cover:
 
@@ -69,8 +82,10 @@ What the proof does not cover:
   files after one, the move was cut short. The next pin refuses such a checkout;
   this finishes the move:
   `git -C ~/.local/share/chamber-release checkout --force --detach <tag>`. Pin
-  prints that command, with the real directory and tag, when its own
-  `git checkout` fails.
+  prints that command, with the real directory and tag quoted for a POSIX shell,
+  when its own `git checkout` fails in a release checkout that already existed.
+  A first pin that fails to check out removes the directory it made, so there is
+  nothing to repair and pin prints no command.
 - A pin killed while the release runs leaves its throwaway clone in the system
   temp directory, named `chamber-pin-proof-*`. Delete it. If it was a first pin,
   killed during the fetch or the proof, it also leaves

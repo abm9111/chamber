@@ -15945,6 +15945,42 @@ test("config", "a tokenizer refusal the probe remembers is cleared by putting th
   }
 });
 
+// ─── the docs say what the pin and embedder follow-ups changed ──────────────
+
+test("config", "the docs and the changelog describe the pin and embedder follow-ups, and none says a refusal lasts until a restart", () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const read = (...parts: string[]): string => readFileSync(join(root, ...parts), "utf8").replace(/\s+/g, " ");
+  const limitations = read("docs", "KNOWN_LIMITATIONS.md");
+  for (const needle of [
+    "`model_quantized.onnx` or `tokenizer.json` does not match",
+    "the bytes that are hashed are the bytes that load",
+    "is asked again when the weights, the tokenizer or `VERSION` change",
+  ]) {
+    assert(limitations.includes(needle), `KNOWN_LIMITATIONS.md does not say: ${needle}`);
+  }
+  const changelog = read("CHANGELOG.md");
+  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.0"));
+  assert(unreleased.length > 0 && unreleased.includes("### Fixed"), "no Unreleased / Fixed section found in CHANGELOG.md");
+  for (const heading of [
+    "**A refused pin does not leave its tag in the release checkout.**",
+    "**The repair command pin prints is quoted.**",
+    "**SCHEDULING.md matches the order of pin's checks.**",
+    "**Pin says when the daily snapshot job is not on the release.**",
+    "**VERSION covers `tokenizer.json`, and always comes from the installed package.**",
+    "**The embedder loads the bytes it hashed.**",
+    "**A weights refusal is asked again when the files change.**",
+  ]) {
+    assert(unreleased.includes(heading), `CHANGELOG.md Unreleased does not have: ${heading}`);
+  }
+  for (const [name, text] of [
+    ["KNOWN_LIMITATIONS.md", limitations],
+    ["CHANGELOG.md (Unreleased)", unreleased],
+    ["src/embedder.ts", read("src", "embedder.ts")],
+  ] as const) {
+    assert(!text.includes("until it is restarted"), `${name} still says a weights refusal lasts until a restart`);
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

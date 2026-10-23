@@ -833,16 +833,23 @@ query's model against the corpus's dominant model and says so in its note
 channel rather than returning an empty result with no cause.
 
 **Closed: weights that were refused never become hash vectors.**
-`scripts/embed_minilm.py` exits 3 when `model_quantized.onnx` does not match the
-SHA-256 in `models/minilm/VERSION`. That is not a machine without an embedder:
-the weights are there and were refused. `minilmAvailable()`, `embedLocal` and
+`scripts/embed_minilm.py` exits 3 when `model_quantized.onnx` or `tokenizer.json`
+does not match the SHA-256 that the package's own `models/minilm/VERSION`
+records for it. `CHAMBER_MINILM_DIR` moves those two files and never the VERSION
+they are held to, and the bytes that are hashed are the bytes that load: each
+file is read once and the session and tokenizers are built from that copy. That
+is not a machine without an embedder: the weights are there and were refused.
+`minilmAvailable()`, `embedLocal` and
 `embedLocalBatch` throw `MinilmIntegrityError` for it in every mode, `auto`
 included, so `ingest`, `search` and `ask` stop with the mismatch instead of
 writing or querying with `local-hash-v1`. A missing interpreter or dependency
 still degrades with the warning above, and `CHAMBER_EMBEDDER=hash` still chooses
 hash on purpose. In `commit_belief` the throw lands in the debt check's own
 catch inside the transaction: the check is recorded as not run, as for any
-embedder failure, and the commit is not parked.
+embedder failure, and the commit is not parked. A refusal that
+`minilmAvailable()` remembers is asked again when the weights, the tokenizer or
+`VERSION` change, so a running `chamber mcp` recovers when the files are put
+back; no other path caches a refusal.
 
 **Closed: one subprocess per passage.** `embedLocalBatch` is wired into
 `src/ingest.ts`, which was the path that took 75 minutes for 28,500 passages.

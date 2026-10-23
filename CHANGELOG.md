@@ -25,6 +25,50 @@ history and the GitHub releases.
   allows plain http to any host, but no longer any other scheme: it used to
   skip the check entirely, so `file:`, `smb:` and application URL schemes
   passed too.
+- **A refused pin does not leave its tag in the release checkout.** Pin fetches
+  the tag before it knows the release runs, and a tag it then refused (the
+  release does not run, or has no `bin/chamber.js`) stayed behind as a local
+  ref. Git does not move a tag it has, so a release fixed and re-pointed on
+  origin failed the second pin with a bare `git fetch exited 1`. The ref is now
+  removed again unless the tag was there before. A tag that was there and has
+  moved on origin is still refused, and the message now says so and prints the
+  command that deletes the local copy.
+- **The repair command pin prints is quoted.** The directory and the tag went
+  into `git -C <dir> checkout --force --detach <tag>` raw, and the command is
+  now the last thing on the line. Both are quoted for a POSIX shell, so a home
+  directory with a space or a quote in it, and a tag with `$` or `;` in it, run
+  as printed.
+- **SCHEDULING.md matches the order of pin's checks.** It listed the missing
+  `bin/chamber.js` among the refusals made before the fetch; the check needs the
+  fetched commit and comes after it, and the doc now says so. It also did not say
+  that a first pin prints no repair command (its new directory is removed
+  instead).
+- **Pin says when the daily snapshot job is not on the release.** After a pin
+  that worked, if `~/Library/LaunchAgents/com.chamber.daily-snapshot.plist`
+  exists and does not run the release checkout's `scripts/daily-snapshot.sh` (or
+  cannot be read), pin prints one warning line and the quoted commands that
+  reinstall it. It never rewrites or loads that plist, and prints nothing when
+  there is none or it is already right. A release with no
+  `scripts/daily-snapshot.sh`, or a clone with no
+  `deploy/launchd/com.chamber.daily-snapshot.plist` to copy, gets the warning
+  and no commands.
+- **VERSION covers `tokenizer.json`, and always comes from the installed package.**
+  `models/minilm/VERSION` has a second line, `Vocab-SHA-256:`, for
+  `tokenizer.json`; the original `SHA-256:` line is unchanged and still means the
+  weights. The embedder exits 3 unless both files match, and reads VERSION from
+  the package it sits in and nowhere else: `CHAMBER_MINILM_DIR` moves the two
+  files and no longer carries a VERSION of its own that could vouch for them. A
+  VERSION that is not UTF-8, or has no line or two lines for either hash, is now a
+  refusal (exit 3) and not a crash.
+- **The embedder loads the bytes it hashed.** Each file is read once, hashed in
+  memory and kept; the session is built from the bytes and the tokenizers from
+  the text. Before, `onnxruntime` and the tokenizer opened the paths again after
+  the hash, and a file replaced in between loaded unhashed.
+- **A weights refusal is asked again when the files change.** A running
+  `chamber mcp` used to keep a `MinilmIntegrityError` until it restarted. The
+  availability probe now remembers it with a stat signature of the weights, the
+  tokenizer and VERSION and asks the script again when it changes. The "restart
+  the process" sentence is gone from errors that cache nothing.
 
 ## 0.2.0 — 2026-10-23
 

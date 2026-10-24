@@ -3,7 +3,10 @@
 All notable changes to Chamber. Versions before 0.1.6 are described in the git
 history and the GitHub releases.
 
-## Unreleased
+## 0.2.1 — 2026-10-24
+
+0.2.0 was tagged but never published to npm or the MCP Registry, so this is
+the first 0.2 release there. It includes everything under 0.2.0 below.
 
 ### Changed (breaking)
 
@@ -71,6 +74,23 @@ history and the GitHub releases.
   availability probe now remembers it with a stat signature of the weights, the
   tokenizer and VERSION and asks the script again when it changes. The "restart
   the process" sentence is gone from errors that cache nothing.
+- **A model file that is not a regular file is refused.** Each model file is
+  opened without blocking and checked on that same open, so a FIFO or a
+  directory in place of the weights or `tokenizer.json` exits 3 at once instead
+  of hanging the embedder. No file is read past 256 MiB; a larger one is
+  refused.
+- **Pin's printed commands are quoted throughout.** The `launchctl` lines after
+  a failed reload quote the plist path, and a word starting with `=` is quoted
+  so zsh does not expand it.
+- **What pin prints from plutil is escaped.** plutil's reason and the script
+  path from a snapshot plist go through `JSON.stringify` plus `\u00XX` escapes
+  for DEL and the C1 controls, so no raw control byte reaches the terminal.
+
+### Security
+
+- **Dependencies:** body-parser 2.4.0 (GHSA-27r3-jxmh-p828) and undici 6.29.1 /
+  7.30.1 (GHSA-4qv8-2p9j-2685, GHSA-f72v-6w45-q472, GHSA-xjj6-f33q-929c),
+  all transitive through the Slack and Discord gateways.
 
 ## 0.2.0 — 2026-10-23
 

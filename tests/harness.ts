@@ -16659,6 +16659,54 @@ test("config", "the embedder's docstrings say a weights path that cannot be exam
   );
 });
 
+// ─── the docs say what an npm or Docker install embeds with ─────────────────
+
+test("config", "the docs say an npm or Docker install embeds with hash vectors, and the package and the images really do not carry the model", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const read = (...parts: string[]): string => readFileSync(join(root, ...parts), "utf8");
+  const flat = (text: string): string => text.replace(/\s+/g, " ");
+  // The facts the docs state. If the package or an image starts to carry the
+  // model, these fail and the docs below are stale.
+  const pkg = JSON.parse(read("package.json")) as { files?: string[] };
+  assert(
+    !(pkg.files ?? []).some((f) => f.replace(/^\.\//, "").startsWith("models")),
+    "package.json now ships models/, but the README and KNOWN_LIMITATIONS say the npm package does not carry the model",
+  );
+  for (const [name, text] of [
+    ["Dockerfile", read("Dockerfile")],
+    ["deploy/Dockerfile", read("deploy", "Dockerfile")],
+  ] as const) {
+    assert(!/^COPY\b.*\bmodels\b/m.test(text), `${name} now copies models/, but the README says the Docker images do not carry the model`);
+  }
+  const readme = flat(read("README.md"));
+  for (const needle of [
+    "An npm or Docker install embeds with `local-hash-v1` vectors, without a warning",
+    "do not carry `models/minilm/`",
+    "pip install --require-hashes -r scripts/requirements-embed.txt",
+    "set `CHAMBER_PYTHON`",
+  ]) {
+    assert(readme.includes(needle), `README.md does not say: ${needle}`);
+  }
+  const limits = flat(read("docs", "KNOWN_LIMITATIONS.md"));
+  assert(!limits.includes("Both ship in the repo"), "KNOWN_LIMITATIONS.md still says both files ship in the repo");
+  assert(
+    limits.includes("the npm package and the Docker images carry the script but not the model file"),
+    "KNOWN_LIMITATIONS.md does not say the npm package and the Docker images lack the model file",
+  );
+  assert(limits.includes("cannot be searched"), "KNOWN_LIMITATIONS.md does not say a model directory that cannot be searched is a refusal");
+  const changelog = read("CHANGELOG.md");
+  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.1"));
+  assert(unreleased.length > 0 && unreleased.includes("### Fixed"), "no Unreleased / Fixed section found above 0.2.1 in CHANGELOG.md");
+  for (const heading of [
+    "**A child's stderr is escaped before it reaches a terminal.**",
+    "**The Telegram poll loop waits after a refusal from the Bot API.**",
+    "**An unreadable model folder is a refusal, not \"no embedder\".**",
+    "**An npm or Docker install embeds with hash vectors.**",
+  ]) {
+    assert(unreleased.includes(heading), `CHANGELOG.md Unreleased does not have: ${heading}`);
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

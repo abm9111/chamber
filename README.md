@@ -241,6 +241,16 @@ chamber verify           # re-check stored pins against the corpus
 chamber corpus           # what is actually in the index
 ```
 
+**Which embedder you get depends on how you installed.** An npm or Docker
+install embeds with `local-hash-v1` vectors, without a warning: the npm package
+and both Dockerfiles do not carry `models/minilm/` (the 23 MB MiniLM weights),
+so `chamber ingest` and the retrieval behind `chamber_ask` match on character
+n-grams and not on meaning. `chamber_check` is not affected; it uses no model.
+For MiniLM, use a clone of the repo, install its Python dependencies with
+`pip install --require-hashes -r scripts/requirements-embed.txt`, and set
+`CHAMBER_PYTHON` to the interpreter that has them. A clone whose interpreter
+lacks onnxruntime falls back to hash vectors too, with a warning on stderr.
+
 **Set your excludes before the first ingest.** There is no default exclude list.
 Pointed at a folder of exported chat logs, Chamber will happily index all of
 them and answer from them — see `chamber corpus` and

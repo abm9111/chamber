@@ -3,7 +3,7 @@
 All notable changes to Chamber. Versions before 0.1.6 are described in the git
 history and the GitHub releases.
 
-## Unreleased
+## 0.2.2 — 2026-10-24
 
 ### Fixed
 

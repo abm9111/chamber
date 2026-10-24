@@ -15,7 +15,7 @@ whatever branch you had checked out at 08:30. The job runs a second checkout,
 pinned to a release tag:
 
 ```bash
-chamber pin v0.2.1    # from a clone of this repository
+chamber pin v0.2.2    # from a clone of this repository
 ```
 
 `chamber pin <tag>` fetches the tag from your clone's `origin` and keeps
@@ -132,7 +132,7 @@ passages took over an hour). Pin when it is not running: look at the end of
 1. Pin a release (see the prerequisite above):
 
    ```bash
-   chamber pin v0.2.1
+   chamber pin v0.2.2
    ```
 
    With no job installed yet, pin clones the checkout and prints that no

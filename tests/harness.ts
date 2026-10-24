@@ -16695,15 +16695,15 @@ test("config", "the docs say an npm or Docker install embeds with hash vectors, 
   );
   assert(limits.includes("cannot be searched"), "KNOWN_LIMITATIONS.md does not say a model directory that cannot be searched is a refusal");
   const changelog = read("CHANGELOG.md");
-  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.1"));
-  assert(unreleased.length > 0 && unreleased.includes("### Fixed"), "no Unreleased / Fixed section found above 0.2.1 in CHANGELOG.md");
+  const unreleased = changelog.slice(changelog.indexOf("## 0.2.2"), changelog.indexOf("## 0.2.1"));
+  assert(unreleased.length > 0 && unreleased.includes("### Fixed"), "no 0.2.2 / Fixed section found above 0.2.1 in CHANGELOG.md");
   for (const heading of [
     "**A child's stderr is escaped before it reaches a terminal.**",
     "**The Telegram poll loop waits after a refusal from the Bot API.**",
     "**An unreadable model folder is a refusal, not \"no embedder\".**",
     "**An npm or Docker install embeds with hash vectors.**",
   ]) {
-    assert(unreleased.includes(heading), `CHANGELOG.md Unreleased does not have: ${heading}`);
+    assert(unreleased.includes(heading), `CHANGELOG.md 0.2.2 does not have: ${heading}`);
   }
 });
 
@@ -16716,10 +16716,10 @@ test("config", "server.json's top-level description is at most the 100 character
   const length = [...registry.description].length;
   assert(length <= 100, `server.json's description is ${length} characters, and mcp-publisher refuses more than 100: ${registry.description}`);
   const changelog = readFileSync(join(root, "CHANGELOG.md"), "utf8");
-  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.1"));
+  const unreleased = changelog.slice(changelog.indexOf("## 0.2.2"), changelog.indexOf("## 0.2.1"));
   assert(
     unreleased.includes("**The MCP Registry description says what the check does.**"),
-    "CHANGELOG.md Unreleased does not mention the server.json description",
+    "CHANGELOG.md 0.2.2 does not mention the server.json description",
   );
 });
 

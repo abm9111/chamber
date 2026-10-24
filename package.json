@@ -1,6 +1,6 @@
 {
   "name": "@bu7umaid/chamber",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Checks that the numbers, capitalised names, and file names in a claim occur in the indexed note. Local, no model. It does not judge meaning. Zero runtime dependencies.",
   "license": "MIT",

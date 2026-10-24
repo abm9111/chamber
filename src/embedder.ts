@@ -26,16 +26,23 @@ export const HASH_MODEL = "local-hash-v1";
 export const HASH_DIMS = 256;
 export const OLLAMA_MODEL_DEFAULT = "nomic-embed-text";
 
-/** The exit code `scripts/embed_minilm.py` uses when the weights fail their hash check. */
+/**
+ * The exit code `scripts/embed_minilm.py` uses when it refuses the model files:
+ * a hash that is not the one VERSION records, or a file it cannot read or that
+ * is not a regular file.
+ */
 export const MINILM_WEIGHTS_REFUSED_EXIT = 3;
 
 /**
- * The MiniLM weights are on disk and were refused by their hash check
- * (`scripts/embed_minilm.py` exit 3). That is not a machine without an
- * embedder, which is entitled to hash vectors and a warning: it is weights that
- * changed, and writing `local-hash-v1` vectors in their place is the silent
- * downgrade this module exists to prevent. So this error is never turned into a
- * fallback, in `auto` mode or any other.
+ * The MiniLM model files are on disk, or may be, and were refused
+ * (`scripts/embed_minilm.py` exit 3): they fail their hash check, or the script
+ * could not read them, or one is not a regular file. That is not a machine
+ * without an embedder, which is entitled to hash vectors and a warning: it is
+ * files that changed or went unreadable, and writing `local-hash-v1` vectors in
+ * their place is the silent downgrade this module exists to prevent. So this
+ * error is never turned into a fallback, in `auto` mode or any other. It is
+ * keyed on the exit code alone; the detail is the script's own line, which says
+ * which of these it was.
  */
 export class MinilmIntegrityError extends Error {
   /**
@@ -45,9 +52,11 @@ export class MinilmIntegrityError extends Error {
    */
   constructor(detail: string, remembered: boolean = false) {
     super(
-      `embed_minilm failed (${MINILM_WEIGHTS_REFUSED_EXIT}): ${detail}. The MiniLM weights were refused, ` +
-        `and Chamber will not write hash vectors in their place: put back the model_quantized.onnx and ` +
-        `tokenizer.json that models/minilm/VERSION records. ` +
+      `embed_minilm failed (${MINILM_WEIGHTS_REFUSED_EXIT}): ${detail}. The MiniLM model files were refused or ` +
+        `could not be read, and Chamber will not write hash vectors in their place. The detail before this says ` +
+        `which. If a hash differs from what models/minilm/VERSION records, put back the model_quantized.onnx ` +
+        `and tokenizer.json that it records. If a file could not be read or is not a regular file, fix its ` +
+        `permissions or what it is. ` +
         `To embed with something else on purpose, set CHAMBER_EMBEDDER=hash or ollama.` +
         (remembered
           ? ` A running process remembers this refusal only until the weights, the tokenizer or VERSION change, and then asks again.`

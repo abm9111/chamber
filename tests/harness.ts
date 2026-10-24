@@ -10,7 +10,7 @@ import { CURL_FIXED_ARGV, buildCurlInvocation, httpSync } from "../src/http_sync
 import { TurnPool, TurnWorkerError } from "../src/turn_pool.ts";
 import { isSqliteBusy } from "../src/turn.ts";
 import { mcpDiscover } from "../src/mcp_client.ts";
-import { TelegramGateway, canTelegramTalk, TELEGRAM_TALK_REFUSAL } from "../src/gateway.ts";
+import { TelegramGateway, canTelegramTalk, TELEGRAM_TALK_REFUSAL, withoutTelegramToken, telegramApiText } from "../src/gateway.ts";
 import { claimHash, newId, sha256 } from "../src/hash.ts";
 import { commitBelief } from "../src/commit_belief.ts";
 import {
@@ -16695,15 +16695,15 @@ test("config", "the docs say an npm or Docker install embeds with hash vectors, 
   );
   assert(limits.includes("cannot be searched"), "KNOWN_LIMITATIONS.md does not say a model directory that cannot be searched is a refusal");
   const changelog = read("CHANGELOG.md");
-  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.1"));
-  assert(unreleased.length > 0 && unreleased.includes("### Fixed"), "no Unreleased / Fixed section found above 0.2.1 in CHANGELOG.md");
+  const unreleased = changelog.slice(changelog.indexOf("## 0.2.2"), changelog.indexOf("## 0.2.1"));
+  assert(unreleased.length > 0 && unreleased.includes("### Fixed"), "no 0.2.2 / Fixed section found above 0.2.1 in CHANGELOG.md");
   for (const heading of [
     "**A child's stderr is escaped before it reaches a terminal.**",
     "**The Telegram poll loop waits after a refusal from the Bot API.**",
     "**An unreadable model folder is a refusal, not \"no embedder\".**",
     "**An npm or Docker install embeds with hash vectors.**",
   ]) {
-    assert(unreleased.includes(heading), `CHANGELOG.md Unreleased does not have: ${heading}`);
+    assert(unreleased.includes(heading), `CHANGELOG.md 0.2.2 does not have: ${heading}`);
   }
 });
 
@@ -16716,11 +16716,597 @@ test("config", "server.json's top-level description is at most the 100 character
   const length = [...registry.description].length;
   assert(length <= 100, `server.json's description is ${length} characters, and mcp-publisher refuses more than 100: ${registry.description}`);
   const changelog = readFileSync(join(root, "CHANGELOG.md"), "utf8");
-  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.1"));
+  const unreleased = changelog.slice(changelog.indexOf("## 0.2.2"), changelog.indexOf("## 0.2.1"));
   assert(
     unreleased.includes("**The MCP Registry description says what the check does.**"),
-    "CHANGELOG.md Unreleased does not mention the server.json description",
+    "CHANGELOG.md 0.2.2 does not mention the server.json description",
   );
+});
+
+// ─── jsonForTerminal keeps a closed set of characters ───────────────────────
+
+test("release", "jsonForTerminal writes every character that is not a letter, mark, number, punctuation, symbol or the space as an escape", () => {
+  const j = pinApi.jsonForTerminal;
+  // Each of these is a character a terminal acts on, or a log or a pasted message shows as nothing or out of order.
+  for (const [what, ch, escape] of [
+    ["ESC", "\u001b", "\\u001b"],
+    ["DEL", "\u007f", "\\u007f"],
+    ["a C1 control (U+009B is the 8-bit CSI)", "\u009b", "\\u009b"],
+    ["a right-to-left override", "\u202e", "\\u202e"],
+    ["a left-to-right isolate", "\u2066", "\\u2066"],
+    ["a zero-width space", "\u200b", "\\u200b"],
+    ["a zero-width joiner", "\u200d", "\\u200d"],
+    ["a byte order mark", "\ufeff", "\\ufeff"],
+    ["the Arabic letter mark", "\u061c", "\\u061c"],
+    ["the line separator", "\u2028", "\\u2028"],
+    ["the paragraph separator", "\u2029", "\\u2029"],
+    ["a no-break space", "\u00a0", "\\u00a0"],
+    ["an em space", "\u2003", "\\u2003"],
+    ["an ideographic space", "\u3000", "\\u3000"],
+    ["a private-use character", "\ue000", "\\ue000"],
+    ["an unassigned code point", "\u0378", "\\u0378"],
+    ["a lone high surrogate", "\ud83d", "\\ud83d"],
+    ["a lone low surrogate", "\ude00", "\\ude00"],
+    ["a tag character, which is above U+FFFF and so a surrogate pair", "\u{e0041}", "\\udb40\\udc41"],
+    ["the last code point, also a surrogate pair", "\u{10ffff}", "\\udbff\\udfff"],
+  ] as const) {
+    const out = j(`a${ch}b`);
+    assert(out === `"a${escape}b"`, `${what}: got ${out}, wanted "a${escape}b"`);
+    assert(JSON.parse(out) === `a${ch}b`, `${what}: ${out} does not parse back to the input`);
+  }
+  // Each of these is text a person wrote, and comes out exactly as JSON.stringify writes it.
+  for (const [what, text] of [
+    ["accented Latin", "café über"],
+    ["Arabic", "مرحبا بالعالم"],
+    ["Chinese", "你好，世界"],
+    ["emoji, which are surrogate pairs", "\u{1f600} \u{1f680}"],
+    ["a combining mark and a variation selector", "e\u0301 \u2764\ufe0f"],
+    ["a currency symbol, a dash and a digit from another script", "€5 — ٣"],
+    ["the ASCII punctuation JSON leaves alone", "!#$%&'()*+,-./:;<=>?@[]^_`{|}~"],
+    ["spaces between words", "a b  c"],
+    ["the quotes, the backslash and the five controls JSON has short escapes for", 'say "hi"\\ \b\f\n\r\t'],
+    ["nothing", ""],
+  ] as const) {
+    assert(j(text) === JSON.stringify(text), `${what}: got ${j(text)}, JSON.stringify writes ${JSON.stringify(text)}`);
+    assert(JSON.parse(j(text)) === text, `${what}: ${j(text)} does not parse back to the input`);
+  }
+  // The zero-width joiner is the price: an emoji sequence shows it as an escape.
+  assert(j("\u{1f468}\u200d\u{1f469}") === '"\u{1f468}\\u200d\u{1f469}"', `a joined emoji sequence: ${j("\u{1f468}\u200d\u{1f469}")}`);
+  // Every code point. What is kept is a letter, mark, number, punctuation mark, symbol or the space, written
+  // from the complement (control, format, surrogate, private use, unassigned, separator) so that this does
+  // not repeat the implementation's expression; what is not kept is ASCII only; and all of it parses back.
+  const notKept = /^[\p{C}\p{Z}]$/u;
+  for (let cp = 0; cp <= 0x10ffff; cp++) {
+    const ch = String.fromCodePoint(cp);
+    const out = j(ch);
+    if (JSON.parse(out) !== ch) assert(false, `U+${cp.toString(16)} does not parse back from ${out}`);
+    const kept = ch === " " || !notKept.test(ch);
+    if (ch === '"' || ch === "\\") {
+      if (out !== JSON.stringify(ch)) assert(false, `U+${cp.toString(16)} came out as ${out}`);
+    } else if (kept) {
+      if (out !== `"${ch}"`) assert(false, `U+${cp.toString(16)} is kept but came out as ${out}`);
+    } else if ([...out].some((c) => (c.codePointAt(0) ?? 0) > 0x7e)) {
+      assert(false, `U+${cp.toString(16)} is not kept and was not escaped: ${out}`);
+    }
+  }
+});
+
+// ─── the Telegram gateway prints nothing from the network raw, and backs off ─
+
+/** A `curl` first on PATH for the length of `fn`: it reads its stdin, then runs `script`. */
+async function withCurlScript<T>(script: string, fn: () => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-curlscript-"));
+  writeFileSync(join(dir, "curl"), `#!/bin/sh\ncat >/dev/null\n${script}\n`, { mode: 0o755 });
+  const savedPath = process.env.PATH;
+  try {
+    process.env.PATH = `${dir}:${savedPath ?? ""}`;
+    return await fn();
+  } finally {
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** A TelegramGateway whose real `api` can be called, and whose retry delay is short. */
+class ApiTelegram extends TelegramGateway {
+  constructor() {
+    super("TESTTOKEN-not-real");
+    this.retryDelayMs = 20;
+  }
+  call(method: string): unknown {
+    return this.api(method);
+  }
+}
+
+/** Throws what `thrown` lists, one entry per getUpdates, then stops and answers with an accepted, empty reply. */
+class ThrowingTelegram extends TelegramGateway {
+  thrown: unknown[];
+  polls = 0;
+  constructor(thrown: unknown[]) {
+    super("TESTTOKEN-not-real");
+    this.thrown = thrown;
+    this.retryDelayMs = 5;
+  }
+  protected override api(): unknown {
+    this.polls += 1;
+    if (this.polls > this.thrown.length) {
+      void this.stop();
+      return { ok: true, result: [] };
+    }
+    throw this.thrown[this.polls - 1];
+  }
+}
+
+/** Answers getUpdates from `script` (an Error in it is thrown), then stops itself and answers with an accepted, empty reply. */
+class ScriptedTelegram extends TelegramGateway {
+  script: unknown[];
+  constructor(script: readonly unknown[]) {
+    super("TESTTOKEN-not-real");
+    this.script = [...script];
+  }
+  protected override api(method: string): unknown {
+    if (method !== "getUpdates") throw new Error(`unexpected Bot API method ${method}`);
+    if (this.script.length === 0) {
+      void this.stop();
+      return { ok: true, result: [] };
+    }
+    const next = this.script.shift();
+    if (next instanceof Error) throw next;
+    return next;
+  }
+}
+
+/** Stops itself, then throws, with a retry delay of 15 s. */
+class StopsThenThrows extends TelegramGateway {
+  constructor() {
+    super("TESTTOKEN-not-real");
+    this.retryDelayMs = 15_000;
+  }
+  protected override api(): unknown {
+    void this.stop();
+    throw new Error("thrown after stop()");
+  }
+}
+
+/** Runs `fn` with setTimeout replaced by a recorder that fires at once, and returns the delays it was asked for. */
+async function recordedDelays(fn: () => Promise<unknown>): Promise<number[]> {
+  const real = globalThis.setTimeout;
+  const asked: number[] = [];
+  globalThis.setTimeout = ((handler: () => void, ms?: number): ReturnType<typeof setTimeout> => {
+    asked.push(ms ?? 0);
+    return real(handler, 0);
+  }) as unknown as typeof setTimeout;
+  try {
+    await fn();
+  } finally {
+    globalThis.setTimeout = real;
+  }
+  return asked;
+}
+
+/** Whether `p` settles within `ms`. */
+function settlesWithin(p: Promise<unknown>, ms: number): Promise<boolean> {
+  return new Promise<boolean>((ok) => {
+    const timer = setTimeout(() => ok(false), ms);
+    void p.then(() => {
+      clearTimeout(timer);
+      ok(true);
+    });
+  });
+}
+
+// A body that is not JSON (an ESC, then 300 zeros, then a tail marker), and a curl that fails with bad bytes on stderr.
+const NON_JSON_CURL = "printf '<html>\\033[31m boom %0300d TAILMARK\\n200' 0";
+const FAILING_CURL = "printf 'curl: (22) bad \\033[31mRED \\302\\233csi \\177del\\n' >&2\nexit 22";
+const REFUSE_401 = { ok: false, error_code: 401, description: "Unauthorized" };
+
+test("telegram", "T5_a_body_that_is_not_JSON_is_reported_by_its_size_only_and_a_curl_that_fails_by_its_exit_code", async () => {
+  await withCurlScript(NON_JSON_CURL, async () => {
+    let caught: unknown;
+    try {
+      new ApiTelegram().call("getUpdates");
+    } catch (e) {
+      caught = e;
+    }
+    assert(caught instanceof Error, `a non-JSON body did not throw: ${String(caught)}`);
+    // Its size, and not one word of it.
+    assert(/^telegram api returned non-JSON \(\d+ bytes\)$/.test(caught.message), `the error is not the size alone: ${JSON.stringify(caught.message)}`);
+  });
+  await withCurlScript(FAILING_CURL, async () => {
+    let caught: unknown;
+    try {
+      new ApiTelegram().call("getUpdates");
+    } catch (e) {
+      caught = e;
+    }
+    assert(caught instanceof Error, `a curl that failed did not throw: ${String(caught)}`);
+    // curl's exit code, and not a word of what it wrote to stderr.
+    assert(caught.message === "telegram api failed: curl exit 22", `unexpected message: ${JSON.stringify(caught.message)}`);
+  });
+  // The loop, end to end: the real api() throws, and the line the catch prints is one escaped line.
+  await withCurlScript(NON_JSON_CURL, async () => {
+    const gw = new ApiTelegram();
+    const logged = await captureStderrAsync(async () => {
+      const done = gw.start(async () => "never");
+      await new Promise<void>((r) => setTimeout(r, 250));
+      await gw.stop();
+      await done;
+    });
+    const lines = logged.split("\n").filter((l) => l.includes("telegram poll error"));
+    assert(lines.length >= 1, `nothing was logged about a body that is not JSON: "${logged}"`);
+    for (const l of logged.split("\n")) {
+      const raw = firstRawControl(l);
+      assert(raw === null, `${raw} reached stderr: ${JSON.stringify(l)}`);
+    }
+    assert(/non-JSON \(\d+ bytes\)/.test(lines[0]!) && !lines[0]!.includes("boom"), `the line does not say what happened, or quotes the body: ${lines[0]}`);
+  });
+});
+
+test("telegram", "T11_the_bot_token_never_reaches_a_log_line_or_an_error_even_when_the_answer_echoes_it", async () => {
+  // A curl that answers with what it was asked: the URL is on its stdin, as httpSync sends it, so the page
+  // echoes /bot<token>/getUpdates the way a proxy's or a captive portal's error page can.
+  const token = "123456789:AAH-secret_PART-for-the-test";
+  const secret = token.slice(token.indexOf(":") + 1);
+  const leaks = (text: string): boolean => text.includes(secret) || text.includes(token.slice(0, 14));
+  const dir = mkdtempSync(join(tmpdir(), "chamber-curlecho-"));
+  const savedPath = process.env.PATH;
+  const run = (script: string, fn: () => void): void => {
+    writeFileSync(join(dir, "curl"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+    fn();
+  };
+  class EchoTelegram extends TelegramGateway {
+    constructor() {
+      super(token);
+    }
+    call(): unknown {
+      return this.api("getUpdates");
+    }
+  }
+  try {
+    process.env.PATH = `${dir}:${savedPath ?? ""}`;
+    const messages: string[] = [];
+    const caught = (fn: () => unknown): void => {
+      try {
+        fn();
+        messages.push("(did not throw)");
+      } catch (e) {
+        messages.push(e instanceof Error ? e.message : String(e));
+      }
+    };
+    // A page that is not JSON, echoing the request (the token in the URL on curl's stdin).
+    run(`printf '<h1>404</h1> '; cat`, () => caught(() => new EchoTelegram().call()));
+    // The token starting at character 180, so a cut at 200 made before the token is removed keeps its first 20.
+    run(`cat >/dev/null; printf '%0180d${token}' 0`, () => caught(() => new EchoTelegram().call()));
+    // A curl that fails and repeats the request on stderr, cut and upper-cased past any copy redaction.
+    run(`cat >&2; printf ' %s' '${secret.slice(0, 20).toUpperCase()}' >&2; exit 22`, () => caught(() => new EchoTelegram().call()));
+    assert(messages.length === 3 && !messages.includes("(did not throw)"), `expected three errors: ${JSON.stringify(messages)}`);
+    for (const m of messages) {
+      assert(!leaks(m), `the token is in an error message: ${JSON.stringify(m)}`);
+    }
+    assert(messages[0]!.startsWith("telegram api returned non-JSON (") && messages[1]!.startsWith("telegram api returned non-JSON ("), `a page that is not JSON is quoted: ${JSON.stringify(messages)}`);
+    assert(messages[2] === "telegram api failed: curl exit 22", `curl's stderr reached the error: ${JSON.stringify(messages[2])}`);
+    // JSON refusals whose description and code repeat the token: whole, upper-cased, cut to 20 characters of
+    // the secret, and base64-encoded. Through the poll loop and its log line.
+    const b64 = Buffer.from(`/bot${token}/getUpdates`).toString("base64");
+    const lines = [
+      `{"ok":false,"error_code":404,"description":"no route /bot${token}/getUpdates"}`,
+      `{"ok":false,"error_code":404,"description":"NO ROUTE /BOT${token.toUpperCase()}/GETUPDATES"}`,
+      `{"ok":false,"error_code":404,"description":"no route /bot${token.slice(0, 30)}"}`,
+      `{"ok":false,"error_code":"E${secret.slice(0, 20).toUpperCase()}","description":"see ?r=${b64}"}`,
+    ];
+    run(`cat >/dev/null; n=$(cat "${dir}/n" 2>/dev/null || echo 0); echo $((n + 1)) > "${dir}/n"; case $n in ${lines.map((l, i) => `${i}) printf '%s' '${l}' ;;`).join(" ")} *) printf '%s' '{"ok":false,"error_code":404,"description":"Not Found"}' ;; esac`, () => undefined);
+    const gw = new EchoTelegram();
+    (gw as unknown as { retryDelayMs: number }).retryDelayMs = 20;
+    const logged = await captureStderrAsync(async () => {
+      const done = gw.start(async () => "never");
+      await new Promise<void>((r) => setTimeout(r, 700));
+      await gw.stop();
+      await done;
+    });
+    const refused = logged.split("\n").filter((l) => l.includes("getUpdates refused"));
+    assert(refused.length >= lines.length, `expected ${lines.length} refusal lines, got ${refused.length}: "${logged}"`);
+    assert(!leaks(logged) && !logged.toLowerCase().includes(secret.toLowerCase().slice(0, 16)), `the token reached stderr: ${JSON.stringify(logged)}`);
+    assert(!logged.includes(b64.slice(8, 24)), `the base64 echo reached stderr: ${JSON.stringify(logged)}`);
+    assert(logged.includes("Not Found"), `the API's own words were masked too: "${logged}"`);
+  } finally {
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // Anything else the loop catches (it also runs the turn) is cleaned too, not only what api() threw.
+  class ThrowsTokenTelegram extends TelegramGateway {
+    rounds = 0;
+    constructor() {
+      super(token);
+      this.retryDelayMs = 5;
+    }
+    protected override api(): unknown {
+      this.rounds += 1;
+      if (this.rounds > 1) void this.stop();
+      throw new Error(`turn failed calling https://api.telegram.org/bot${token}/x`);
+    }
+  }
+  const thrown = await captureStderrAsync(() => new ThrowsTokenTelegram().start(async () => "never"));
+  assert(thrown.includes("telegram poll error"), `nothing was logged for a thrown error: "${thrown}"`);
+  assert(!leaks(thrown), `the token in a thrown error reached stderr: ${JSON.stringify(thrown)}`);
+  // The helper itself: every copy goes, longest first, and a short or missing secret half is left alone.
+  assert(withoutTelegramToken(`a ${token} b ${secret} c`, token) === "a <token> b <token> c", "withoutTelegramToken left a copy");
+  assert(withoutTelegramToken("plain", "") === "plain", "an empty token changed the text");
+  assert(withoutTelegramToken(`x ${token.toUpperCase()} y`, token) === "x <token> y", "an upper-cased copy was left");
+  assert(
+    telegramApiText(`Conflict: terminated by other getUpdates request ${secret.slice(0, 18)}`, token) ===
+      "Conflict: terminated by other getUpdates request <redacted>",
+    "telegramApiText did not mask a cut copy, or masked the API's own words",
+  );
+});
+
+test("telegram", "T6_the_poll_loop_prints_whatever_was_thrown_as_an_escaped_string", async () => {
+  const gw = new ThrowingTelegram([
+    new Error("boom \u001b[31m\u009b\u007f\u202e"),
+    "plain string \u001b[2J",
+    { toString: (): string => "object \u001b]0;title\u0007" },
+    Object.assign(new Error("message"), { name: "Nm\u001b[1mame" }),
+  ]);
+  const logged = await captureStderrAsync(() => gw.start(async () => "never"));
+  const lines = logged.split("\n").filter((l) => l.includes("telegram poll error"));
+  assert(lines.length === 4, `expected four poll error lines, got ${lines.length}: "${logged}"`);
+  for (const l of logged.split("\n")) {
+    const raw = firstRawControl(l);
+    assert(raw === null, `${raw} reached stderr: ${JSON.stringify(l)}`);
+    assert(!l.includes("\u202e"), `a right-to-left override reached stderr: ${JSON.stringify(l)}`);
+  }
+  assert(lines[0]!.includes("boom \\u001b[31m\\u009b\\u007f\\u202e"), `the Error's message is not shown as escapes: ${lines[0]}`);
+  assert(lines[1]!.includes("plain string \\u001b[2J"), `a thrown string is not shown as escapes: ${lines[1]}`);
+  assert(lines[2]!.includes("object \\u001b]0;title\\u0007"), `a thrown object is not shown as escapes: ${lines[2]}`);
+  assert(lines[3]!.includes("Nm\\u001b[1mame"), `the Error's name is not shown as escapes: ${lines[3]}`);
+});
+
+test("telegram", "T7_consecutive_failed_rounds_wait_longer_each_time_up_to_five_minutes_and_an_accepted_answer_starts_over", async () => {
+  const gw = new ScriptedTelegram([
+    ...Array.from({ length: 10 }, () => REFUSE_401),
+    { ok: true, result: [] },
+    REFUSE_401,
+    REFUSE_401,
+    new Error("a thrown error is a failed round too"),
+    { ok: false, error_code: 404, description: "Not Found" },
+  ]);
+  let delays: number[] = [];
+  const logged = await captureStderrAsync(async () => {
+    delays = await recordedDelays(() => gw.start(async () => "never"));
+  });
+  // The default 3000 ms doubles to 192000 and then stops at five minutes (300000); the accepted answer in the
+  // middle sets it back to 3000; the thrown error and the 404 after it carry on from there.
+  const want = [3000, 6000, 12000, 24000, 48000, 96000, 192000, 300000, 300000, 300000, 3000, 6000, 12000, 24000];
+  assert(delays.join(",") === want.join(","), `the loop waited ${delays.join(",")}, wanted ${want.join(",")}`);
+  const errorLines = logged.split("\n").filter((l) => l.includes("telegram poll error"));
+  assert(errorLines.length === 1, `expected one poll error line, got ${errorLines.length}: "${logged}"`);
+});
+
+test("telegram", "T8_a_429_waits_as_long_as_retry_after_says_up_to_five_minutes_and_other_values_are_ignored", async () => {
+  const limited = (retryAfter: unknown): unknown => ({
+    ok: false,
+    error_code: 429,
+    description: "Too Many Requests: retry later",
+    parameters: { retry_after: retryAfter },
+  });
+  const gw = new ScriptedTelegram([
+    limited(7),
+    limited(100000),
+    REFUSE_401,
+    limited(0),
+    limited("7"),
+    limited(-3),
+    { ok: false, error_code: 429, parameters: null },
+    limited(1.5),
+    limited(0.5),
+    limited(0.001),
+    limited(5e-324),
+  ]);
+  let delays: number[] = [];
+  await captureStderrAsync(async () => {
+    delays = await recordedDelays(() => gw.start(async () => "never"));
+  });
+  // 7 s as asked; 100000 s capped at five minutes; the 401 is the third failed round in a row, so 3000 * 4;
+  // a zero, a string, a negative number and a null `parameters` are not a wait the API asked for, so the
+  // doubling goes on (24000, 48000, 96000, 192000); 1.5 s is honoured; anything under a second waits a
+  // second, or a tiny retry_after would bring back the loop with no delay.
+  const want = [7000, 300000, 12000, 24000, 48000, 96000, 192000, 1500, 1000, 1000, 1000];
+  assert(delays.join(",") === want.join(","), `the loop waited ${delays.join(",")}, wanted ${want.join(",")}`);
+});
+
+test("telegram", "T9_stop_ends_a_wait_of_seconds_and_a_loop_that_was_stopped_does_not_start_one", async () => {
+  // Asked to wait 15 s; stopped after 60 ms.
+  const waiting = new RefusedTelegram({ ok: false, error_code: 429, parameters: { retry_after: 15 } }, 1e9);
+  await captureStderrAsync(async () => {
+    const done = waiting.start(async () => "never");
+    await new Promise<void>((r) => setTimeout(r, 60));
+    await waiting.stop();
+    assert(await settlesWithin(done, 2000), "stop() did not end a loop that was waiting out a 15 s retry_after");
+  });
+  assert(waiting.polls === 1, `the loop asked ${waiting.polls} times; it should not ask again once stopped`);
+  // stop() arrives while the loop is in a poll or a turn, and an error follows: the wait after it must not start.
+  await captureStderrAsync(async () => {
+    const late = new StopsThenThrows();
+    assert(await settlesWithin(late.start(async () => "never"), 2000), "a loop that was stopped before its wait still waited 15 s");
+  });
+});
+
+test("telegram", "T10_a_refusal_description_is_cut_at_300_characters_and_a_non_numeric_code_is_not_printed", async () => {
+  // Words, as the API's text is: a long unbroken run would be masked as part of a token (T11).
+  const gw = new RefusedTelegram({ ok: false, error_code: "Q ".repeat(500), description: "Z ".repeat(150) + "TAILMARK" }, 0);
+  const logged = await captureStderrAsync(() => gw.send({ channel: "telegram", chatId: "9", text: "hello" }));
+  const count = (ch: string): number => logged.split(ch).length - 1;
+  assert(count("Z") === 150 && !logged.includes("TAILMARK"), `the description is not cut at 300 characters: ${count("Z")} Z, tail ${logged.includes("TAILMARK")}`);
+  // An error_code that is not a number is not printed at all: the Bot API's is always a number.
+  assert(count("Q") === 0 && logged.includes("error_code (not a number)"), `a non-numeric error code was printed: ${count("Q")} Q`);
+});
+
+// ─── deploy/Dockerfile has a HEALTHCHECK that works ─────────────────────────
+
+test("server", "deploy/Dockerfile's HEALTHCHECK has compose's timings, and its command is healthy for a running server on PORT and unhealthy for anything else", async () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const dockerfile = readFileSync(join(root, "deploy", "Dockerfile"), "utf8").replace(/\\\n\s*/g, " ");
+  const instructions = dockerfile.split("\n").filter((l) => l.startsWith("HEALTHCHECK"));
+  assert(instructions.length === 1, `deploy/Dockerfile has ${instructions.length} HEALTHCHECK instructions, wanted one`);
+  const instruction = instructions[0]!;
+  // The same timings as the healthcheck the compose file already has.
+  const compose = readFileSync(join(root, "deploy", "docker-compose.yml"), "utf8");
+  for (const key of ["interval", "timeout", "retries"]) {
+    const value = new RegExp(`^\\s+${key}:\\s*(\\S+)\\s*$`, "m").exec(compose)?.[1];
+    assert(value !== undefined, `docker-compose.yml has no healthcheck ${key}`);
+    assert(instruction.includes(`--${key}=${value} `), `the HEALTHCHECK does not say --${key}=${value}, as docker-compose.yml does: ${instruction}`);
+  }
+  // The command, as docker runs it: exec form, in the container's environment.
+  const json = / CMD (\[.*\])\s*$/.exec(instruction)?.[1];
+  assert(json !== undefined, `the HEALTHCHECK has no exec-form CMD: ${instruction}`);
+  const parsed: unknown = JSON.parse(json);
+  const argv: string[] = Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === "string") : [];
+  assert(argv.length === 3 && argv[0] === "node" && argv[1] === "-e", `the HEALTHCHECK command is not node -e <script>: ${json}`);
+  // An IPv4 literal: `localhost` can resolve to ::1, where the server, bound to 0.0.0.0, does not listen.
+  assert(argv[2]!.includes("http://127.0.0.1:"), `the HEALTHCHECK does not ask 127.0.0.1: ${json}`);
+  // Asynchronous: the 503 server below lives in this process, and a synchronous spawn would stop it from answering.
+  const probe = (port: number): Promise<number | null> =>
+    new Promise((ok) => {
+      const child = spawn(process.execPath, ["-e", argv[2]!], { env: { ...process.env, PORT: String(port) }, stdio: "ignore" });
+      const timer = setTimeout(() => child.kill("SIGKILL"), 20_000);
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        ok(code);
+      });
+    });
+  const guarded = await startLiveServer({ CHAMBER_API_TOKEN: "test-token-value" });
+  try {
+    assert((await probe(guarded.port)) === 0, "the HEALTHCHECK says a running server that needs a token is unhealthy; /health takes none");
+    assert((await probe(await freePort())) === 1, "the HEALTHCHECK says a port nothing listens on is healthy, or it is not reading PORT");
+  } finally {
+    await guarded.stop();
+  }
+  const open = await startLiveServer();
+  try {
+    assert((await probe(open.port)) === 0, "the HEALTHCHECK says a running server with no token is unhealthy (its Host header must name loopback)");
+  } finally {
+    await open.stop();
+  }
+  assert((await probe(open.port)) === 1, "the HEALTHCHECK says a stopped server is healthy");
+  const { createServer: createHttpServer } = await import("node:http");
+  const failing = createHttpServer((_req, res) => {
+    res.statusCode = 503;
+    res.end("down");
+  });
+  const failingPort: number = await new Promise<number>((ok) => failing.listen(0, "127.0.0.1", () => ok((failing.address() as AddressInfo).port)));
+  try {
+    assert((await probe(failingPort)) === 1, "the HEALTHCHECK says a server that answers /health with 503 is healthy");
+  } finally {
+    await new Promise<void>((ok) => failing.close(() => ok()));
+  }
+});
+
+// ─── the refusal's advice fits a hash that does not match and a file that cannot be read ─
+
+test("config", "a refusal's advice covers a hash that does not match and a file that cannot be read, and only the exit code makes a failure a refusal", () => {
+  const covers = (label: string, message: string): void => {
+    for (const needle of [
+      "were refused or could not be read",
+      "differs from what models/minilm/VERSION records",
+      "is not a regular file",
+      "fix its permissions",
+    ]) {
+      assert(message.includes(needle), `${label}: the advice does not say "${needle}": ${message}`);
+    }
+    assert(!message.includes("in their place: put back"), `${label}: the advice still tells every refusal to put the files back: ${message}`);
+  };
+  const thrownBy = (run: () => unknown): unknown => {
+    try {
+      run();
+    } catch (e) {
+      return e;
+    }
+    return undefined;
+  };
+  covers("a hash detail", new MinilmIntegrityError('"model_quantized.onnx has SHA-256 aa, but VERSION records bb"').message);
+  covers("a remembered refusal", new MinilmIntegrityError('"model_quantized.onnx has SHA-256 aa, but VERSION records bb"', true).message);
+
+  const loop = minilmDirWith({});
+  rmSync(join(loop, "model_quantized.onnx"));
+  symlinkSync("model_quantized.onnx", join(loop, "model_quantized.onnx"));
+  const notAFile = minilmDirWith({});
+  rmSync(join(notAFile, "model_quantized.onnx"));
+  mkdirSync(join(notAFile, "model_quantized.onnx"));
+  const stubs = mkdtempSync(join(tmpdir(), "chamber-stub-python-"));
+  const stub = (status: number, said: string): string => {
+    const path = join(stubs, `python-exit-${status}`);
+    writeFileSync(path, `#!/bin/sh\ncat >/dev/null\necho '${said}' >&2\nexit ${status}\n`);
+    chmodSync(path, 0o755);
+    return path;
+  };
+  const savedPython = process.env.CHAMBER_PYTHON;
+  const savedDir = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  delete process.env.CHAMBER_EMBEDDER;
+  try {
+    // The real script, through the real embed call.
+    for (const [what, dir, detail] of [
+      ["a symlink loop as the weights file", loop, "cannot read "],
+      ["a directory as the weights file", notAFile, "model_quantized.onnx is not a regular file"],
+    ] as const) {
+      process.env.CHAMBER_MINILM_DIR = dir;
+      resetMinilmProbe();
+      const err = thrownBy(() => embedMinilm("a sentence"));
+      assert(err instanceof MinilmIntegrityError, `${what}: the embed call did not refuse: ${String(err)}`);
+      assert(err.message.includes(detail), `${what}: the script's own line is not in the message: ${err.message}`);
+      covers(what, err.message);
+    }
+    // Only the exit code decides.
+    delete process.env.CHAMBER_MINILM_DIR;
+    process.env.CHAMBER_PYTHON = stub(3, "something that says nothing about reading");
+    resetMinilmProbe();
+    const exit3 = thrownBy(() => embedMinilm("a sentence"));
+    assert(exit3 instanceof MinilmIntegrityError, `exit 3 with any text is a refusal: ${String(exit3)}`);
+    process.env.CHAMBER_PYTHON = stub(1, "cannot read /x/model_quantized.onnx (Permission denied)");
+    resetMinilmProbe();
+    const exit1 = thrownBy(() => embedMinilm("a sentence"));
+    assert(
+      exit1 instanceof Error && !(exit1 instanceof MinilmIntegrityError) && exit1.message.includes("embed_minilm failed (1)"),
+      `exit 1 with a "cannot read" line is not a refusal: ${String(exit1)}`,
+    );
+  } finally {
+    if (savedPython === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = savedPython;
+    if (savedDir === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = savedDir;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    for (const dir of [loop, notAFile, stubs]) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── the 0.2.2 changelog covers the audit fixes ─────────────────────────────
+
+test("config", "the 0.2.2 changelog has an entry for each of the four audit fixes, and no longer says the Telegram loop waits a fixed 3 s", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const changelog = readFileSync(join(root, "CHANGELOG.md"), "utf8");
+  const section = changelog.slice(changelog.indexOf("## 0.2.2"), changelog.indexOf("## 0.2.1"));
+  const fixedAt = section.indexOf("### Fixed");
+  const changedAt = section.indexOf("### Changed");
+  assert(fixedAt > 0 && changedAt > fixedAt, "the 0.2.2 section of CHANGELOG.md does not have ### Fixed and then ### Changed");
+  const fixed = section.slice(fixedAt, changedAt);
+  const changed = section.slice(changedAt);
+  for (const [heading, words] of [
+    ["**Text from the network and from children is shown from a closed set.**", ["U+202E", "\\uXXXX", "U+200D"]],
+    ["**The Telegram gateway prints nothing from the network raw, and backs off.**", ["not JSON", "five minutes", "retry_after", "300 characters"]],
+    ["**A refusal's advice fits an unreadable model file too.**", ["could not be read", "exit code"]],
+  ] as const) {
+    assert(fixed.includes(heading), `CHANGELOG.md 0.2.2 / Fixed does not have: ${heading}`);
+    const entry = fixed.slice(fixed.indexOf(heading));
+    for (const word of words) assert(entry.includes(word), `the entry ${heading} does not mention ${word}`);
+  }
+  const healthcheck = "**The HTTP server image has a healthcheck.**";
+  assert(changed.includes(healthcheck), `CHANGELOG.md 0.2.2 / Changed does not have: ${healthcheck}`);
+  for (const word of ["deploy/Dockerfile", "HEALTHCHECK", "/health", "docker-compose.yml"]) {
+    assert(changed.slice(changed.indexOf(healthcheck)).includes(word), `the healthcheck entry does not mention ${word}`);
+  }
+  assert(!section.includes("waits 3 s as it does after an error"), "the Telegram entry above still says the loop waits a fixed 3 s");
 });
 
 // ─── cli process smoke tests ────────────────────────────────────────────────

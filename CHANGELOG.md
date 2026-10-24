@@ -53,8 +53,9 @@ history and the GitHub releases.
   `<redacted>`. That does not decode: a description that spells the token in
   HTML entities or percent-escapes, or cuts it under 16 characters, still
   shows it. The poll loop prints whatever it caught as a JSON string without
-  the token (the stack trace is no longer printed). A refusal that does not go away (a revoked token, a 404) was asked
-  again every 3 s for ever: the wait now doubles for each failed round in a row
+  the token (the stack trace is no longer printed). A refusal that does not go
+  away (a revoked token, a 404) was asked again every 3 s for ever: the wait now
+  doubles for each failed round in a row
   (an error counts too), up to five minutes, and starts over when the API
   accepts a `getUpdates`. A 429 waits as long as its `parameters.retry_after`
   says, at least one second and up to the same five minutes. `stop()` ends a

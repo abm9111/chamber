@@ -81,9 +81,9 @@ const MAX_RETRY_DELAY_MS = 5 * 60 * 1000;
 /** The shortest wait a `retry_after` can ask for: a tiny one would bring back the loop with no delay. */
 const MIN_RETRY_AFTER_MS = 1000;
 /**
- * A run of the token's own alphabet this long. The Bot API's descriptions and
- * curl's messages are words, so a run like this in them is a token or part of
- * one: echoed, cut, re-cased or re-encoded.
+ * A run of the token's own alphabet this long. The Bot API's descriptions are
+ * words, so a run like this in one is a token or part of one: echoed, cut or
+ * re-cased.
  */
 const TOKEN_ALPHABET_RUN = /[A-Za-z0-9_-]{16,}/g;
 
@@ -144,8 +144,8 @@ function telegramRetryAfterSec(data: unknown): number | undefined {
  * revoked token, 409 for a second poller, 429 for a rate limit, 403 for a blocked
  * bot) as a parsed `{ok:false,error_code,description}`, which `api` returns like
  * any other body: nothing throws. When it did not say `ok: true`, one line says
- * what it answered and this returns false. The code and the description are
- * the API's text, so they are printed as JSON strings.
+ * what it answered and this returns false: the code only as a number, and the
+ * description through `telegramApiText` as a JSON string.
  */
 function telegramAnswered(method: string, data: unknown, token: string): boolean {
   const body: { ok?: unknown; error_code?: unknown; description?: unknown } =
@@ -219,7 +219,7 @@ export class TelegramGateway implements GatewayAdapter {
     // not resolve, 7: could not connect, 28: timeout, 35/60: TLS). Its stderr can
     // carry text from the network, and runs with -s, so it is usually empty anyway.
     if (res.exitStatus !== 0) {
-      throw new Error(`telegram api failed: curl exit ${res.exitStatus === null ? "none (not started)" : String(res.exitStatus)}`);
+      throw new Error(`telegram api failed: curl exit ${res.exitStatus === null ? "none (not started, killed, or past the 4 MiB cap)" : String(res.exitStatus)}`);
     }
     try {
       return JSON.parse(res.body || "{}");

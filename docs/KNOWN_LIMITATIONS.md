@@ -810,8 +810,10 @@ what this entry used to describe has been closed; what follows separates the
 two.
 
 **Closed: the availability check answered the wrong question.**
-`minilmAvailable()` tested that two *files* exist. Both ship in the repo, so it
-returned true on every checkout — including on the machine whose resolved
+`minilmAvailable()` tested that two *files* exist. Both are in a checkout of the
+repo (the npm package and the Docker images carry the script but not the model
+file, and embed with hash vectors by design), so it returned true on every
+checkout — including on the machine whose resolved
 `python3` had neither numpy nor onnxruntime. `embedMinilm` threw, `embedLocal`
 caught, a 256-dimension hash vector went in where a 384-dimension semantic one
 belonged, and nothing downstream could tell: a hash vector is a valid vector.
@@ -836,7 +838,10 @@ channel rather than returning an empty result with no cause.
 `scripts/embed_minilm.py` exits 3 when `model_quantized.onnx` or `tokenizer.json`
 does not match the SHA-256 that the package's own `models/minilm/VERSION`
 records for it. A `tokenizer.json` that is missing or unreadable while the weights
-file exists is the same refusal (a missing weights file is exit 1: no embedder).
+file exists is the same refusal (a missing weights file is exit 1: no embedder),
+and so is a weights path the script cannot examine at all, such as a model
+directory that cannot be searched; only a path that is not there (missing, a
+dangling symlink, or under a file) is "no embedder".
 `CHAMBER_MINILM_DIR` moves those two files and never the VERSION
 they are held to, and the bytes that are hashed are the bytes that load: each
 file is read once and the session and tokenizers are built from that copy. That

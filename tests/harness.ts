@@ -16368,6 +16368,361 @@ test("release", "jsonForTerminal escapes DEL and the C1 controls that JSON.strin
   });
 });
 
+// ─── a child's stderr is escaped before it reaches a terminal ───────────────
+
+/**
+ * The first character of `text` a terminal would act on (a C0 control, DEL or a
+ * C1 control) as "U+XXXX", or null. A char-code loop: a control-character class
+ * in a regular expression is what the no-control-regex rule refuses.
+ */
+function firstRawControl(text: string): string | null {
+  for (const ch of text) {
+    const c = ch.codePointAt(0) ?? 0;
+    if (c < 0x20 || c === 0x7f || (c >= 0x80 && c <= 0x9f)) return `U+${c.toString(16).padStart(4, "0")}`;
+  }
+  return null;
+}
+
+test("release", "a release whose bin writes an ESC, a C1 control and a DEL to stderr is refused with them shown as escapes", () => {
+  withReleaseFixture((fx) => {
+    const esc = fixtureCommit(
+      fx.origin,
+      {
+        ...releaseTree("escexit", "1.0.5", 'process.stderr.write("bad \\u001b[31mRED \\u009bcsi \\u007fdel\\n");\nprocess.exit(1);\n'),
+        "README.md": "six\n",
+      },
+      "bin exits non-zero with control bytes on stderr",
+      fx.v2,
+    );
+    fixtureGit(fx.origin, ["tag", "escexit", esc]);
+    const bare = jobPlistXml(BARE_SCRIPT);
+    writePlistFile(fx.plistPath, bare);
+    const lc = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "escexit", lc.run));
+    assert(r.code === 1, `a release that exits 1 was pinned: ${r.err.join("\n")}`);
+    const line = r.err.find((l) => l.startsWith("chamber pin: the release at escexit did not run: "));
+    assert(line !== undefined && line.includes("exited 1"), r.err.join("\n"));
+    assert(
+      line.includes("\\u001b[31mRED") && line.includes("\\u009bcsi") && line.includes("\\u007fdel"),
+      `the ESC, the CSI and the DEL are not shown as escapes: ${JSON.stringify(line)}`,
+    );
+    for (const l of [...r.out, ...r.err]) {
+      const raw = firstRawControl(l);
+      assert(raw === null, `${raw} reached pin's output: ${JSON.stringify(l)}`);
+    }
+    assert(lc.calls.length === 0, `launchctl was called: ${lc.calls.join(" | ")}`);
+  });
+});
+
+test("config", "stderr with an ESC, a C1 control and a DEL reaches the embedder's errors escaped, on the refusal, probe and embed paths", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-stub-python-"));
+  // An interpreter that reads its stdin, says the same bad line on stderr and exits with `status`.
+  const stub = (status: number): string => {
+    const path = join(dir, `python-exit-${status}`);
+    writeFileSync(path, `#!/bin/sh\ncat >/dev/null\nprintf 'bad \\033[31mRED \\302\\233csi \\177del\\n' >&2\nexit ${status}\n`);
+    chmodSync(path, 0o755);
+    return path;
+  };
+  const savedPython = process.env.CHAMBER_PYTHON;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  delete process.env.CHAMBER_EMBEDDER;
+  const shown = (label: string, text: string): void => {
+    assert(
+      text.includes("\\u001b[31mRED") && text.includes("\\u009bcsi") && text.includes("\\u007fdel"),
+      `${label}: the ESC, the CSI and the DEL are not shown as escapes: ${JSON.stringify(text)}`,
+    );
+    for (const l of text.split("\n")) {
+      const raw = firstRawControl(l);
+      assert(raw === null, `${label}: ${raw} reached the message: ${JSON.stringify(l)}`);
+    }
+  };
+  const thrownBy = (run: () => unknown): unknown => {
+    try {
+      run();
+    } catch (e) {
+      return e;
+    }
+    return undefined;
+  };
+  try {
+    // Exit 3: a refusal. The probe holds it, the embed call throws it afresh.
+    process.env.CHAMBER_PYTHON = stub(3);
+    resetMinilmProbe();
+    const probeRefusal = thrownBy(() => minilmAvailable());
+    assert(probeRefusal instanceof MinilmIntegrityError, `the probe did not refuse: ${String(probeRefusal)}`);
+    shown("refusal, probe", probeRefusal.message);
+    const embedRefusal = thrownBy(() => embedMinilm("a sentence"));
+    assert(embedRefusal instanceof MinilmIntegrityError, `the embed call did not refuse: ${String(embedRefusal)}`);
+    shown("refusal, embed", embedRefusal.message);
+
+    // Exit 7: an ordinary failure. The probe reports it in the fallback warning.
+    process.env.CHAMBER_PYTHON = stub(7);
+    resetMinilmProbe();
+    const probed = captureStderr(() => minilmAvailable());
+    assert(probed.value === false, "a probe that exited 7 was taken for a working embedder");
+    assert(probed.stderr.includes("probe exited 7"), `the fallback warning does not carry the probe's failure: ${probed.stderr}`);
+    shown("probe exited", probed.stderr);
+    const embedFailure = thrownBy(() => embedMinilm("a sentence"));
+    assert(
+      embedFailure instanceof Error && embedFailure.message.includes("embed_minilm failed (7)"),
+      `the embed call did not report the failure: ${String(embedFailure)}`,
+    );
+    shown("embed failed", embedFailure.message);
+  } finally {
+    if (savedPython === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = savedPython;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── the Telegram gateway does not spin on a refusal from the Bot API ───────
+
+/** Like captureStderr, for an async `fn`: what it wrote to stderr, kept from the terminal. */
+async function captureStderrAsync(fn: () => Promise<unknown>): Promise<string> {
+  const original = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+    captured += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await fn();
+  } finally {
+    process.stderr.write = original;
+  }
+  return captured;
+}
+
+/**
+ * A TelegramGateway whose Bot API answers every call with `answer`, as it does
+ * with `{ok:false}` for a revoked token (401), a second poller (409) or a rate
+ * limit (429). No network. The gateway is told to stop from inside its first
+ * `getUpdates` after `windowMs`: a loop that never yields to the event loop
+ * could not be stopped by a timer, so a spinning loop here runs for `windowMs`,
+ * is counted, and is then stopped.
+ */
+class RefusedTelegram extends TelegramGateway {
+  answer: unknown;
+  windowMs: number;
+  polls = 0;
+  sendAttempts = 0;
+  opened = Date.now();
+  constructor(answer: unknown, windowMs: number) {
+    super("TESTTOKEN-not-real");
+    this.answer = answer;
+    this.windowMs = windowMs;
+    this.retryDelayMs = 40;
+  }
+  protected override api(method: string): unknown {
+    if (method === "getUpdates") {
+      this.polls += 1;
+      if (Date.now() - this.opened > this.windowMs) void this.stop();
+      return this.answer;
+    }
+    if (method === "sendMessage") {
+      this.sendAttempts += 1;
+      return this.answer;
+    }
+    throw new Error(`unexpected Bot API method ${method}`);
+  }
+}
+
+test("telegram", "T3_a_getUpdates_the_Bot_API_refuses_is_logged_and_waited_out_not_spun_on", async () => {
+  const refusal = { ok: false, error_code: 401, description: "Unauthorized \u001b[31m\u009b\u007f" };
+  const gw = new RefusedTelegram(refusal, 300);
+  let turns = 0;
+  const logged = await captureStderrAsync(() =>
+    gw.start(async () => {
+      turns += 1;
+      return "never";
+    }),
+  );
+  // 40 ms between polls in 300 ms is about 8; a loop with no wait makes thousands.
+  assert(gw.polls >= 2, `the loop gave up after ${gw.polls} poll(s) instead of trying again`);
+  assert(gw.polls <= 20, `${gw.polls} getUpdates calls in about 300 ms: the loop does not wait after a refusal`);
+  assert(turns === 0, "a refused poll reached the turn");
+  const lines = logged.split("\n").filter((l) => l.includes("getUpdates"));
+  assert(lines.length >= 1, `nothing about the refusal was logged: "${logged}"`);
+  assert(lines.length <= gw.polls, `${lines.length} lines for ${gw.polls} polls`);
+  const line = lines[0]!;
+  assert(line.includes("telegram getUpdates refused"), line);
+  assert(line.includes("error_code 401"), `the line does not say the error code: ${line}`);
+  assert(line.includes("Unauthorized"), `the line does not say the description: ${line}`);
+  assert(line.includes("\\u001b[31m\\u009b\\u007f"), `the description's control characters are not shown as escapes: ${JSON.stringify(line)}`);
+  for (const l of logged.split("\n")) {
+    const raw = firstRawControl(l);
+    assert(raw === null, `${raw} reached stderr: ${JSON.stringify(l)}`);
+  }
+});
+
+test("telegram", "T4_a_sendMessage_the_Bot_API_refuses_is_logged_and_an_accepted_one_is_not", async () => {
+  const blocked = new RefusedTelegram({ ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" }, 0);
+  const logged = await captureStderrAsync(() => blocked.send({ channel: "telegram", chatId: "9", text: "hello" }));
+  assert(blocked.sendAttempts === 1, `sendMessage was called ${blocked.sendAttempts} times`);
+  assert(logged.includes("telegram sendMessage refused"), `a refused send was silent: "${logged}"`);
+  assert(logged.includes("error_code 403") && logged.includes("Forbidden: bot was blocked by the user"), logged);
+  // An answer that is not the documented shape is a refusal too, and what is in it is escaped.
+  for (const [what, answer] of [
+    ["a code that is not a number", { ok: false, error_code: "4\u001b[2J", description: 7 }],
+    ["no object at all", null],
+    ["ok as a string", { ok: "true" }],
+  ] as const) {
+    const odd = new RefusedTelegram(answer, 0);
+    const oddLog = await captureStderrAsync(() => odd.send({ channel: "telegram", chatId: "9", text: "hello" }));
+    assert(oddLog.includes("telegram sendMessage refused"), `${what}: a send the API did not accept was silent: "${oddLog}"`);
+    const raw = firstRawControl(oddLog.trim());
+    assert(raw === null, `${what}: ${raw} reached stderr: ${JSON.stringify(oddLog)}`);
+  }
+  // The control: an accepted send says nothing, so the line above is the refusal and not a banner.
+  const fine = new RefusedTelegram({ ok: true, result: {} }, 0);
+  const quiet = await captureStderrAsync(() => fine.send({ channel: "telegram", chatId: "9", text: "hello" }));
+  assert(fine.sendAttempts === 1 && quiet === "", `an accepted send wrote to stderr: "${quiet}"`);
+});
+
+// ─── a model folder the script cannot examine is a refusal, not "no embedder" ─
+
+test("config", "a weights path the script cannot examine is refused with exit 3 in every mode, and a missing, dangling or non-directory one stays exit 1", () => {
+  const runIn = (
+    dir: string,
+    args: readonly string[],
+    input: string | undefined,
+  ): { error?: Error; status: number | null; stdout: string; stderr: string } =>
+    spawnSync(embedPython(), [EMBED_SCRIPT, ...args], {
+      encoding: "utf8",
+      input,
+      timeout: 10_000,
+      env: { ...process.env, CHAMBER_MINILM_DIR: dir },
+    });
+  // Root can search any directory, so the locked case is skipped there.
+  const canLock = (process.getuid?.() ?? 0) !== 0;
+  const locked = minilmDirWith({});
+  const dangling = minilmDirWith({});
+  rmSync(join(dangling, "model_quantized.onnx"));
+  symlinkSync(join(dangling, "nowhere"), join(dangling, "model_quantized.onnx"));
+  const loop = minilmDirWith({});
+  rmSync(join(loop, "model_quantized.onnx"));
+  symlinkSync("model_quantized.onnx", join(loop, "model_quantized.onnx"));
+  const underFile = mkdtempSync(join(tmpdir(), "chamber-minilm-file-"));
+  writeFileSync(join(underFile, "not-a-directory"), "x\n");
+  try {
+    if (canLock) chmodSync(locked, 0o000);
+    for (const [label, args, input] of [
+      ["one-shot", ["a sentence"], undefined],
+      ["--json -", ["--json", "-"], '["a sentence"]'],
+      ["--serve", ["--serve"], '["a sentence"]\n'],
+    ] as const) {
+      // Exit 3: the path is there, or may be, and cannot be looked at.
+      const refused: [string, string][] = canLock ? [["a model directory that cannot be searched", locked]] : [];
+      refused.push(["a symlink loop", loop]);
+      for (const [what, dir] of refused) {
+        const r = runIn(dir, args, input);
+        assert(r.error === undefined, `${label}, ${what}: the script did not finish within 10 s (${String(r.error)})`);
+        assert(r.status === 3, `${label}, ${what}: exit ${r.status}, stderr ${r.stderr}`);
+        assert(r.stdout === "", `${label}, ${what}: wrote a reply before refusing: ${r.stdout}`);
+        const lines = r.stderr.trim().split("\n");
+        assert(lines.length === 1, `${label}, ${what}: expected one stderr line, got ${lines.length}: ${r.stderr}`);
+        assert(
+          lines[0]!.includes("cannot read") && lines[0]!.includes("model_quantized.onnx") && !lines[0]!.includes("missing model"),
+          `${label}, ${what}: the line does not say the weights cannot be read: ${lines[0]}`,
+        );
+      }
+      // Exit 1: there is no weights file, and nothing else is wrong.
+      for (const [what, dir] of [
+        ["a dangling symlink as the weights file", dangling],
+        ["CHAMBER_MINILM_DIR naming a file", join(underFile, "not-a-directory")],
+      ] as const) {
+        const r = runIn(dir, args, input);
+        assert(r.error === undefined, `${label}, ${what}: the script did not finish within 10 s (${String(r.error)})`);
+        assert(r.status === 1 && r.stderr.includes("missing model"), `${label}, ${what}: exit ${r.status}, stderr ${r.stderr}`);
+      }
+    }
+  } finally {
+    chmodSync(locked, 0o755);
+    for (const dir of [locked, dangling, loop, underFile]) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the embedder's docstrings say a weights path that cannot be examined is exit 3 and a missing one is exit 1", () => {
+  const text = readFileSync(EMBED_SCRIPT, "utf8").replace(/\s+/g, " ");
+  const verify = text.slice(text.indexOf("def verify_weights"), text.indexOf("global _weights_verified"));
+  assert(verify.length > 0, "could not find verify_weights in scripts/embed_minilm.py");
+  assert(
+    verify.includes("a weights path that cannot be examined") && verify.includes("a dangling symlink"),
+    "the verify_weights docstring does not say what is exit 3 and what is a missing weights file",
+  );
+  const head = text.slice(0, text.indexOf("from __future__"));
+  assert(
+    head.includes("the weights file cannot be examined") && head.includes("a dangling symlink"),
+    "the module docstring does not say a weights path that cannot be examined is exit 3",
+  );
+});
+
+// ─── the docs say what an npm or Docker install embeds with ─────────────────
+
+test("config", "the docs say an npm or Docker install embeds with hash vectors, and the package and the images really do not carry the model", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const read = (...parts: string[]): string => readFileSync(join(root, ...parts), "utf8");
+  const flat = (text: string): string => text.replace(/\s+/g, " ");
+  // The facts the docs state. If the package or an image starts to carry the
+  // model, these fail and the docs below are stale.
+  const pkg = JSON.parse(read("package.json")) as { files?: string[] };
+  assert(
+    !(pkg.files ?? []).some((f) => f.replace(/^\.\//, "").startsWith("models")),
+    "package.json now ships models/, but the README and KNOWN_LIMITATIONS say the npm package does not carry the model",
+  );
+  for (const [name, text] of [
+    ["Dockerfile", read("Dockerfile")],
+    ["deploy/Dockerfile", read("deploy", "Dockerfile")],
+  ] as const) {
+    assert(!/^COPY\b.*\bmodels\b/m.test(text), `${name} now copies models/, but the README says the Docker images do not carry the model`);
+  }
+  const readme = flat(read("README.md"));
+  for (const needle of [
+    "An npm or Docker install embeds with `local-hash-v1` vectors, without a warning, unless a local Ollama server answers on 127.0.0.1:11434 or `CHAMBER_EMBEDDER=ollama` is set",
+    "do not carry `models/minilm/`",
+    "pip install --require-hashes -r scripts/requirements-embed.txt",
+    "set `CHAMBER_PYTHON`",
+  ]) {
+    assert(readme.includes(needle), `README.md does not say: ${needle}`);
+  }
+  const limits = flat(read("docs", "KNOWN_LIMITATIONS.md"));
+  assert(!limits.includes("Both ship in the repo"), "KNOWN_LIMITATIONS.md still says both files ship in the repo");
+  assert(
+    limits.includes("the npm package and the Docker images carry the script but not the model file"),
+    "KNOWN_LIMITATIONS.md does not say the npm package and the Docker images lack the model file",
+  );
+  assert(limits.includes("cannot be searched"), "KNOWN_LIMITATIONS.md does not say a model directory that cannot be searched is a refusal");
+  const changelog = read("CHANGELOG.md");
+  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.1"));
+  assert(unreleased.length > 0 && unreleased.includes("### Fixed"), "no Unreleased / Fixed section found above 0.2.1 in CHANGELOG.md");
+  for (const heading of [
+    "**A child's stderr is escaped before it reaches a terminal.**",
+    "**The Telegram poll loop waits after a refusal from the Bot API.**",
+    "**An unreadable model folder is a refusal, not \"no embedder\".**",
+    "**An npm or Docker install embeds with hash vectors.**",
+  ]) {
+    assert(unreleased.includes(heading), `CHANGELOG.md Unreleased does not have: ${heading}`);
+  }
+});
+
+// ─── server.json's description fits what mcp-publisher accepts ──────────────
+
+test("config", "server.json's top-level description is at most the 100 characters mcp-publisher accepts, and the changelog says it changed", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const registry = JSON.parse(readFileSync(join(root, "server.json"), "utf8")) as { description?: unknown };
+  assert(typeof registry.description === "string" && registry.description.trim() !== "", "server.json has no top-level description");
+  const length = [...registry.description].length;
+  assert(length <= 100, `server.json's description is ${length} characters, and mcp-publisher refuses more than 100: ${registry.description}`);
+  const changelog = readFileSync(join(root, "CHANGELOG.md"), "utf8");
+  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.1"));
+  assert(
+    unreleased.includes("**The MCP Registry description says what the check does.**"),
+    "CHANGELOG.md Unreleased does not mention the server.json description",
+  );
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

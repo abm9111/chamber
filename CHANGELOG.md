@@ -3,6 +3,47 @@
 All notable changes to Chamber. Versions before 0.1.6 are described in the git
 history and the GitHub releases.
 
+## Unreleased
+
+### Fixed
+
+- **A child's stderr is escaped before it reaches a terminal.** The text pin
+  printed when a release did not run, and the text in the embedder's errors for
+  a refused model, a failed availability probe and a failed embed call, carried
+  the child's stderr raw, so an ESC, a C1 control (U+009B is the 8-bit CSI) or a
+  DEL in it reached the terminal. All four now go through `jsonForTerminal`,
+  which moved to `src/terminal_text.ts` (still exported from `release_pin.ts`).
+  The text is now a quoted JSON string in those messages.
+- **The Telegram poll loop waits after a refusal from the Bot API.** A
+  `getUpdates` answered `{ok:false}` (401 for a revoked token, 409 for a second
+  poller, 429) has no `result`, so the loop ran again at once, one `curl` spawn
+  after another. It now logs one line with the error code and the description
+  (escaped), waits 3 s as it does after an error, and asks again. A
+  `sendMessage` the API refuses is logged too, and was silent.
+- **An unreadable model folder is a refusal, not "no embedder".**
+  `scripts/embed_minilm.py` tested the weights path with `exists()`, which says
+  no when the stat fails for any reason, so a model directory that could not be
+  searched exited 1 ("missing model") and auto ingest wrote hash vectors. It now
+  stats the path: not there (missing, a dangling symlink, under a file) is still
+  exit 1; anything else it cannot examine is exit 3 with a "cannot read" line.
+
+### Changed
+
+- **An npm or Docker install embeds with hash vectors.** The npm package and the
+  Dockerfiles have never carried `models/minilm/`, so `chamber ingest` and
+  `chamber_ask` on those installs use `local-hash-v1` vectors without a warning,
+  unless a local Ollama server answers on 127.0.0.1:11434 or
+  `CHAMBER_EMBEDDER=ollama` is set.
+  This is now written in the README and in `docs/KNOWN_LIMITATIONS.md`, which
+  said both model files "ship in the repo". For MiniLM, use a clone of the repo,
+  `pip install --require-hashes -r scripts/requirements-embed.txt`, and
+  `CHAMBER_PYTHON`. Nothing about the package contents changed.
+- **The MCP Registry description says what the check does.** `server.json`'s
+  description is now "Checks a claim's numbers, names and file names against
+  your indexed notes. Local; no model." (91 characters). `mcp-publisher` refuses
+  more than 100, and a test now holds that. `package.json`'s description is
+  unchanged.
+
 ## 0.2.1 — 2026-10-24
 
 0.2.0 was tagged but never published to npm or the MCP Registry, so this is

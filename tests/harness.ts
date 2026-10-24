@@ -16707,6 +16707,22 @@ test("config", "the docs say an npm or Docker install embeds with hash vectors, 
   }
 });
 
+// ─── server.json's description fits what mcp-publisher accepts ──────────────
+
+test("config", "server.json's top-level description is at most the 100 characters mcp-publisher accepts, and the changelog says it changed", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const registry = JSON.parse(readFileSync(join(root, "server.json"), "utf8")) as { description?: unknown };
+  assert(typeof registry.description === "string" && registry.description.trim() !== "", "server.json has no top-level description");
+  const length = [...registry.description].length;
+  assert(length <= 100, `server.json's description is ${length} characters, and mcp-publisher refuses more than 100: ${registry.description}`);
+  const changelog = readFileSync(join(root, "CHANGELOG.md"), "utf8");
+  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.1"));
+  assert(
+    unreleased.includes("**The MCP Registry description says what the check does.**"),
+    "CHANGELOG.md Unreleased does not mention the server.json description",
+  );
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

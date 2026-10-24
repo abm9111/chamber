@@ -36,6 +36,11 @@ history and the GitHub releases.
   said both model files "ship in the repo". For MiniLM, use a clone of the repo,
   `pip install --require-hashes -r scripts/requirements-embed.txt`, and
   `CHAMBER_PYTHON`. Nothing about the package contents changed.
+- **The MCP Registry description says what the check does.** `server.json`'s
+  description is now "Checks a claim's numbers, names and file names against
+  your indexed notes. Local; no model." (91 characters). `mcp-publisher` refuses
+  more than 100, and a test now holds that. `package.json`'s description is
+  unchanged.
 
 ## 0.2.1 — 2026-10-24
 

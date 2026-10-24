@@ -242,10 +242,11 @@ chamber corpus           # what is actually in the index
 ```
 
 **Which embedder you get depends on how you installed.** An npm or Docker
-install embeds with `local-hash-v1` vectors, without a warning: the npm package
-and both Dockerfiles do not carry `models/minilm/` (the 23 MB MiniLM weights),
-so `chamber ingest` and the retrieval behind `chamber_ask` match on character
-n-grams and not on meaning. `chamber_check` is not affected; it uses no model.
+install embeds with `local-hash-v1` vectors, without a warning, unless a local
+Ollama server answers on 127.0.0.1:11434 or `CHAMBER_EMBEDDER=ollama` is
+set: the npm package and both Dockerfiles do not carry `models/minilm/`
+(the 23 MB MiniLM weights), so with hash vectors `chamber ingest` and the
+retrieval behind `chamber_ask` match on character n-grams and not on meaning. `chamber_check` is not affected; it uses no model.
 For MiniLM, use a clone of the repo, install its Python dependencies with
 `pip install --require-hashes -r scripts/requirements-embed.txt`, and set
 `CHAMBER_PYTHON` to the interpreter that has them. A clone whose interpreter

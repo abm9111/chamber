@@ -16680,7 +16680,7 @@ test("config", "the docs say an npm or Docker install embeds with hash vectors, 
   }
   const readme = flat(read("README.md"));
   for (const needle of [
-    "An npm or Docker install embeds with `local-hash-v1` vectors, without a warning",
+    "An npm or Docker install embeds with `local-hash-v1` vectors, without a warning, unless a local Ollama server answers on 127.0.0.1:11434 or `CHAMBER_EMBEDDER=ollama` is set",
     "do not carry `models/minilm/`",
     "pip install --require-hashes -r scripts/requirements-embed.txt",
     "set `CHAMBER_PYTHON`",

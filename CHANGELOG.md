@@ -31,7 +31,9 @@ history and the GitHub releases.
 
 - **An npm or Docker install embeds with hash vectors.** The npm package and the
   Dockerfiles have never carried `models/minilm/`, so `chamber ingest` and
-  `chamber_ask` on those installs use `local-hash-v1` vectors without a warning.
+  `chamber_ask` on those installs use `local-hash-v1` vectors without a warning,
+  unless a local Ollama server answers on 127.0.0.1:11434 or
+  `CHAMBER_EMBEDDER=ollama` is set.
   This is now written in the README and in `docs/KNOWN_LIMITATIONS.md`, which
   said both model files "ship in the repo". For MiniLM, use a clone of the repo,
   `pip install --require-hashes -r scripts/requirements-embed.txt`, and

@@ -42,19 +42,20 @@ history and the GitHub releases.
 - **The Telegram gateway prints nothing from the network raw, and backs off.**
   A reply that was not JSON (a proxy's error page, a captive portal) made
   `JSON.parse` throw a `SyntaxError` whose message quotes the start of the body
-  as it was, and the poll loop printed that, and curl's stderr, unescaped. The
-  errors `api()` throws now carry the body (its first 200 characters) or curl's
-  stderr as a JSON string, the poll loop prints whatever it caught as
-  a JSON string (the stack trace is no longer printed), and the description and
-  error code in a refusal line are cut at 300 characters. A refusal that does
-  not go away (a revoked token, a 404) was asked again every 3 s for ever: the
-  wait now doubles for each failed round in a row (an error counts too), up to
-  five minutes, and starts over when the API accepts a `getUpdates`. A 429 waits
-  as long as its `parameters.retry_after` says, at least one second and up to
-  the same five minutes. `stop()` ends a wait, so a long one does not hold the
-  process. The bot token is removed from all of this text before it is cut (as
-  `<token>`: whole, or its secret half), since a page that echoes
-  the request path carries `/bot<token>/` with it.
+  as it was, and the poll loop printed that, and curl's stderr, unescaped. A
+  body that is not JSON is now reported by its size alone, never quoted: such a
+  page can echo the request path, and with it the bot token, cut, re-cased or
+  encoded past any redaction. curl's stderr and a refusal's description and
+  error code are printed as JSON strings, cut at 300 characters, with the token
+  removed in any case and every run of 16 or more of its alphabet (letters,
+  digits, `-`, `_`) shown as `<redacted>`; the poll loop prints whatever it
+  caught as a JSON string without the token (the stack trace is no longer
+  printed). A refusal that does not go away (a revoked token, a 404) was asked
+  again every 3 s for ever: the wait now doubles for each failed round in a row
+  (an error counts too), up to five minutes, and starts over when the API
+  accepts a `getUpdates`. A 429 waits as long as its `parameters.retry_after`
+  says, at least one second and up to the same five minutes. `stop()` ends a
+  wait, so a long one does not hold the process.
 - **A refusal's advice fits an unreadable model file too.** The error for a
   refused model told every case to put back the files `models/minilm/VERSION`
   records, which is wrong when the script could not read a file (exit 3 since

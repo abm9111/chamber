@@ -76,27 +76,42 @@ export function canTelegramTalk(userId: string | undefined): boolean {
 
 /** The most of the Bot API's own text (a description, an error code, curl's stderr) one log line or error carries. */
 const MAX_LOGGED_API_TEXT = 300;
-/** The most of a body that is not JSON that an error message carries. */
-const MAX_NON_JSON_BODY = 200;
 /** The longest the poll loop waits between two asks, whatever the backoff or the API says. */
 const MAX_RETRY_DELAY_MS = 5 * 60 * 1000;
 /** The shortest wait a `retry_after` can ask for: a tiny one would bring back the loop with no delay. */
 const MIN_RETRY_AFTER_MS = 1000;
+/**
+ * A run of the token's own alphabet this long. The Bot API's descriptions and
+ * curl's messages are words, so a run like this in them is a token or part of
+ * one: echoed, cut, re-cased or re-encoded.
+ */
+const TOKEN_ALPHABET_RUN = /[A-Za-z0-9_-]{16,}/g;
 
 /**
- * `text` with every copy of the bot token replaced by `<token>`: the whole
- * token, and its secret half (after the colon), which a page that echoes or
- * URL-encodes the request path still carries as it is (it is letters, digits,
- * `-` and `_`). Run before the text is cut, so a cut cannot leave the start of a
- * token behind.
+ * `text` with every copy of the bot token, in any case, replaced by `<token>`:
+ * the whole token and its secret half (after the colon), which a page that
+ * echoes or URL-encodes the request path still carries as it is. Run before the
+ * text is cut, so a cut cannot leave the start of a token behind.
  */
 export function withoutTelegramToken(text: string, token: string): string {
   const copies = [token, token.slice(token.indexOf(":") + 1)]
     .filter((s) => s.length >= 8)
     .sort((a, b) => b.length - a.length);
   let out = text;
-  for (const copy of copies) out = out.split(copy).join("<token>");
+  for (const copy of copies) {
+    out = out.replace(new RegExp(copy.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), "<token>");
+  }
   return out;
+}
+
+/**
+ * Text the Bot API or curl sent (a refusal's description and code, curl's
+ * stderr), as it may be logged: without the token, and with every run of 16 or
+ * more of the token's alphabet replaced by `<redacted>`, so a cut, re-cased or
+ * re-encoded echo of the request path cannot carry most of the token either.
+ */
+export function telegramApiText(text: string, token: string): string {
+  return withoutTelegramToken(text, token).replace(TOKEN_ALPHABET_RUN, "<redacted>");
 }
 
 /**
@@ -140,8 +155,8 @@ function telegramAnswered(method: string, data: unknown, token: string): boolean
   const code =
     typeof body.error_code === "number"
       ? String(body.error_code)
-      : jsonForTerminal(withoutTelegramToken(String(body.error_code ?? "none"), token).slice(0, MAX_LOGGED_API_TEXT));
-  const why = jsonForTerminal(withoutTelegramToken(String(body.description ?? "none"), token).slice(0, MAX_LOGGED_API_TEXT));
+      : jsonForTerminal(telegramApiText(String(body.error_code ?? "none"), token).slice(0, MAX_LOGGED_API_TEXT));
+  const why = jsonForTerminal(telegramApiText(String(body.description ?? "none"), token).slice(0, MAX_LOGGED_API_TEXT));
   console.error(`telegram ${method} refused: error_code ${code}, description ${why}`);
   return false;
 }
@@ -200,19 +215,19 @@ export class TelegramGateway implements GatewayAdapter {
       timeoutSec: 35,
       maxBytes: 4 * 1024 * 1024,
     });
-    // curl's stderr and the body are text from the network, so each goes into an
-    // Error message as a JSON string, and the body only as far as 200 characters.
-    // The token goes first: a proxy's or portal's page can echo the request path.
+    // curl's stderr is text from the network, so it goes into the Error message as
+    // a JSON string, without the token or anything shaped like part of it.
     if (res.exitStatus !== 0) {
-      const said = withoutTelegramToken(String(res.stderr || "no message"), this.token);
+      const said = telegramApiText(String(res.stderr || "no message"), this.token);
       throw new Error(`telegram api failed: ${jsonForTerminal(said.slice(0, MAX_LOGGED_API_TEXT))}`);
     }
     try {
       return JSON.parse(res.body || "{}");
     } catch {
-      // V8's SyntaxError message quotes the start of the body as it is, so it is dropped.
-      const page = withoutTelegramToken(String(res.body), this.token);
-      throw new Error(`telegram api returned non-JSON: ${jsonForTerminal(page.slice(0, MAX_NON_JSON_BODY))}`);
+      // Not a word of the body: a proxy's or portal's page can echo the request
+      // path, and with it the token, cut, re-cased or encoded past any redaction.
+      // V8's SyntaxError message, which quotes the body, is dropped too.
+      throw new Error(`telegram api returned non-JSON (${Buffer.byteLength(String(res.body))} bytes)`);
     }
   }
 

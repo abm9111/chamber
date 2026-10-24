@@ -10,7 +10,7 @@ import { CURL_FIXED_ARGV, buildCurlInvocation, httpSync } from "../src/http_sync
 import { TurnPool, TurnWorkerError } from "../src/turn_pool.ts";
 import { isSqliteBusy } from "../src/turn.ts";
 import { mcpDiscover } from "../src/mcp_client.ts";
-import { TelegramGateway, canTelegramTalk, TELEGRAM_TALK_REFUSAL, withoutTelegramToken } from "../src/gateway.ts";
+import { TelegramGateway, canTelegramTalk, TELEGRAM_TALK_REFUSAL, withoutTelegramToken, telegramApiText } from "../src/gateway.ts";
 import { claimHash, newId, sha256 } from "../src/hash.ts";
 import { commitBelief } from "../src/commit_belief.ts";
 import {
@@ -16901,8 +16901,7 @@ const NON_JSON_CURL = "printf '<html>\\033[31m boom %0300d TAILMARK\\n200' 0";
 const FAILING_CURL = "printf 'curl: (22) bad \\033[31mRED \\302\\233csi \\177del\\n' >&2\nexit 22";
 const REFUSE_401 = { ok: false, error_code: 401, description: "Unauthorized" };
 
-test("telegram", "T5_a_body_that_is_not_JSON_and_a_curl_that_fails_reach_the_error_as_escaped_capped_text", async () => {
-  const prefix = "telegram api returned non-JSON: ";
+test("telegram", "T5_a_body_that_is_not_JSON_is_reported_by_its_size_only_and_a_curl_that_fails_as_escaped_capped_text", async () => {
   await withCurlScript(NON_JSON_CURL, async () => {
     let caught: unknown;
     try {
@@ -16911,14 +16910,8 @@ test("telegram", "T5_a_body_that_is_not_JSON_and_a_curl_that_fails_reach_the_err
       caught = e;
     }
     assert(caught instanceof Error, `a non-JSON body did not throw: ${String(caught)}`);
-    assert(caught.message.startsWith(prefix), `the error does not say the body was not JSON: ${JSON.stringify(caught.message)}`);
-    const raw = firstRawControl(caught.message);
-    assert(raw === null, `${raw} is in the error's message: ${JSON.stringify(caught.message)}`);
-    assert(caught.message.includes("\\u001b[31m boom"), `the ESC is not shown as an escape: ${JSON.stringify(caught.message)}`);
-    assert(!caught.message.includes("TAILMARK"), "the error carries more than 200 characters of the body");
-    const shown: unknown = JSON.parse(caught.message.slice(prefix.length));
-    assert(typeof shown === "string" && shown.length === 200, `the body is not carried as a JSON string of 200 characters: ${JSON.stringify(shown)}`);
-    assert(!caught.message.includes("not valid JSON"), `V8's own message is in the error: ${JSON.stringify(caught.message)}`);
+    // Its size, and not one word of it.
+    assert(/^telegram api returned non-JSON \(\d+ bytes\)$/.test(caught.message), `the error is not the size alone: ${JSON.stringify(caught.message)}`);
   });
   await withCurlScript(FAILING_CURL, async () => {
     let caught: unknown;
@@ -16951,7 +16944,7 @@ test("telegram", "T5_a_body_that_is_not_JSON_and_a_curl_that_fails_reach_the_err
       const raw = firstRawControl(l);
       assert(raw === null, `${raw} reached stderr: ${JSON.stringify(l)}`);
     }
-    assert(lines[0]!.includes("non-JSON") && lines[0]!.includes("u001b[31m boom"), `the line does not say what happened: ${lines[0]}`);
+    assert(/non-JSON \(\d+ bytes\)/.test(lines[0]!) && !lines[0]!.includes("boom"), `the line does not say what happened, or quotes the body: ${lines[0]}`);
   });
 });
 
@@ -16996,19 +16989,31 @@ test("telegram", "T11_the_bot_token_never_reaches_a_log_line_or_an_error_even_wh
     for (const m of messages) {
       assert(!leaks(m), `the token is in an error message: ${JSON.stringify(m)}`);
     }
-    assert(messages.every((m) => m.includes("<token>")), `the token was not marked as removed: ${JSON.stringify(messages)}`);
-    // A JSON refusal whose description repeats the token, through the poll loop and its log line.
-    run(`cat >/dev/null; printf '{"ok":false,"error_code":404,"description":"no route /bot${token}/getUpdates"}'`, () => undefined);
+    assert(messages[0]!.startsWith("telegram api returned non-JSON (") && messages[1]!.startsWith("telegram api returned non-JSON ("), `a page that is not JSON is quoted: ${JSON.stringify(messages)}`);
+    assert(messages[2]!.includes("<token>"), `the token on curl's stderr was not marked as removed: ${JSON.stringify(messages[2])}`);
+    // JSON refusals whose description and code repeat the token: whole, upper-cased, cut to 20 characters of
+    // the secret, and base64-encoded. Through the poll loop and its log line.
+    const b64 = Buffer.from(`/bot${token}/getUpdates`).toString("base64");
+    const lines = [
+      `{"ok":false,"error_code":404,"description":"no route /bot${token}/getUpdates"}`,
+      `{"ok":false,"error_code":404,"description":"NO ROUTE /BOT${token.toUpperCase()}/GETUPDATES"}`,
+      `{"ok":false,"error_code":404,"description":"no route /bot${token.slice(0, 30)}"}`,
+      `{"ok":false,"error_code":"E${secret}","description":"see ?r=${b64}"}`,
+    ];
+    run(`cat >/dev/null; n=$(cat "${dir}/n" 2>/dev/null || echo 0); echo $((n + 1)) > "${dir}/n"; case $n in ${lines.map((l, i) => `${i}) printf '%s' '${l}' ;;`).join(" ")} *) printf '%s' '{"ok":false,"error_code":404,"description":"Not Found"}' ;; esac`, () => undefined);
     const gw = new EchoTelegram();
     (gw as unknown as { retryDelayMs: number }).retryDelayMs = 20;
     const logged = await captureStderrAsync(async () => {
       const done = gw.start(async () => "never");
-      await new Promise<void>((r) => setTimeout(r, 150));
+      await new Promise<void>((r) => setTimeout(r, 700));
       await gw.stop();
       await done;
     });
-    assert(logged.includes("getUpdates refused"), `the refusal was not logged: "${logged}"`);
-    assert(!leaks(logged), `the token reached stderr: ${JSON.stringify(logged)}`);
+    const refused = logged.split("\n").filter((l) => l.includes("getUpdates refused"));
+    assert(refused.length >= lines.length, `expected ${lines.length} refusal lines, got ${refused.length}: "${logged}"`);
+    assert(!leaks(logged) && !logged.toLowerCase().includes(secret.toLowerCase().slice(0, 16)), `the token reached stderr: ${JSON.stringify(logged)}`);
+    assert(!logged.includes(b64.slice(8, 24)), `the base64 echo reached stderr: ${JSON.stringify(logged)}`);
+    assert(logged.includes("Not Found"), `the API's own words were masked too: "${logged}"`);
   } finally {
     if (savedPath === undefined) delete process.env.PATH;
     else process.env.PATH = savedPath;
@@ -17033,6 +17038,12 @@ test("telegram", "T11_the_bot_token_never_reaches_a_log_line_or_an_error_even_wh
   // The helper itself: every copy goes, longest first, and a short or missing secret half is left alone.
   assert(withoutTelegramToken(`a ${token} b ${secret} c`, token) === "a <token> b <token> c", "withoutTelegramToken left a copy");
   assert(withoutTelegramToken("plain", "") === "plain", "an empty token changed the text");
+  assert(withoutTelegramToken(`x ${token.toUpperCase()} y`, token) === "x <token> y", "an upper-cased copy was left");
+  assert(
+    telegramApiText(`Conflict: terminated by other getUpdates request ${secret.slice(0, 18)}`, token) ===
+      "Conflict: terminated by other getUpdates request <redacted>",
+    "telegramApiText did not mask a cut copy, or masked the API's own words",
+  );
 });
 
 test("telegram", "T6_the_poll_loop_prints_whatever_was_thrown_as_an_escaped_string", async () => {
@@ -17127,11 +17138,12 @@ test("telegram", "T9_stop_ends_a_wait_of_seconds_and_a_loop_that_was_stopped_doe
 });
 
 test("telegram", "T10_the_API_text_in_a_refusal_line_is_cut_at_300_characters", async () => {
-  const gw = new RefusedTelegram({ ok: false, error_code: "Q".repeat(1000), description: "Z".repeat(300) + "TAILMARK" }, 0);
+  // Words, as the API's text is: a long unbroken run would be masked as part of a token (T11).
+  const gw = new RefusedTelegram({ ok: false, error_code: "Q ".repeat(500), description: "Z ".repeat(150) + "TAILMARK" }, 0);
   const logged = await captureStderrAsync(() => gw.send({ channel: "telegram", chatId: "9", text: "hello" }));
   const count = (ch: string): number => logged.split(ch).length - 1;
-  assert(count("Z") === 300 && !logged.includes("TAILMARK"), `the description is not cut at 300 characters: ${count("Z")} Z, tail ${logged.includes("TAILMARK")}`);
-  assert(count("Q") === 300, `the error code is not cut at 300 characters: ${count("Q")} Q`);
+  assert(count("Z") === 150 && !logged.includes("TAILMARK"), `the description is not cut at 300 characters: ${count("Z")} Z, tail ${logged.includes("TAILMARK")}`);
+  assert(count("Q") === 150, `the error code is not cut at 300 characters: ${count("Q")} Q`);
 });
 
 // ─── deploy/Dockerfile has a HEALTHCHECK that works ─────────────────────────

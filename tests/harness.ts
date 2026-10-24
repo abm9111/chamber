@@ -17014,6 +17014,22 @@ test("telegram", "T11_the_bot_token_never_reaches_a_log_line_or_an_error_even_wh
     else process.env.PATH = savedPath;
     rmSync(dir, { recursive: true, force: true });
   }
+  // Anything else the loop catches (it also runs the turn) is cleaned too, not only what api() threw.
+  class ThrowsTokenTelegram extends TelegramGateway {
+    rounds = 0;
+    constructor() {
+      super(token);
+      this.retryDelayMs = 5;
+    }
+    protected override api(): unknown {
+      this.rounds += 1;
+      if (this.rounds > 1) void this.stop();
+      throw new Error(`turn failed calling https://api.telegram.org/bot${token}/x`);
+    }
+  }
+  const thrown = await captureStderrAsync(() => new ThrowsTokenTelegram().start(async () => "never"));
+  assert(thrown.includes("telegram poll error"), `nothing was logged for a thrown error: "${thrown}"`);
+  assert(!leaks(thrown), `the token in a thrown error reached stderr: ${JSON.stringify(thrown)}`);
   // The helper itself: every copy goes, longest first, and a short or missing secret half is left alone.
   assert(withoutTelegramToken(`a ${token} b ${secret} c`, token) === "a <token> b <token> c", "withoutTelegramToken left a copy");
   assert(withoutTelegramToken("plain", "") === "plain", "an empty token changed the text");

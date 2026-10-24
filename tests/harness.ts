@@ -17108,6 +17108,85 @@ test("server", "deploy/Dockerfile's HEALTHCHECK has compose's timings, and its c
   }
 });
 
+// ─── the refusal's advice fits a hash that does not match and a file that cannot be read ─
+
+test("config", "a refusal's advice covers a hash that does not match and a file that cannot be read, and only the exit code makes a failure a refusal", () => {
+  const covers = (label: string, message: string): void => {
+    for (const needle of [
+      "were refused or could not be read",
+      "differs from what models/minilm/VERSION records",
+      "is not a regular file",
+      "fix its permissions",
+    ]) {
+      assert(message.includes(needle), `${label}: the advice does not say "${needle}": ${message}`);
+    }
+    assert(!message.includes("in their place: put back"), `${label}: the advice still tells every refusal to put the files back: ${message}`);
+  };
+  const thrownBy = (run: () => unknown): unknown => {
+    try {
+      run();
+    } catch (e) {
+      return e;
+    }
+    return undefined;
+  };
+  covers("a hash detail", new MinilmIntegrityError('"model_quantized.onnx has SHA-256 aa, but VERSION records bb"').message);
+  covers("a remembered refusal", new MinilmIntegrityError('"model_quantized.onnx has SHA-256 aa, but VERSION records bb"', true).message);
+
+  const loop = minilmDirWith({});
+  rmSync(join(loop, "model_quantized.onnx"));
+  symlinkSync("model_quantized.onnx", join(loop, "model_quantized.onnx"));
+  const notAFile = minilmDirWith({});
+  rmSync(join(notAFile, "model_quantized.onnx"));
+  mkdirSync(join(notAFile, "model_quantized.onnx"));
+  const stubs = mkdtempSync(join(tmpdir(), "chamber-stub-python-"));
+  const stub = (status: number, said: string): string => {
+    const path = join(stubs, `python-exit-${status}`);
+    writeFileSync(path, `#!/bin/sh\ncat >/dev/null\necho '${said}' >&2\nexit ${status}\n`);
+    chmodSync(path, 0o755);
+    return path;
+  };
+  const savedPython = process.env.CHAMBER_PYTHON;
+  const savedDir = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  delete process.env.CHAMBER_EMBEDDER;
+  try {
+    // The real script, through the real embed call.
+    for (const [what, dir, detail] of [
+      ["a symlink loop as the weights file", loop, "cannot read "],
+      ["a directory as the weights file", notAFile, "model_quantized.onnx is not a regular file"],
+    ] as const) {
+      process.env.CHAMBER_MINILM_DIR = dir;
+      resetMinilmProbe();
+      const err = thrownBy(() => embedMinilm("a sentence"));
+      assert(err instanceof MinilmIntegrityError, `${what}: the embed call did not refuse: ${String(err)}`);
+      assert(err.message.includes(detail), `${what}: the script's own line is not in the message: ${err.message}`);
+      covers(what, err.message);
+    }
+    // Only the exit code decides.
+    delete process.env.CHAMBER_MINILM_DIR;
+    process.env.CHAMBER_PYTHON = stub(3, "something that says nothing about reading");
+    resetMinilmProbe();
+    const exit3 = thrownBy(() => embedMinilm("a sentence"));
+    assert(exit3 instanceof MinilmIntegrityError, `exit 3 with any text is a refusal: ${String(exit3)}`);
+    process.env.CHAMBER_PYTHON = stub(1, "cannot read /x/model_quantized.onnx (Permission denied)");
+    resetMinilmProbe();
+    const exit1 = thrownBy(() => embedMinilm("a sentence"));
+    assert(
+      exit1 instanceof Error && !(exit1 instanceof MinilmIntegrityError) && exit1.message.includes("embed_minilm failed (1)"),
+      `exit 1 with a "cannot read" line is not a refusal: ${String(exit1)}`,
+    );
+  } finally {
+    if (savedPython === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = savedPython;
+    if (savedDir === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = savedDir;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    for (const dir of [loop, notAFile, stubs]) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

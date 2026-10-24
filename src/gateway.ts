@@ -74,6 +74,34 @@ export function canTelegramTalk(userId: string | undefined): boolean {
   return userId !== undefined && telegramTalkAllowlist().has(userId);
 }
 
+/** The most of the Bot API's own text (a description, an error code, curl's stderr) one log line or error carries. */
+const MAX_LOGGED_API_TEXT = 300;
+/** The most of a body that is not JSON that an error message carries. */
+const MAX_NON_JSON_BODY = 200;
+/** The longest the poll loop waits between two asks, whatever the backoff or the API says. */
+const MAX_RETRY_DELAY_MS = 5 * 60 * 1000;
+
+/**
+ * How long the poll loop waits after its `failures`th failed round in a row (1
+ * is the first): `baseMs`, doubled for each round after the first, and never
+ * more than five minutes. When the API said how long to wait (`retryAfterSec`,
+ * from a 429's `parameters.retry_after`) that is the wait instead, with the same
+ * ceiling.
+ */
+function telegramRetryDelayMs(baseMs: number, failures: number, retryAfterSec: number | undefined): number {
+  const wanted = retryAfterSec !== undefined ? retryAfterSec * 1000 : baseMs * 2 ** Math.min(Math.max(failures, 1) - 1, 30);
+  return Math.min(wanted, MAX_RETRY_DELAY_MS);
+}
+
+/** `parameters.retry_after` of the API's answer, if it is a positive number of seconds; anything else is no instruction. */
+function telegramRetryAfterSec(data: unknown): number | undefined {
+  if (typeof data !== "object" || data === null || !("parameters" in data)) return undefined;
+  const params = data.parameters;
+  if (typeof params !== "object" || params === null || !("retry_after" in params)) return undefined;
+  const sec = params.retry_after;
+  return typeof sec === "number" && Number.isFinite(sec) && sec > 0 ? sec : undefined;
+}
+
 /**
  * Whether the Bot API accepted `method`. The API answers a refusal (401 for a
  * revoked token, 409 for a second poller, 429 for a rate limit, 403 for a blocked
@@ -87,8 +115,12 @@ function telegramAnswered(method: string, data: unknown): boolean {
     typeof data === "object" && data !== null ? data : {};
   if (body.ok === true) return true;
   // A number is digits; anything else the API sent in its place is escaped like the description.
-  const code = typeof body.error_code === "number" ? String(body.error_code) : jsonForTerminal(String(body.error_code ?? "none"));
-  const why = jsonForTerminal(String(body.description ?? "none"));
+  // Both are cut before they are escaped: the answer can be as long as httpSync reads (4 MiB).
+  const code =
+    typeof body.error_code === "number"
+      ? String(body.error_code)
+      : jsonForTerminal(String(body.error_code ?? "none").slice(0, MAX_LOGGED_API_TEXT));
+  const why = jsonForTerminal(String(body.description ?? "none").slice(0, MAX_LOGGED_API_TEXT));
   console.error(`telegram ${method} refused: error_code ${code}, description ${why}`);
   return false;
 }
@@ -103,8 +135,14 @@ export class TelegramGateway implements GatewayAdapter {
   private token: string;
   private offset = 0;
   private running = false;
-  /** How long the poll loop waits after an error or a refusal before it asks again. */
+  /**
+   * How long the poll loop waits after its first failed round, an error or a
+   * refusal, before it asks again. It doubles for each failed round after that,
+   * up to five minutes, and starts over when the API accepts a getUpdates.
+   */
   protected retryDelayMs = 3000;
+  /** The wait the poll loop is in, so that `stop()` can end it. */
+  private sleeping: { timer: ReturnType<typeof setTimeout>; wake: () => void } | undefined;
 
   constructor(token = process.env.TELEGRAM_BOT_TOKEN ?? "") {
     this.token = token;
@@ -112,6 +150,20 @@ export class TelegramGateway implements GatewayAdapter {
 
   get available(): boolean {
     return !!this.token;
+  }
+
+  /** Waits `ms`, or until `stop()`; no wait at all once the gateway is stopped. */
+  private sleep(ms: number): Promise<void> {
+    if (!this.running) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const wake = (): void => {
+        clearTimeout(timer);
+        this.sleeping = undefined;
+        resolve();
+      };
+      const timer = setTimeout(wake, ms);
+      this.sleeping = { timer, wake };
+    });
   }
 
   protected api(method: string, body?: Record<string, unknown>): unknown {
@@ -127,10 +179,17 @@ export class TelegramGateway implements GatewayAdapter {
       timeoutSec: 35,
       maxBytes: 4 * 1024 * 1024,
     });
+    // curl's stderr and the body are text from the network, so each goes into an
+    // Error message as a JSON string, and the body only as far as 200 characters.
     if (res.exitStatus !== 0) {
-      throw new Error(String(res.stderr || "telegram api failed"));
+      throw new Error(`telegram api failed: ${jsonForTerminal(String(res.stderr || "no message").slice(0, MAX_LOGGED_API_TEXT))}`);
     }
-    return JSON.parse(res.body || "{}");
+    try {
+      return JSON.parse(res.body || "{}");
+    } catch {
+      // V8's SyntaxError message quotes the start of the body as it is, so it is dropped.
+      throw new Error(`telegram api returned non-JSON: ${jsonForTerminal(String(res.body).slice(0, MAX_NON_JSON_BODY))}`);
+    }
   }
 
   async send(msg: OutboundMessage): Promise<void> {
@@ -155,6 +214,8 @@ export class TelegramGateway implements GatewayAdapter {
     }
     this.running = true;
     console.log("Telegram gateway: long-poll started");
+    // Failed rounds (a refusal, or an error) since the API last accepted a getUpdates.
+    let failures = 0;
     while (this.running) {
       try {
         const data = this.api("getUpdates", {
@@ -175,9 +236,11 @@ export class TelegramGateway implements GatewayAdapter {
         // `{ok:false}` has no `result`, so without this check the loop would run
         // again at once, one curl spawn after another, and never reach the catch.
         if (!telegramAnswered("getUpdates", data)) {
-          await new Promise((r) => setTimeout(r, this.retryDelayMs));
+          failures += 1;
+          await this.sleep(telegramRetryDelayMs(this.retryDelayMs, failures, telegramRetryAfterSec(data)));
           continue;
         }
+        failures = 0;
         for (const u of data.result ?? []) {
           this.offset = u.update_id + 1;
           const m = u.message;
@@ -207,14 +270,20 @@ export class TelegramGateway implements GatewayAdapter {
           });
         }
       } catch (e) {
-        console.error("telegram poll error", e);
-        await new Promise((r) => setTimeout(r, this.retryDelayMs));
+        failures += 1;
+        // Whatever was thrown (this loop also runs the turn) is printed as a JSON
+        // string and not as the Error, whose message can carry text from the network.
+        const what = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        console.error(`telegram poll error ${jsonForTerminal(what)}`);
+        await this.sleep(telegramRetryDelayMs(this.retryDelayMs, failures, undefined));
       }
     }
   }
 
   async stop(): Promise<void> {
     this.running = false;
+    // A loop that is waiting out a backoff of minutes would otherwise hold the process.
+    this.sleeping?.wake();
   }
 }
 

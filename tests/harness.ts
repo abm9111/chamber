@@ -16791,6 +16791,265 @@ test("release", "jsonForTerminal writes every character that is not a letter, ma
   }
 });
 
+// ─── the Telegram gateway prints nothing from the network raw, and backs off ─
+
+/** A `curl` first on PATH for the length of `fn`: it reads its stdin, then runs `script`. */
+async function withCurlScript<T>(script: string, fn: () => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-curlscript-"));
+  writeFileSync(join(dir, "curl"), `#!/bin/sh\ncat >/dev/null\n${script}\n`, { mode: 0o755 });
+  const savedPath = process.env.PATH;
+  try {
+    process.env.PATH = `${dir}:${savedPath ?? ""}`;
+    return await fn();
+  } finally {
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** A TelegramGateway whose real `api` can be called, and whose retry delay is short. */
+class ApiTelegram extends TelegramGateway {
+  constructor() {
+    super("TESTTOKEN-not-real");
+    this.retryDelayMs = 20;
+  }
+  call(method: string): unknown {
+    return this.api(method);
+  }
+}
+
+/** Throws what `thrown` lists, one entry per getUpdates, then stops and answers with an accepted, empty reply. */
+class ThrowingTelegram extends TelegramGateway {
+  thrown: unknown[];
+  polls = 0;
+  constructor(thrown: unknown[]) {
+    super("TESTTOKEN-not-real");
+    this.thrown = thrown;
+    this.retryDelayMs = 5;
+  }
+  protected override api(): unknown {
+    this.polls += 1;
+    if (this.polls > this.thrown.length) {
+      void this.stop();
+      return { ok: true, result: [] };
+    }
+    throw this.thrown[this.polls - 1];
+  }
+}
+
+/** Answers getUpdates from `script` (an Error in it is thrown), then stops itself and answers with an accepted, empty reply. */
+class ScriptedTelegram extends TelegramGateway {
+  script: unknown[];
+  constructor(script: readonly unknown[]) {
+    super("TESTTOKEN-not-real");
+    this.script = [...script];
+  }
+  protected override api(method: string): unknown {
+    if (method !== "getUpdates") throw new Error(`unexpected Bot API method ${method}`);
+    if (this.script.length === 0) {
+      void this.stop();
+      return { ok: true, result: [] };
+    }
+    const next = this.script.shift();
+    if (next instanceof Error) throw next;
+    return next;
+  }
+}
+
+/** Stops itself, then throws, with a retry delay of 15 s. */
+class StopsThenThrows extends TelegramGateway {
+  constructor() {
+    super("TESTTOKEN-not-real");
+    this.retryDelayMs = 15_000;
+  }
+  protected override api(): unknown {
+    void this.stop();
+    throw new Error("thrown after stop()");
+  }
+}
+
+/** Runs `fn` with setTimeout replaced by a recorder that fires at once, and returns the delays it was asked for. */
+async function recordedDelays(fn: () => Promise<unknown>): Promise<number[]> {
+  const real = globalThis.setTimeout;
+  const asked: number[] = [];
+  globalThis.setTimeout = ((handler: () => void, ms?: number): ReturnType<typeof setTimeout> => {
+    asked.push(ms ?? 0);
+    return real(handler, 0);
+  }) as unknown as typeof setTimeout;
+  try {
+    await fn();
+  } finally {
+    globalThis.setTimeout = real;
+  }
+  return asked;
+}
+
+/** Whether `p` settles within `ms`. */
+function settlesWithin(p: Promise<unknown>, ms: number): Promise<boolean> {
+  return new Promise<boolean>((ok) => {
+    const timer = setTimeout(() => ok(false), ms);
+    void p.then(() => {
+      clearTimeout(timer);
+      ok(true);
+    });
+  });
+}
+
+// A body that is not JSON (an ESC, then 300 zeros, then a tail marker), and a curl that fails with bad bytes on stderr.
+const NON_JSON_CURL = "printf '<html>\\033[31m boom %0300d TAILMARK\\n200' 0";
+const FAILING_CURL = "printf 'curl: (22) bad \\033[31mRED \\302\\233csi \\177del\\n' >&2\nexit 22";
+const REFUSE_401 = { ok: false, error_code: 401, description: "Unauthorized" };
+
+test("telegram", "T5_a_body_that_is_not_JSON_and_a_curl_that_fails_reach_the_error_as_escaped_capped_text", async () => {
+  const prefix = "telegram api returned non-JSON: ";
+  await withCurlScript(NON_JSON_CURL, async () => {
+    let caught: unknown;
+    try {
+      new ApiTelegram().call("getUpdates");
+    } catch (e) {
+      caught = e;
+    }
+    assert(caught instanceof Error, `a non-JSON body did not throw: ${String(caught)}`);
+    assert(caught.message.startsWith(prefix), `the error does not say the body was not JSON: ${JSON.stringify(caught.message)}`);
+    const raw = firstRawControl(caught.message);
+    assert(raw === null, `${raw} is in the error's message: ${JSON.stringify(caught.message)}`);
+    assert(caught.message.includes("\\u001b[31m boom"), `the ESC is not shown as an escape: ${JSON.stringify(caught.message)}`);
+    assert(!caught.message.includes("TAILMARK"), "the error carries more than 200 characters of the body");
+    const shown: unknown = JSON.parse(caught.message.slice(prefix.length));
+    assert(typeof shown === "string" && shown.length === 200, `the body is not carried as a JSON string of 200 characters: ${JSON.stringify(shown)}`);
+    assert(!caught.message.includes("not valid JSON"), `V8's own message is in the error: ${JSON.stringify(caught.message)}`);
+  });
+  await withCurlScript(FAILING_CURL, async () => {
+    let caught: unknown;
+    try {
+      new ApiTelegram().call("getUpdates");
+    } catch (e) {
+      caught = e;
+    }
+    assert(caught instanceof Error, `a curl that failed did not throw: ${String(caught)}`);
+    assert(caught.message.startsWith("telegram api failed: "), `unexpected message: ${JSON.stringify(caught.message)}`);
+    assert(
+      caught.message.includes("\\u001b[31mRED") && caught.message.includes("\\u009bcsi") && caught.message.includes("\\u007fdel"),
+      `curl's ESC, CSI and DEL are not shown as escapes: ${JSON.stringify(caught.message)}`,
+    );
+    const raw = firstRawControl(caught.message);
+    assert(raw === null, `${raw} is in the error's message: ${JSON.stringify(caught.message)}`);
+  });
+  // The loop, end to end: the real api() throws, and the line the catch prints is one escaped line.
+  await withCurlScript(NON_JSON_CURL, async () => {
+    const gw = new ApiTelegram();
+    const logged = await captureStderrAsync(async () => {
+      const done = gw.start(async () => "never");
+      await new Promise<void>((r) => setTimeout(r, 250));
+      await gw.stop();
+      await done;
+    });
+    const lines = logged.split("\n").filter((l) => l.includes("telegram poll error"));
+    assert(lines.length >= 1, `nothing was logged about a body that is not JSON: "${logged}"`);
+    for (const l of logged.split("\n")) {
+      const raw = firstRawControl(l);
+      assert(raw === null, `${raw} reached stderr: ${JSON.stringify(l)}`);
+    }
+    assert(lines[0]!.includes("non-JSON") && lines[0]!.includes("u001b[31m boom"), `the line does not say what happened: ${lines[0]}`);
+  });
+});
+
+test("telegram", "T6_the_poll_loop_prints_whatever_was_thrown_as_an_escaped_string", async () => {
+  const gw = new ThrowingTelegram([
+    new Error("boom \u001b[31m\u009b\u007f\u202e"),
+    "plain string \u001b[2J",
+    { toString: (): string => "object \u001b]0;title\u0007" },
+    Object.assign(new Error("message"), { name: "Nm\u001b[1mame" }),
+  ]);
+  const logged = await captureStderrAsync(() => gw.start(async () => "never"));
+  const lines = logged.split("\n").filter((l) => l.includes("telegram poll error"));
+  assert(lines.length === 4, `expected four poll error lines, got ${lines.length}: "${logged}"`);
+  for (const l of logged.split("\n")) {
+    const raw = firstRawControl(l);
+    assert(raw === null, `${raw} reached stderr: ${JSON.stringify(l)}`);
+    assert(!l.includes("\u202e"), `a right-to-left override reached stderr: ${JSON.stringify(l)}`);
+  }
+  assert(lines[0]!.includes("boom \\u001b[31m\\u009b\\u007f\\u202e"), `the Error's message is not shown as escapes: ${lines[0]}`);
+  assert(lines[1]!.includes("plain string \\u001b[2J"), `a thrown string is not shown as escapes: ${lines[1]}`);
+  assert(lines[2]!.includes("object \\u001b]0;title\\u0007"), `a thrown object is not shown as escapes: ${lines[2]}`);
+  assert(lines[3]!.includes("Nm\\u001b[1mame"), `the Error's name is not shown as escapes: ${lines[3]}`);
+});
+
+test("telegram", "T7_consecutive_failed_rounds_wait_longer_each_time_up_to_five_minutes_and_an_accepted_answer_starts_over", async () => {
+  const gw = new ScriptedTelegram([
+    ...Array.from({ length: 10 }, () => REFUSE_401),
+    { ok: true, result: [] },
+    REFUSE_401,
+    REFUSE_401,
+    new Error("a thrown error is a failed round too"),
+    { ok: false, error_code: 404, description: "Not Found" },
+  ]);
+  let delays: number[] = [];
+  const logged = await captureStderrAsync(async () => {
+    delays = await recordedDelays(() => gw.start(async () => "never"));
+  });
+  // The default 3000 ms doubles to 192000 and then stops at five minutes (300000); the accepted answer in the
+  // middle sets it back to 3000; the thrown error and the 404 after it carry on from there.
+  const want = [3000, 6000, 12000, 24000, 48000, 96000, 192000, 300000, 300000, 300000, 3000, 6000, 12000, 24000];
+  assert(delays.join(",") === want.join(","), `the loop waited ${delays.join(",")}, wanted ${want.join(",")}`);
+  const errorLines = logged.split("\n").filter((l) => l.includes("telegram poll error"));
+  assert(errorLines.length === 1, `expected one poll error line, got ${errorLines.length}: "${logged}"`);
+});
+
+test("telegram", "T8_a_429_waits_as_long_as_retry_after_says_up_to_five_minutes_and_other_values_are_ignored", async () => {
+  const limited = (retryAfter: unknown): unknown => ({
+    ok: false,
+    error_code: 429,
+    description: "Too Many Requests: retry later",
+    parameters: { retry_after: retryAfter },
+  });
+  const gw = new ScriptedTelegram([
+    limited(7),
+    limited(100000),
+    REFUSE_401,
+    limited(0),
+    limited("7"),
+    limited(-3),
+    { ok: false, error_code: 429, parameters: null },
+    limited(0.5),
+  ]);
+  let delays: number[] = [];
+  await captureStderrAsync(async () => {
+    delays = await recordedDelays(() => gw.start(async () => "never"));
+  });
+  // 7 s as asked; 100000 s capped at five minutes; the 401 is the third failed round in a row, so 3000 * 4;
+  // a zero, a string, a negative number and a null `parameters` are not a wait the API asked for, so the
+  // doubling goes on (24000, 48000, 96000, 192000); a half second is honoured.
+  const want = [7000, 300000, 12000, 24000, 48000, 96000, 192000, 500];
+  assert(delays.join(",") === want.join(","), `the loop waited ${delays.join(",")}, wanted ${want.join(",")}`);
+});
+
+test("telegram", "T9_stop_ends_a_wait_of_seconds_and_a_loop_that_was_stopped_does_not_start_one", async () => {
+  // Asked to wait 15 s; stopped after 60 ms.
+  const waiting = new RefusedTelegram({ ok: false, error_code: 429, parameters: { retry_after: 15 } }, 1e9);
+  await captureStderrAsync(async () => {
+    const done = waiting.start(async () => "never");
+    await new Promise<void>((r) => setTimeout(r, 60));
+    await waiting.stop();
+    assert(await settlesWithin(done, 2000), "stop() did not end a loop that was waiting out a 15 s retry_after");
+  });
+  assert(waiting.polls === 1, `the loop asked ${waiting.polls} times; it should not ask again once stopped`);
+  // stop() arrives while the loop is in a poll or a turn, and an error follows: the wait after it must not start.
+  await captureStderrAsync(async () => {
+    const late = new StopsThenThrows();
+    assert(await settlesWithin(late.start(async () => "never"), 2000), "a loop that was stopped before its wait still waited 15 s");
+  });
+});
+
+test("telegram", "T10_the_API_text_in_a_refusal_line_is_cut_at_300_characters", async () => {
+  const gw = new RefusedTelegram({ ok: false, error_code: "Q".repeat(1000), description: "Z".repeat(300) + "TAILMARK" }, 0);
+  const logged = await captureStderrAsync(() => gw.send({ channel: "telegram", chatId: "9", text: "hello" }));
+  const count = (ch: string): number => logged.split(ch).length - 1;
+  assert(count("Z") === 300 && !logged.includes("TAILMARK"), `the description is not cut at 300 characters: ${count("Z")} Z, tail ${logged.includes("TAILMARK")}`);
+  assert(count("Q") === 300, `the error code is not cut at 300 characters: ${count("Q")} Q`);
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

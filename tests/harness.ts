@@ -16760,7 +16760,7 @@ test("release", "jsonForTerminal writes every character that is not a letter, ma
     ["Arabic", "مرحبا بالعالم"],
     ["Chinese", "你好，世界"],
     ["emoji, which are surrogate pairs", "\u{1f600} \u{1f680}"],
-    ["a combining mark and a variation selector", "é ❤️"],
+    ["a combining mark and a variation selector", "e\u0301 \u2764\ufe0f"],
     ["a currency symbol, a dash and a digit from another script", "€5 — ٣"],
     ["the ASCII punctuation JSON leaves alone", "!#$%&'()*+,-./:;<=>?@[]^_`{|}~"],
     ["spaces between words", "a b  c"],
@@ -17155,6 +17155,8 @@ test("server", "deploy/Dockerfile's HEALTHCHECK has compose's timings, and its c
   const parsed: unknown = JSON.parse(json);
   const argv: string[] = Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === "string") : [];
   assert(argv.length === 3 && argv[0] === "node" && argv[1] === "-e", `the HEALTHCHECK command is not node -e <script>: ${json}`);
+  // An IPv4 literal: `localhost` can resolve to ::1, where the server, bound to 0.0.0.0, does not listen.
+  assert(argv[2]!.includes("http://127.0.0.1:"), `the HEALTHCHECK does not ask 127.0.0.1: ${json}`);
   // Asynchronous: the 503 server below lives in this process, and a synchronous spawn would stop it from answering.
   const probe = (port: number): Promise<number | null> =>
     new Promise((ok) => {

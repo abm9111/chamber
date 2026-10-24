@@ -35,6 +35,13 @@ export const JOB_LABEL = "com.chamber.verify";
 export const RELEASE_SUBDIR = ".local/share/chamber-release";
 export const RELEASE_COMMAND = `node "$HOME/${RELEASE_SUBDIR}/bin/chamber.js"`;
 
+export const SNAPSHOT_JOB_LABEL = "com.chamber.daily-snapshot";
+/**
+ * The script the shipped snapshot plist runs, as the plist writes it: the job's
+ * login shell expands $HOME, so the file holds the variable and not a path.
+ */
+export const SNAPSHOT_SCRIPT = `$HOME/${RELEASE_SUBDIR}/scripts/daily-snapshot.sh`;
+
 /**
  * The shipped job script, with `chamber` standing for whatever runs Chamber.
  * The installed script is accepted only when it is exactly one of the two
@@ -65,6 +72,9 @@ export type JobScriptForm = "bare" | "pinned";
 export type JobPlistRead =
   | { ok: true; form: JobScriptForm }
   | { ok: false; reason: string };
+
+/** The script a plist's ProgramArguments runs, once the shape around it is accepted. */
+export type PlistScriptRead = { ok: true; script: string } | { ok: false; reason: string };
 
 // `/bin/sh`, `-lc`, then the script, and nothing else in the array. Groups:
 // 1 everything up to the script's opening tag, 2 the shell, 3 the flag,
@@ -115,6 +125,22 @@ export type PlistParse =
 
 export type PlistParser = (xml: string) => PlistParse;
 
+/**
+ * `text` as a JSON string, with DEL and the C1 controls written as \u00XX too.
+ * JSON.stringify escapes quotes, backslashes and the C0 controls but leaves U+007F
+ * and U+0080-U+009F raw, and a terminal acts on U+009B (the 8-bit CSI). For text
+ * that comes out of a file and goes to a terminal. A loop, not a regular
+ * expression: a control-character class is what the no-control-regex rule refuses.
+ */
+export function jsonForTerminal(text: string): string {
+  let out = "";
+  for (const ch of JSON.stringify(text)) {
+    const c = ch.codePointAt(0) ?? 0;
+    out += c === 0x7f || (c >= 0x80 && c <= 0x9f) ? `\\u${c.toString(16).padStart(4, "0")}` : ch;
+  }
+  return out;
+}
+
 const PLUTIL_TIMEOUT_MS = 15_000;
 
 /** Where plutil is. Run by absolute path, so a `plutil` earlier on PATH is never what decides. */
@@ -146,7 +172,12 @@ function parseWithPlutil(path: string, xml: string): PlistParse {
   }
   if (r.status !== 0) {
     const said = (r.stderr ?? "").trim().split("\n")[0] ?? "";
-    return { kind: "rejected", reason: `plutil does not accept the plist${said !== "" ? `: ${said.slice(0, 200)}` : ""}` };
+    // plutil echoes bytes of the plist, so what it says is data from a file, not
+    // text of ours: it goes out as a JSON string, as snapshotJobNotice's script does.
+    return {
+      kind: "rejected",
+      reason: `plutil does not accept the plist${said !== "" ? `: ${jsonForTerminal(said.slice(0, 200))}` : ""}`,
+    };
   }
   try {
     return { kind: "parsed", value: JSON.parse(r.stdout ?? "") as unknown };
@@ -165,12 +196,22 @@ export const plutilParser: PlistParser = plutilParserAt(PLUTIL_PATH);
 /** A parser that is never there: the text reader decides. For tests and for callers that must not run plutil. */
 export const noPlistParser: PlistParser = () => ({ kind: "unavailable" });
 
+/** The verdict on a script: one of the two Chamber ships for the 08:30 job, or why not. */
+function formOfScript(script: string): JobPlistRead {
+  if (script === BARE_SCRIPT) return { ok: true, form: "bare" };
+  if (script === PINNED_SCRIPT) return { ok: true, form: "pinned" };
+  return {
+    ok: false,
+    reason: "its script is not the one Chamber ships, with bare chamber or with the release checkout",
+  };
+}
+
 /**
- * The verdict on a parsed plist: no `Program` key (launchd runs it instead of
- * ProgramArguments[0]) and ProgramArguments exactly `/bin/sh`, `-lc`, one of the
- * two scripts Chamber ships. Nothing here looks at the text.
+ * The script of a parsed plist: no `Program` key (launchd runs it instead of
+ * ProgramArguments[0]) and ProgramArguments exactly `/bin/sh`, `-lc`, one
+ * script. Nothing here looks at the text.
  */
-function judgeParsedPlist(value: unknown): JobPlistRead {
+function scriptOfParsedPlist(value: unknown): PlistScriptRead {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return { ok: false, reason: "the plist is not a dictionary" };
   }
@@ -182,12 +223,13 @@ function judgeParsedPlist(value: unknown): JobPlistRead {
   if (!Array.isArray(args) || args.length !== 3 || args[0] !== "/bin/sh" || args[1] !== "-lc" || typeof args[2] !== "string") {
     return { ok: false, reason: "ProgramArguments is not /bin/sh -lc followed by one script" };
   }
-  if (args[2] === BARE_SCRIPT) return { ok: true, form: "bare" };
-  if (args[2] === PINNED_SCRIPT) return { ok: true, form: "pinned" };
-  return {
-    ok: false,
-    reason: "its script is not the one Chamber ships, with bare chamber or with the release checkout",
-  };
+  return { ok: true, script: args[2] };
+}
+
+/** The verdict on a parsed plist for the 08:30 job. */
+function judgeParsedPlist(value: unknown): JobPlistRead {
+  const s = scriptOfParsedPlist(value);
+  return s.ok ? formOfScript(s.script) : s;
 }
 
 /**
@@ -222,8 +264,12 @@ export const SHIPPED_PROLOG = [
   `  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`,
 ].join("\n");
 
-/** The text reader: the whole check where there is no plutil, and the way to find the block to rewrite. */
-export function readJobPlistText(xml: string): JobPlistRead {
+/**
+ * The text reader's half of the check: the script, once every shape it does not
+ * model has been refused. Where there is no plutil this decides, for the 08:30
+ * job and for the snapshot job alike.
+ */
+function scriptOfPlistText(xml: string): PlistScriptRead {
   // The prolog is a closed set: exactly the declaration and DOCTYPE the shipped
   // plist has, with nothing before them. Both are markup this reader does not
   // model, and a `<!--` in either (`<?xml version="1.0" encoding="UTF-8" <!-- ?>`,
@@ -276,13 +322,25 @@ export function readJobPlistText(xml: string): JobPlistRead {
   if (m === null || m[2] !== "/bin/sh" || m[3] !== "-lc" || m[4] === undefined) {
     return { ok: false, reason: "ProgramArguments is not /bin/sh -lc followed by one script" };
   }
-  const script = decodeXmlText(m[4]);
-  if (script === BARE_SCRIPT) return { ok: true, form: "bare" };
-  if (script === PINNED_SCRIPT) return { ok: true, form: "pinned" };
-  return {
-    ok: false,
-    reason: "its script is not the one Chamber ships, with bare chamber or with the release checkout",
-  };
+  return { ok: true, script: decodeXmlText(m[4]) };
+}
+
+/** The text reader: the whole check where there is no plutil, and the way to find the block to rewrite. */
+export function readJobPlistText(xml: string): JobPlistRead {
+  const s = scriptOfPlistText(xml);
+  return s.ok ? formOfScript(s.script) : s;
+}
+
+/**
+ * The script a job plist runs, read the way readJobPlist reads it: plutil's
+ * reading where there is plutil, the strict text reader where there is not. It
+ * says nothing about whether the script is a good one; that is the caller's.
+ */
+export function readPlistScript(xml: string, parse: PlistParser = plutilParser): PlistScriptRead {
+  const parsed = parse(xml);
+  if (parsed.kind === "rejected") return { ok: false, reason: parsed.reason };
+  if (parsed.kind === "parsed") return scriptOfParsedPlist(parsed.value);
+  return scriptOfPlistText(xml);
 }
 
 function canonicalJson(value: unknown): string {
@@ -428,6 +486,21 @@ function git(cwd: string, args: readonly string[], timeoutMs: number = gitTimeou
   };
 }
 
+/**
+ * `text` as one POSIX shell word. A word made only of characters the shell
+ * never treats specially is returned as it is; anything else, the empty string
+ * included, goes inside single quotes with each `'` written as `'\''`. Pin
+ * prints a command for the owner to paste, and both the directory (a home
+ * directory can hold a space or a quote) and the tag (git allows `$`, `;`, `&`
+ * and `'` in one) come from outside this file. `=` is safe inside a word but
+ * not at the start of one: zsh, the owner's shell, expands `=x` to the path of
+ * the command `x`, so a leading `=` is quoted.
+ */
+export function shellQuote(text: string): string {
+  if (/^[A-Za-z0-9_@%+:,./-][A-Za-z0-9_@%+=:,./-]*$/.test(text)) return text;
+  return `'${text.replaceAll("'", `'\\''`)}'`;
+}
+
 function tagNameRefusal(tag: string): string | null {
   if (tag === "") return "the tag name is empty";
   if (tag.startsWith("-")) return `the tag name ${JSON.stringify(tag)} starts with "-"`;
@@ -513,15 +586,40 @@ function moveCheckout(
   }
   // Only refs/tags/<tag>, so a branch or a raw commit is simply not found.
   // No `+`: a tag that moved on origin is git's refusal, not a silent move.
+  // Whether the tag was here before decides what a refusal below leaves behind.
+  const hadTag = git(dir, ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}`]).ok;
   const fetch = git(
     dir,
     ["fetch", "--quiet", "--no-tags", "origin", `refs/tags/${tag}:refs/tags/${tag}`],
     gitTimeouts.fetchMs,
   );
-  if (!fetch.ok) return { ok: false, reason: `git fetch: ${fetch.message}` };
+  if (!fetch.ok) {
+    // `--quiet` hides git's own "would clobber existing tag", so a tag that
+    // moved arrives here as "git fetch exited 1". Say what git did not, and how
+    // to accept the move on purpose.
+    const moved = hadTag
+      ? `; ${dir} already has a tag ${tag}, and git does not move a tag it has. ` +
+        `If ${tag} was moved on origin on purpose, delete the local one and pin again: ` +
+        `git -C ${shellQuote(dir)} tag -d ${shellQuote(tag)}`
+      : "";
+    return { ok: false, reason: `git fetch: ${fetch.message}${moved}` };
+  }
+  // A refusal from here to the checkout leaves HEAD and the files alone, and
+  // must leave the tag as it found it too. A ref this call added and then
+  // refused would stop a tag re-pointed on origin from ever being fetched
+  // again, because git will not move it. A tag that was here before stays. The
+  // checkout's own failure keeps the ref: its repair command needs it. Best
+  // effort: a ref that cannot be removed is met by the message above next time.
+  const forgetTag = (): void => {
+    if (!hadTag) git(dir, ["update-ref", "-d", `refs/tags/${tag}`]);
+  };
   const commit = git(dir, ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}^{commit}`]);
-  if (!commit.ok) return { ok: false, reason: `${tag} does not point at a commit` };
+  if (!commit.ok) {
+    forgetTag();
+    return { ok: false, reason: `${tag} does not point at a commit` };
+  }
   if (!git(dir, ["cat-file", "-e", `${commit.out}:bin/chamber.js`]).ok) {
+    forgetTag();
     return { ok: false, reason: `${tag} has no bin/chamber.js; left unpinned` };
   }
   const head = git(dir, ["rev-parse", "--verify", "--quiet", "HEAD"]);
@@ -535,6 +633,7 @@ function moveCheckout(
   if (prove !== undefined) {
     const proof = prove(commit.out);
     if (!proof.ok) {
+      forgetTag();
       const where = created
         ? `no release checkout was left at ${dir}`
         : head.ok
@@ -551,10 +650,11 @@ function moveCheckout(
     if (!checkout.ok) {
       // A first pin's directory is removed by the caller, so there is nothing to
       // repair there; an existing checkout may have been left half-moved.
+      // The command goes last, so a line pasted whole into a shell is the command.
       const repair = created
         ? ""
-        : `; if it left ${dir} half-moved, finish the move with: ` +
-          `git -C ${dir} checkout --force --detach ${tag} (--force overwrites changes in that checkout)`;
+        : `; --force overwrites changes in that checkout; if the checkout left ${dir} half-moved, ` +
+          `finish the move with: git -C ${shellQuote(dir)} checkout --force --detach ${shellQuote(tag)}`;
       return { ok: false, reason: `git checkout: ${checkout.message}${repair}` };
     }
   }
@@ -591,8 +691,9 @@ export function originCredentialRefusal(url: string): string | null {
  * Fetch `tag` from the source checkout's origin and leave `releaseDir`
  * detached at it. Every refusal before the checkout, `prove`'s included,
  * leaves an existing release checkout exactly as it was (the fetch adds the
- * tag's objects and ref to its .git; HEAD and the files stay). A directory this
- * call created is removed when the checkout fails to reach the tag.
+ * tag's objects to its .git, and the tag's ref too unless the tag was there
+ * already, in which case it is the same one; HEAD and the files stay). A
+ * directory this call created is removed when the checkout fails to reach the tag.
  */
 export function pinCheckout(opts: CheckoutOptions, prove?: ProveBeforeMove): CheckoutResult {
   const { tag, sourceRoot, releaseDir } = opts;
@@ -689,6 +790,12 @@ export interface PinOptions extends CheckoutOptions {
   workDir?: string;
   /** How long the release may take to print its version, in ms (default 60 s). */
   proofTimeoutMs?: number;
+  /**
+   * Where the daily snapshot job's plist would be. When set, a pin that worked
+   * says if that job does not run the release checkout's script. Pin never
+   * changes that plist. Left unset, pin does not look.
+   */
+  snapshotPlistPath?: string;
 }
 
 export interface PinOutcome {
@@ -711,6 +818,9 @@ export interface PinOutcome {
  * failure exits 1.
  */
 function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: string[]): 0 | 1 {
+  // For the commands printed below: the path came from outside this file, and
+  // a home directory can hold a space or a quote.
+  const plist = shellQuote(plistPath);
   // Read again at the moment of writing, not trusted from the check made
   // before the checkout moved.
   const xml = readFileSync(plistPath, "utf8");
@@ -743,7 +853,7 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
     }
     if (launchctl(["list", JOB_LABEL]).status === 0) {
       err.push(`chamber pin: launchctl unload exited 0 but ${JOB_LABEL} is still loaded`);
-      err.push(`${plistPath} is pinned; reload it by hand: launchctl unload ${plistPath} && launchctl load ${plistPath}`);
+      err.push(`${plistPath} is pinned; reload it by hand: launchctl unload ${plist} && launchctl load ${plist}`);
       return 1;
     }
   }
@@ -752,7 +862,7 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
     err.push(`chamber pin: launchctl load failed (${load.status}): ${load.stderr.trim()}`);
     if (wasLoaded) {
       err.push(
-        `chamber pin: the agent is now unloaded and will not run at 08:30; load it with: launchctl load ${plistPath}`,
+        `chamber pin: the agent is now unloaded and will not run at 08:30; load it with: launchctl load ${plist}`,
       );
     }
     return 1;
@@ -761,17 +871,86 @@ function pinAgent(plistPath: string, launchctl: Launchctl, out: string[], err: s
   if (listed.status !== 0) {
     err.push(
       `chamber pin: launchctl load exited 0 but ${JOB_LABEL} is not loaded, so the 08:30 job will not run; ` +
-        `load it with: launchctl load ${plistPath}`,
+        `load it with: launchctl load ${plist}`,
     );
     return 1;
   }
   if (!listed.stdout.includes(PINNED_SCRIPT)) {
     err.push(`chamber pin: ${JOB_LABEL} is loaded but launchd is not running the pinned script`);
-    err.push(`${plistPath} is pinned; reload it by hand: launchctl unload ${plistPath} && launchctl load ${plistPath}`);
+    err.push(`${plistPath} is pinned; reload it by hand: launchctl unload ${plist} && launchctl load ${plist}`);
     return 1;
   }
   out.push(`${wasLoaded ? "reloaded" : "loaded"} ${JOB_LABEL}`);
   return 0;
+}
+
+/**
+ * The warning for a snapshot job that is not on the release, and the commands
+ * that put it right. `problem` says what is wrong with it. A release with no
+ * scripts/daily-snapshot.sh gets no commands: reinstalling the job would point
+ * it at a file that is not there. Nor does a clone with no template to copy.
+ */
+function snapshotWarning(plistPath: string, sourceRoot: string, releaseDir: string, problem: string): string[] {
+  const head =
+    `chamber pin: warning: the daily snapshot job (${plistPath}) does not run the release checkout's ` +
+    `scripts/daily-snapshot.sh: ${problem}. Pin did not change it.`;
+  if (!existsSync(join(releaseDir, "scripts", "daily-snapshot.sh"))) {
+    return [
+      `${head} This release has no scripts/daily-snapshot.sh either: pin a tag that has one, ` +
+        `then reinstall the job (see "Daily snapshot" in deploy/SCHEDULING.md).`,
+    ];
+  }
+  // The sed line truncates the plist before it reads the template, so a clone
+  // without one would leave the job empty: no template, no commands.
+  const templatePath = join(sourceRoot, "deploy", "launchd", `${SNAPSHOT_JOB_LABEL}.plist`);
+  if (!existsSync(templatePath)) {
+    return [
+      `${head} The clone pin ran from has no deploy/launchd/${SNAPSHOT_JOB_LABEL}.plist to reinstall it from: ` +
+        `run pin from a clone that has one (see "Daily snapshot" in deploy/SCHEDULING.md).`,
+    ];
+  }
+  const plist = shellQuote(plistPath);
+  const template = shellQuote(templatePath);
+  return [
+    `${head} To reinstall it:`,
+    `  launchctl unload ${plist}`,
+    `  sed "s|REPLACE_WITH_HOME|$HOME|g" ${template} > ${plist}`,
+    `  launchctl load ${plist}`,
+  ];
+}
+
+/**
+ * What pin has to say about the daily snapshot job after a pin that worked:
+ * nothing when no snapshot plist is installed or when it already runs the
+ * release checkout's scripts/daily-snapshot.sh (as the shipped plist writes it,
+ * or as an absolute path), a warning and the commands that fix it otherwise.
+ * Pin never rewrites or loads this plist: it is a second job with its own
+ * schedule and log, and what it reports on is the owner's call.
+ *
+ * The plist is read with readPlistScript. Its contents appear only inside a JSON
+ * string in the warning line; the commands are built from the paths pin was
+ * given, quoted, and never from the plist.
+ */
+export function snapshotJobNotice(
+  plistPath: string,
+  sourceRoot: string,
+  releaseDir: string,
+  parse: PlistParser = plutilParser,
+): string[] {
+  let xml: string;
+  try {
+    xml = readFileSync(plistPath, "utf8");
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return [];
+    return snapshotWarning(plistPath, sourceRoot, releaseDir, `it cannot be read (${code ?? String(e)})`);
+  }
+  const read = readPlistScript(xml, parse);
+  if (!read.ok) {
+    return snapshotWarning(plistPath, sourceRoot, releaseDir, `it cannot be read as a job that runs one script (${read.reason})`);
+  }
+  if (read.script === SNAPSHOT_SCRIPT || read.script === join(releaseDir, "scripts", "daily-snapshot.sh")) return [];
+  return snapshotWarning(plistPath, sourceRoot, releaseDir, `it runs ${jsonForTerminal(read.script.slice(0, 200))}`);
 }
 
 const RUN_PROOF_TIMEOUT_MS = 60_000;
@@ -924,9 +1103,19 @@ export function pinRelease(opts: PinOptions): PinOutcome {
       : `${opts.releaseDir} is on ${opts.tag} (${short})`,
   );
   out.push(`the release runs: node bin/chamber.js --version printed ${version} (tried in a throwaway clone before the checkout moved)`);
+  // A pin that worked says if the snapshot job is not on this release. A pin
+  // that failed says nothing about it: the checkout may not have moved.
+  const noteSnapshot = (): void => {
+    if (opts.snapshotPlistPath !== undefined) {
+      out.push(...snapshotJobNotice(opts.snapshotPlistPath, opts.sourceRoot, opts.releaseDir));
+    }
+  };
   if (!existsSync(opts.plistPath)) {
     out.push(`no LaunchAgent was installed at ${opts.plistPath}; nothing else was changed`);
+    noteSnapshot();
     return { code: 0, out, err };
   }
-  return { code: pinAgent(opts.plistPath, opts.launchctl, out, err), out, err };
+  const code = pinAgent(opts.plistPath, opts.launchctl, out, err);
+  if (code === 0) noteSnapshot();
+  return { code, out, err };
 }

@@ -10,7 +10,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -37,13 +37,20 @@ export const MINILM_WEIGHTS_REFUSED_EXIT = 3;
  * fallback, in `auto` mode or any other.
  */
 export class MinilmIntegrityError extends Error {
-  constructor(detail: string) {
+  /**
+   * `remembered`: the availability probe holds this error and asks the script
+   * again when the weights, the tokenizer or VERSION change. Only the holder can
+   * say so; an embed that throws it has nothing cached and says nothing of the kind.
+   */
+  constructor(detail: string, remembered: boolean = false) {
     super(
       `embed_minilm failed (${MINILM_WEIGHTS_REFUSED_EXIT}): ${detail}. The MiniLM weights were refused, ` +
-        `and Chamber will not write hash vectors in their place: restore ` +
-        `models/minilm/model_quantized.onnx, or the SHA-256 line in models/minilm/VERSION. ` +
-        `To embed with something else on purpose, set CHAMBER_EMBEDDER=hash or ollama. ` +
-        `A long-running chamber process (chamber mcp, a bridge) keeps this refusal until it is restarted.`,
+        `and Chamber will not write hash vectors in their place: put back the model_quantized.onnx and ` +
+        `tokenizer.json that models/minilm/VERSION records. ` +
+        `To embed with something else on purpose, set CHAMBER_EMBEDDER=hash or ollama.` +
+        (remembered
+          ? ` A running process remembers this refusal only until the weights, the tokenizer or VERSION change, and then asks again.`
+          : ``),
     );
     this.name = "MinilmIntegrityError";
   }
@@ -95,7 +102,41 @@ let resolvedKind: EmbedderKind | null = null;
  * process — so a server that re-reads config, or anything that sets the var
  * later, would be told about an interpreter it is no longer using.
  */
-const minilmProbe = new Map<string, { ok: boolean; err?: unknown }>();
+const minilmProbe = new Map<string, { ok: boolean; err?: unknown; sig?: string }>();
+
+function fileSignature(path: string): string {
+  try {
+    const s = statSync(path, { bigint: true });
+    return `${s.size}:${s.mtimeNs}:${s.ctimeNs}:${s.ino}`;
+  } catch (e) {
+    return `absent:${(e as NodeJS.ErrnoException).code ?? "?"}`;
+  }
+}
+
+/**
+ * What a remembered weights refusal was about: the directory the weights and
+ * tokenizer come from (CHAMBER_MINILM_DIR, as scripts/embed_minilm.py reads it)
+ * and the size, mtime, ctime and inode of the weights, the tokenizer and the
+ * package's VERSION, or why one of them cannot be looked at.
+ *
+ * A stat, not a re-hash. Three stats cost about 6 microseconds, measured over
+ * 20,000 calls on a warm cache; reading and hashing the 23 MB weights costs
+ * about 12 milliseconds, and this is read on every call while a refusal is
+ * cached. It is also the safer of the two: it decides only whether to ask the
+ * script again, and the script hashes on every start. A change it fails to notice
+ * keeps a refusal too long; it can never let a bad file through.
+ */
+export function weightsSignature(
+  modelDir: string = process.env.CHAMBER_MINILM_DIR || join(ROOT, "models/minilm"),
+  versionPath: string = join(ROOT, "models/minilm/VERSION"),
+): string {
+  return [
+    modelDir,
+    fileSignature(join(modelDir, "model_quantized.onnx")),
+    fileSignature(join(modelDir, "tokenizer.json")),
+    fileSignature(versionPath),
+  ].join("|");
+}
 
 /**
  * Whether MiniLM can actually produce a vector here.
@@ -140,10 +181,18 @@ export function minilmAvailable(): boolean {
   const bin = pythonBin();
   const cached = minilmProbe.get(bin);
   if (cached !== undefined) {
-    if (cached.err instanceof MinilmIntegrityError) throw cached.err;
-    return cached.ok;
+    if (!(cached.err instanceof MinilmIntegrityError)) return cached.ok;
+    // A refusal is remembered only while the files it was about are the ones on
+    // disk. Weights put back, a tokenizer replaced or a VERSION updated under a
+    // running process is a new question, and answering it with the old refusal
+    // would keep a repaired install out of service until a restart.
+    if (cached.sig === weightsSignature()) throw cached.err;
+    minilmProbe.delete(bin);
   }
 
+  // Taken before the probe runs: a file that changes while it runs is then seen
+  // as changed the next time, and not remembered as the one that was probed.
+  const sig = weightsSignature();
   let ok = false;
   let err: unknown;
   try {
@@ -157,7 +206,7 @@ export function minilmAvailable(): boolean {
     });
     if (r.error) err = r.error;
     else if (r.status === MINILM_WEIGHTS_REFUSED_EXIT)
-      err = new MinilmIntegrityError(refusalDetail(r.stderr));
+      err = new MinilmIntegrityError(refusalDetail(r.stderr), true);
     else if (r.status !== 0)
       err = new Error(
         `probe exited ${r.status}: ${(r.stderr || "").trim().slice(0, 300)}`,
@@ -176,7 +225,7 @@ export function minilmAvailable(): boolean {
     // crash: callers degrade or throw on their own terms below.
     err = e;
   }
-  minilmProbe.set(bin, { ok, err });
+  minilmProbe.set(bin, { ok, err, sig });
   // The model is installed and will not run. Before this probe existed that
   // situation announced itself by accident: availability said yes, the embed
   // threw, and the catch in `embedLocal` warned. Answering honestly up front

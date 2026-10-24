@@ -4,6 +4,10 @@ File:     model_quantized.onnx
 Size:     22972370 bytes
 SHA-256:  afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1
 
+Vocab:    tokenizer.json (the vocabulary and the tokenizer settings)
+Size:     711661 bytes
+Vocab-SHA-256:  da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0
+
 Upstream: sentence-transformers/all-MiniLM-L6-v2 (quantized ONNX export)
 Licence:  Apache-2.0
 Revision: UNIDENTIFIED — no upstream commit/revision was recorded when these
@@ -13,3 +17,9 @@ Revision: UNIDENTIFIED — no upstream commit/revision was recorded when these
 These weights are load-bearing: src/embedder.ts uses them for retrieval, which
 feeds the citation-pin path. An unattested artifact inside that path undercuts
 the provenance guarantee, hence this file.
+
+tokenizer.json is hashed on its own line for the same reason: the same process
+parses it, and a doctored one changes every vector without changing a byte of
+the weights. scripts/embed_minilm.py reads this file from the installed package
+and from nowhere else, and exits 3 unless both files hash to the two lines
+above. The original line keeps its name and still means the weights.

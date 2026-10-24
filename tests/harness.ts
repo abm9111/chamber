@@ -118,6 +118,8 @@ import {
   noteMinilmStderr,
   MinilmIntegrityError,
 } from "../src/embedder.ts";
+// Reached through a namespace so that an export that is missing fails the one test that needs it.
+import * as embedderApi from "../src/embedder.ts";
 import { CALIBRATED_THRESHOLDS } from "../src/commit_belief.ts";
 import {
   claimsDifferMaterially,
@@ -296,6 +298,8 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  truncateSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -13345,52 +13349,105 @@ test("config", "CI pins its actions by SHA, installs Python by hash, scans both 
 
 // ─── MiniLM weights are checked before they are loaded ──────────────────────
 
+const REAL_MODEL_DIR = fileURLToPath(new URL("../models/minilm", import.meta.url));
+
+function sha256Hex(bytes: Buffer): string {
+  return nodeCreateHash("sha256").update(bytes).digest("hex");
+}
+
+/** The two hashes the shipped models/minilm/VERSION records. */
+function recordedHashes(): { weights: string; tokenizer: string } {
+  const real = readFileSync(join(REAL_MODEL_DIR, "VERSION"), "utf8");
+  const w = /^SHA-256:\s*([0-9a-f]{64})\s*$/m.exec(real);
+  const t = /^Vocab-SHA-256:\s*([0-9a-f]{64})\s*$/m.exec(real);
+  assert(w !== null && t !== null, "models/minilm/VERSION lacks a SHA-256 or a Vocab-SHA-256 line");
+  return { weights: w[1]!, tokenizer: t[1]! };
+}
+
+/** What a file in a directory CHAMBER_MINILM_DIR names is: a link to the shipped one, a copy of it, or other bytes. */
+type ModelFile = "real" | "copy" | Buffer;
+
 /**
- * A model directory the embedder can be pointed at with CHAMBER_MINILM_DIR.
- * The weights and tokenizer are symlinks to the real files, so nothing is
- * copied; VERSION is a real file. `version` is the text to write there, or
- * null for no VERSION file at all.
+ * A directory CHAMBER_MINILM_DIR can name. "real" is a symlink to the shipped
+ * file, so nothing is copied and the file must only be read; "copy" is a private
+ * copy a test may overwrite; a Buffer is written as the file. `ownVersion`, when
+ * given, is written as the directory's own VERSION, which the embedder ignores.
  */
-function minilmDirWithVersion(version: string | null): string {
-  const real = fileURLToPath(new URL("../models/minilm", import.meta.url));
+function minilmDirWith(opts: { weights?: ModelFile; tokenizer?: ModelFile; ownVersion?: string }): string {
   const dir = mkdtempSync(join(tmpdir(), "chamber-minilm-dir-"));
-  symlinkSync(join(real, "model_quantized.onnx"), join(dir, "model_quantized.onnx"));
-  symlinkSync(join(real, "tokenizer.json"), join(dir, "tokenizer.json"));
-  if (version !== null) writeFileSync(join(dir, "VERSION"), version);
+  for (const [name, what] of [
+    ["model_quantized.onnx", opts.weights ?? "real"],
+    ["tokenizer.json", opts.tokenizer ?? "real"],
+  ] as const) {
+    if (what === "real") symlinkSync(join(REAL_MODEL_DIR, name), join(dir, name));
+    else writeFileSync(join(dir, name), what === "copy" ? readFileSync(join(REAL_MODEL_DIR, name)) : what);
+  }
+  if (opts.ownVersion !== undefined) writeFileSync(join(dir, "VERSION"), opts.ownVersion);
   return dir;
 }
 
-/** The real VERSION text with the first hex digit of its SHA-256 changed. */
-function tamperedVersion(): { text: string; expected: string; actualDigest: string } {
-  const real = readFileSync(fileURLToPath(new URL("../models/minilm/VERSION", import.meta.url)), "utf8");
-  const m = /^SHA-256:\s*([0-9a-f]{64})\s*$/m.exec(real);
-  assert(m !== null, "models/minilm/VERSION has no SHA-256 line");
-  const digest = m[1]!;
-  const wrong = (digest[0] === "0" ? "1" : "0") + digest.slice(1);
-  return { text: real.replace(digest, wrong), expected: wrong, actualDigest: digest };
+const NOT_THE_WEIGHTS = Buffer.from("these are not the MiniLM weights\n");
+const NOT_THE_TOKENIZER = Buffer.from('{"not": "the MiniLM tokenizer"}\n');
+
+/**
+ * A directory whose weights are not the ones VERSION records. `expected` is the
+ * hash VERSION records, `actualDigest` is what the file in the directory hashes to.
+ */
+function tamperedWeights(): { dir: string; expected: string; actualDigest: string } {
+  return {
+    dir: minilmDirWith({ weights: NOT_THE_WEIGHTS }),
+    expected: recordedHashes().weights,
+    actualDigest: sha256Hex(NOT_THE_WEIGHTS),
+  };
+}
+
+/**
+ * A package root of its own: a copy of the script whose models/minilm/VERSION is
+ * `version` (null: no such file). The weights and the tokenizer are links to the
+ * shipped ones, so the files hash as they should and only VERSION varies.
+ */
+function fakePackage(version: string | Buffer | null): { root: string; script: string } {
+  const root = mkdtempSync(join(tmpdir(), "chamber-fake-package-"));
+  mkdirSync(join(root, "scripts"));
+  mkdirSync(join(root, "models", "minilm"), { recursive: true });
+  const script = join(root, "scripts", "embed_minilm.py");
+  writeFileSync(script, readFileSync(EMBED_SCRIPT));
+  for (const name of ["model_quantized.onnx", "tokenizer.json"]) {
+    symlinkSync(join(REAL_MODEL_DIR, name), join(root, "models", "minilm", name));
+  }
+  if (version !== null) writeFileSync(join(root, "models", "minilm", "VERSION"), version);
+  return { root, script };
 }
 
 const EMBED_SCRIPT = fileURLToPath(new URL("../scripts/embed_minilm.py", import.meta.url));
 
+/**
+ * Run the script with python3. `dir` is CHAMBER_MINILM_DIR (null: unset, so the
+ * shipped model); `script` is another copy of the script, as fakePackage makes.
+ */
 function runEmbedScript(
-  dir: string,
+  dir: string | null,
   args: readonly string[],
   input?: string,
   pythonFlags: readonly string[] = [],
+  script: string = EMBED_SCRIPT,
 ): { status: number | null; stdout: string; stderr: string } {
-  const r = spawnSync("python3", [...pythonFlags, EMBED_SCRIPT, ...args], {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (dir === null) delete env.CHAMBER_MINILM_DIR;
+  else env.CHAMBER_MINILM_DIR = dir;
+  const r = spawnSync("python3", [...pythonFlags, script, ...args], {
     encoding: "utf8",
     input,
     timeout: 120_000,
-    env: { ...process.env, CHAMBER_MINILM_DIR: dir },
+    env,
   });
   assert(r.error === undefined, `python3 did not run: ${r.error}`);
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
 test("config", "weights that do not match VERSION exit 3 in every mode, naming both hashes", () => {
-  const bad = tamperedVersion();
-  const dir = minilmDirWithVersion(bad.text);
+  const bad = tamperedWeights();
+  const dir = bad.dir;
   try {
     for (const [label, args, input] of [
       ["one-shot", ["a sentence"], undefined],
@@ -13420,31 +13477,105 @@ test("config", "weights that do not match VERSION exit 3 in every mode, naming b
   }
 });
 
-test("config", "a missing VERSION or a VERSION without a SHA-256 line also exits 3", () => {
+test("config", "a missing or unreadable VERSION, or one without exactly one of each hash, also exits 3", () => {
+  const { weights, tokenizer } = recordedHashes();
+  const both = `SHA-256:  ${weights}\nVocab-SHA-256:  ${tokenizer}\n`;
   for (const [label, version, want] of [
     ["missing VERSION", null, "cannot read"],
-    ["no SHA-256 line", "File: model_quantized.onnx\nSize: 22972370 bytes\n", "no SHA-256 line"],
-    ["short digest", "SHA-256:  afdb6f1a0e45b715d0bb9b11772f032c\n", "no SHA-256 line"],
+    ["not UTF-8", Buffer.from([0xff, 0xfe, 0xfd]), "is not UTF-8"],
+    ["no SHA-256 line", `File: model_quantized.onnx\nVocab-SHA-256:  ${tokenizer}\n`, "no SHA-256 line"],
+    ["short digest", `SHA-256:  afdb6f1a0e45b715d0bb9b11772f032c\nVocab-SHA-256:  ${tokenizer}\n`, "no SHA-256 line"],
+    ["a VERSION from before the tokenizer was hashed", `SHA-256:  ${weights}\n`, "no Vocab-SHA-256 line"],
+    ["two weights lines", `${both}SHA-256:  ${weights}\n`, "more than one SHA-256 line"],
+    ["two tokenizer lines", `${both}Vocab-SHA-256:  ${tokenizer}\n`, "more than one Vocab-SHA-256 line"],
   ] as const) {
-    const dir = minilmDirWithVersion(version);
+    // A package of its own, so this VERSION is the installed one.
+    const pkg = fakePackage(version);
     try {
-      const r = runEmbedScript(dir, ["a sentence"]);
+      const r = runEmbedScript(null, ["a sentence"], undefined, [], pkg.script);
       assert(r.status === 3, `${label}: exit ${r.status}, stderr ${r.stderr}`);
       assert(r.stderr.includes(want) && r.stderr.includes("VERSION"), `${label}: ${r.stderr}`);
       assert(r.stdout === "", `${label}: wrote a reply before refusing`);
+    } finally {
+      rmSync(pkg.root, { recursive: true, force: true });
+    }
+  }
+  // And the control: the same fake package with a VERSION that records both
+  // hashes is not refused, so the cases above fail for the VERSION and not for
+  // the copy. Where numpy and onnxruntime are missing the script fails later and
+  // differently, which is not exit 3.
+  const ok = fakePackage(both);
+  try {
+    const r = runEmbedScript(null, ["a sentence"], undefined, [], ok.script);
+    assert(r.status !== 3 && !r.stderr.includes("SHA-256"), `a good VERSION was refused: ${r.stderr}`);
+  } finally {
+    rmSync(ok.root, { recursive: true, force: true });
+  }
+});
+
+test("config", "a tokenizer that does not match VERSION exits 3 in every mode, naming both hashes", () => {
+  const dir = minilmDirWith({ tokenizer: NOT_THE_TOKENIZER });
+  try {
+    const want = recordedHashes().tokenizer;
+    const got = sha256Hex(NOT_THE_TOKENIZER);
+    for (const [label, args, input] of [
+      ["one-shot", ["a sentence"], undefined],
+      ["--json -", ["--json", "-"], '["a sentence"]'],
+      ["--serve", ["--serve"], '["a sentence"]\n'],
+    ] as const) {
+      const r = runEmbedScript(dir, args, input);
+      assert(r.status === 3, `${label}: exit ${r.status}, stderr ${r.stderr}`);
+      assert(r.stdout === "", `${label}: wrote a reply before refusing: ${r.stdout}`);
+      const lines = r.stderr.trim().split("\n");
+      assert(lines.length === 1, `${label}: expected one stderr line, got ${lines.length}: ${r.stderr}`);
+      assert(
+        lines[0]!.includes("tokenizer.json") && lines[0]!.includes(got) && lines[0]!.includes(want),
+        `${label}: the line must name the tokenizer and both hashes: ${lines[0]}`,
+      );
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "a directory CHAMBER_MINILM_DIR names cannot vouch for itself with a VERSION of its own", () => {
+  // Weights and tokenizer that are not the shipped ones, and a VERSION in the
+  // same directory that records exactly what they hash to. Before this rule that
+  // directory passed its own check.
+  const own = `SHA-256:  ${sha256Hex(NOT_THE_WEIGHTS)}\nVocab-SHA-256:  ${sha256Hex(NOT_THE_TOKENIZER)}\n`;
+  const recorded = recordedHashes();
+  for (const [label, opts, shipped] of [
+    ["weights", { weights: NOT_THE_WEIGHTS, ownVersion: own }, recorded.weights],
+    ["tokenizer", { tokenizer: NOT_THE_TOKENIZER, ownVersion: own }, recorded.tokenizer],
+  ] as const) {
+    const dir = minilmDirWith(opts);
+    try {
+      const r = runEmbedScript(dir, ["a sentence"]);
+      assert(r.status === 3, `${label}: the directory vouched for itself (exit ${r.status}): ${r.stderr}`);
+      assert(r.stderr.includes(shipped), `${label}: the refusal does not name the shipped hash: ${r.stderr}`);
+      assert(!r.stderr.includes(dir + "/VERSION"), `${label}: the directory's own VERSION was read: ${r.stderr}`);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   }
 });
 
+test("config", "models/minilm/VERSION records both hashes, and its original SHA-256 line is still the only one the original pattern reads", () => {
+  const real = readFileSync(join(REAL_MODEL_DIR, "VERSION"), "utf8");
+  // The pattern the script used before the tokenizer was hashed: a reader that
+  // only knows it must still find the weights' hash, and only that.
+  const original = [...real.matchAll(/^SHA-256:\s*([0-9a-fA-F]{64})\s*$/gm)];
+  const weightsHash = sha256Hex(readFileSync(join(REAL_MODEL_DIR, "model_quantized.onnx")));
+  assert(original.length === 1 && original[0]![1] === weightsHash, `the original pattern reads ${JSON.stringify(original.map((m) => m[1]))}`);
+  const tokenizerHash = sha256Hex(readFileSync(join(REAL_MODEL_DIR, "tokenizer.json")));
+  assert(recordedHashes().tokenizer === tokenizerHash, "VERSION's Vocab-SHA-256 is not the hash of models/minilm/tokenizer.json");
+});
+
 test("config", "the real model directory passes the weights check", () => {
-  // Same files, VERSION untouched: the check lets it through. Where an
-  // embedder runs here it must also answer; where numpy or onnxruntime is
-  // missing the script fails later and differently, which is not exit 3.
-  const dir = minilmDirWithVersion(
-    readFileSync(fileURLToPath(new URL("../models/minilm/VERSION", import.meta.url)), "utf8"),
-  );
+  // The shipped files, reached through CHAMBER_MINILM_DIR: the check lets them
+  // through. Where an embedder runs here it must also answer; where numpy or
+  // onnxruntime is missing the script fails later and differently, which is not exit 3.
+  const dir = minilmDirWith({});
   try {
     const r = runEmbedScript(dir, ["a sentence"]);
     assert(r.status !== 3 && !r.stderr.includes("SHA-256"), `refused the real weights: ${r.stderr}`);
@@ -13460,7 +13591,7 @@ test("config", "the real model directory passes the weights check", () => {
 });
 
 test("config", "refused MiniLM weights make every embed path throw, in auto mode as well as with minilm preferred, and never write hash vectors", () => {
-  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const dir = tamperedWeights().dir;
   const saved = process.env.CHAMBER_MINILM_DIR;
   const savedKind = process.env.CHAMBER_EMBEDDER;
   const savedWrite = process.stderr.write;
@@ -13515,10 +13646,8 @@ test("config", "refused MiniLM weights make every embed path throw, in auto mode
 });
 
 test("config", "weights swapped after the probe passed still throw from embedLocal auto instead of degrading", () => {
-  const good = minilmDirWithVersion(
-    readFileSync(fileURLToPath(new URL("../models/minilm/VERSION", import.meta.url)), "utf8"),
-  );
-  const bad = minilmDirWithVersion(tamperedVersion().text);
+  const good = minilmDirWith({});
+  const bad = tamperedWeights().dir;
   const saved = process.env.CHAMBER_MINILM_DIR;
   const savedKind = process.env.CHAMBER_EMBEDDER;
   process.env.CHAMBER_MINILM_DIR = good;
@@ -13552,7 +13681,7 @@ test("config", "weights swapped after the probe passed still throw from embedLoc
 });
 
 test("config", "an ingest with refused MiniLM weights stops, writes no hash vectors, and a search stops too", () => {
-  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const dir = tamperedWeights().dir;
   const notes = mkdtempSync(join(tmpdir(), "chamber-refused-notes-"));
   writeFileSync(join(notes, "a.md"), "# Alpha\n\nA passage about refund windows.\n");
   const db = freshDb();
@@ -13592,7 +13721,7 @@ test("gates", "refused MiniLM weights soften the debt check inside the commit's 
   // write are one transaction) and catches the embedder's throw right there.
   // The refusal now throws where it used to return hash vectors, and it must
   // land in that catch: the check is recorded as not run, the commit goes on.
-  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const dir = tamperedWeights().dir;
   const db = freshDb();
   const indebted = "The refund policy allows returns within 30 days.";
   insertDebt(db, claimHash("belief", indebted), indebted);
@@ -13629,7 +13758,7 @@ test("gates", "refused MiniLM weights are named in the debt:degraded record and 
   // The commit goes through (FM-6), so this record and this line are the only
   // places an operator can learn that the paraphrase gate is off because the
   // weights changed, and not because python is missing.
-  const dir = minilmDirWithVersion(tamperedVersion().text);
+  const dir = tamperedWeights().dir;
   const db = freshDb();
   const indebted = "The refund policy allows returns within 30 days.";
   insertDebt(db, claimHash("belief", indebted), indebted);
@@ -13693,8 +13822,8 @@ test("gates", "refused MiniLM weights are named in the debt:degraded record and 
 });
 
 test("config", "the integrity refusal keeps the hash VERSION records, however long the model path is", () => {
-  const t = tamperedVersion();
-  const short = minilmDirWithVersion(t.text);
+  const t = tamperedWeights();
+  const short = t.dir;
   // The refusal is one line with two absolute paths in it, and the hash that
   // matters is last. The 08:30 job's own path already put it past 300 characters.
   const dir = `${short}-${"x".repeat(150)}`;
@@ -13720,8 +13849,14 @@ test("config", "the integrity refusal keeps the hash VERSION records, however lo
       embedded = e instanceof Error ? e.message : String(e);
     }
     assert(embedded.includes(t.expected), `the embed's message was cut before the hash VERSION records: "${embedded}"`);
-    // minilmAvailable() remembers a refusal for the life of the process.
-    assert(probed.includes("until it is restarted"), `the message does not say that a running process must be restarted: "${probed}"`);
+    // minilmAvailable() remembers a refusal and says when it stops remembering:
+    // not at a restart. The embed above remembers nothing, so it must not say it does.
+    assert(
+      probed.includes("remembers this refusal only until the weights, the tokenizer or VERSION change"),
+      `the probe's message does not say when it asks again: "${probed}"`,
+    );
+    assert(!probed.includes("restart"), `the probe's message still tells the owner to restart: "${probed}"`);
+    assert(!embedded.includes("remembers") && !embedded.includes("restart"), `an embed that caches nothing claims it does: "${embedded}"`);
   } finally {
     if (savedDir === undefined) delete process.env.CHAMBER_MINILM_DIR;
     else process.env.CHAMBER_MINILM_DIR = savedDir;
@@ -15309,6 +15444,928 @@ test("config", "the pin docs say what is known about launchd's parser, what a ki
   // The design spec names the reason a refused-weights commit logs and the warning.
   const spec = flat("docs", "superpowers", "specs", "2026-10-21-supply-chain-and-pin-followups-design.md");
   assert(spec.includes("MinilmIntegrityError") && spec.includes("per distinct message"), "the design spec does not say what a refused-weights commit logs and warns");
+});
+
+// ─── the repair command pin prints is quoted for a POSIX shell ──────────────
+
+test("release", "shellQuote leaves a plain word alone and single-quotes everything else", () => {
+  assert(pinApi.shellQuote("/home/ab/.local/share/chamber-release") === "/home/ab/.local/share/chamber-release", "a plain path was quoted");
+  assert(pinApi.shellQuote("v0.2.0-rc.1") === "v0.2.0-rc.1", "a plain tag was quoted");
+  assert(pinApi.shellQuote("") === "''", "the empty word must stay a word");
+  assert(pinApi.shellQuote("a b") === "'a b'", "a space was not quoted");
+  assert(pinApi.shellQuote("it's") === `'it'\\''s'`, `a quote was not escaped: ${pinApi.shellQuote("it's")}`);
+  assert(pinApi.shellQuote("$HOME;x") === "'$HOME;x'", "shell syntax was not quoted");
+});
+
+test("release", "the repair command pin prints runs as printed, for a directory and a tag that need quoting", () => {
+  withReleaseFixture((fx) => {
+    // A directory with a space and a quote in it, and a tag git accepts that
+    // carries shell syntax. Unquoted, the first breaks the command and the
+    // second is expanded by the shell.
+    const releaseDir = join(fx.root, "my dir's share", "chamber-release");
+    const tag = "it's;$HOME";
+    fixtureGit(fx.origin, ["tag", tag, fx.v2]);
+    const opts = { sourceRoot: fx.source, releaseDir };
+    assert(pinCheckout({ ...opts, tag: "v1" }).ok, "v1 refused");
+    // v2 adds CHANGES.md; an untracked file of that name makes git refuse the checkout.
+    writeFileSync(join(releaseDir, "CHANGES.md"), "mine\n");
+    const r = pinCheckout({ ...opts, tag });
+    assert(!r.ok && r.reason.includes("git checkout:"), JSON.stringify(r));
+    const marker = "finish the move with: ";
+    const at = r.ok ? -1 : r.reason.indexOf(marker);
+    assert(at >= 0, `no repair command in: ${JSON.stringify(r)}`);
+    const command = r.ok ? "" : r.reason.slice(at + marker.length);
+    const ran = spawnSync("/bin/sh", ["-c", command], { encoding: "utf8" });
+    assert(ran.status === 0, `the printed repair failed (${ran.status}): ${ran.stderr}\ncommand: ${command}`);
+    assert(headOf(releaseDir) === fx.v2, "the printed repair did not move the checkout to the tag");
+  });
+});
+
+// ─── a refused tag does not stay behind in the release checkout ─────────────
+
+test("release", "a refused release leaves no tag ref behind, so the tag can be re-pointed and pinned; a tag that was already there stays", () => {
+  withReleaseFixture((fx) => {
+    const lc = fakeLaunchctl({ loaded: false });
+    assert(pinRelease(pinOpts(fx, "v1", lc.run)).code === 0, "the first pin failed");
+    const hasRef = (tag: string): boolean =>
+      spawnSync("git", ["-C", fx.releaseDir, "rev-parse", "--verify", "--quiet", `refs/tags/${tag}`]).status === 0;
+
+    // A release that does not run is refused after its tag was fetched.
+    fixtureGit(fx.origin, ["tag", "fixme", fx.badexit]);
+    const refused = pinRelease(pinOpts(fx, "fixme", lc.run));
+    assert(refused.code === 1 && refused.err.some((l) => l.includes("did not run")), refused.err.join("\n"));
+    assert(!hasRef("fixme"), "the refused tag's ref stayed in the release checkout");
+    assert(headOf(fx.releaseDir) === fx.v1, "a refused pin moved HEAD");
+
+    // The maintainer fixes the release and moves the tag. Before this change git
+    // refused the second fetch with a bare "git fetch exited 1".
+    fixtureGit(fx.origin, ["tag", "-f", "fixme", fx.v2]);
+    const again = pinRelease(pinOpts(fx, "fixme", lc.run));
+    assert(again.code === 0, again.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v2, "the re-pointed tag was not pinned");
+
+    // A tag with no bin/chamber.js is refused after its fetch too.
+    const nobin = pinRelease(pinOpts(fx, "nobin", lc.run));
+    assert(nobin.code === 1 && nobin.err.some((l) => l.includes("has no bin/chamber.js")), nobin.err.join("\n"));
+    assert(!hasRef("nobin"), "a tag without bin/chamber.js stayed in the release checkout");
+
+    // A tag that was already in the checkout is not removed by a refusal: v1 was
+    // pinned first. A proof that cannot finish in a millisecond refuses it.
+    assert(hasRef("v1"), "the fixture lost v1");
+    const slow = pinRelease({ ...pinOpts(fx, "v1", lc.run), proofTimeoutMs: 1 });
+    assert(slow.code === 1 && slow.err.some((l) => l.includes("did not run")), slow.err.join("\n"));
+    assert(hasRef("v1"), "a refusal removed a tag that was in the checkout before the pin");
+    assert(headOf(fx.releaseDir) === fx.v2, "a refused pin moved HEAD");
+  });
+});
+
+test("release", "a tag that moved on origin after it was pinned is refused, with the command that clears the local tag", () => {
+  withReleaseFixture((fx) => {
+    const lc = fakeLaunchctl({ loaded: false });
+    assert(pinRelease(pinOpts(fx, "v1", lc.run)).code === 0, "the first pin failed");
+    fixtureGit(fx.origin, ["tag", "-f", "v1", fx.v2]);
+    const refused = pinRelease(pinOpts(fx, "v1", lc.run));
+    const line = refused.err.find((l) => l.startsWith("chamber pin: git fetch:")) ?? "";
+    assert(refused.code === 1 && line !== "", refused.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v1, "HEAD followed a tag that moved on origin");
+    const marker = "pin again: ";
+    const at = line.indexOf(marker);
+    assert(at >= 0, `no command that clears the local tag in: ${line}`);
+    const ran = spawnSync("/bin/sh", ["-c", line.slice(at + marker.length)], { encoding: "utf8" });
+    assert(ran.status === 0, `the printed command failed (${ran.status}): ${ran.stderr}`);
+    const again = pinRelease(pinOpts(fx, "v1", lc.run));
+    assert(again.code === 0, again.err.join("\n"));
+    assert(headOf(fx.releaseDir) === fx.v2, "the moved tag was not pinned after the printed command");
+  });
+});
+
+// ─── SCHEDULING.md says what pin does about the order of its checks and its repair command ──
+
+test("release", "SCHEDULING.md puts the missing-bin refusal after the fetch, and says the repair command is for an existing checkout", () => {
+  const sched = readFileSync(fileURLToPath(new URL("../deploy/SCHEDULING.md", import.meta.url)), "utf8").replace(/\s+/g, " ");
+  const first = sched.indexOf("Pin refuses before it fetches or moves anything in these cases:");
+  const after = sched.indexOf("Two refusals can only come after the fetch");
+  assert(first >= 0 && after > first, "the before-the-fetch list or the after-the-fetch paragraph is missing");
+  // The check reads bin/chamber.js out of the fetched commit, so it cannot come first.
+  assert(
+    !sched.slice(first, after).includes("bin/chamber.js"),
+    "SCHEDULING.md lists a bin/chamber.js refusal among those made before the fetch; the code makes it after",
+  );
+  for (const needle of [
+    "a tag with no `bin/chamber.js`",
+    "a tag the checkout did not have before is removed again",
+    "git -C <dir> tag -d <tag>",
+    "quoted for a POSIX shell",
+    "in a release checkout that already existed",
+    "so there is nothing to repair and pin prints no command",
+  ]) {
+    assert(sched.includes(needle), `SCHEDULING.md does not say: ${needle}`);
+  }
+});
+
+// ─── pin says if the daily snapshot job is not on the release ───────────────
+
+const SNAPSHOT_TEMPLATE_PATH = fileURLToPath(new URL("../deploy/launchd/com.chamber.daily-snapshot.plist", import.meta.url));
+
+/** A tag, a child of v2, whose tree has scripts/daily-snapshot.sh, as a release that ships the snapshot job does. */
+function addSnapshotTag(fx: ReleaseFixture, name: string): void {
+  const commit = fixtureCommit(
+    fx.origin,
+    { ...releaseTree(name, "1.0.5"), "scripts/daily-snapshot.sh": "#!/bin/sh\nexit 0\n" },
+    "has scripts/daily-snapshot.sh",
+    fx.v2,
+  );
+  fixtureGit(fx.origin, ["tag", name, commit]);
+}
+
+/** The template the printed `sed` reads, put where pin looks for it: under the clone pin runs from. */
+function putSnapshotTemplate(fx: ReleaseFixture): string {
+  const template = join(fx.source, "deploy", "launchd", "com.chamber.daily-snapshot.plist");
+  mkdirSync(dirname(template), { recursive: true });
+  writeFileSync(template, readFileSync(SNAPSHOT_TEMPLATE_PATH, "utf8"));
+  return template;
+}
+
+/** A snapshot plist running `script`, at a path that needs quoting. Returns the path. */
+function writeSnapshotPlist(fx: ReleaseFixture, script: string): string {
+  const path = join(fx.root, "Library dir's", "LaunchAgents", "com.chamber.daily-snapshot.plist");
+  writePlistFile(path, jobPlistXml(script).replace("com.chamber.verify", "com.chamber.daily-snapshot"));
+  return path;
+}
+
+const SNAPSHOT_WARNING = "chamber pin: warning: the daily snapshot job";
+
+test("release", "the shipped snapshot plist runs SNAPSHOT_SCRIPT, as plutil reads it and as the text reader reads it", () => {
+  const xml = readFileSync(SNAPSHOT_TEMPLATE_PATH, "utf8");
+  for (const [label, parse] of [
+    ["plutil", plutilParser],
+    ["text reader", noPlistParser],
+  ] as const) {
+    const read = pinApi.readPlistScript(xml, parse);
+    assert(read.ok && read.script === pinApi.SNAPSHOT_SCRIPT, `${label}: ${JSON.stringify(read)}`);
+  }
+  assert(pinApi.SNAPSHOT_JOB_LABEL === "com.chamber.daily-snapshot", pinApi.SNAPSHOT_JOB_LABEL);
+});
+
+test("release", "a pin that worked warns when the snapshot job runs something else, prints quoted reinstall commands, and changes nothing", () => {
+  withReleaseFixture((fx) => {
+    addSnapshotTag(fx, "withsnap");
+    const template = putSnapshotTemplate(fx);
+    // Shell syntax in the script: it may appear in the warning, never in a command.
+    const stale = "$HOME/Projects/chamber/scripts/daily-snapshot.sh; touch PWNED";
+    const snap = writeSnapshotPlist(fx, stale);
+    const before = readFileSync(snap, "utf8");
+    // The 08:30 job is installed and loaded, so this pin reloads it.
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const lc = fakeLaunchctl({ loaded: true });
+    const r = pinRelease({ ...pinOpts(fx, "withsnap", lc.run), snapshotPlistPath: snap });
+    assert(r.code === 0, r.err.join("\n"));
+    assert(
+      JSON.stringify(lc.calls) ===
+        JSON.stringify([`list ${JOB_LABEL}`, `unload ${fx.plistPath}`, `list ${JOB_LABEL}`, `load ${fx.plistPath}`, `list ${JOB_LABEL}`]),
+      `pin touched launchd for something other than the verify job: ${lc.calls.join(" | ")}`,
+    );
+    assert(readFileSync(snap, "utf8") === before, "pin rewrote the snapshot plist");
+
+    const at = r.out.findIndex((l) => l.startsWith(SNAPSHOT_WARNING));
+    assert(at >= 0, r.out.join("\n"));
+    assert(r.out[at]!.includes(JSON.stringify(stale)), `the warning does not show what the job runs: ${r.out[at]}`);
+    const commands = r.out.slice(at + 1);
+    const q = pinApi.shellQuote;
+    assert(
+      JSON.stringify(commands) ===
+        JSON.stringify([
+          `  launchctl unload ${q(snap)}`,
+          `  sed "s|REPLACE_WITH_HOME|$HOME|g" ${q(template)} > ${q(snap)}`,
+          `  launchctl load ${q(snap)}`,
+        ]),
+      `the reinstall commands are not the quoted ones:\n${commands.join("\n")}`,
+    );
+    assert(!commands.join("\n").includes("PWNED"), "the plist's contents reached a command");
+
+    // Run the sed line as printed (the other two talk to launchd and are not run
+    // here) with a throwaway HOME: the job is now what the template says.
+    const home = join(fx.root, "home");
+    const ran = spawnSync("/bin/sh", ["-c", commands[1]!.trim()], { encoding: "utf8", env: { ...process.env, HOME: home } });
+    assert(ran.status === 0, `the printed sed failed (${ran.status}): ${ran.stderr}`);
+    const installed = readFileSync(snap, "utf8");
+    const read = pinApi.readPlistScript(installed);
+    assert(read.ok && read.script === pinApi.SNAPSHOT_SCRIPT, JSON.stringify(read));
+    assert(installed.includes(`${home}/Library/Logs/chamber-daily-snapshot.log`), "REPLACE_WITH_HOME was not substituted");
+    assert(pinApi.snapshotJobNotice(snap, fx.source, fx.releaseDir).length === 0, "the notice stays after the printed commands were applied");
+  });
+});
+
+test("release", "the snapshot warning is printed when no 08:30 job is installed too", () => {
+  withReleaseFixture((fx) => {
+    addSnapshotTag(fx, "withsnap");
+    const snap = writeSnapshotPlist(fx, "$HOME/Projects/chamber/scripts/daily-snapshot.sh");
+    const r = pinRelease({ ...pinOpts(fx, "withsnap", fakeLaunchctl({ loaded: false }).run), snapshotPlistPath: snap });
+    assert(r.code === 0 && r.out.some((l) => l.includes("no LaunchAgent was installed")), r.out.join("\n"));
+    assert(r.out.some((l) => l.startsWith(SNAPSHOT_WARNING)), r.out.join("\n"));
+  });
+});
+
+test("release", "a pin says nothing about a snapshot job that is absent, already on the release, or not asked about", () => {
+  withReleaseFixture((fx) => {
+    addSnapshotTag(fx, "withsnap");
+    const lc = fakeLaunchctl({ loaded: false });
+    const quiet = (label: string, snapshotPlistPath: string | undefined): void => {
+      const r = pinRelease({ ...pinOpts(fx, "withsnap", lc.run), snapshotPlistPath });
+      assert(r.code === 0, `${label}: ${r.err.join("\n")}`);
+      assert(!r.out.some((l) => l.includes("snapshot")), `${label}: ${r.out.join("\n")}`);
+    };
+    quiet("absent", join(fx.root, "nowhere", "com.chamber.daily-snapshot.plist"));
+    quiet("as shipped", writeSnapshotPlist(fx, pinApi.SNAPSHOT_SCRIPT));
+    quiet("as an absolute path", writeSnapshotPlist(fx, join(fx.releaseDir, "scripts", "daily-snapshot.sh")));
+    // Not asked: a stale plist exists and pin was not given its path.
+    writeSnapshotPlist(fx, "$HOME/Projects/chamber/scripts/daily-snapshot.sh");
+    quiet("not asked", undefined);
+  });
+});
+
+test("release", "an unreadable snapshot plist is a warning, a release without the script gets no commands, and a refused pin says nothing", () => {
+  withReleaseFixture((fx) => {
+    addSnapshotTag(fx, "withsnap");
+    const lc = fakeLaunchctl({ loaded: false });
+    const snap = writeSnapshotPlist(fx, pinApi.SNAPSHOT_SCRIPT);
+    writeFileSync(snap, "this is not a property list\n");
+    const unreadable = pinRelease({ ...pinOpts(fx, "withsnap", lc.run), snapshotPlistPath: snap });
+    assert(
+      unreadable.code === 0 && unreadable.out.some((l) => l.startsWith(SNAPSHOT_WARNING) && l.includes("cannot be read")),
+      unreadable.out.join("\n"),
+    );
+
+    // v2 has no scripts/daily-snapshot.sh: a stale job gets the warning and no reinstall commands.
+    writeSnapshotPlist(fx, "$HOME/Projects/chamber/scripts/daily-snapshot.sh");
+    const noScript = pinRelease({ ...pinOpts(fx, "v2", lc.run), snapshotPlistPath: snap });
+    assert(
+      noScript.code === 0 && noScript.out.some((l) => l.startsWith(SNAPSHOT_WARNING) && l.includes("has no scripts/daily-snapshot.sh")),
+      noScript.out.join("\n"),
+    );
+    assert(!noScript.out.some((l) => l.includes("launchctl")), `commands were printed for a release without the script:\n${noScript.out.join("\n")}`);
+
+    // A pin that failed says nothing about the snapshot job.
+    const refused = pinRelease({ ...pinOpts(fx, "badexit", lc.run), snapshotPlistPath: snap });
+    assert(refused.code === 1 && !refused.out.some((l) => l.includes("snapshot")), refused.out.join("\n"));
+  });
+});
+
+test("release", "chamber pin gives pinRelease the snapshot job's plist path, and SCHEDULING.md describes the notice", () => {
+  const cli = readFileSync(fileURLToPath(new URL("../src/cli.ts", import.meta.url)), "utf8");
+  assert(
+    cli.includes('snapshotPlistPath: join(homedir(), "Library", "LaunchAgents", `${SNAPSHOT_JOB_LABEL}.plist`),'),
+    "cmdPin does not pass the snapshot plist path, so the notice never runs",
+  );
+  const sched = readFileSync(fileURLToPath(new URL("../deploy/SCHEDULING.md", import.meta.url)), "utf8").replace(/\s+/g, " ");
+  for (const needle of [
+    "`chamber pin` does not rewrite or load the snapshot job's plist",
+    "prints one warning line and the commands that reinstall it",
+    "launchctl unload ~/Library/LaunchAgents/com.chamber.daily-snapshot.plist",
+    "pin prints nothing about it",
+    "prints no commands",
+  ]) {
+    assert(sched.includes(needle), `SCHEDULING.md does not say: ${needle}`);
+  }
+});
+
+test("release", "a clone with no snapshot template gets the warning and no commands, so a printed sed cannot empty the job", () => {
+  withReleaseFixture((fx) => {
+    addSnapshotTag(fx, "withsnap");
+    // No putSnapshotTemplate: the clone pin runs from predates deploy/launchd.
+    const snap = writeSnapshotPlist(fx, "$HOME/Projects/chamber/scripts/daily-snapshot.sh");
+    const before = readFileSync(snap, "utf8");
+    const lc = fakeLaunchctl({ loaded: false });
+    const r = pinRelease({ ...pinOpts(fx, "withsnap", lc.run), snapshotPlistPath: snap });
+    assert(r.code === 0, r.err.join("\n"));
+    const at = r.out.findIndex((l) => l.startsWith(SNAPSHOT_WARNING));
+    assert(at >= 0 && r.out[at]!.includes("has no deploy/launchd/com.chamber.daily-snapshot.plist"), r.out.join("\n"));
+    assert(
+      !r.out.some((l) => l.includes("sed ") || l.includes("launchctl")),
+      `commands were printed with no template to build them from:\n${r.out.join("\n")}`,
+    );
+    assert(readFileSync(snap, "utf8") === before, "pin rewrote the snapshot plist");
+  });
+});
+
+// ─── the embedder loads the bytes it hashed ─────────────────────────────────
+
+/**
+ * Imports the script as a module and does what main() does, in its order, with
+ * one addition: both files are replaced after the check and before the load.
+ * argv[1] is the script. Prints the first vector as JSON.
+ */
+const REPLACE_AFTER_CHECK_DRIVER = [
+  "import importlib.util, json, sys",
+  "spec = importlib.util.spec_from_file_location('embed_minilm', sys.argv[1])",
+  "m = importlib.util.module_from_spec(spec)",
+  "spec.loader.exec_module(m)",
+  "m.verify_weights()",
+  "m._import_stack()",
+  "m.ONNX_PATH.write_bytes(b'replaced after the hash')",
+  "m.TOK_PATH.write_bytes(b'replaced after the hash')",
+  "vecs = m.embed_texts(['a sentence'])",
+  "m.embed_texts(['word ' * 400])  # fills the window, so the measuring tokenizer is built too",
+  "print(json.dumps(vecs[0]))",
+  "",
+].join("\n");
+
+test("config", "the model and tokenizer that load are the bytes that were hashed: files replaced after the check change nothing", () => {
+  if (!minilmAvailable()) {
+    // No numpy or onnxruntime here: there is no session to build.
+    assert(true, "no runnable embedder on this machine");
+    return;
+  }
+  const dir = minilmDirWith({ weights: "copy", tokenizer: "copy" });
+  const work = mkdtempSync(join(tmpdir(), "chamber-replace-driver-"));
+  try {
+    const driver = join(work, "driver.py");
+    writeFileSync(driver, REPLACE_AFTER_CHECK_DRIVER);
+    const python = process.env.CHAMBER_PYTHON?.trim() || "python3";
+    // -B: do not leave a __pycache__ next to the script in the repository. -E -P: no PYTHON* variables and
+    // not the script's directory on sys.path. Not -I: it also drops the user site, where CI's pip puts numpy.
+    const r = spawnSync(python, ["-B", "-E", "-P", driver, EMBED_SCRIPT], {
+      encoding: "utf8",
+      timeout: 120_000,
+      env: { ...process.env, CHAMBER_MINILM_DIR: dir },
+    });
+    assert(r.error === undefined, `${python} did not run: ${r.error}`);
+    assert(
+      readFileSync(join(dir, "model_quantized.onnx"), "utf8") === "replaced after the hash" &&
+        readFileSync(join(dir, "tokenizer.json"), "utf8") === "replaced after the hash",
+      `the driver did not replace the files, so this run proves nothing (exit ${r.status}): ${(r.stderr ?? "").slice(-600)}`,
+    );
+    assert(r.status === 0, `the embedder loaded what was on disk after the check (exit ${r.status}): ${(r.stderr ?? "").slice(-600)}`);
+    const got = JSON.parse((r.stdout ?? "").trim().split("\n").pop() ?? "[]") as number[];
+    const want = embedMinilm("a sentence");
+    assert(
+      got.length === want.length && got.every((v, i) => Math.abs(v - want[i]!) < 1e-6),
+      "the vector from the held bytes is not the shipped model's vector",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
+// ─── a remembered weights refusal is asked again when the files change ──────
+
+test("config", "weightsSignature changes when the weights, the tokenizer or VERSION is rewritten, replaced, grown or removed", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-signature-"));
+  try {
+    const files = {
+      weights: join(dir, "model_quantized.onnx"),
+      tokenizer: join(dir, "tokenizer.json"),
+      version: join(dir, "VERSION"),
+    };
+    // mtime is set by hand: two writes within one filesystem tick would share it.
+    let tick = 1_700_000_000;
+    const put = (file: string, text: string): void => {
+      writeFileSync(file, text);
+      tick += 10;
+      utimesSync(file, tick, tick);
+    };
+    for (const f of Object.values(files)) put(f, "one\n");
+    const sig = (): string => embedderApi.weightsSignature(dir, files.version);
+    assert(sig() === sig(), "the signature of unchanged files is not stable");
+    for (const [what, file] of Object.entries(files)) {
+      let last = sig();
+      const changed = (how: string): void => {
+        const now = sig();
+        assert(now !== last, `${what}: ${how} did not change the signature`);
+        last = now;
+      };
+      put(file, "two\n");
+      changed("rewriting it in place with the same size");
+      put(`${file}.new`, "two\n");
+      renameSync(`${file}.new`, file);
+      changed("replacing it with another file of the same size");
+      put(file, "a much longer text than before\n");
+      changed("growing it");
+      rmSync(file);
+      changed("removing it");
+      put(file, "one\n");
+      changed("putting it back");
+    }
+    // Another directory is another question, whatever the files in it look like.
+    const other = mkdtempSync(join(tmpdir(), "chamber-signature-other-"));
+    try {
+      assert(embedderApi.weightsSignature(other, files.version) !== sig(), "a different model directory has the same signature");
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "a weights refusal the probe remembers is asked again when the weights change, and only then", () => {
+  const dir = minilmDirWith({ weights: NOT_THE_WEIGHTS, tokenizer: "copy" });
+  const weights = join(dir, "model_quantized.onnx");
+  const savedDir = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  const refusal = (): MinilmIntegrityError => {
+    try {
+      minilmAvailable();
+    } catch (e) {
+      if (e instanceof MinilmIntegrityError) return e;
+      throw e;
+    }
+    throw new Error("minilmAvailable() did not refuse");
+  };
+  try {
+    const first = refusal();
+    assert(first.message.includes(sha256Hex(NOT_THE_WEIGHTS)), `the refusal does not name the file's hash: ${first.message}`);
+    assert(refusal() === first, "an unchanged refusal was asked again: it is not remembered at all");
+
+    // Three ways a file changes under a running process. Each must be asked again
+    // and must name the new file's hash, so it is a new answer and not the old one.
+    const other = Buffer.from("another file, of another size, entirely\n");
+    writeFileSync(weights, other);
+    const grown = refusal();
+    assert(grown !== first && grown.message.includes(sha256Hex(other)), "a weights file of another size was not asked again");
+
+    const sameSize = Buffer.from("X".repeat(other.length));
+    writeFileSync(`${weights}.new`, sameSize);
+    renameSync(`${weights}.new`, weights);
+    const replaced = refusal();
+    assert(replaced !== grown && replaced.message.includes(sha256Hex(sameSize)), "a weights file replaced by one of the same size was not asked again");
+
+    const again = Buffer.from("Y".repeat(other.length));
+    utimesSync(weights, 1_700_000_000, 1_700_000_000);
+    writeFileSync(weights, again);
+    const rewritten = refusal();
+    assert(rewritten !== replaced && rewritten.message.includes(sha256Hex(again)), "a weights file rewritten in place was not asked again");
+  } finally {
+    if (savedDir === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = savedDir;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "a tokenizer refusal the probe remembers is cleared by putting the tokenizer back", () => {
+  const dir = minilmDirWith({ weights: "copy", tokenizer: NOT_THE_TOKENIZER });
+  const savedDir = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    let first: unknown;
+    try {
+      minilmAvailable();
+    } catch (e) {
+      first = e;
+    }
+    assert(first instanceof MinilmIntegrityError && first.message.includes("tokenizer.json"), `no tokenizer refusal: ${String(first)}`);
+
+    // Only the tokenizer changes: the weights are the shipped ones throughout.
+    writeFileSync(join(dir, "tokenizer.json"), readFileSync(join(REAL_MODEL_DIR, "tokenizer.json")));
+    let after: unknown = null;
+    let available: boolean | null = null;
+    captureStderr(() => {
+      try {
+        available = minilmAvailable();
+      } catch (e) {
+        after = e;
+      }
+    });
+    assert(after === null, `the repaired install still gets a refusal: ${after instanceof Error ? after.message : String(after)}`);
+    // True where an embedder runs here; false, with a warning, where numpy or onnxruntime is missing.
+    assert(available === true || available === false, "minilmAvailable() did not answer");
+  } finally {
+    if (savedDir === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = savedDir;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── the docs say what the pin and embedder follow-ups changed ──────────────
+
+test("config", "the docs and the changelog describe the pin and embedder follow-ups, and none says a refusal lasts until a restart", () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const read = (...parts: string[]): string => readFileSync(join(root, ...parts), "utf8").replace(/\s+/g, " ");
+  const limitations = read("docs", "KNOWN_LIMITATIONS.md");
+  for (const needle of [
+    "`model_quantized.onnx` or `tokenizer.json` does not match",
+    "the bytes that are hashed are the bytes that load",
+    "is asked again when the weights, the tokenizer or `VERSION` change",
+  ]) {
+    assert(limitations.includes(needle), `KNOWN_LIMITATIONS.md does not say: ${needle}`);
+  }
+  const changelog = read("CHANGELOG.md");
+  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.0"));
+  assert(unreleased.length > 0 && unreleased.includes("### Fixed"), "no Unreleased / Fixed section found in CHANGELOG.md");
+  for (const heading of [
+    "**A refused pin does not leave its tag in the release checkout.**",
+    "**The repair command pin prints is quoted.**",
+    "**SCHEDULING.md matches the order of pin's checks.**",
+    "**Pin says when the daily snapshot job is not on the release.**",
+    "**VERSION covers `tokenizer.json`, and always comes from the installed package.**",
+    "**The embedder loads the bytes it hashed.**",
+    "**A weights refusal is asked again when the files change.**",
+  ]) {
+    assert(unreleased.includes(heading), `CHANGELOG.md Unreleased does not have: ${heading}`);
+  }
+  for (const [name, text] of [
+    ["KNOWN_LIMITATIONS.md", limitations],
+    ["CHANGELOG.md (Unreleased)", unreleased],
+    ["src/embedder.ts", read("src", "embedder.ts")],
+  ] as const) {
+    assert(!text.includes("until it is restarted"), `${name} still says a weights refusal lasts until a restart`);
+  }
+});
+
+// ─── a tokenizer.json that is gone next to weights that exist is a refusal ───
+
+test("config", "weights that fail the hash exit 3 even when tokenizer.json is gone, good weights with no tokenizer.json exit 3 too, and no weights file stays exit 1", () => {
+  const bad = tamperedWeights();
+  const goodWeights = minilmDirWith({});
+  const noWeights = minilmDirWith({});
+  rmSync(join(bad.dir, "tokenizer.json"));
+  rmSync(join(goodWeights, "tokenizer.json"));
+  rmSync(join(noWeights, "model_quantized.onnx"));
+  try {
+    for (const [label, args, input] of [
+      ["one-shot", ["a sentence"], undefined],
+      ["--json -", ["--json", "-"], '["a sentence"]'],
+      ["--serve", ["--serve"], '["a sentence"]\n'],
+    ] as const) {
+      // Tampered weights and no tokenizer: the weights are hashed first and are
+      // what is reported. Before this, the missing tokenizer was an ordinary
+      // failure (exit 1) and `auto` ingest wrote hash vectors for it.
+      const tampered = runEmbedScript(bad.dir, args, input);
+      assert(tampered.status === 3, `${label}, tampered weights and no tokenizer: exit ${tampered.status}, stderr ${tampered.stderr}`);
+      assert(tampered.stdout === "", `${label}: wrote a reply before refusing: ${tampered.stdout}`);
+      const lines = tampered.stderr.trim().split("\n");
+      assert(lines.length === 1, `${label}: expected one stderr line, got ${lines.length}: ${tampered.stderr}`);
+      assert(
+        lines[0]!.includes(bad.actualDigest) && lines[0]!.includes(bad.expected),
+        `${label}: the line must name the weights' hashes: ${lines[0]}`,
+      );
+      // Good weights and no tokenizer: the tokenizer is read through the hashed
+      // reader, so its absence is a refusal and not a "missing" failure.
+      const gone = runEmbedScript(goodWeights, args, input);
+      assert(gone.status === 3, `${label}, good weights and no tokenizer: exit ${gone.status}, stderr ${gone.stderr}`);
+      assert(gone.stdout === "", `${label}: wrote a reply before refusing: ${gone.stdout}`);
+      assert(
+        gone.stderr.includes("tokenizer.json") && gone.stderr.includes("cannot read"),
+        `${label}: the refusal does not say the tokenizer cannot be read: ${gone.stderr}`,
+      );
+      // No weights file: there is no embedder, exit 1, as it always was.
+      const none = runEmbedScript(noWeights, args, input);
+      assert(none.status === 1, `${label}, no weights file: exit ${none.status}, stderr ${none.stderr}`);
+      assert(none.stderr.includes("missing model"), `${label}: ${none.stderr}`);
+    }
+  } finally {
+    rmSync(bad.dir, { recursive: true, force: true });
+    rmSync(goodWeights, { recursive: true, force: true });
+    rmSync(noWeights, { recursive: true, force: true });
+  }
+});
+
+test("config", "tampered weights with no tokenizer.json make every auto embed throw the refusal, and an ingest writes no hash vectors", () => {
+  const dir = tamperedWeights().dir;
+  rmSync(join(dir, "tokenizer.json"));
+  const notes = mkdtempSync(join(tmpdir(), "chamber-refused-notes-"));
+  writeFileSync(join(notes, "a.md"), "# Alpha\n\nA passage about refund windows.\n");
+  const db = freshDb();
+  const saved = process.env.CHAMBER_MINILM_DIR;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  process.env.CHAMBER_MINILM_DIR = dir;
+  delete process.env.CHAMBER_EMBEDDER;
+  resetMinilmProbe();
+  try {
+    const { stderr } = captureStderr(() => {
+      const refusal = (label: string, run: () => unknown): void => {
+        let thrown: unknown;
+        try {
+          run();
+        } catch (e) {
+          thrown = e;
+        }
+        const said = thrown instanceof Error ? thrown.message : String(thrown);
+        assert(thrown instanceof MinilmIntegrityError, `${label}: expected the weights refusal, got: ${said}`);
+        assert(said.includes("embed_minilm failed (3)") && said.includes("SHA-256"), `${label}: the refusal does not say why: ${said}`);
+      };
+      refusal("embedLocalBatch auto", () => embedLocalBatch(["a sentence"], "auto"));
+      refusal("embedLocal auto", () => embedLocal("a sentence", "auto"));
+      refusal("ingestDirectory", () => ingestDirectory(db, notes));
+    });
+    assert(count(db, `SELECT COUNT(*) AS c FROM vector_embedding`) === 0, "the ingest wrote vectors for refused weights");
+    assert(!stderr.includes("hash vectors"), `a refusal was announced as a downgrade to hash vectors: ${stderr}`);
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_MINILM_DIR;
+    else process.env.CHAMBER_MINILM_DIR = saved;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(notes, { recursive: true, force: true });
+  }
+});
+
+test("config", "the docs and the changelog say a tokenizer.json missing next to existing weights is a refusal", () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const read = (...parts: string[]): string => readFileSync(join(root, ...parts), "utf8").replace(/\s+/g, " ");
+  const needle = "missing or unreadable while the weights file exists";
+  assert(read("docs", "KNOWN_LIMITATIONS.md").includes(needle), "KNOWN_LIMITATIONS.md does not say it");
+  const changelog = read("CHANGELOG.md");
+  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.0"));
+  assert(unreleased.includes(needle), "CHANGELOG.md Unreleased does not say it");
+});
+
+// ─── a model file over the size cap is refused, not read to the end ─────────
+
+/**
+ * Runs the script as __main__ with argv "a sentence" and prints its peak
+ * resident memory and the interpreter that ran it to stderr as
+ * PEAK_RSS=<bytes> PYTHON=<sys.executable> (ru_maxrss is bytes on macOS and KiB
+ * on Linux). argv[1] is the script.
+ */
+const PEAK_MEMORY_DRIVER = [
+  "import resource, runpy, sys",
+  "script = sys.argv[1]",
+  "sys.argv = [script, 'a sentence']",
+  "code = 0",
+  "try:",
+  "    runpy.run_path(script, run_name='__main__')",
+  "except SystemExit as e:",
+  "    code = e.code",
+  "peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == 'darwin' else 1024)",
+  "print('PEAK_RSS=%d PYTHON=%s' % (peak, sys.executable), file=sys.stderr)",
+  "sys.exit(code if isinstance(code, int) else 1)",
+].join("\n");
+
+test("config", "a model file one byte over the cap is refused with exit 3 before it is hashed, in every mode; a file exactly at the cap is hashed", () => {
+  const cap = 256 * 1024 * 1024;
+  assert(
+    readFileSync(EMBED_SCRIPT, "utf8").includes("MAX_MODEL_FILE_BYTES = 256 * 1024 * 1024"),
+    "scripts/embed_minilm.py does not define MAX_MODEL_FILE_BYTES as 256 MiB, which this test assumes",
+  );
+  // A sparse file costs no disk: truncate makes it any length of zeros.
+  const dir = minilmDirWith({ weights: Buffer.alloc(0) });
+  const weights = join(dir, "model_quantized.onnx");
+  try {
+    truncateSync(weights, cap + 1);
+    for (const [label, args, input] of [
+      ["one-shot", ["a sentence"], undefined],
+      ["--json -", ["--json", "-"], '["a sentence"]'],
+      ["--serve", ["--serve"], '["a sentence"]\n'],
+    ] as const) {
+      const r = runEmbedScript(dir, args, input);
+      assert(r.status === 3, `${label}: exit ${r.status}, stderr ${r.stderr}`);
+      assert(r.stdout === "", `${label}: wrote a reply before refusing: ${r.stdout}`);
+      const lines = r.stderr.trim().split("\n");
+      assert(lines.length === 1, `${label}: expected one stderr line, got ${lines.length}: ${r.stderr}`);
+      assert(
+        lines[0]!.includes("is larger than") && lines[0]!.includes(String(cap)),
+        `${label}: the line must say the file is over the cap: ${lines[0]}`,
+      );
+    }
+    // Far over the cap: 4 GiB of sparse zeros. Refusing it is not the point, any
+    // read that counts the bytes does that; the point is not holding it. The
+    // driver reports the script's peak memory, which stops near the cap if the
+    // read does and reaches 4 GiB if it does not.
+    truncateSync(weights, 4 * 1024 * 1024 * 1024);
+    const huge = spawnSync(embedPython(), ["-c", PEAK_MEMORY_DRIVER, EMBED_SCRIPT], {
+      encoding: "utf8",
+      timeout: 120_000,
+      env: { ...process.env, CHAMBER_MINILM_DIR: dir },
+    });
+    assert(huge.status === 3 && huge.stderr.includes("is larger than"), `4 GiB: exit ${huge.status}, stderr ${huge.stderr}`);
+    const peak = /PEAK_RSS=(\d+) PYTHON=(.+)/.exec(huge.stderr);
+    assert(peak !== null, `the driver did not report its peak memory: ${huge.stderr}`);
+    assert(Number(peak[1]) < 1024 * 1024 * 1024, `refusing a 4 GiB file held ${peak[1]} bytes: the read is not bounded`);
+    // It ran under the interpreter the suite was told to use, not whichever
+    // python3 comes first on PATH.
+    const named = (process.env.CHAMBER_PYTHON ?? "").trim();
+    if (named !== "") {
+      assert(realpathSync(peak[2]!) === realpathSync(named), `the 4 GiB case ran ${peak[2]}, not CHAMBER_PYTHON (${named})`);
+    }
+    // The boundary: exactly the cap is read whole and hashed, and it is not the
+    // weights, so it is refused for its hash and not for its size.
+    truncateSync(weights, cap);
+    const exact = runEmbedScript(dir, ["a sentence"]);
+    assert(exact.status === 3, `at the cap: exit ${exact.status}, stderr ${exact.stderr}`);
+    assert(
+      exact.stderr.includes("has SHA-256") && !exact.stderr.includes("is larger than"),
+      `a file exactly at the cap was refused for its size: ${exact.stderr}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── the launchctl commands pin prints on a failed reload are quoted ────────
+
+test("release", "the launchctl commands pin prints when a reload fails run as printed, for a plist path that needs quoting", () => {
+  type Case = { label: string; start: Parameters<typeof fakeLaunchctl>[0]; verbs: readonly string[] };
+  // One case for each place pin prints a launchctl command to paste.
+  const cases: Case[] = [
+    { label: "an unload that changed nothing", start: { loaded: true, unload: "lies" }, verbs: ["unload", "load"] },
+    { label: "a load that failed after the unload", start: { loaded: true, load: "fails" }, verbs: ["load"] },
+    { label: "a load that exited 0 without loading", start: { loaded: false, load: "lies" }, verbs: ["load"] },
+    { label: "a load that left the old script running", start: { loaded: true, script: BARE_SCRIPT, load: "stale" }, verbs: ["unload", "load"] },
+  ];
+  for (const c of cases) {
+    withReleaseFixture((fx) => {
+      // A directory with a space and a quote in its name: unquoted, the first
+      // splits the path into two arguments and the second never closes.
+      const plist = join(fx.root, "my dir's agents", "com.chamber.verify.plist");
+      writePlistFile(plist, jobPlistXml(BARE_SCRIPT));
+      const r = pinRelease({ ...pinOpts(fx, "v1", fakeLaunchctl(c.start).run), plistPath: plist });
+      assert(r.code === 1, `${c.label}: pin reported success: ${r.out.join("\n")}`);
+      const printed = r.err.map((l) => /(?:reload it by hand|load it with): (launchctl .*)$/.exec(l)).filter((m): m is RegExpExecArray => m !== null);
+      assert(printed.length === 1, `${c.label}: expected one printed command, got ${printed.length}:\n${r.err.join("\n")}`);
+
+      // A launchctl on PATH that records its arguments, one per line.
+      const bin = join(fx.root, "bin");
+      mkdirSync(bin);
+      writeFileSync(
+        join(bin, "launchctl"),
+        '#!/bin/sh\nprintf "CALL\\n" >> "$LAUNCHCTL_LOG"\nfor a in "$@"; do printf "ARG:%s\\n" "$a" >> "$LAUNCHCTL_LOG"; done\n',
+      );
+      chmodSync(join(bin, "launchctl"), 0o755);
+      const log = join(fx.root, "launchctl.log");
+      const ran = spawnSync("/bin/sh", ["-c", printed[0]![1]!], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, LAUNCHCTL_LOG: log },
+      });
+      assert(ran.status === 0, `${c.label}: the printed command failed (${ran.status}): ${ran.stderr}\n${printed[0]![1]!}`);
+      const want = c.verbs.map((v) => `CALL\nARG:${v}\nARG:${plist}\n`).join("");
+      const got = existsSync(log) ? readFileSync(log, "utf8") : "";
+      assert(got === want, `${c.label}: launchctl did not receive the path as one argument:\n${got}\nprinted: ${printed[0]![1]!}`);
+    });
+  }
+});
+
+// ─── shellQuote and a word that starts with = ───────────────────────────────
+
+test("release", "shellQuote quotes a word that starts with =, which zsh expands as a command lookup, and a quoted word round-trips through sh and zsh", () => {
+  assert(pinApi.shellQuote("=x") === "'=x'", `a leading = was not quoted: ${pinApi.shellQuote("=x")}`);
+  assert(pinApi.shellQuote("a=b") === "a=b", "an = inside a word was quoted");
+  assert(pinApi.shellQuote("v0.2.0-rc.1") === "v0.2.0-rc.1", "a plain tag was quoted");
+  const shells: Array<[string, string]> = [["/bin/sh", "-c"]];
+  // zsh is the owner's login shell and the one that expands =word. -f: no startup files.
+  if (existsSync("/bin/zsh")) shells.push(["/bin/zsh", "-fc"]);
+  for (const [shell, flag] of shells) {
+    for (const word of ["=x", "=ls", "==", "=", "x=y", "a b=c", "=it's"]) {
+      const r = spawnSync(shell, [flag, `printf %s ${pinApi.shellQuote(word)}`], { encoding: "utf8" });
+      assert(r.status === 0 && r.stdout === word, `${shell}: ${JSON.stringify(word)} came back as ${JSON.stringify(r.stdout)} (${r.status}): ${r.stderr}`);
+    }
+  }
+});
+
+// ─── what plutil says reaches the snapshot warning as a JSON string ─────────
+
+test("release", "what plutil says about a snapshot plist reaches the warning as a JSON string, with no raw control character", () => {
+  withReleaseFixture((fx) => {
+    // A plutil that refuses the plist and says so with an escape, a bell, a CSI
+    // (U+009B, as UTF-8) and a DEL in the first line, as plutil does when it
+    // echoes the bytes it choked on.
+    const fake = join(fx.root, "fake-plutil");
+    writeFileSync(fake, "#!/bin/sh\ncat > /dev/null\nprintf 'bad \\033[31mRED \\007bell \\302\\233csi \\177del\\n' >&2\nexit 1\n");
+    chmodSync(fake, 0o755);
+    const snap = writeSnapshotPlist(fx, pinApi.SNAPSHOT_SCRIPT);
+    const lines = pinApi.snapshotJobNotice(snap, fx.source, fx.releaseDir, pinApi.plutilParserAt(fake));
+    const warning = lines.find((l) => l.startsWith(SNAPSHOT_WARNING));
+    assert(warning !== undefined && warning.includes("cannot be read as a job that runs one script"), lines.join("\n"));
+    assert(warning.includes("RED") && warning.includes("bell"), `the reason was dropped: ${warning}`);
+    const isControl = (ch: string): boolean => {
+      const c = ch.charCodeAt(0);
+      return c < 0x20 || (c >= 0x7f && c <= 0x9f);
+    };
+    for (const line of lines) {
+      assert(![...line].some(isControl), `a raw control character reached the output: ${JSON.stringify(line)}`);
+    }
+    assert(warning.includes("\\u001b[31mRED"), `the escape byte is not shown as a JSON escape: ${warning}`);
+    assert(
+      warning.includes("\\u009bcsi") && warning.includes("\\u007fdel"),
+      `the CSI and the DEL are not shown as escapes: ${warning}`,
+    );
+  });
+});
+
+// ─── a pin that failed after the checkout moved says nothing about the snapshot job
+
+test("release", "a pin whose reload failed after the checkout moved says nothing about the snapshot job, and the same setup says it when the reload works", () => {
+  withReleaseFixture((fx) => {
+    // The 08:30 job is installed, the checkout will move, launchctl load fails,
+    // and a stale snapshot plist is there to be reported if pin were to look.
+    writePlistFile(fx.plistPath, jobPlistXml(BARE_SCRIPT));
+    const snap = writeSnapshotPlist(fx, "$HOME/Projects/chamber/scripts/daily-snapshot.sh");
+    const failed = pinRelease({ ...pinOpts(fx, "v1", fakeLaunchctl({ loaded: false, load: "fails" }).run), snapshotPlistPath: snap });
+    assert(failed.code === 1, `pin reported success: ${failed.out.join("\n")}`);
+    assert(failed.out.some((l) => l.includes("is on v1")), `the checkout did not move, so this is not the case under test:\n${failed.out.join("\n")}`);
+    assert(failed.err.some((l) => l.includes("launchctl load failed")), failed.err.join("\n"));
+    const said = [...failed.out, ...failed.err].filter((l) => l.toLowerCase().includes("snapshot"));
+    assert(said.length === 0, `a failed pin spoke about the snapshot job:\n${said.join("\n")}`);
+
+    // The control: the same plist, and a reload that works, is reported. Without
+    // this, "said nothing" could be a snapshot path nothing ever looks at.
+    const worked = pinRelease({ ...pinOpts(fx, "v1", fakeLaunchctl({ loaded: false }).run), snapshotPlistPath: snap });
+    assert(worked.code === 0, worked.err.join("\n"));
+    assert(worked.out.some((l) => l.startsWith(SNAPSHOT_WARNING)), `the control did not warn:\n${worked.out.join("\n")}`);
+  });
+});
+
+// ─── a model file that is not a regular file is refused, not waited on ──────
+
+/** A FIFO at `path`. Nothing ever opens its other end. */
+function makeFifo(path: string): void {
+  const r = spawnSync("mkfifo", [path], { encoding: "utf8" });
+  assert(r.status === 0, `mkfifo ${path} failed: ${r.stderr}`);
+}
+
+/** The interpreter the embedder tests are told to use: CHAMBER_PYTHON when set, else python3 from PATH. */
+function embedPython(): string {
+  return (process.env.CHAMBER_PYTHON ?? "").trim() || "python3";
+}
+
+test("config", "a model file that is a FIFO or a directory is refused with exit 3 in every mode, without waiting, and a missing weights file stays exit 1", () => {
+  // A model directory whose one file is replaced by `make`'s result.
+  const dirWith = (name: "model_quantized.onnx" | "tokenizer.json", make: (path: string) => void): string => {
+    const dir = minilmDirWith({});
+    rmSync(join(dir, name));
+    make(join(dir, name));
+    return dir;
+  };
+  const fifoTokenizer = dirWith("tokenizer.json", makeFifo);
+  const dirTokenizer = dirWith("tokenizer.json", (p) => mkdirSync(p));
+  const fifoWeights = dirWith("model_quantized.onnx", makeFifo);
+  const noWeights = dirWith("model_quantized.onnx", () => undefined);
+  try {
+    for (const [label, args, input] of [
+      ["one-shot", ["a sentence"], undefined],
+      ["--json -", ["--json", "-"], '["a sentence"]'],
+      ["--serve", ["--serve"], '["a sentence"]\n'],
+    ] as const) {
+      for (const [what, dir] of [
+        ["a FIFO tokenizer.json", fifoTokenizer],
+        ["a directory as tokenizer.json", dirTokenizer],
+        ["a FIFO weights file", fifoWeights],
+      ] as const) {
+        // Bounded: a read that waits for a writer that never comes is killed
+        // after 10 s and fails here, instead of hanging the suite.
+        const r = spawnSync(embedPython(), [EMBED_SCRIPT, ...args], {
+          encoding: "utf8",
+          input,
+          timeout: 10_000,
+          env: { ...process.env, CHAMBER_MINILM_DIR: dir },
+        });
+        assert(r.error === undefined, `${label}, ${what}: the script did not finish within 10 s (${String(r.error)})`);
+        assert(r.status === 3, `${label}, ${what}: exit ${r.status}, stderr ${r.stderr}`);
+        assert(r.stdout === "", `${label}, ${what}: wrote a reply before refusing: ${r.stdout}`);
+        const lines = r.stderr.trim().split("\n");
+        assert(lines.length === 1, `${label}, ${what}: expected one stderr line, got ${lines.length}: ${r.stderr}`);
+        assert(lines[0]!.includes("is not a regular file"), `${label}, ${what}: the line does not say why: ${lines[0]}`);
+      }
+      // No weights file at all is still no embedder: exit 1, not a refusal.
+      const none = runEmbedScript(noWeights, args, input);
+      assert(none.status === 1 && none.stderr.includes("missing model"), `${label}, no weights file: exit ${none.status}, stderr ${none.stderr}`);
+    }
+  } finally {
+    for (const dir of [fifoTokenizer, dirTokenizer, fifoWeights, noWeights]) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the embedder's docstrings say a model file that cannot be read or is not a regular file is exit 3", () => {
+  const text = readFileSync(EMBED_SCRIPT, "utf8").replace(/\s+/g, " ");
+  const verify = text.slice(text.indexOf("def verify_weights"), text.indexOf("global _weights_verified"));
+  assert(verify.length > 0, "could not find verify_weights in scripts/embed_minilm.py");
+  assert(
+    verify.includes("a model file is not a regular file or cannot be read"),
+    "the verify_weights docstring does not say a non-regular or unreadable model file is exit 3",
+  );
+  const head = text.slice(0, text.indexOf("from __future__"));
+  assert(head.includes("a model file is not a regular file"), "the module docstring does not say a non-regular model file is exit 3");
+});
+
+// ─── DEL and the C1 controls are escaped in what a file makes pin print ─────
+
+test("release", "jsonForTerminal escapes DEL and the C1 controls that JSON.stringify leaves raw, and the snapshot warning shows the plist's script that way", () => {
+  assert(pinApi.jsonForTerminal("a\u009bb\u007fc\u001bd") === '"a\\u009bb\\u007fc\\u001bd"', pinApi.jsonForTerminal("a\u009bb\u007fc\u001bd"));
+  assert(pinApi.jsonForTerminal('say "hi"\\') === JSON.stringify('say "hi"\\'), "an ordinary string is not what JSON.stringify makes");
+  assert(pinApi.jsonForTerminal("é ü 日本") === JSON.stringify("é ü 日本"), "printable non-ASCII was escaped");
+  withReleaseFixture((fx) => {
+    // The text reader hands the script through as written; it carries a CSI
+    // (U+009B) and a DEL, and shell syntax that must stay out of the commands.
+    const snap = writeSnapshotPlist(fx, "/x/daily-snapshot.sh\u009b\u007f; touch PWNED");
+    const lines = pinApi.snapshotJobNotice(snap, fx.source, fx.releaseDir, noPlistParser);
+    const warning = lines.find((l) => l.startsWith(SNAPSHOT_WARNING));
+    assert(warning !== undefined && warning.includes("it runs"), lines.join("\n"));
+    assert(warning.includes("\\u009b\\u007f"), `the script's CSI and DEL are not shown as escapes: ${warning}`);
+    for (const line of lines) {
+      assert(![...line].some((ch) => ch.charCodeAt(0) === 0x7f || (ch.charCodeAt(0) >= 0x80 && ch.charCodeAt(0) <= 0x9f)), `a raw DEL or C1 reached the output: ${JSON.stringify(line)}`);
+    }
+  });
 });
 
 // ─── cli process smoke tests ────────────────────────────────────────────────

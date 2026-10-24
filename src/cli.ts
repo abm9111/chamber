@@ -58,7 +58,7 @@ import {
 import { completeSync, syncCompletionAvailable } from "./model.ts";
 import { enforceReplyContract } from "./contract.ts";
 import { runAsk, stubDisclosure } from "./ask.ts";
-import { JOB_LABEL, RELEASE_SUBDIR, pinRelease, systemLaunchctl } from "./release_pin.ts";
+import { JOB_LABEL, RELEASE_SUBDIR, SNAPSHOT_JOB_LABEL, pinRelease, systemLaunchctl } from "./release_pin.ts";
 import {
   buildVerifyReport,
   findExcludedDocuments,
@@ -887,6 +887,7 @@ function cmdPin(rest: string[]): number {
     sourceRoot: join(dirname(fileURLToPath(import.meta.url)), ".."),
     releaseDir: join(homedir(), RELEASE_SUBDIR),
     plistPath: join(homedir(), "Library", "LaunchAgents", `${JOB_LABEL}.plist`),
+    snapshotPlistPath: join(homedir(), "Library", "LaunchAgents", `${SNAPSHOT_JOB_LABEL}.plist`),
     launchctl: systemLaunchctl,
   });
   for (const line of r.out) console.log(line);

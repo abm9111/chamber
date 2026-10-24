@@ -3,7 +3,7 @@
 All notable changes to Chamber. Versions before 0.1.6 are described in the git
 history and the GitHub releases.
 
-## 0.2.2 — 2026-10-24
+## 0.2.2 — 2026-10-25
 
 ### Fixed
 
@@ -50,8 +50,11 @@ history and the GitHub releases.
   not go away (a revoked token, a 404) was asked again every 3 s for ever: the
   wait now doubles for each failed round in a row (an error counts too), up to
   five minutes, and starts over when the API accepts a `getUpdates`. A 429 waits
-  as long as its `parameters.retry_after` says, up to the same five minutes.
-  `stop()` ends a wait, so a long one does not hold the process.
+  as long as its `parameters.retry_after` says, at least one second and up to
+  the same five minutes. `stop()` ends a wait, so a long one does not hold the
+  process. The bot token is removed from all of this text before it is cut (as
+  `<token>`: whole, URL-encoded, or its secret half), since a page that echoes
+  the request path carries `/bot<token>/` with it.
 - **A refusal's advice fits an unreadable model file too.** The error for a
   refused model told every case to put back the files `models/minilm/VERSION`
   records, which is wrong when the script could not read a file (exit 3 since

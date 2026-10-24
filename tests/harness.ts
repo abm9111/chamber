@@ -10,7 +10,7 @@ import { CURL_FIXED_ARGV, buildCurlInvocation, httpSync } from "../src/http_sync
 import { TurnPool, TurnWorkerError } from "../src/turn_pool.ts";
 import { isSqliteBusy } from "../src/turn.ts";
 import { mcpDiscover } from "../src/mcp_client.ts";
-import { TelegramGateway, canTelegramTalk, TELEGRAM_TALK_REFUSAL } from "../src/gateway.ts";
+import { TelegramGateway, canTelegramTalk, TELEGRAM_TALK_REFUSAL, withoutTelegramToken } from "../src/gateway.ts";
 import { claimHash, newId, sha256 } from "../src/hash.ts";
 import { commitBelief } from "../src/commit_belief.ts";
 import {
@@ -16955,6 +16955,68 @@ test("telegram", "T5_a_body_that_is_not_JSON_and_a_curl_that_fails_reach_the_err
   });
 });
 
+test("telegram", "T11_the_bot_token_never_reaches_a_log_line_or_an_error_even_when_the_answer_echoes_it", async () => {
+  // A curl that answers with what it was asked: the URL is on its stdin, as httpSync sends it, so the page
+  // echoes /bot<token>/getUpdates the way a proxy's or a captive portal's error page can.
+  const token = "123456789:AAH-secret_PART-for-the-test";
+  const secret = token.slice(token.indexOf(":") + 1);
+  const leaks = (text: string): boolean => text.includes(secret) || text.includes(token.slice(0, 14));
+  const dir = mkdtempSync(join(tmpdir(), "chamber-curlecho-"));
+  const savedPath = process.env.PATH;
+  const run = (script: string, fn: () => void): void => {
+    writeFileSync(join(dir, "curl"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+    fn();
+  };
+  class EchoTelegram extends TelegramGateway {
+    constructor() {
+      super(token);
+    }
+    call(): unknown {
+      return this.api("getUpdates");
+    }
+  }
+  try {
+    process.env.PATH = `${dir}:${savedPath ?? ""}`;
+    const messages: string[] = [];
+    const caught = (fn: () => unknown): void => {
+      try {
+        fn();
+        messages.push("(did not throw)");
+      } catch (e) {
+        messages.push(e instanceof Error ? e.message : String(e));
+      }
+    };
+    // A page that is not JSON, with the token at the start and again where a 200-character cut would halve it.
+    run(`printf '<h1>404</h1> '; cat; printf '%0180d${token}' 0`, () => caught(() => new EchoTelegram().call()));
+    // A curl that fails and repeats the request on stderr, the token URL-encoded.
+    run(`cat >&2; printf ' %s' '${encodeURIComponent(token)}' >&2; exit 22`, () => caught(() => new EchoTelegram().call()));
+    assert(messages.length === 2 && !messages.includes("(did not throw)"), `expected two errors: ${JSON.stringify(messages)}`);
+    for (const m of messages) {
+      assert(!leaks(m), `the token is in an error message: ${JSON.stringify(m)}`);
+    }
+    assert(messages[0]!.includes("<token>") && messages[1]!.includes("<token>"), `the token was not marked as removed: ${JSON.stringify(messages)}`);
+    // A JSON refusal whose description repeats the token, through the poll loop and its log line.
+    run(`cat >/dev/null; printf '{"ok":false,"error_code":404,"description":"no route /bot${token}/getUpdates"}'`, () => undefined);
+    const gw = new EchoTelegram();
+    (gw as unknown as { retryDelayMs: number }).retryDelayMs = 20;
+    const logged = await captureStderrAsync(async () => {
+      const done = gw.start(async () => "never");
+      await new Promise<void>((r) => setTimeout(r, 150));
+      await gw.stop();
+      await done;
+    });
+    assert(logged.includes("getUpdates refused"), `the refusal was not logged: "${logged}"`);
+    assert(!leaks(logged), `the token reached stderr: ${JSON.stringify(logged)}`);
+  } finally {
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // The helper itself: every copy goes, longest first, and a short or missing secret half is left alone.
+  assert(withoutTelegramToken(`a ${token} b ${secret} c`, token) === "a <token> b <token> c", "withoutTelegramToken left a copy");
+  assert(withoutTelegramToken("plain", "") === "plain", "an empty token changed the text");
+});
+
 test("telegram", "T6_the_poll_loop_prints_whatever_was_thrown_as_an_escaped_string", async () => {
   const gw = new ThrowingTelegram([
     new Error("boom \u001b[31m\u009b\u007f\u202e"),
@@ -17012,7 +17074,10 @@ test("telegram", "T8_a_429_waits_as_long_as_retry_after_says_up_to_five_minutes_
     limited("7"),
     limited(-3),
     { ok: false, error_code: 429, parameters: null },
+    limited(1.5),
     limited(0.5),
+    limited(0.001),
+    limited(5e-324),
   ]);
   let delays: number[] = [];
   await captureStderrAsync(async () => {
@@ -17020,8 +17085,9 @@ test("telegram", "T8_a_429_waits_as_long_as_retry_after_says_up_to_five_minutes_
   });
   // 7 s as asked; 100000 s capped at five minutes; the 401 is the third failed round in a row, so 3000 * 4;
   // a zero, a string, a negative number and a null `parameters` are not a wait the API asked for, so the
-  // doubling goes on (24000, 48000, 96000, 192000); a half second is honoured.
-  const want = [7000, 300000, 12000, 24000, 48000, 96000, 192000, 500];
+  // doubling goes on (24000, 48000, 96000, 192000); 1.5 s is honoured; anything under a second waits a
+  // second, or a tiny retry_after would bring back the loop with no delay.
+  const want = [7000, 300000, 12000, 24000, 48000, 96000, 192000, 1500, 1000, 1000, 1000];
   assert(delays.join(",") === want.join(","), `the loop waited ${delays.join(",")}, wanted ${want.join(",")}`);
 });
 

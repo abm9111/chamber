@@ -30,6 +30,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { jsonForTerminal } from "./terminal_text.ts";
+
+// Moved to terminal_text.ts so that embedder.ts can use it without importing this
+// module; still exported from here for the callers and tests that import it from here.
+export { jsonForTerminal };
 
 export const JOB_LABEL = "com.chamber.verify";
 export const RELEASE_SUBDIR = ".local/share/chamber-release";
@@ -124,22 +129,6 @@ export type PlistParse =
   | { kind: "parsed"; value: unknown };
 
 export type PlistParser = (xml: string) => PlistParse;
-
-/**
- * `text` as a JSON string, with DEL and the C1 controls written as \u00XX too.
- * JSON.stringify escapes quotes, backslashes and the C0 controls but leaves U+007F
- * and U+0080-U+009F raw, and a terminal acts on U+009B (the 8-bit CSI). For text
- * that comes out of a file and goes to a terminal. A loop, not a regular
- * expression: a control-character class is what the no-control-regex rule refuses.
- */
-export function jsonForTerminal(text: string): string {
-  let out = "";
-  for (const ch of JSON.stringify(text)) {
-    const c = ch.codePointAt(0) ?? 0;
-    out += c === 0x7f || (c >= 0x80 && c <= 0x9f) ? `\\u${c.toString(16).padStart(4, "0")}` : ch;
-  }
-  return out;
-}
 
 const PLUTIL_TIMEOUT_MS = 15_000;
 
@@ -983,7 +972,12 @@ function proveReleaseRuns(releaseDir: string, env: NodeJS.ProcessEnv, timeoutMs:
   }
   if (r.status !== 0) {
     const said = (r.stderr ?? "").trim().split("\n").slice(-3).join(" | ").slice(0, 300);
-    return { ok: false, reason: `it exited ${r.status ?? `from signal ${r.signal}`}${said !== "" ? `: ${said}` : ""}` };
+    // The release's own stderr, so any byte can be in it. Escaped after the
+    // emptiness check: jsonForTerminal("") is two characters, not nothing.
+    return {
+      ok: false,
+      reason: `it exited ${r.status ?? `from signal ${r.signal}`}${said !== "" ? `: ${jsonForTerminal(said)}` : ""}`,
+    };
   }
   // A login profile may print before the command does (a banner, a fortune),
   // and the job's output only lands in a log. The version is the last line.

@@ -16368,6 +16368,115 @@ test("release", "jsonForTerminal escapes DEL and the C1 controls that JSON.strin
   });
 });
 
+// ─── a child's stderr is escaped before it reaches a terminal ───────────────
+
+/**
+ * The first character of `text` a terminal would act on (a C0 control, DEL or a
+ * C1 control) as "U+XXXX", or null. A char-code loop: a control-character class
+ * in a regular expression is what the no-control-regex rule refuses.
+ */
+function firstRawControl(text: string): string | null {
+  for (const ch of text) {
+    const c = ch.codePointAt(0) ?? 0;
+    if (c < 0x20 || c === 0x7f || (c >= 0x80 && c <= 0x9f)) return `U+${c.toString(16).padStart(4, "0")}`;
+  }
+  return null;
+}
+
+test("release", "a release whose bin writes an ESC, a C1 control and a DEL to stderr is refused with them shown as escapes", () => {
+  withReleaseFixture((fx) => {
+    const esc = fixtureCommit(
+      fx.origin,
+      {
+        ...releaseTree("escexit", "1.0.5", 'process.stderr.write("bad \\u001b[31mRED \\u009bcsi \\u007fdel\\n");\nprocess.exit(1);\n'),
+        "README.md": "six\n",
+      },
+      "bin exits non-zero with control bytes on stderr",
+      fx.v2,
+    );
+    fixtureGit(fx.origin, ["tag", "escexit", esc]);
+    const bare = jobPlistXml(BARE_SCRIPT);
+    writePlistFile(fx.plistPath, bare);
+    const lc = fakeLaunchctl({ loaded: true });
+    const r = pinRelease(pinOpts(fx, "escexit", lc.run));
+    assert(r.code === 1, `a release that exits 1 was pinned: ${r.err.join("\n")}`);
+    const line = r.err.find((l) => l.startsWith("chamber pin: the release at escexit did not run: "));
+    assert(line !== undefined && line.includes("exited 1"), r.err.join("\n"));
+    assert(
+      line.includes("\\u001b[31mRED") && line.includes("\\u009bcsi") && line.includes("\\u007fdel"),
+      `the ESC, the CSI and the DEL are not shown as escapes: ${JSON.stringify(line)}`,
+    );
+    for (const l of [...r.out, ...r.err]) {
+      const raw = firstRawControl(l);
+      assert(raw === null, `${raw} reached pin's output: ${JSON.stringify(l)}`);
+    }
+    assert(lc.calls.length === 0, `launchctl was called: ${lc.calls.join(" | ")}`);
+  });
+});
+
+test("config", "stderr with an ESC, a C1 control and a DEL reaches the embedder's errors escaped, on the refusal, probe and embed paths", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-stub-python-"));
+  // An interpreter that reads its stdin, says the same bad line on stderr and exits with `status`.
+  const stub = (status: number): string => {
+    const path = join(dir, `python-exit-${status}`);
+    writeFileSync(path, `#!/bin/sh\ncat >/dev/null\nprintf 'bad \\033[31mRED \\302\\233csi \\177del\\n' >&2\nexit ${status}\n`);
+    chmodSync(path, 0o755);
+    return path;
+  };
+  const savedPython = process.env.CHAMBER_PYTHON;
+  const savedKind = process.env.CHAMBER_EMBEDDER;
+  delete process.env.CHAMBER_EMBEDDER;
+  const shown = (label: string, text: string): void => {
+    assert(
+      text.includes("\\u001b[31mRED") && text.includes("\\u009bcsi") && text.includes("\\u007fdel"),
+      `${label}: the ESC, the CSI and the DEL are not shown as escapes: ${JSON.stringify(text)}`,
+    );
+    for (const l of text.split("\n")) {
+      const raw = firstRawControl(l);
+      assert(raw === null, `${label}: ${raw} reached the message: ${JSON.stringify(l)}`);
+    }
+  };
+  const thrownBy = (run: () => unknown): unknown => {
+    try {
+      run();
+    } catch (e) {
+      return e;
+    }
+    return undefined;
+  };
+  try {
+    // Exit 3: a refusal. The probe holds it, the embed call throws it afresh.
+    process.env.CHAMBER_PYTHON = stub(3);
+    resetMinilmProbe();
+    const probeRefusal = thrownBy(() => minilmAvailable());
+    assert(probeRefusal instanceof MinilmIntegrityError, `the probe did not refuse: ${String(probeRefusal)}`);
+    shown("refusal, probe", probeRefusal.message);
+    const embedRefusal = thrownBy(() => embedMinilm("a sentence"));
+    assert(embedRefusal instanceof MinilmIntegrityError, `the embed call did not refuse: ${String(embedRefusal)}`);
+    shown("refusal, embed", embedRefusal.message);
+
+    // Exit 7: an ordinary failure. The probe reports it in the fallback warning.
+    process.env.CHAMBER_PYTHON = stub(7);
+    resetMinilmProbe();
+    const probed = captureStderr(() => minilmAvailable());
+    assert(probed.value === false, "a probe that exited 7 was taken for a working embedder");
+    assert(probed.stderr.includes("probe exited 7"), `the fallback warning does not carry the probe's failure: ${probed.stderr}`);
+    shown("probe exited", probed.stderr);
+    const embedFailure = thrownBy(() => embedMinilm("a sentence"));
+    assert(
+      embedFailure instanceof Error && embedFailure.message.includes("embed_minilm failed (7)"),
+      `the embed call did not report the failure: ${String(embedFailure)}`,
+    );
+    shown("embed failed", embedFailure.message);
+  } finally {
+    if (savedPython === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = savedPython;
+    if (savedKind !== undefined) process.env.CHAMBER_EMBEDDER = savedKind;
+    resetMinilmProbe();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

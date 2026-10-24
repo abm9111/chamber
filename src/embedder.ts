@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { jsonForTerminal } from "./terminal_text.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
@@ -61,11 +62,15 @@ export class MinilmIntegrityError extends Error {
  * that matters most, the hash VERSION records, is last. Cutting it at 300 or
  * 400 characters removed that hash for the path the 08:30 job uses. The cap
  * only bounds a runaway stderr.
+ *
+ * It is the child's stderr and goes into an Error message that ends on a
+ * terminal, so it is returned as a JSON string (see jsonForTerminal): quoted,
+ * with every control character written as an escape.
  */
 const REFUSAL_DETAIL_MAX = 2000;
 
 function refusalDetail(stderr: string | null | undefined): string {
-  return (stderr ?? "").trim().slice(0, REFUSAL_DETAIL_MAX);
+  return jsonForTerminal((stderr ?? "").trim().slice(0, REFUSAL_DETAIL_MAX));
 }
 
 /** Fallback hash embedder (no Python). Kept here to avoid cycle with vector.ts */
@@ -209,7 +214,7 @@ export function minilmAvailable(): boolean {
       err = new MinilmIntegrityError(refusalDetail(r.stderr), true);
     else if (r.status !== 0)
       err = new Error(
-        `probe exited ${r.status}: ${(r.stderr || "").trim().slice(0, 300)}`,
+        `probe exited ${r.status}: ${jsonForTerminal((r.stderr || "").trim().slice(0, 300))}`,
       );
     else {
       const line = (r.stdout || "").trim().split("\n").filter(Boolean).pop();
@@ -395,7 +400,7 @@ function spawnMinilmStdin(payload: string): number[][] {
   if (r.status === MINILM_WEIGHTS_REFUSED_EXIT) throw new MinilmIntegrityError(refusalDetail(r.stderr));
   if (r.status !== 0) {
     throw new Error(
-      `embed_minilm failed (${r.status}): ${(r.stderr || "").slice(0, 400)}`,
+      `embed_minilm failed (${r.status}): ${jsonForTerminal((r.stderr || "").trim().slice(0, 400))}`,
     );
   }
   noteTruncation(r.stderr || "");

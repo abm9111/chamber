@@ -17050,6 +17050,64 @@ test("telegram", "T10_the_API_text_in_a_refusal_line_is_cut_at_300_characters", 
   assert(count("Q") === 300, `the error code is not cut at 300 characters: ${count("Q")} Q`);
 });
 
+// ─── deploy/Dockerfile has a HEALTHCHECK that works ─────────────────────────
+
+test("server", "deploy/Dockerfile's HEALTHCHECK has compose's timings, and its command is healthy for a running server on PORT and unhealthy for anything else", async () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const dockerfile = readFileSync(join(root, "deploy", "Dockerfile"), "utf8").replace(/\\\n\s*/g, " ");
+  const instructions = dockerfile.split("\n").filter((l) => l.startsWith("HEALTHCHECK"));
+  assert(instructions.length === 1, `deploy/Dockerfile has ${instructions.length} HEALTHCHECK instructions, wanted one`);
+  const instruction = instructions[0]!;
+  // The same timings as the healthcheck the compose file already has.
+  const compose = readFileSync(join(root, "deploy", "docker-compose.yml"), "utf8");
+  for (const key of ["interval", "timeout", "retries"]) {
+    const value = new RegExp(`^\\s+${key}:\\s*(\\S+)\\s*$`, "m").exec(compose)?.[1];
+    assert(value !== undefined, `docker-compose.yml has no healthcheck ${key}`);
+    assert(instruction.includes(`--${key}=${value} `), `the HEALTHCHECK does not say --${key}=${value}, as docker-compose.yml does: ${instruction}`);
+  }
+  // The command, as docker runs it: exec form, in the container's environment.
+  const json = / CMD (\[.*\])\s*$/.exec(instruction)?.[1];
+  assert(json !== undefined, `the HEALTHCHECK has no exec-form CMD: ${instruction}`);
+  const parsed: unknown = JSON.parse(json);
+  const argv: string[] = Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === "string") : [];
+  assert(argv.length === 3 && argv[0] === "node" && argv[1] === "-e", `the HEALTHCHECK command is not node -e <script>: ${json}`);
+  // Asynchronous: the 503 server below lives in this process, and a synchronous spawn would stop it from answering.
+  const probe = (port: number): Promise<number | null> =>
+    new Promise((ok) => {
+      const child = spawn(process.execPath, ["-e", argv[2]!], { env: { ...process.env, PORT: String(port) }, stdio: "ignore" });
+      const timer = setTimeout(() => child.kill("SIGKILL"), 20_000);
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        ok(code);
+      });
+    });
+  const guarded = await startLiveServer({ CHAMBER_API_TOKEN: "test-token-value" });
+  try {
+    assert((await probe(guarded.port)) === 0, "the HEALTHCHECK says a running server that needs a token is unhealthy; /health takes none");
+    assert((await probe(await freePort())) === 1, "the HEALTHCHECK says a port nothing listens on is healthy, or it is not reading PORT");
+  } finally {
+    await guarded.stop();
+  }
+  const open = await startLiveServer();
+  try {
+    assert((await probe(open.port)) === 0, "the HEALTHCHECK says a running server with no token is unhealthy (its Host header must name loopback)");
+  } finally {
+    await open.stop();
+  }
+  assert((await probe(open.port)) === 1, "the HEALTHCHECK says a stopped server is healthy");
+  const { createServer: createHttpServer } = await import("node:http");
+  const failing = createHttpServer((_req, res) => {
+    res.statusCode = 503;
+    res.end("down");
+  });
+  const failingPort: number = await new Promise<number>((ok) => failing.listen(0, "127.0.0.1", () => ok((failing.address() as AddressInfo).port)));
+  try {
+    assert((await probe(failingPort)) === 1, "the HEALTHCHECK says a server that answers /health with 503 is healthy");
+  } finally {
+    await new Promise<void>((ok) => failing.close(() => ok()));
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

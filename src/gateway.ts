@@ -7,6 +7,7 @@
  */
 
 import { httpSync } from "./http_sync.ts";
+import { jsonForTerminal } from "./terminal_text.ts";
 
 export type GatewayChannel =
   | "cli"
@@ -74,6 +75,25 @@ export function canTelegramTalk(userId: string | undefined): boolean {
 }
 
 /**
+ * Whether the Bot API accepted `method`. The API answers a refusal (401 for a
+ * revoked token, 409 for a second poller, 429 for a rate limit, 403 for a blocked
+ * bot) as a parsed `{ok:false,error_code,description}`, which `api` returns like
+ * any other body: nothing throws. When it did not say `ok: true`, one line says
+ * what it answered and this returns false. The code and the description are
+ * the API's text, so they are printed as JSON strings.
+ */
+function telegramAnswered(method: string, data: unknown): boolean {
+  const body: { ok?: unknown; error_code?: unknown; description?: unknown } =
+    typeof data === "object" && data !== null ? data : {};
+  if (body.ok === true) return true;
+  // A number is digits; anything else the API sent in its place is escaped like the description.
+  const code = typeof body.error_code === "number" ? String(body.error_code) : jsonForTerminal(String(body.error_code ?? "none"));
+  const why = jsonForTerminal(String(body.description ?? "none"));
+  console.error(`telegram ${method} refused: error_code ${code}, description ${why}`);
+  return false;
+}
+
+/**
  * Telegram long-poll adapter (optional).
  * Requires TELEGRAM_BOT_TOKEN. Soft-no-op if missing.
  * Only senders on `CHAMBER_TELEGRAM_ALLOWED_USERS` reach `onMessage`.
@@ -83,6 +103,8 @@ export class TelegramGateway implements GatewayAdapter {
   private token: string;
   private offset = 0;
   private running = false;
+  /** How long the poll loop waits after an error or a refusal before it asks again. */
+  protected retryDelayMs = 3000;
 
   constructor(token = process.env.TELEGRAM_BOT_TOKEN ?? "") {
     this.token = token;
@@ -112,10 +134,15 @@ export class TelegramGateway implements GatewayAdapter {
   }
 
   async send(msg: OutboundMessage): Promise<void> {
-    this.api("sendMessage", {
-      chat_id: msg.chatId,
-      text: msg.text.slice(0, 4000),
-    });
+    // A refused send is logged and does not throw: the poll loop would only
+    // catch it, wait and ask again, with the offset already moved past the update.
+    telegramAnswered(
+      "sendMessage",
+      this.api("sendMessage", {
+        chat_id: msg.chatId,
+        text: msg.text.slice(0, 4000),
+      }),
+    );
   }
 
   async start(onMessage: (msg: InboundMessage) => Promise<string>): Promise<void> {
@@ -145,6 +172,12 @@ export class TelegramGateway implements GatewayAdapter {
             };
           }[];
         };
+        // `{ok:false}` has no `result`, so without this check the loop would run
+        // again at once, one curl spawn after another, and never reach the catch.
+        if (!telegramAnswered("getUpdates", data)) {
+          await new Promise((r) => setTimeout(r, this.retryDelayMs));
+          continue;
+        }
         for (const u of data.result ?? []) {
           this.offset = u.update_id + 1;
           const m = u.message;
@@ -175,7 +208,7 @@ export class TelegramGateway implements GatewayAdapter {
         }
       } catch (e) {
         console.error("telegram poll error", e);
-        await new Promise((r) => setTimeout(r, 3000));
+        await new Promise((r) => setTimeout(r, this.retryDelayMs));
       }
     }
   }

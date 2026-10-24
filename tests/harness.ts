@@ -16477,6 +16477,110 @@ test("config", "stderr with an ESC, a C1 control and a DEL reaches the embedder'
   }
 });
 
+// ─── the Telegram gateway does not spin on a refusal from the Bot API ───────
+
+/** Like captureStderr, for an async `fn`: what it wrote to stderr, kept from the terminal. */
+async function captureStderrAsync(fn: () => Promise<unknown>): Promise<string> {
+  const original = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+    captured += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await fn();
+  } finally {
+    process.stderr.write = original;
+  }
+  return captured;
+}
+
+/**
+ * A TelegramGateway whose Bot API answers every call with `answer`, as it does
+ * with `{ok:false}` for a revoked token (401), a second poller (409) or a rate
+ * limit (429). No network. The gateway is told to stop from inside its first
+ * `getUpdates` after `windowMs`: a loop that never yields to the event loop
+ * could not be stopped by a timer, so a spinning loop here runs for `windowMs`,
+ * is counted, and is then stopped.
+ */
+class RefusedTelegram extends TelegramGateway {
+  answer: unknown;
+  windowMs: number;
+  polls = 0;
+  sendAttempts = 0;
+  opened = Date.now();
+  constructor(answer: unknown, windowMs: number) {
+    super("TESTTOKEN-not-real");
+    this.answer = answer;
+    this.windowMs = windowMs;
+    this.retryDelayMs = 40;
+  }
+  protected override api(method: string): unknown {
+    if (method === "getUpdates") {
+      this.polls += 1;
+      if (Date.now() - this.opened > this.windowMs) void this.stop();
+      return this.answer;
+    }
+    if (method === "sendMessage") {
+      this.sendAttempts += 1;
+      return this.answer;
+    }
+    throw new Error(`unexpected Bot API method ${method}`);
+  }
+}
+
+test("telegram", "T3_a_getUpdates_the_Bot_API_refuses_is_logged_and_waited_out_not_spun_on", async () => {
+  const refusal = { ok: false, error_code: 401, description: "Unauthorized \u001b[31m\u009b\u007f" };
+  const gw = new RefusedTelegram(refusal, 300);
+  let turns = 0;
+  const logged = await captureStderrAsync(() =>
+    gw.start(async () => {
+      turns += 1;
+      return "never";
+    }),
+  );
+  // 40 ms between polls in 300 ms is about 8; a loop with no wait makes thousands.
+  assert(gw.polls >= 2, `the loop gave up after ${gw.polls} poll(s) instead of trying again`);
+  assert(gw.polls <= 20, `${gw.polls} getUpdates calls in about 300 ms: the loop does not wait after a refusal`);
+  assert(turns === 0, "a refused poll reached the turn");
+  const lines = logged.split("\n").filter((l) => l.includes("getUpdates"));
+  assert(lines.length >= 1, `nothing about the refusal was logged: "${logged}"`);
+  assert(lines.length <= gw.polls, `${lines.length} lines for ${gw.polls} polls`);
+  const line = lines[0]!;
+  assert(line.includes("telegram getUpdates refused"), line);
+  assert(line.includes("error_code 401"), `the line does not say the error code: ${line}`);
+  assert(line.includes("Unauthorized"), `the line does not say the description: ${line}`);
+  assert(line.includes("\\u001b[31m\\u009b\\u007f"), `the description's control characters are not shown as escapes: ${JSON.stringify(line)}`);
+  for (const l of logged.split("\n")) {
+    const raw = firstRawControl(l);
+    assert(raw === null, `${raw} reached stderr: ${JSON.stringify(l)}`);
+  }
+});
+
+test("telegram", "T4_a_sendMessage_the_Bot_API_refuses_is_logged_and_an_accepted_one_is_not", async () => {
+  const blocked = new RefusedTelegram({ ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" }, 0);
+  const logged = await captureStderrAsync(() => blocked.send({ channel: "telegram", chatId: "9", text: "hello" }));
+  assert(blocked.sendAttempts === 1, `sendMessage was called ${blocked.sendAttempts} times`);
+  assert(logged.includes("telegram sendMessage refused"), `a refused send was silent: "${logged}"`);
+  assert(logged.includes("error_code 403") && logged.includes("Forbidden: bot was blocked by the user"), logged);
+  // An answer that is not the documented shape is a refusal too, and what is in it is escaped.
+  for (const [what, answer] of [
+    ["a code that is not a number", { ok: false, error_code: "4\u001b[2J", description: 7 }],
+    ["no object at all", null],
+    ["ok as a string", { ok: "true" }],
+  ] as const) {
+    const odd = new RefusedTelegram(answer, 0);
+    const oddLog = await captureStderrAsync(() => odd.send({ channel: "telegram", chatId: "9", text: "hello" }));
+    assert(oddLog.includes("telegram sendMessage refused"), `${what}: a send the API did not accept was silent: "${oddLog}"`);
+    const raw = firstRawControl(oddLog.trim());
+    assert(raw === null, `${what}: ${raw} reached stderr: ${JSON.stringify(oddLog)}`);
+  }
+  // The control: an accepted send says nothing, so the line above is the refusal and not a banner.
+  const fine = new RefusedTelegram({ ok: true, result: {} }, 0);
+  const quiet = await captureStderrAsync(() => fine.send({ channel: "telegram", chatId: "9", text: "hello" }));
+  assert(fine.sendAttempts === 1 && quiet === "", `an accepted send wrote to stderr: "${quiet}"`);
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

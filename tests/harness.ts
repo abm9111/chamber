@@ -16723,6 +16723,74 @@ test("config", "server.json's top-level description is at most the 100 character
   );
 });
 
+// ─── jsonForTerminal keeps a closed set of characters ───────────────────────
+
+test("release", "jsonForTerminal writes every character that is not a letter, mark, number, punctuation, symbol or the space as an escape", () => {
+  const j = pinApi.jsonForTerminal;
+  // Each of these is a character a terminal acts on, or a log or a pasted message shows as nothing or out of order.
+  for (const [what, ch, escape] of [
+    ["ESC", "\u001b", "\\u001b"],
+    ["DEL", "\u007f", "\\u007f"],
+    ["a C1 control (U+009B is the 8-bit CSI)", "\u009b", "\\u009b"],
+    ["a right-to-left override", "\u202e", "\\u202e"],
+    ["a left-to-right isolate", "\u2066", "\\u2066"],
+    ["a zero-width space", "\u200b", "\\u200b"],
+    ["a zero-width joiner", "\u200d", "\\u200d"],
+    ["a byte order mark", "\ufeff", "\\ufeff"],
+    ["the Arabic letter mark", "\u061c", "\\u061c"],
+    ["the line separator", "\u2028", "\\u2028"],
+    ["the paragraph separator", "\u2029", "\\u2029"],
+    ["a no-break space", "\u00a0", "\\u00a0"],
+    ["an em space", "\u2003", "\\u2003"],
+    ["an ideographic space", "\u3000", "\\u3000"],
+    ["a private-use character", "\ue000", "\\ue000"],
+    ["an unassigned code point", "\u0378", "\\u0378"],
+    ["a lone high surrogate", "\ud83d", "\\ud83d"],
+    ["a lone low surrogate", "\ude00", "\\ude00"],
+    ["a tag character, which is above U+FFFF and so a surrogate pair", "\u{e0041}", "\\udb40\\udc41"],
+    ["the last code point, also a surrogate pair", "\u{10ffff}", "\\udbff\\udfff"],
+  ] as const) {
+    const out = j(`a${ch}b`);
+    assert(out === `"a${escape}b"`, `${what}: got ${out}, wanted "a${escape}b"`);
+    assert(JSON.parse(out) === `a${ch}b`, `${what}: ${out} does not parse back to the input`);
+  }
+  // Each of these is text a person wrote, and comes out exactly as JSON.stringify writes it.
+  for (const [what, text] of [
+    ["accented Latin", "café über"],
+    ["Arabic", "مرحبا بالعالم"],
+    ["Chinese", "你好，世界"],
+    ["emoji, which are surrogate pairs", "\u{1f600} \u{1f680}"],
+    ["a combining mark and a variation selector", "é ❤️"],
+    ["a currency symbol, a dash and a digit from another script", "€5 — ٣"],
+    ["the ASCII punctuation JSON leaves alone", "!#$%&'()*+,-./:;<=>?@[]^_`{|}~"],
+    ["spaces between words", "a b  c"],
+    ["the quotes, the backslash and the five controls JSON has short escapes for", 'say "hi"\\ \b\f\n\r\t'],
+    ["nothing", ""],
+  ] as const) {
+    assert(j(text) === JSON.stringify(text), `${what}: got ${j(text)}, JSON.stringify writes ${JSON.stringify(text)}`);
+    assert(JSON.parse(j(text)) === text, `${what}: ${j(text)} does not parse back to the input`);
+  }
+  // The zero-width joiner is the price: an emoji sequence shows it as an escape.
+  assert(j("\u{1f468}\u200d\u{1f469}") === '"\u{1f468}\\u200d\u{1f469}"', `a joined emoji sequence: ${j("\u{1f468}\u200d\u{1f469}")}`);
+  // Every code point. What is kept is a letter, mark, number, punctuation mark, symbol or the space, written
+  // from the complement (control, format, surrogate, private use, unassigned, separator) so that this does
+  // not repeat the implementation's expression; what is not kept is ASCII only; and all of it parses back.
+  const notKept = /^[\p{C}\p{Z}]$/u;
+  for (let cp = 0; cp <= 0x10ffff; cp++) {
+    const ch = String.fromCodePoint(cp);
+    const out = j(ch);
+    if (JSON.parse(out) !== ch) assert(false, `U+${cp.toString(16)} does not parse back from ${out}`);
+    const kept = ch === " " || !notKept.test(ch);
+    if (ch === '"' || ch === "\\") {
+      if (out !== JSON.stringify(ch)) assert(false, `U+${cp.toString(16)} came out as ${out}`);
+    } else if (kept) {
+      if (out !== `"${ch}"`) assert(false, `U+${cp.toString(16)} is kept but came out as ${out}`);
+    } else if ([...out].some((c) => (c.codePointAt(0) ?? 0) > 0x7e)) {
+      assert(false, `U+${cp.toString(16)} is not kept and was not escaped: ${out}`);
+    }
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

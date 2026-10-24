@@ -16986,15 +16986,17 @@ test("telegram", "T11_the_bot_token_never_reaches_a_log_line_or_an_error_even_wh
         messages.push(e instanceof Error ? e.message : String(e));
       }
     };
-    // A page that is not JSON, with the token at the start and again where a 200-character cut would halve it.
-    run(`printf '<h1>404</h1> '; cat; printf '%0180d${token}' 0`, () => caught(() => new EchoTelegram().call()));
+    // A page that is not JSON, echoing the request (the token in the URL on curl's stdin).
+    run(`printf '<h1>404</h1> '; cat`, () => caught(() => new EchoTelegram().call()));
+    // The token starting at character 180, so a cut at 200 made before the token is removed keeps its first 20.
+    run(`cat >/dev/null; printf '%0180d${token}' 0`, () => caught(() => new EchoTelegram().call()));
     // A curl that fails and repeats the request on stderr, the token URL-encoded.
     run(`cat >&2; printf ' %s' '${encodeURIComponent(token)}' >&2; exit 22`, () => caught(() => new EchoTelegram().call()));
-    assert(messages.length === 2 && !messages.includes("(did not throw)"), `expected two errors: ${JSON.stringify(messages)}`);
+    assert(messages.length === 3 && !messages.includes("(did not throw)"), `expected three errors: ${JSON.stringify(messages)}`);
     for (const m of messages) {
       assert(!leaks(m), `the token is in an error message: ${JSON.stringify(m)}`);
     }
-    assert(messages[0]!.includes("<token>") && messages[1]!.includes("<token>"), `the token was not marked as removed: ${JSON.stringify(messages)}`);
+    assert(messages.every((m) => m.includes("<token>")), `the token was not marked as removed: ${JSON.stringify(messages)}`);
     // A JSON refusal whose description repeats the token, through the poll loop and its log line.
     run(`cat >/dev/null; printf '{"ok":false,"error_code":404,"description":"no route /bot${token}/getUpdates"}'`, () => undefined);
     const gw = new EchoTelegram();

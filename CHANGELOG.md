@@ -53,7 +53,7 @@ history and the GitHub releases.
   as long as its `parameters.retry_after` says, at least one second and up to
   the same five minutes. `stop()` ends a wait, so a long one does not hold the
   process. The bot token is removed from all of this text before it is cut (as
-  `<token>`: whole, URL-encoded, or its secret half), since a page that echoes
+  `<token>`: whole, or its secret half), since a page that echoes
   the request path carries `/bot<token>/` with it.
 - **A refusal's advice fits an unreadable model file too.** The error for a
   refused model told every case to put back the files `models/minilm/VERSION`

@@ -85,12 +85,13 @@ const MIN_RETRY_AFTER_MS = 1000;
 
 /**
  * `text` with every copy of the bot token replaced by `<token>`: the whole
- * token, its URL-encoded form, and its secret half (after the colon), which a
- * page that echoes the request path can carry on its own. Run before the text is
- * cut, so a cut cannot leave the start of a token behind.
+ * token, and its secret half (after the colon), which a page that echoes or
+ * URL-encodes the request path still carries as it is (it is letters, digits,
+ * `-` and `_`). Run before the text is cut, so a cut cannot leave the start of a
+ * token behind.
  */
 export function withoutTelegramToken(text: string, token: string): string {
-  const copies = [token, encodeURIComponent(token), token.slice(token.indexOf(":") + 1)]
+  const copies = [token, token.slice(token.indexOf(":") + 1)]
     .filter((s) => s.length >= 8)
     .sort((a, b) => b.length - a.length);
   let out = text;

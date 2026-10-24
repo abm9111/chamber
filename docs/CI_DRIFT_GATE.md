@@ -70,7 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: abm9111/chamber@v0.2.0
+      - uses: abm9111/chamber@v0.2.1
         with:
           docs-path: docs
           code-path: src          # optional; omit to skip code indexing
@@ -88,9 +88,9 @@ Without the action, the same gate by hand:
       - uses: actions/setup-node@v4
         with: { node-version: 24 }   # npx runs dist/, compiled JS since
                                      # 0.1.3 (KL 18).
-      - run: npx -y @bu7umaid/chamber@0.2.0 ingest ./docs
-      - run: npx -y @bu7umaid/chamber@0.2.0 index-code ./src
-      - run: npx -y @bu7umaid/chamber@0.2.0 verify --json
+      - run: npx -y @bu7umaid/chamber@0.2.1 ingest ./docs
+      - run: npx -y @bu7umaid/chamber@0.2.1 index-code ./src
+      - run: npx -y @bu7umaid/chamber@0.2.1 verify --json
 ```
 
 (Point `CHAMBER_DB`/config at the persisted database per the section above;

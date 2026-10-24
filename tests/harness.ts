@@ -15961,8 +15961,8 @@ test("config", "the docs and the changelog describe the pin and embedder follow-
     assert(limitations.includes(needle), `KNOWN_LIMITATIONS.md does not say: ${needle}`);
   }
   const changelog = read("CHANGELOG.md");
-  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.0"));
-  assert(unreleased.length > 0 && unreleased.includes("### Fixed"), "no Unreleased / Fixed section found in CHANGELOG.md");
+  const unreleased = changelog.slice(changelog.indexOf("## 0.2.1"), changelog.indexOf("## 0.2.0"));
+  assert(unreleased.length > 0 && unreleased.includes("### Fixed"), "no 0.2.1 / Fixed section found in CHANGELOG.md");
   for (const heading of [
     "**A refused pin does not leave its tag in the release checkout.**",
     "**The repair command pin prints is quoted.**",
@@ -15972,11 +15972,11 @@ test("config", "the docs and the changelog describe the pin and embedder follow-
     "**The embedder loads the bytes it hashed.**",
     "**A weights refusal is asked again when the files change.**",
   ]) {
-    assert(unreleased.includes(heading), `CHANGELOG.md Unreleased does not have: ${heading}`);
+    assert(unreleased.includes(heading), `CHANGELOG.md 0.2.1 does not have: ${heading}`);
   }
   for (const [name, text] of [
     ["KNOWN_LIMITATIONS.md", limitations],
-    ["CHANGELOG.md (Unreleased)", unreleased],
+    ["CHANGELOG.md (0.2.1)", unreleased],
     ["src/embedder.ts", read("src", "embedder.ts")],
   ] as const) {
     assert(!text.includes("until it is restarted"), `${name} still says a weights refusal lasts until a restart`);
@@ -16077,8 +16077,8 @@ test("config", "the docs and the changelog say a tokenizer.json missing next to 
   const needle = "missing or unreadable while the weights file exists";
   assert(read("docs", "KNOWN_LIMITATIONS.md").includes(needle), "KNOWN_LIMITATIONS.md does not say it");
   const changelog = read("CHANGELOG.md");
-  const unreleased = changelog.slice(changelog.indexOf("## Unreleased"), changelog.indexOf("## 0.2.0"));
-  assert(unreleased.includes(needle), "CHANGELOG.md Unreleased does not say it");
+  const unreleased = changelog.slice(changelog.indexOf("## 0.2.1"), changelog.indexOf("## 0.2.0"));
+  assert(unreleased.includes(needle), "CHANGELOG.md 0.2.1 does not say it");
 });
 
 // ─── a model file over the size cap is refused, not read to the end ─────────

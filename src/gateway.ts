@@ -74,7 +74,7 @@ export function canTelegramTalk(userId: string | undefined): boolean {
   return userId !== undefined && telegramTalkAllowlist().has(userId);
 }
 
-/** The most of the Bot API's own text (a description, an error code, curl's stderr) one log line or error carries. */
+/** The most of a refusal's description, the one piece of the Bot API's own text, that one log line carries. */
 const MAX_LOGGED_API_TEXT = 300;
 /** The longest the poll loop waits between two asks, whatever the backoff or the API says. */
 const MAX_RETRY_DELAY_MS = 5 * 60 * 1000;
@@ -105,10 +105,11 @@ export function withoutTelegramToken(text: string, token: string): string {
 }
 
 /**
- * Text the Bot API or curl sent (a refusal's description and code, curl's
- * stderr), as it may be logged: without the token, and with every run of 16 or
- * more of the token's alphabet replaced by `<redacted>`, so a cut, re-cased or
- * re-encoded echo of the request path cannot carry most of the token either.
+ * A refusal's description as it may be logged: without the token, and with
+ * every run of 16 or more of the token's alphabet replaced by `<redacted>`, so a
+ * cut or re-cased echo of the request path cannot carry most of the token either.
+ * It does not decode: a description that spells the token in entities or
+ * percent-escapes, or cuts it under 16 characters, is not caught.
  */
 export function telegramApiText(text: string, token: string): string {
   return withoutTelegramToken(text, token).replace(TOKEN_ALPHABET_RUN, "<redacted>");
@@ -150,12 +151,11 @@ function telegramAnswered(method: string, data: unknown, token: string): boolean
   const body: { ok?: unknown; error_code?: unknown; description?: unknown } =
     typeof data === "object" && data !== null ? data : {};
   if (body.ok === true) return true;
-  // A number is digits; anything else the API sent in its place is escaped like the description.
-  // Both are cut before they are escaped: the answer can be as long as httpSync reads (4 MiB).
-  const code =
-    typeof body.error_code === "number"
-      ? String(body.error_code)
-      : jsonForTerminal(telegramApiText(String(body.error_code ?? "none"), token).slice(0, MAX_LOGGED_API_TEXT));
+  // The Bot API's error_code is a number, so only a number is printed. The
+  // description is the one piece of the answer's own text that is: cut before it
+  // is escaped (the answer can be as long as httpSync reads, 4 MiB), without the
+  // token and without any run of its alphabet long enough to be part of one.
+  const code = typeof body.error_code === "number" && Number.isFinite(body.error_code) ? String(body.error_code) : "(not a number)";
   const why = jsonForTerminal(telegramApiText(String(body.description ?? "none"), token).slice(0, MAX_LOGGED_API_TEXT));
   console.error(`telegram ${method} refused: error_code ${code}, description ${why}`);
   return false;
@@ -215,11 +215,11 @@ export class TelegramGateway implements GatewayAdapter {
       timeoutSec: 35,
       maxBytes: 4 * 1024 * 1024,
     });
-    // curl's stderr is text from the network, so it goes into the Error message as
-    // a JSON string, without the token or anything shaped like part of it.
+    // Only curl's exit code, a documented number that says what failed (6: could
+    // not resolve, 7: could not connect, 28: timeout, 35/60: TLS). Its stderr can
+    // carry text from the network, and runs with -s, so it is usually empty anyway.
     if (res.exitStatus !== 0) {
-      const said = telegramApiText(String(res.stderr || "no message"), this.token);
-      throw new Error(`telegram api failed: ${jsonForTerminal(said.slice(0, MAX_LOGGED_API_TEXT))}`);
+      throw new Error(`telegram api failed: curl exit ${res.exitStatus === null ? "none (not started)" : String(res.exitStatus)}`);
     }
     try {
       return JSON.parse(res.body || "{}");

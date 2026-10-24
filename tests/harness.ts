@@ -16901,7 +16901,7 @@ const NON_JSON_CURL = "printf '<html>\\033[31m boom %0300d TAILMARK\\n200' 0";
 const FAILING_CURL = "printf 'curl: (22) bad \\033[31mRED \\302\\233csi \\177del\\n' >&2\nexit 22";
 const REFUSE_401 = { ok: false, error_code: 401, description: "Unauthorized" };
 
-test("telegram", "T5_a_body_that_is_not_JSON_is_reported_by_its_size_only_and_a_curl_that_fails_as_escaped_capped_text", async () => {
+test("telegram", "T5_a_body_that_is_not_JSON_is_reported_by_its_size_only_and_a_curl_that_fails_by_its_exit_code", async () => {
   await withCurlScript(NON_JSON_CURL, async () => {
     let caught: unknown;
     try {
@@ -16921,13 +16921,8 @@ test("telegram", "T5_a_body_that_is_not_JSON_is_reported_by_its_size_only_and_a_
       caught = e;
     }
     assert(caught instanceof Error, `a curl that failed did not throw: ${String(caught)}`);
-    assert(caught.message.startsWith("telegram api failed: "), `unexpected message: ${JSON.stringify(caught.message)}`);
-    assert(
-      caught.message.includes("\\u001b[31mRED") && caught.message.includes("\\u009bcsi") && caught.message.includes("\\u007fdel"),
-      `curl's ESC, CSI and DEL are not shown as escapes: ${JSON.stringify(caught.message)}`,
-    );
-    const raw = firstRawControl(caught.message);
-    assert(raw === null, `${raw} is in the error's message: ${JSON.stringify(caught.message)}`);
+    // curl's exit code, and not a word of what it wrote to stderr.
+    assert(caught.message === "telegram api failed: curl exit 22", `unexpected message: ${JSON.stringify(caught.message)}`);
   });
   // The loop, end to end: the real api() throws, and the line the catch prints is one escaped line.
   await withCurlScript(NON_JSON_CURL, async () => {
@@ -16983,14 +16978,14 @@ test("telegram", "T11_the_bot_token_never_reaches_a_log_line_or_an_error_even_wh
     run(`printf '<h1>404</h1> '; cat`, () => caught(() => new EchoTelegram().call()));
     // The token starting at character 180, so a cut at 200 made before the token is removed keeps its first 20.
     run(`cat >/dev/null; printf '%0180d${token}' 0`, () => caught(() => new EchoTelegram().call()));
-    // A curl that fails and repeats the request on stderr, the token URL-encoded.
-    run(`cat >&2; printf ' %s' '${encodeURIComponent(token)}' >&2; exit 22`, () => caught(() => new EchoTelegram().call()));
+    // A curl that fails and repeats the request on stderr, cut and upper-cased past any copy redaction.
+    run(`cat >&2; printf ' %s' '${secret.slice(0, 20).toUpperCase()}' >&2; exit 22`, () => caught(() => new EchoTelegram().call()));
     assert(messages.length === 3 && !messages.includes("(did not throw)"), `expected three errors: ${JSON.stringify(messages)}`);
     for (const m of messages) {
       assert(!leaks(m), `the token is in an error message: ${JSON.stringify(m)}`);
     }
     assert(messages[0]!.startsWith("telegram api returned non-JSON (") && messages[1]!.startsWith("telegram api returned non-JSON ("), `a page that is not JSON is quoted: ${JSON.stringify(messages)}`);
-    assert(messages[2]!.includes("<token>"), `the token on curl's stderr was not marked as removed: ${JSON.stringify(messages[2])}`);
+    assert(messages[2] === "telegram api failed: curl exit 22", `curl's stderr reached the error: ${JSON.stringify(messages[2])}`);
     // JSON refusals whose description and code repeat the token: whole, upper-cased, cut to 20 characters of
     // the secret, and base64-encoded. Through the poll loop and its log line.
     const b64 = Buffer.from(`/bot${token}/getUpdates`).toString("base64");
@@ -16998,7 +16993,7 @@ test("telegram", "T11_the_bot_token_never_reaches_a_log_line_or_an_error_even_wh
       `{"ok":false,"error_code":404,"description":"no route /bot${token}/getUpdates"}`,
       `{"ok":false,"error_code":404,"description":"NO ROUTE /BOT${token.toUpperCase()}/GETUPDATES"}`,
       `{"ok":false,"error_code":404,"description":"no route /bot${token.slice(0, 30)}"}`,
-      `{"ok":false,"error_code":"E${secret}","description":"see ?r=${b64}"}`,
+      `{"ok":false,"error_code":"E${secret.slice(0, 20).toUpperCase()}","description":"see ?r=${b64}"}`,
     ];
     run(`cat >/dev/null; n=$(cat "${dir}/n" 2>/dev/null || echo 0); echo $((n + 1)) > "${dir}/n"; case $n in ${lines.map((l, i) => `${i}) printf '%s' '${l}' ;;`).join(" ")} *) printf '%s' '{"ok":false,"error_code":404,"description":"Not Found"}' ;; esac`, () => undefined);
     const gw = new EchoTelegram();
@@ -17137,13 +17132,14 @@ test("telegram", "T9_stop_ends_a_wait_of_seconds_and_a_loop_that_was_stopped_doe
   });
 });
 
-test("telegram", "T10_the_API_text_in_a_refusal_line_is_cut_at_300_characters", async () => {
+test("telegram", "T10_a_refusal_description_is_cut_at_300_characters_and_a_non_numeric_code_is_not_printed", async () => {
   // Words, as the API's text is: a long unbroken run would be masked as part of a token (T11).
   const gw = new RefusedTelegram({ ok: false, error_code: "Q ".repeat(500), description: "Z ".repeat(150) + "TAILMARK" }, 0);
   const logged = await captureStderrAsync(() => gw.send({ channel: "telegram", chatId: "9", text: "hello" }));
   const count = (ch: string): number => logged.split(ch).length - 1;
   assert(count("Z") === 150 && !logged.includes("TAILMARK"), `the description is not cut at 300 characters: ${count("Z")} Z, tail ${logged.includes("TAILMARK")}`);
-  assert(count("Q") === 150, `the error code is not cut at 300 characters: ${count("Q")} Q`);
+  // An error_code that is not a number is not printed at all: the Bot API's is always a number.
+  assert(count("Q") === 0 && logged.includes("error_code (not a number)"), `a non-numeric error code was printed: ${count("Q")} Q`);
 });
 
 // ─── deploy/Dockerfile has a HEALTHCHECK that works ─────────────────────────

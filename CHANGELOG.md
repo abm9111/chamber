@@ -45,12 +45,15 @@ history and the GitHub releases.
   as it was, and the poll loop printed that, and curl's stderr, unescaped. A
   body that is not JSON is now reported by its size alone, never quoted: such a
   page can echo the request path, and with it the bot token, cut, re-cased or
-  encoded past any redaction. curl's stderr and a refusal's description and
-  error code are printed as JSON strings, cut at 300 characters, with the token
-  removed in any case and every run of 16 or more of its alphabet (letters,
-  digits, `-`, `_`) shown as `<redacted>`; the poll loop prints whatever it
-  caught as a JSON string without the token (the stack trace is no longer
-  printed). A refusal that does not go away (a revoked token, a 404) was asked
+  encoded past any redaction. A curl that fails is reported by its exit code
+  alone, and a refusal's `error_code` only when it is a number. The one piece
+  of the API's own text that is printed, a refusal's description, is a JSON
+  string cut at 300 characters, with the token removed in any case and every
+  run of 16 or more of its alphabet (letters, digits, `-`, `_`) shown as
+  `<redacted>`. That does not decode: a description that spells the token in
+  HTML entities or percent-escapes, or cuts it under 16 characters, still
+  shows it. The poll loop prints whatever it caught as a JSON string without
+  the token (the stack trace is no longer printed). A refusal that does not go away (a revoked token, a 404) was asked
   again every 3 s for ever: the wait now doubles for each failed round in a row
   (an error counts too), up to five minutes, and starts over when the API
   accepts a `getUpdates`. A 429 waits as long as its `parameters.retry_after`

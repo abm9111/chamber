@@ -13225,7 +13225,7 @@ test("config", "package.json, server.json, the plugin, the served MCP version an
   // package.json installs a published release that predates the flags the
   // args pass: 0.1.9 dropped --notes without a word and every check came back
   // NOT_FOUND.
-  const plugin = JSON.parse(readFileSync(join(root, ".claude-plugin", "plugin.json"), "utf8")) as {
+  const plugin = JSON.parse(readFileSync(join(root, "plugin", ".claude-plugin", "plugin.json"), "utf8")) as {
     version: string;
     mcpServers: Record<string, { args: string[] }>;
   };
@@ -13270,8 +13270,8 @@ test("config", "package.json, server.json, the plugin, the served MCP version an
       "server.json version": registry.version,
       "server.json packages[0].version": registry.packages[0]?.version,
       "CHANGELOG.md first released heading": released[1],
-      ".claude-plugin/plugin.json version": plugin.version,
-      ".claude-plugin/plugin.json npx pin": pinned,
+      "plugin/.claude-plugin/plugin.json version": plugin.version,
+      "plugin/.claude-plugin/plugin.json npx pin": pinned,
       "mcp_server serverInfo.version": reply.result?.serverInfo?.version,
     };
     assert(new Set(Object.values(seen)).size === 1, `the version sites disagree: ${JSON.stringify(seen, null, 2)}`);

@@ -9,9 +9,10 @@ history and the GitHub releases.
 
 - **Claude Code plugin.** `/plugin install chamber --marketplace abm9111/chamber`
   asks for the notes folder, then adds the MCP server and a `chamber-check`
-  skill. The plugin runs the npm package at the version its args pin, 0.2.1;
-  0.1.9 drops `--notes` without a word and every check comes back NOT_FOUND.
-  The version test now covers `.claude-plugin/plugin.json` and the pin. The
+  skill. The plugin lives in `plugin/`, so an install copies that folder, not
+  the repo. It runs the npm package at the version its args pin, 0.2.1; 0.1.9
+  drops `--notes` without a word and every check comes back NOT_FOUND. The
+  version test now covers `plugin/.claude-plugin/plugin.json` and the pin. The
   skill is also what `npx skills add abm9111/chamber` installs.
 
 ## 0.2.2 — 2026-10-25

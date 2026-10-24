@@ -1,7 +1,7 @@
 {
   "name": "chamber",
   "description": "Checks that the numbers, capitalised names, and file names in a claim occur in the indexed note. Local, no model. It does not judge meaning.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "author": {
     "name": "abm9111",
     "url": "https://github.com/abm9111"
@@ -31,7 +31,7 @@
       "command": "npx",
       "args": [
         "-y",
-        "@bu7umaid/chamber@0.2.0",
+        "@bu7umaid/chamber@0.2.1",
         "mcp",
         "--notes",
         "${user_config.notes}"

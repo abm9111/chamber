@@ -3,6 +3,17 @@
 All notable changes to Chamber. Versions before 0.1.6 are described in the git
 history and the GitHub releases.
 
+## Unreleased
+
+### Added
+
+- **Claude Code plugin.** `/plugin install chamber --marketplace abm9111/chamber`
+  asks for the notes folder, then adds the MCP server and a `chamber-check`
+  skill. The plugin runs the npm package at the version its args pin, 0.2.1;
+  0.1.9 drops `--notes` without a word and every check comes back NOT_FOUND.
+  The version test now covers `.claude-plugin/plugin.json` and the pin. The
+  skill is also what `npx skills add abm9111/chamber` installs.
+
 ## 0.2.2 — 2026-10-25
 
 ### Fixed
@@ -95,16 +106,6 @@ history and the GitHub releases.
 
 0.2.0 was tagged but never published to npm or the MCP Registry, so this is
 the first 0.2 release there. It includes everything under 0.2.0 below.
-
-### Added
-
-- **Claude Code plugin.** `/plugin install chamber --marketplace abm9111/chamber`
-  asks for the notes folder, then adds the MCP server and a `chamber-check`
-  skill. The plugin runs the npm package at the version its args pin, which
-  must be published before this reaches the default branch: 0.1.9 drops
-  `--notes` without a word and every check comes back NOT_FOUND. The version
-  test now covers `.claude-plugin/plugin.json` and the pin. The skill is also
-  what `npx skills add abm9111/chamber` installs.
 
 ### Changed (breaking)
 

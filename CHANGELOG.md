@@ -18,14 +18,47 @@ history and the GitHub releases.
   `getUpdates` answered `{ok:false}` (401 for a revoked token, 409 for a second
   poller, 429) has no `result`, so the loop ran again at once, one `curl` spawn
   after another. It now logs one line with the error code and the description
-  (escaped), waits 3 s as it does after an error, and asks again. A
-  `sendMessage` the API refuses is logged too, and was silent.
+  (escaped), waits as it does after an error (3 s, and longer when it keeps
+  failing: see the next Telegram entry), and asks again. A `sendMessage` the API
+  refuses is logged too, and was silent.
 - **An unreadable model folder is a refusal, not "no embedder".**
   `scripts/embed_minilm.py` tested the weights path with `exists()`, which says
   no when the stat fails for any reason, so a model directory that could not be
   searched exited 1 ("missing model") and auto ingest wrote hash vectors. It now
   stats the path: not there (missing, a dangling symlink, under a file) is still
   exit 1; anything else it cannot examine is exit 3 with a "cannot read" line.
+- **Text from the network and from children is shown from a closed set.**
+  `jsonForTerminal` escaped the C0 controls, DEL and the C1 controls and let
+  everything else through, so a right-to-left override (U+202E), the line and
+  paragraph separators, zero-width characters and a byte order mark reached a
+  terminal or a pasted log unmarked. It now keeps a character only if it is the
+  space or a letter, mark, number, punctuation mark or symbol, and writes every
+  other code point as `\uXXXX` (a surrogate pair above U+FFFF). Spaces other
+  than U+0020 are escaped too (a no-break or an ideographic space), and so are
+  the zero-width joiner (U+200D) and non-joiner: a joined emoji sequence,
+  Persian text and Chinese text with U+3000 show `\u200d`, `\u200c` and
+  `\u3000` where they have them. The result is still a JSON string literal and
+  parses back to its input.
+- **The Telegram gateway prints nothing from the network raw, and backs off.**
+  A reply that was not JSON (a proxy's error page, a captive portal) made
+  `JSON.parse` throw a `SyntaxError` whose message quotes the start of the body
+  as it was, and the poll loop printed that, and curl's stderr, unescaped. The
+  errors `api()` throws now carry the body (its first 200 characters) or curl's
+  stderr as a JSON string, the poll loop prints whatever it caught as
+  a JSON string (the stack trace is no longer printed), and the description and
+  error code in a refusal line are cut at 300 characters. A refusal that does
+  not go away (a revoked token, a 404) was asked again every 3 s for ever: the
+  wait now doubles for each failed round in a row (an error counts too), up to
+  five minutes, and starts over when the API accepts a `getUpdates`. A 429 waits
+  as long as its `parameters.retry_after` says, up to the same five minutes.
+  `stop()` ends a wait, so a long one does not hold the process.
+- **A refusal's advice fits an unreadable model file too.** The error for a
+  refused model told every case to put back the files `models/minilm/VERSION`
+  records, which is wrong when the script could not read a file (exit 3 since
+  this release) or the file is not a regular file. It now says the files were
+  refused or could not be read, and gives one instruction for a hash that does
+  not match and one for a file that cannot be read. It is still keyed on the
+  exit code alone.
 
 ### Changed
 
@@ -43,6 +76,12 @@ history and the GitHub releases.
   your indexed notes. Local; no model." (91 characters). `mcp-publisher` refuses
   more than 100, and a test now holds that. `package.json`'s description is
   unchanged.
+- **The HTTP server image has a healthcheck.** `deploy/Dockerfile` now carries a
+  `HEALTHCHECK` that fetches `/health` on `PORT` (it needs no token), every 15 s
+  with a 5 s timeout and 3 retries, as `deploy/docker-compose.yml` already did.
+  A bare `docker run` or another orchestrator now gets a health status; the
+  compose file's own healthcheck is unchanged. The stdio image in the root
+  `Dockerfile` has no port and no healthcheck.
 
 ## 0.2.1 — 2026-10-24
 

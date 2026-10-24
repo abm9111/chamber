@@ -17187,6 +17187,34 @@ test("config", "a refusal's advice covers a hash that does not match and a file 
   }
 });
 
+// ─── the 0.2.2 changelog covers the audit fixes ─────────────────────────────
+
+test("config", "the 0.2.2 changelog has an entry for each of the four audit fixes, and no longer says the Telegram loop waits a fixed 3 s", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const changelog = readFileSync(join(root, "CHANGELOG.md"), "utf8");
+  const section = changelog.slice(changelog.indexOf("## 0.2.2"), changelog.indexOf("## 0.2.1"));
+  const fixedAt = section.indexOf("### Fixed");
+  const changedAt = section.indexOf("### Changed");
+  assert(fixedAt > 0 && changedAt > fixedAt, "the 0.2.2 section of CHANGELOG.md does not have ### Fixed and then ### Changed");
+  const fixed = section.slice(fixedAt, changedAt);
+  const changed = section.slice(changedAt);
+  for (const [heading, words] of [
+    ["**Text from the network and from children is shown from a closed set.**", ["U+202E", "\\uXXXX", "U+200D"]],
+    ["**The Telegram gateway prints nothing from the network raw, and backs off.**", ["not JSON", "five minutes", "retry_after", "300 characters"]],
+    ["**A refusal's advice fits an unreadable model file too.**", ["could not be read", "exit code"]],
+  ] as const) {
+    assert(fixed.includes(heading), `CHANGELOG.md 0.2.2 / Fixed does not have: ${heading}`);
+    const entry = fixed.slice(fixed.indexOf(heading));
+    for (const word of words) assert(entry.includes(word), `the entry ${heading} does not mention ${word}`);
+  }
+  const healthcheck = "**The HTTP server image has a healthcheck.**";
+  assert(changed.includes(healthcheck), `CHANGELOG.md 0.2.2 / Changed does not have: ${healthcheck}`);
+  for (const word of ["deploy/Dockerfile", "HEALTHCHECK", "/health", "docker-compose.yml"]) {
+    assert(changed.slice(changed.indexOf(healthcheck)).includes(word), `the healthcheck entry does not mention ${word}`);
+  }
+  assert(!section.includes("waits 3 s as it does after an error"), "the Telegram entry above still says the loop waits a fixed 3 s");
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

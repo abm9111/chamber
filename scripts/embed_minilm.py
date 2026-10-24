@@ -17,10 +17,13 @@ Exit status 3: the model files were not loaded because they are not the ones the
 package's own models/minilm/VERSION records -- the SHA-256 of
 model_quantized.onnx or of tokenizer.json differs, VERSION is missing or is not
 UTF-8, it lacks exactly one line for either hash, a model file is not a regular
-file (a FIFO or a directory; it is never opened for a blocking read), or
-tokenizer.json cannot be read while the weights file exists (a missing weights
-file is exit 1: there is no embedder). The check runs in every mode, before the
-first reply and before numpy or onnxruntime is imported.
+file (a FIFO or a directory; it is never opened for a blocking read), the
+weights file cannot be examined (a model directory that cannot be searched), or
+tokenizer.json cannot be read while the weights file exists. A weights file that
+is not there is exit 1: there is no embedder. That is a missing file, a dangling
+symlink and a path under something that is not a directory, and nothing else.
+The check runs in every mode, before the first reply and before numpy or
+onnxruntime is imported.
 
 The files are read once. The bytes that were hashed are the bytes the session
 and the tokenizers are built from, so a file replaced on disk after the check is
@@ -144,8 +147,12 @@ def verify_weights() -> None:
     VERSION is missing or is not UTF-8, it has not exactly one line for either
     hash, or a model file is not a regular file or cannot be read (a
     tokenizer.json that is missing, unreadable, a FIFO or a directory included).
-    The weights file must exist: without it the exit is 1, no embedder. This
-    runs before numpy and onnxruntime are imported, so it needs neither.
+    The weights file must exist: without it (not there, a dangling symlink, or a
+    path under something that is not a directory) the exit is 1, no embedder.
+    But a weights path that cannot be examined at all (a model directory that
+    cannot be searched, a symlink loop) is not a missing file: it is exit 3,
+    "cannot read". This runs before numpy and onnxruntime are imported, so it
+    needs neither.
     """
     global _weights_verified, _onnx_bytes, _tokenizer_json
     if _weights_verified:
@@ -156,11 +163,20 @@ def verify_weights() -> None:
     # same hashed reader below, so a tokenizer that is missing or unreadable
     # next to weights that exist is exit 3. As an ordinary failure it let a
     # tampered model file with no tokenizer fall through to hash vectors.
-    # `exists()`, not `is_file()`: a weights path that is there but is not a
-    # regular file (a FIFO, a directory) is not a missing file, and _read_hashed
-    # refuses it without a blocking read.
-    if not ONNX_PATH.exists():
-        raise SystemExit(f"missing model: {ONNX_PATH}")
+    # A stat, not `is_file()` or `exists()`. A weights path that is there but is
+    # not a regular file (a FIFO, a directory) is not a missing file, and
+    # _read_hashed refuses it without a blocking read. And `exists()` answers
+    # False for a stat that failed for any reason: a model directory that cannot
+    # be searched (EACCES) read as "no embedder" and auto ingest wrote hash
+    # vectors. Only a path that is not there is exit 1: ENOENT (missing, or a
+    # dangling symlink: the stat follows links) and ENOTDIR (a component of the
+    # path is a file). Any other failure is a refusal.
+    try:
+        os.stat(ONNX_PATH)
+    except (FileNotFoundError, NotADirectoryError):
+        raise SystemExit(f"missing model: {ONNX_PATH}") from None
+    except OSError as e:
+        _refuse_weights(f"cannot read {ONNX_PATH} ({e.strerror or e})")
     try:
         version_text = VERSION_PATH.read_text(encoding="utf-8")
     except OSError as e:

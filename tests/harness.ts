@@ -16581,6 +16581,84 @@ test("telegram", "T4_a_sendMessage_the_Bot_API_refuses_is_logged_and_an_accepted
   assert(fine.sendAttempts === 1 && quiet === "", `an accepted send wrote to stderr: "${quiet}"`);
 });
 
+// ─── a model folder the script cannot examine is a refusal, not "no embedder" ─
+
+test("config", "a weights path the script cannot examine is refused with exit 3 in every mode, and a missing, dangling or non-directory one stays exit 1", () => {
+  const runIn = (
+    dir: string,
+    args: readonly string[],
+    input: string | undefined,
+  ): { error?: Error; status: number | null; stdout: string; stderr: string } =>
+    spawnSync(embedPython(), [EMBED_SCRIPT, ...args], {
+      encoding: "utf8",
+      input,
+      timeout: 10_000,
+      env: { ...process.env, CHAMBER_MINILM_DIR: dir },
+    });
+  // Root can search any directory, so the locked case is skipped there.
+  const canLock = (process.getuid?.() ?? 0) !== 0;
+  const locked = minilmDirWith({});
+  const dangling = minilmDirWith({});
+  rmSync(join(dangling, "model_quantized.onnx"));
+  symlinkSync(join(dangling, "nowhere"), join(dangling, "model_quantized.onnx"));
+  const loop = minilmDirWith({});
+  rmSync(join(loop, "model_quantized.onnx"));
+  symlinkSync("model_quantized.onnx", join(loop, "model_quantized.onnx"));
+  const underFile = mkdtempSync(join(tmpdir(), "chamber-minilm-file-"));
+  writeFileSync(join(underFile, "not-a-directory"), "x\n");
+  try {
+    if (canLock) chmodSync(locked, 0o000);
+    for (const [label, args, input] of [
+      ["one-shot", ["a sentence"], undefined],
+      ["--json -", ["--json", "-"], '["a sentence"]'],
+      ["--serve", ["--serve"], '["a sentence"]\n'],
+    ] as const) {
+      // Exit 3: the path is there, or may be, and cannot be looked at.
+      const refused: [string, string][] = canLock ? [["a model directory that cannot be searched", locked]] : [];
+      refused.push(["a symlink loop", loop]);
+      for (const [what, dir] of refused) {
+        const r = runIn(dir, args, input);
+        assert(r.error === undefined, `${label}, ${what}: the script did not finish within 10 s (${String(r.error)})`);
+        assert(r.status === 3, `${label}, ${what}: exit ${r.status}, stderr ${r.stderr}`);
+        assert(r.stdout === "", `${label}, ${what}: wrote a reply before refusing: ${r.stdout}`);
+        const lines = r.stderr.trim().split("\n");
+        assert(lines.length === 1, `${label}, ${what}: expected one stderr line, got ${lines.length}: ${r.stderr}`);
+        assert(
+          lines[0]!.includes("cannot read") && lines[0]!.includes("model_quantized.onnx") && !lines[0]!.includes("missing model"),
+          `${label}, ${what}: the line does not say the weights cannot be read: ${lines[0]}`,
+        );
+      }
+      // Exit 1: there is no weights file, and nothing else is wrong.
+      for (const [what, dir] of [
+        ["a dangling symlink as the weights file", dangling],
+        ["CHAMBER_MINILM_DIR naming a file", join(underFile, "not-a-directory")],
+      ] as const) {
+        const r = runIn(dir, args, input);
+        assert(r.error === undefined, `${label}, ${what}: the script did not finish within 10 s (${String(r.error)})`);
+        assert(r.status === 1 && r.stderr.includes("missing model"), `${label}, ${what}: exit ${r.status}, stderr ${r.stderr}`);
+      }
+    }
+  } finally {
+    chmodSync(locked, 0o755);
+    for (const dir of [locked, dangling, loop, underFile]) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the embedder's docstrings say a weights path that cannot be examined is exit 3 and a missing one is exit 1", () => {
+  const text = readFileSync(EMBED_SCRIPT, "utf8").replace(/\s+/g, " ");
+  const verify = text.slice(text.indexOf("def verify_weights"), text.indexOf("global _weights_verified"));
+  assert(verify.length > 0, "could not find verify_weights in scripts/embed_minilm.py");
+  assert(
+    verify.includes("a weights path that cannot be examined") && verify.includes("a dangling symlink"),
+    "the verify_weights docstring does not say what is exit 3 and what is a missing weights file",
+  );
+  const head = text.slice(0, text.indexOf("from __future__"));
+  assert(
+    head.includes("the weights file cannot be examined") && head.includes("a dangling symlink"),
+    "the module docstring does not say a weights path that cannot be examined is exit 3",
+  );
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

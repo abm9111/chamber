@@ -13435,7 +13435,7 @@ function fakePackage(version: string | Buffer | null): { root: string; script: s
 const EMBED_SCRIPT = fileURLToPath(new URL("../scripts/embed_minilm.py", import.meta.url));
 
 /**
- * Run the script with python3. `dir` is CHAMBER_MINILM_DIR (null: unset, so the
+ * Run the script with embedPython(). `dir` is CHAMBER_MINILM_DIR (null: unset, so the
  * shipped model); `script` is another copy of the script, as fakePackage makes.
  */
 function runEmbedScript(
@@ -13448,13 +13448,13 @@ function runEmbedScript(
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (dir === null) delete env.CHAMBER_MINILM_DIR;
   else env.CHAMBER_MINILM_DIR = dir;
-  const r = spawnSync("python3", [...pythonFlags, script, ...args], {
+  const r = spawnSync(embedPython(), [...pythonFlags, script, ...args], {
     encoding: "utf8",
     input,
     timeout: 120_000,
     env,
   });
-  assert(r.error === undefined, `python3 did not run: ${r.error}`);
+  assert(r.error === undefined, `${embedPython()} did not run: ${r.error}`);
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
@@ -13596,7 +13596,7 @@ test("config", "the real model directory passes the weights check", () => {
       assert(r.status === 0, `exit ${r.status}: ${r.stderr}`);
       assert((JSON.parse(r.stdout) as number[]).length === 384, "expected a 384-dimension vector");
     }
-    const plain = spawnSync("python3", [EMBED_SCRIPT, "a sentence"], { encoding: "utf8", timeout: 120_000 });
+    const plain = spawnSync(embedPython(), [EMBED_SCRIPT, "a sentence"], { encoding: "utf8", timeout: 120_000 });
     assert(plain.status !== 3, `the default model directory was refused: ${plain.stderr}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -17320,6 +17320,34 @@ test("config", "the 0.2.2 changelog has an entry for each of the four audit fixe
     assert(changed.slice(changed.indexOf(healthcheck)).includes(word), `the healthcheck entry does not mention ${word}`);
   }
   assert(!section.includes("waits 3 s as it does after an error"), "the Telegram entry above still says the loop waits a fixed 3 s");
+});
+
+// ─── the embed-script spawns in the harness use the interpreter the suite was told to use ──
+
+test("config", "runEmbedScript runs CHAMBER_PYTHON, not whatever python3 the PATH offers", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-fakepy-"));
+  const saved = process.env.CHAMBER_PYTHON;
+  try {
+    const fake = join(dir, "fake-python");
+    writeFileSync(fake, '#!/bin/sh\necho "fake-python $*"\nexit 0\n');
+    chmodSync(fake, 0o755);
+    process.env.CHAMBER_PYTHON = fake;
+    const r = runEmbedScript(null, ["a sentence"]);
+    assert(r.stdout.startsWith("fake-python "), `runEmbedScript did not run CHAMBER_PYTHON (exit ${r.status}): ${r.stdout}${r.stderr}`);
+    assert(r.status === 0, `the fake interpreter exited ${r.status}: ${r.stderr}`);
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "no spawn in the harness names a bare python3", () => {
+  const source = readFileSync(fileURLToPath(import.meta.url), "utf8");
+  // Built from two pieces so this test's own text does not match it.
+  const bare = new RegExp('spawn(?:Sync)?\\(\\s*"python' + '3"', "g");
+  const lines = [...source.matchAll(bare)].map((m) => source.slice(0, m.index).split("\n").length);
+  assert(lines.length === 0, `harness.ts spawns a bare python3 at line(s) ${lines.join(", ")}: use embedPython()`);
 });
 
 // ─── cli process smoke tests ────────────────────────────────────────────────
@@ -22759,7 +22787,7 @@ test("embedder", "stdin groups stay in order and an oversized text throws before
 
 test("embedder", "a long embedder argument is refused before the model is imported", () => {
   const script = fileURLToPath(new URL("../scripts/embed_minilm.py", import.meta.url));
-  const run = spawnSync("python3", [script, "x".repeat(2049)], { encoding: "utf8" });
+  const run = spawnSync(embedPython(), [script, "x".repeat(2049)], { encoding: "utf8" });
   assert(run.status === 2, `status ${run.status} stderr ${run.stderr}`);
   assert(
     (run.stderr || "").trim() ===
@@ -22770,12 +22798,12 @@ test("embedder", "a long embedder argument is refused before the model is import
 
 test("embedder", "--serve refuses a long argument before importing the model", () => {
   const script = fileURLToPath(new URL("../scripts/embed_minilm.py", import.meta.url));
-  const bare = spawnSync("python3", [script], { encoding: "utf8" });
+  const bare = spawnSync(embedPython(), [script], { encoding: "utf8" });
   assert(bare.status === 2, `status ${bare.status} stderr ${bare.stderr}`);
   assert((bare.stderr || "").includes("--serve"), bare.stderr);
 
   const run = spawnSync(
-    "python3",
+    embedPython(),
     ["-X", "importtime", script, "--serve", "x".repeat(2049)],
     { encoding: "utf8" },
   );

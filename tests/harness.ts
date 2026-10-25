@@ -17784,6 +17784,40 @@ test("config", "README, the skill and the CHANGELOG explain updates, the duplica
   }
 });
 
+// ─── CI starts the plugin in Claude Code on Windows ─────────────────────────
+
+test("config", "CI starts the plugin in Claude Code on windows-latest, from fresh npm directories, outside the checkout", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const lines = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8").split("\n");
+  const start = lines.indexOf("  plugin-windows:");
+  assert(start >= 0, "the workflow has no plugin-windows job");
+  let end = start + 1;
+  while (end < lines.length && !/^ {0,2}\S/.test(lines[end] ?? "")) end += 1;
+  const job = lines.slice(start, end).join("\n");
+  for (const [what, needle] of [
+    ["runs on Windows", "runs-on: windows-latest"],
+    ["a fresh npm prefix", "NPM_CONFIG_PREFIX="],
+    ["a fresh npm cache", "NPM_CONFIG_CACHE="],
+    ["a fresh npm user config", "NPM_CONFIG_USERCONFIG="],
+    ["a fresh Claude Code config", "CLAUDE_CONFIG_DIR="],
+    ["the marketplace added from the checkout", 'claude plugin marketplace add "$GITHUB_WORKSPACE"'],
+    ["the plugin installed", "claude plugin install chamber@chamber"],
+    ["the plugin configured", "claude plugin configure chamber@chamber --values-stdin"],
+    ["a notes folder with a space in its name", 'notes="$RUNNER_TEMP/my notes"'],
+    ["the server listed", "claude mcp list"],
+    ["the launcher named in the list", "*launch.mjs*Connected)"],
+    ["the pin read out of plugin.json", "mcpServers.chamber.args[1]"],
+    ["the unpacked package checked for a link", "stat.isSymbolicLink()"],
+    ["the unpacked package compared with the pin", "if (got !== want)"],
+  ] as const) {
+    assert(job.includes(needle), `the plugin-windows job lacks ${what}: ${needle}`);
+  }
+  assert(/^\s+- run: npm install -g .*@anthropic-ai\/claude-code@\d+\.\d+\.\d+\s*$/m.test(job), "Claude Code is not installed at an exact version");
+  assert(!/continue-on-error|^\s+if:/m.test(job), "the plugin-windows job can pass when a step fails (continue-on-error or if:)");
+  const dirs = [...job.matchAll(/working-directory:\s*(.+)$/gm)].map((m) => m[1]);
+  assert(dirs.length >= 2 && dirs.every((d) => d === "${{ runner.temp }}/work"), `Claude Code must run outside the checkout, got working-directory ${JSON.stringify(dirs)}`);
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

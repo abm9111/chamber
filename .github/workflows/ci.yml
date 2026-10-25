@@ -113,6 +113,100 @@ jobs:
       # what the tool does is worse than no demo, so a failure is a red build.
       - run: npm run demos
 
+  # The plugin starts Chamber through plugin/launch.mjs because a bare `npx` is
+  # an npx.cmd shim on native Windows, which Claude Code cannot spawn
+  # (anthropics/claude-code#68221). Nothing else in this file runs on Windows,
+  # and the launcher's unit tests cannot say whether Claude Code can start it.
+  # This job installs Claude Code, adds this checkout as a marketplace,
+  # installs and configures the plugin with a notes folder whose path has a
+  # space, and requires `claude mcp list` to show the server Connected.
+  #
+  # It must not pass on a Chamber that was already on the runner or linked in.
+  # npm's prefix, cache and user config are fresh directories. Claude Code runs
+  # outside the checkout: inside it, `npx -y @bu7umaid/chamber@x` finds the
+  # project's own name, unpacks nothing and runs whatever `chamber` it finds
+  # (measured on a machine with a linked checkout: that one, at another version).
+  # The last step reads the version out of the package npx unpacked and requires
+  # a real directory at the version plugin.json pins.
+  #
+  # Not a required check: main has no branch protection and no rulesets
+  # (checked 2026-10-25), so nothing here is required until someone adds that.
+  plugin-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Fresh npm and Claude Code directories
+        run: |
+          set -euo pipefail
+          for dir in npm-prefix npm-cache claude-config work; do
+            mkdir -p "$RUNNER_TEMP/$dir"
+          done
+          : > "$RUNNER_TEMP/npmrc"
+          {
+            echo "NPM_CONFIG_PREFIX=$(cygpath -w "$RUNNER_TEMP/npm-prefix")"
+            echo "NPM_CONFIG_CACHE=$(cygpath -w "$RUNNER_TEMP/npm-cache")"
+            echo "NPM_CONFIG_USERCONFIG=$(cygpath -w "$RUNNER_TEMP/npmrc")"
+            echo "CLAUDE_CONFIG_DIR=$(cygpath -w "$RUNNER_TEMP/claude-config")"
+          } >> "$GITHUB_ENV"
+          cygpath -w "$RUNNER_TEMP/npm-prefix" >> "$GITHUB_PATH"
+      # Pinned to the release the plugin's behaviour was measured on
+      # (2026-10-25). Moving it is a decision, not drift.
+      - run: npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code@2.1.310
+      - run: claude --version
+      - name: Add the marketplace, install the plugin, set a notes folder with a space in its name
+        working-directory: ${{ runner.temp }}/work
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/my notes"
+          mkdir -p "$notes/sub dir" "$notes/.obsidian"
+          echo 'The budget is 240k.' > "$notes/a.md"
+          claude plugin marketplace add "$GITHUB_WORKSPACE"
+          claude plugin install chamber@chamber
+          node -p "JSON.stringify({ notes: process.argv[1], exclude: '.obsidian,sub dir' })" "$(cygpath -w "$notes")" \
+            | claude plugin configure chamber@chamber --values-stdin
+      - name: Claude Code starts the server through the launcher
+        working-directory: ${{ runner.temp }}/work
+        run: |
+          set -euo pipefail
+          claude mcp list | tr -d '\r' | tee "$RUNNER_TEMP/mcp-list.txt"
+          line=$(grep '^plugin:chamber:chamber:' "$RUNNER_TEMP/mcp-list.txt")
+          case "$line" in
+            *launch.mjs*Connected) echo "connected through launch.mjs" ;;
+            *) echo "the plugin's server is not Connected through launch.mjs: $line" >&2; exit 1 ;;
+          esac
+      - name: What ran is the published package at the version plugin.json pins
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          pin=$(node -p "require('./plugin/.claude-plugin/plugin.json').mcpServers.chamber.args[1]")
+          version=${pin##*@}
+          echo "plugin.json pins $pin"
+          found=0
+          for pkg in "$RUNNER_TEMP"/npm-cache/_npx/*/node_modules/@bu7umaid/chamber; do
+            node -e "
+              const fs = require('fs');
+              const path = require('path');
+              const [dir, want] = process.argv.slice(1);
+              const stat = fs.lstatSync(dir);
+              if (!stat.isDirectory() || stat.isSymbolicLink()) { console.error('not a real directory: ' + dir); process.exit(1); }
+              const got = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version;
+              if (got !== want) { console.error(dir + ' is ' + got + ', plugin.json pins ' + want); process.exit(1); }
+              console.log(dir + ' is ' + got);
+            " "$(cygpath -w "$pkg")" "$version"
+            found=$((found + 1))
+          done
+          [ "$found" -ge 1 ] || { echo "npx unpacked no @bu7umaid/chamber into the fresh cache" >&2; exit 1; }
+          [ ! -e "$RUNNER_TEMP/npm-prefix/node_modules/@bu7umaid" ] || { echo "a global @bu7umaid package exists in the fresh prefix" >&2; exit 1; }
+
   # `npm audit` reads package-lock.json, so it covers the toolchain that
   # `npm ci` installs (eslint, typescript, the Slack and Discord gateways).
   # Runtime dependencies are deliberately empty, which is why this is a

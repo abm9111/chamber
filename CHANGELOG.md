@@ -15,12 +15,16 @@ history and the GitHub releases.
   word and every check comes back NOT_FOUND. It starts the package through
   `plugin/launch.mjs`, not a bare `npx`, which on native Windows is a `.cmd`
   file Claude Code cannot start: the launcher runs npm's own `npx-cli.js` with
-  the same `node`, with no shell, so a folder name with a space, a quote or a
-  `%` reaches Chamber whole. It refuses an empty or relative notes folder with a
+  the same `node` and adds no shell and no quoting of its own. npm's exec step
+  then starts Chamber through a shell with npm's own escaping; on macOS a
+  folder name with a space, a quote, `%`, `$` or a trailing backslash was shown
+  to arrive whole, and on Windows that second step is untested. It refuses an empty or relative notes folder with a
   line that names `/plugin configure chamber@chamber`, passes the host's
   signals to the server, and writes only to stderr, because stdout is the MCP
   stream. It starts the server from the home folder, so a session opened inside
-  a clone of Chamber still runs the pinned version and not the local copy. The
+  a clone of Chamber still runs the pinned version and not the local copy; a
+  relative path in Chamber's own config (an ingest root, `CHAMBER_DB`) now
+  resolves against the home folder too. The
   version test covers `plugin/.claude-plugin/plugin.json`, the pin
   and the skill's pin, and a `windows-latest` CI job installs the plugin into
   Claude Code and requires the server to connect. The skill is also what

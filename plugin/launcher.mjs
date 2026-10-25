@@ -10,7 +10,7 @@
 // goes to stderr, and the child inherits both.
 import { spawn } from "node:child_process";
 import { statSync } from "node:fs";
-import { homedir, constants as osConstants } from "node:os";
+import { homedir, tmpdir, constants as osConstants } from "node:os";
 import { posix, win32 } from "node:path";
 
 const CONFIGURE = "/plugin configure chamber@chamber";
@@ -170,14 +170,20 @@ export function main(options = {}) {
   // From the home folder, not the session's working directory: inside a clone of
   // Chamber (or any folder whose package.json is @bu7umaid/chamber), npx runs that
   // local copy instead of the pinned version. The notes folder is absolute, so the
-  // working directory changes nothing else.
+  // working directory changes nothing else. An empty HOME would make spawn keep
+  // the session's directory, so it falls back to the temp folder instead.
+  const cwd = options.cwd ?? (homedir() || tmpdir());
   const child = spawn(execPath, [npx.path, "-y", parsed.spec, ...built.argv], {
     stdio: "inherit",
     windowsHide: true,
-    cwd: options.cwd ?? homedir(),
+    cwd,
   });
   child.once("error", (error) => {
-    fail(`chamber: could not start npx with ${shown(execPath)}: ${error.message}`, 1);
+    // A working directory that is missing or unreadable is reported by Node as
+    // ENOENT or EACCES on the executable, so the folder is named too.
+    const code = /** @type {NodeJS.ErrnoException} */ (error).code;
+    const where = code === "ENOENT" || code === "EACCES" ? ` (from the folder ${shown(cwd)}, which may be missing or unreadable)` : "";
+    fail(`chamber: could not start npx with ${shown(execPath)}${where}: ${error.message}`, 1);
     process.exit();
   });
   // The host stops a server by signalling this process. The child is what

@@ -17614,6 +17614,11 @@ test("config", "the launcher starts Chamber from the home folder, so a Chamber c
     const seen = r.stdout.replace(/^CWD /, "").trim();
     assert(realpathSync(seen) === realpathSync(homedir()), `npx ran in ${seen}, wanted the home folder ${homedir()}`);
     assert(realpathSync(seen) !== realpathSync(clone), "npx ran in the session's working directory");
+    // A home folder that is gone: Node blames the executable, so the launcher names the folder.
+    const gone = join(fx.dir, "no such home");
+    const missing = runLauncher(fx, { args: [LAUNCHER_SPEC, "--notes", "/n", "--exclude", ""], npxCli: fx.fake, cwd: gone }, "cwd");
+    assert(missing.status === 1 && missing.stdout === "", `a missing start folder: exit ${missing.status}, stdout ${JSON.stringify(missing.stdout)}`);
+    assert(missing.stderr.includes(JSON.stringify(gone)), `the error does not name the folder: ${missing.stderr}`);
   } finally {
     rmSync(fx.dir, { recursive: true, force: true });
   }

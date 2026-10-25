@@ -102,6 +102,7 @@ import {
 // What fix wave 5 adds is reached through a namespace, so that an export that is
 // missing fails the one test that needs it instead of stopping the whole run.
 import * as pinApi from "../src/release_pin.ts";
+import * as launcher from "../plugin/launcher.mjs";
 import * as commitApi from "../src/commit_belief.ts";
 import {
   minilmAvailable,
@@ -17355,6 +17356,114 @@ test("config", "no spawn in the harness names a bare python3", () => {
   const bare = new RegExp('spawn(?:Sync)?\\(\\s*"python' + '3"', "g");
   const lines = [...source.matchAll(bare)].map((m) => source.slice(0, m.index).split("\n").length);
   assert(lines.length === 0, `harness.ts spawns a bare python3 at line(s) ${lines.join(", ")}: use embedPython()`);
+});
+
+// ─── the plugin's launcher builds Chamber's arguments ───────────────────────
+
+function launcherArgv(notes: string, exclude: string, platform: string): string[] {
+  const built = launcher.buildArgs({ notes, exclude, platform });
+  assert("argv" in built, `buildArgs refused ${JSON.stringify(notes)} on ${platform}: ${"refuse" in built ? built.refuse : ""}`);
+  return built.argv;
+}
+
+function launcherRefusal(notes: string, exclude: string, platform: string): string {
+  const built = launcher.buildArgs({ notes, exclude, platform });
+  assert("refuse" in built, `buildArgs accepted ${JSON.stringify(notes)} / ${JSON.stringify(exclude)} on ${platform}: ${JSON.stringify(built)}`);
+  assert(built.refuse.startsWith("chamber: "), `a refusal does not start with "chamber: ": ${built.refuse}`);
+  assert(built.refuse.includes("/plugin configure chamber@chamber"), `a refusal does not name /plugin configure chamber@chamber: ${built.refuse}`);
+  return built.refuse;
+}
+
+test("config", "the launcher passes a notes folder on macOS and Linux as one argument, whatever characters it has", () => {
+  for (const platform of ["darwin", "linux"]) {
+    for (const [what, notes] of [
+      ["a space", "/Users/a b/Notes x"],
+      ["quotes", `/Users/o'brien/"q"`],
+      ["percent and dollar signs", "/tmp/100%/$HOME/%PATH%"],
+      ["unicode", "/Users/ü ñ/笔记/\u{1f4d3}"],
+      ["a backslash", "/tmp/a\\b"],
+      ["a home folder", "~"],
+      ["a folder under home", "~/My Notes"],
+    ] as const) {
+      const argv = launcherArgv(notes, "", platform);
+      assert(JSON.stringify(argv) === JSON.stringify(["mcp", "--notes", notes]), `${what} on ${platform}: ${JSON.stringify(argv)}`);
+    }
+  }
+});
+
+test("config", "the launcher passes a notes folder on Windows as one argument, whatever characters it has", () => {
+  for (const [what, notes] of [
+    ["a space", "C:\\Users\\a b\\Notes x"],
+    ["quotes", `C:\\Users\\o'brien\\"q"`],
+    ["percent and dollar signs", "D:\\100%\\%PATH%\\$x"],
+    ["forward slashes", "C:/Users/forward slash/notes"],
+    ["a UNC share", "\\\\srv\\share\\a b"],
+    ["unicode", "C:\\Users\\ü ñ\\笔记"],
+    ["a home folder", "~"],
+    ["a folder under home", "~/My Notes"],
+  ] as const) {
+    const argv = launcherArgv(notes, "", "win32");
+    assert(JSON.stringify(argv) === JSON.stringify(["mcp", "--notes", notes]), `${what}: ${JSON.stringify(argv)}`);
+  }
+});
+
+test("config", "the launcher turns the comma list into one --exclude per folder, trimmed, with empty items dropped", () => {
+  for (const platform of ["darwin", "win32"]) {
+    const notes = platform === "win32" ? "C:\\n" : "/n";
+    for (const [exclude, items] of [
+      ["", []],
+      ["   ", []],
+      [",,,", []],
+      ["a", ["a"]],
+      ["a b,c", ["a b", "c"]],
+      [" .obsidian , *sync-conflict* ,, attachments ", [".obsidian", "*sync-conflict*", "attachments"]],
+      ["ü ñ,笔记", ["ü ñ", "笔记"]],
+      [`a"b,%PATH%`, [`a"b`, "%PATH%"]],
+    ] as const) {
+      const want = ["mcp", "--notes", notes, ...items.flatMap((item) => ["--exclude", item])];
+      const argv = launcherArgv(notes, exclude, platform);
+      assert(JSON.stringify(argv) === JSON.stringify(want), `${JSON.stringify(exclude)} on ${platform}: ${JSON.stringify(argv)}, wanted ${JSON.stringify(want)}`);
+    }
+  }
+});
+
+test("config", "the launcher refuses a notes folder Chamber would resolve against the wrong directory, and names /plugin configure", () => {
+  for (const notes of ["", "   "]) {
+    for (const platform of ["darwin", "win32"]) {
+      assert(launcherRefusal(notes, "", platform).includes("no notes folder is set"), `${JSON.stringify(notes)} on ${platform}: the refusal does not say no folder is set`);
+    }
+  }
+  for (const [notes, platform] of [
+    ["rel/notes", "darwin"],
+    ["./notes", "linux"],
+    ["../notes", "darwin"],
+    ["notes", "darwin"],
+    ["~bob/notes", "darwin"],
+    ["C:\\Users\\x", "darwin"],
+    ["rel\\notes", "win32"],
+    ["C:notes", "win32"],
+    ["notes", "win32"],
+    ["~bob\\notes", "win32"],
+    ["-x", "darwin"],
+  ] as const) {
+    const refusal = launcherRefusal(notes, "", platform);
+    assert(refusal.includes("is not an absolute path") && refusal.includes(JSON.stringify(notes)), `${notes} on ${platform}: ${refusal}`);
+  }
+  for (const exclude of ["-x", "a,-b", " -c"]) {
+    assert(launcherRefusal("/n", exclude, "darwin").includes('starts with "-"'), `${JSON.stringify(exclude)} was not refused for its leading "-"`);
+  }
+});
+
+test("config", "tsc and eslint both cover the plugin's JavaScript", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+    include: string[];
+    compilerOptions: { allowJs?: boolean; checkJs?: boolean };
+  };
+  assert(tsconfig.include.includes("plugin/**/*.mjs"), "tsconfig.json does not include plugin/**/*.mjs");
+  assert(tsconfig.compilerOptions.allowJs === true && tsconfig.compilerOptions.checkJs === true, "tsconfig.json does not type-check JavaScript");
+  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { scripts: Record<string, string> };
+  assert(/^eslint\b.*\bplugin\b/.test(pkg.scripts["lint"] ?? ""), `the lint script does not lint plugin/: ${pkg.scripts["lint"]}`);
 });
 
 // ─── cli process smoke tests ────────────────────────────────────────────────

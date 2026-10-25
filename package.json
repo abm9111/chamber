@@ -68,7 +68,7 @@
     "serve": "node --experimental-strip-types src/server.ts",
     "gateway:slack": "node --experimental-strip-types src/slack_runner.ts",
     "gateway:discord": "node --experimental-strip-types src/discord_runner.ts",
-    "lint": "eslint src tests probes demos scripts",
+    "lint": "eslint src tests probes demos scripts plugin",
     "probes:isolation": "CHAMBER_SANDBOX_REQUIRED=1 node --experimental-strip-types probes/sandbox_confines.ts",
     "calibrate:paraphrase": "node --experimental-strip-types scripts/calibrate_paraphrase_threshold.ts",
     "eval:retrieval": "node --experimental-strip-types scripts/eval_retrieval.ts",

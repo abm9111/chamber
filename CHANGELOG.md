@@ -20,7 +20,8 @@ history and the GitHub releases.
   folder name with a space, a quote, `%`, `$` or a trailing backslash was shown
   to arrive whole, and on Windows that second step is untested. It refuses an empty or relative notes folder with a
   line that names `/plugin configure chamber@chamber`, passes the host's
-  signals to the server, and writes only to stderr, because stdout is the MCP
+  signals to the server (a hangup as SIGTERM, since npm forwards only SIGINT
+  and SIGTERM), and writes only to stderr, because stdout is the MCP
   stream. It starts the server from the home folder, so a session opened inside
   a clone of Chamber still runs the pinned version and not the local copy; a
   relative path in Chamber's own config (an ingest root, `CHAMBER_DB`) now

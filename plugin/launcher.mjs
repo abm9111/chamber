@@ -187,10 +187,12 @@ export function main(options = {}) {
     process.exit();
   });
   // The host stops a server by signalling this process. The child is what
-  // holds the notes database open, so it has to hear it too.
-  for (const signal of /** @type {const} */ (["SIGTERM", "SIGINT", "SIGHUP"])) {
-    process.on(signal, () => child.kill(signal));
-  }
+  // holds the notes database open, so it has to hear it too. npm passes on only
+  // SIGINT and SIGTERM to the package it runs: a SIGHUP would end npx and leave
+  // Chamber running with no parent, so a hangup reaches npx as SIGTERM.
+  process.on("SIGTERM", () => child.kill("SIGTERM"));
+  process.on("SIGINT", () => child.kill("SIGINT"));
+  process.on("SIGHUP", () => child.kill("SIGTERM"));
   child.once("exit", (code, signal) => {
     process.exit(code ?? 128 + (signal === null ? 0 : (osConstants.signals[signal] ?? 0)));
   });

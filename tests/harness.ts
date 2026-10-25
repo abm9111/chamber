@@ -17637,13 +17637,14 @@ test("config", "the launcher exits with the child's code, and 128 plus the signa
   }
 });
 
-test("config", "the launcher passes SIGTERM, SIGINT and SIGHUP to the child and exits with the code the child chose", async () => {
+test("config", "the launcher passes SIGTERM and SIGINT to the child, a SIGHUP as SIGTERM, and exits with the code the child chose", async () => {
   const fx = launcherFixture();
   try {
-    for (const [signal, code] of [
-      ["SIGTERM", 10],
-      ["SIGINT", 11],
-      ["SIGHUP", 12],
+    // npm forwards only SIGINT and SIGTERM to the package it runs, so a hangup must reach npx as SIGTERM.
+    for (const [signal, code, seen] of [
+      ["SIGTERM", 10, "SIGTERM"],
+      ["SIGINT", 11, "SIGINT"],
+      ["SIGHUP", 10, "SIGTERM"],
     ] as const) {
       writeFileSync(fx.optionsFile, JSON.stringify({ args: [LAUNCHER_SPEC, "--notes", "/n", "--exclude", ""], npxCli: fx.fake }));
       const launcherProcess = spawn(process.execPath, [fx.driver, fx.optionsFile], {
@@ -17666,7 +17667,7 @@ test("config", "the launcher passes SIGTERM, SIGINT and SIGHUP to the child and 
         launcherProcess.kill(signal);
         const exit = await Promise.race([closed, new Promise<string>((ok) => setTimeout(() => ok("timeout"), 10_000))]);
         assert(exit === code, `${signal}: the launcher exited ${exit}, wanted ${code} (the child's code); stdout ${JSON.stringify(stdout)} stderr ${JSON.stringify(stderr)}`);
-        assert(stdout === `READY ${childPid}\nGOT ${signal}\n`, `${signal}: stdout is ${JSON.stringify(stdout)}`);
+        assert(stdout === `READY ${childPid}\nGOT ${seen}\n`, `${signal}: stdout is ${JSON.stringify(stdout)}`);
         assert(stderr === "", `${signal}: the launcher wrote to stderr: ${JSON.stringify(stderr)}`);
       } finally {
         launcherProcess.kill("SIGKILL");

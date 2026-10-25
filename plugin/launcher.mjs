@@ -8,9 +8,13 @@
 //
 // stdout is the MCP stream. Nothing in this file writes to it. Every message
 // goes to stderr, and the child inherits both.
+import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
+import { constants as osConstants } from "node:os";
 import { posix, win32 } from "node:path";
 
 const CONFIGURE = "/plugin configure chamber@chamber";
+const USAGE = "usage: launch.mjs <npm spec> --notes <folder> [--exclude <a,b,c>]";
 
 /**
  * @param {string} why
@@ -61,4 +65,119 @@ export function buildArgs({ notes, exclude, platform }) {
   const argv = ["mcp", "--notes", notes];
   for (const item of items) argv.push("--exclude", item);
   return { argv };
+}
+
+/**
+ * Where npm's npx script is, for the node that is running this file. The
+ * plugin runs it as `node npx-cli.js`, which is all the `npx` shim does, so no
+ * shell and no PATH lookup of a `.cmd` file is needed.
+ *
+ *   Windows (zip, installer, nvm-windows):  <dir of node.exe>\node_modules\npm\bin\npx-cli.js
+ *   macOS and Linux (tarball, nvm, fnm):    <prefix>/lib/node_modules/npm/bin/npx-cli.js
+ *   Homebrew:                               <prefix>/libexec/lib/node_modules/npm/bin/npx-cli.js
+ *
+ * @param {string} execPath
+ * @param {string} platform
+ * @returns {string[]}
+ */
+export function npxCliCandidates(execPath, platform) {
+  if (platform === "win32") {
+    return [win32.join(win32.dirname(execPath), "node_modules", "npm", "bin", "npx-cli.js")];
+  }
+  const prefix = posix.dirname(posix.dirname(execPath));
+  return [
+    posix.join(prefix, "lib", "node_modules", "npm", "bin", "npx-cli.js"),
+    posix.join(prefix, "libexec", "lib", "node_modules", "npm", "bin", "npx-cli.js"),
+  ];
+}
+
+/**
+ * @param {{ execPath: string, platform: string, isFile: (path: string) => boolean }} input
+ * @returns {{ path: string } | { refuse: string }}
+ */
+export function findNpxCli({ execPath, platform, isFile }) {
+  const candidates = npxCliCandidates(execPath, platform);
+  const path = candidates.find((candidate) => isFile(candidate));
+  if (path !== undefined) return { path };
+  return {
+    refuse:
+      `chamber: npm is not installed next to this node (${shown(execPath)}). ` +
+      `Looked for ${candidates.join(" and ")}. Use a node that ships with npm, such as the one from nodejs.org.`,
+  };
+}
+
+/**
+ * @param {string[]} args
+ * @returns {{ spec: string, notes: string, exclude: string } | { refuse: string }}
+ */
+export function parseLauncherArgs(args) {
+  const [spec, ...rest] = args;
+  const bad = { refuse: `chamber: ${USAGE}` };
+  if (spec === undefined || spec === "" || spec.startsWith("-")) return bad;
+  let notes = "";
+  let exclude = "";
+  for (let i = 0; i < rest.length; i += 2) {
+    // A last flag with nothing after it has an empty value. A host that dropped
+    // the argument for an unset list would otherwise stop every server whose
+    // user did not set one.
+    const value = rest[i + 1] ?? "";
+    if (rest[i] === "--notes") notes = value;
+    else if (rest[i] === "--exclude") exclude = value;
+    else return bad;
+  }
+  return { spec, notes, exclude };
+}
+
+/**
+ * @param {string} path
+ * @returns {boolean}
+ */
+function isFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * @param {string} message
+ * @param {number} code
+ * @returns {void}
+ */
+function fail(message, code) {
+  process.stderr.write(`${message}\n`);
+  process.exitCode = code;
+}
+
+/**
+ * Start Chamber and become it: same stdio, same exit code. The options exist
+ * for a test that imports this file; the file plugin.json runs passes none.
+ *
+ * @param {{ args?: string[], execPath?: string, platform?: string, npxCli?: string }} [options]
+ * @returns {void}
+ */
+export function main(options = {}) {
+  const execPath = options.execPath ?? process.execPath;
+  const platform = options.platform ?? process.platform;
+  const parsed = parseLauncherArgs(options.args ?? process.argv.slice(2));
+  if ("refuse" in parsed) return fail(parsed.refuse, 2);
+  const built = buildArgs({ notes: parsed.notes, exclude: parsed.exclude, platform });
+  if ("refuse" in built) return fail(built.refuse, 1);
+  const npx = options.npxCli !== undefined ? { path: options.npxCli } : findNpxCli({ execPath, platform, isFile });
+  if ("refuse" in npx) return fail(npx.refuse, 1);
+
+  const child = spawn(execPath, [npx.path, "-y", parsed.spec, ...built.argv], { stdio: "inherit", windowsHide: true });
+  child.once("error", (error) => {
+    fail(`chamber: could not start npx with ${shown(execPath)}: ${error.message}`, 1);
+    process.exit();
+  });
+  // The host stops a server by signalling this process. The child is what
+  // holds the notes database open, so it has to hear it too.
+  for (const signal of /** @type {const} */ (["SIGTERM", "SIGINT", "SIGHUP"])) {
+    process.on(signal, () => child.kill(signal));
+  }
+  child.once("exit", (code, signal) => {
+    process.exit(code ?? 128 + (signal === null ? 0 : (osConstants.signals[signal] ?? 0)));
+  });
 }

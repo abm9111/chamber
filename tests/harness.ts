@@ -17466,6 +17466,229 @@ test("config", "tsc and eslint both cover the plugin's JavaScript", () => {
   assert(/^eslint\b.*\bplugin\b/.test(pkg.scripts["lint"] ?? ""), `the lint script does not lint plugin/: ${pkg.scripts["lint"]}`);
 });
 
+// ─── the plugin's launcher finds npm, starts Chamber and hands over stdio ───
+
+const LAUNCHER_DIR = fileURLToPath(new URL("../plugin/", import.meta.url));
+const LAUNCHER_SPEC = "@bu7umaid/chamber@0.2.2";
+
+// Stands in for npm's npx-cli.js. It prints what it was run with and does what
+// FAKE_MODE says, so the launcher's own behaviour is the only variable.
+const FAKE_NPX_CLI = `
+const mode = process.env.FAKE_MODE ?? "argv";
+const say = (stream, text, then) => stream.write(text, then);
+if (mode === "argv") {
+  say(process.stderr, "fake-npx execPath " + process.execPath + "\\n");
+  say(process.stdout, "FAKE-NPX " + JSON.stringify(process.argv.slice(1)) + "\\n");
+} else if (mode === "exit3") {
+  process.exit(3);
+} else if (mode === "sigkill") {
+  process.kill(process.pid, "SIGKILL");
+} else if (mode === "wait") {
+  for (const [name, code] of [["SIGTERM", 10], ["SIGINT", 11], ["SIGHUP", 12]]) {
+    process.on(name, () => say(process.stdout, "GOT " + name + "\\n", () => process.exit(code)));
+  }
+  say(process.stdout, "READY " + process.pid + "\\n");
+  setTimeout(() => process.exit(99), 15000);
+}
+`;
+
+interface LauncherFixture {
+  dir: string;
+  fake: string;
+  driver: string;
+  optionsFile: string;
+}
+
+/**
+ * A fake npx-cli.js, and a driver that imports launcher.mjs and calls main()
+ * with the options in a JSON file. main()'s options exist for this: the file
+ * plugin.json runs passes none, and nothing in the environment can set them.
+ */
+function launcherFixture(): LauncherFixture {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-launcher-"));
+  const fake = join(dir, "fake npx-cli.js");
+  writeFileSync(fake, FAKE_NPX_CLI);
+  const driver = join(dir, "driver.mjs");
+  writeFileSync(
+    driver,
+    [
+      'import { readFileSync } from "node:fs";',
+      `import { main } from ${JSON.stringify(pathToFileURL(join(LAUNCHER_DIR, "launcher.mjs")).href)};`,
+      'main(JSON.parse(readFileSync(process.argv[2], "utf8")));',
+      "",
+    ].join("\n"),
+  );
+  return { dir, fake, driver, optionsFile: join(dir, "options.json") };
+}
+
+function runLauncher(fx: LauncherFixture, options: object, mode: string): { status: number | null; stdout: string; stderr: string } {
+  writeFileSync(fx.optionsFile, JSON.stringify(options));
+  const r = spawnSync(process.execPath, [fx.driver, fx.optionsFile], {
+    encoding: "utf8",
+    timeout: 30_000,
+    env: { ...process.env, FAKE_MODE: mode },
+  });
+  assert(r.error === undefined, `the launcher did not run: ${r.error}`);
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
+
+test("config", "the launcher finds npx-cli.js in each Node layout, and refuses with every place it looked when it is not there", () => {
+  const present = (want: string) => (path: string): boolean => path === want;
+  for (const [what, platform, execPath, want] of [
+    ["the nodejs.org tarball, nvm and fnm", "linux", "/home/me/.nvm/versions/node/v24.22.1/bin/node", "/home/me/.nvm/versions/node/v24.22.1/lib/node_modules/npm/bin/npx-cli.js"],
+    ["the macOS installer", "darwin", "/usr/local/bin/node", "/usr/local/lib/node_modules/npm/bin/npx-cli.js"],
+    ["Homebrew, which keeps npm in libexec", "darwin", "/opt/homebrew/Cellar/node/26.12.1/bin/node", "/opt/homebrew/Cellar/node/26.12.1/libexec/lib/node_modules/npm/bin/npx-cli.js"],
+    ["the Windows installer", "win32", "C:\\Program Files\\nodejs\\node.exe", "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js"],
+    ["the Windows zip", "win32", "D:\\tools\\node-v24.22.1-win-x64\\node.exe", "D:\\tools\\node-v24.22.1-win-x64\\node_modules\\npm\\bin\\npx-cli.js"],
+  ] as const) {
+    const found = launcher.findNpxCli({ execPath, platform, isFile: present(want) });
+    assert("path" in found && found.path === want, `${what}: ${JSON.stringify(found)}, wanted ${want}`);
+    const missing = launcher.findNpxCli({ execPath, platform, isFile: () => false });
+    assert("refuse" in missing, `${what}: found a file that is not there`);
+    for (const candidate of launcher.npxCliCandidates(execPath, platform)) {
+      assert(missing.refuse.includes(candidate), `${what}: the refusal does not name ${candidate}: ${missing.refuse}`);
+    }
+  }
+  // The other platform's layout is not looked at.
+  const wrong = launcher.findNpxCli({ execPath: "C:\\Program Files\\nodejs\\node.exe", platform: "win32", isFile: present("C:\\Program Files\\lib\\node_modules\\npm\\bin\\npx-cli.js") });
+  assert("refuse" in wrong, "a Windows node was matched to the lib/node_modules layout");
+});
+
+test("config", "npm is where the launcher looks for the node that runs this harness", () => {
+  const found = launcher.findNpxCli({ execPath: process.execPath, platform: process.platform, isFile: existsSync });
+  assert("path" in found, `${"refuse" in found ? found.refuse : ""}`);
+});
+
+test("config", "the launcher runs npx-cli.js with the node that runs it, hands over stdout untouched, and passes each argument whole", () => {
+  const fx = launcherFixture();
+  try {
+    const wrapper = join(fx.dir, "node wrapper");
+    const marker = join(fx.dir, "wrapper-ran");
+    writeFileSync(wrapper, `#!/bin/sh\necho ran >> '${marker}'\nexec '${process.execPath}' "$@"\n`);
+    chmodSync(wrapper, 0o755);
+    const notes = `/tmp/x y/"q" 100%/ü 笔记`;
+    for (const [exclude, flags] of [
+      ["a b,c", ["--exclude", "a b", "--exclude", "c"]],
+      ["", []],
+    ] as const) {
+      const args = [LAUNCHER_SPEC, "--notes", notes, "--exclude", exclude];
+      const want = `FAKE-NPX ${JSON.stringify([fx.fake, "-y", LAUNCHER_SPEC, "mcp", "--notes", notes, ...flags])}\n`;
+      const r = runLauncher(fx, { args, npxCli: fx.fake }, "argv");
+      assert(r.status === 0, `exit ${r.status}: ${r.stderr}`);
+      assert(r.stdout === want, `stdout is not exactly the child's:\n${r.stdout}\nwanted:\n${want}`);
+      assert(r.stderr === `fake-npx execPath ${process.execPath}\n`, `stderr is not exactly the child's: ${JSON.stringify(r.stderr)}`);
+    }
+    // A host that left out the argument for an unset list leaves `--exclude` last with nothing after it: no flag, not an error.
+    const dangling = runLauncher(fx, { args: [LAUNCHER_SPEC, "--notes", notes, "--exclude"], npxCli: fx.fake }, "argv");
+    assert(
+      dangling.status === 0 && dangling.stdout === `FAKE-NPX ${JSON.stringify([fx.fake, "-y", LAUNCHER_SPEC, "mcp", "--notes", notes])}\n`,
+      `a trailing --exclude with no value: exit ${dangling.status}, stdout ${JSON.stringify(dangling.stdout)}: ${dangling.stderr}`,
+    );
+    // execPath is spawned, not whatever `node` the PATH offers.
+    const viaWrapper = runLauncher(fx, { args: [LAUNCHER_SPEC, "--notes", notes, "--exclude", ""], npxCli: fx.fake, execPath: wrapper }, "argv");
+    assert(viaWrapper.status === 0, `exit ${viaWrapper.status}: ${viaWrapper.stderr}`);
+    assert(existsSync(marker), "the launcher did not spawn the execPath it was given");
+  } finally {
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the launcher exits with the child's code, and 128 plus the signal when the child is killed", () => {
+  const fx = launcherFixture();
+  try {
+    const args = [LAUNCHER_SPEC, "--notes", "/n", "--exclude", ""];
+    const three = runLauncher(fx, { args, npxCli: fx.fake }, "exit3");
+    assert(three.status === 3 && three.stdout === "", `exit ${three.status}, stdout ${JSON.stringify(three.stdout)}`);
+    const killed = runLauncher(fx, { args, npxCli: fx.fake }, "sigkill");
+    assert(killed.status === 137 && killed.stdout === "", `a child killed by SIGKILL: exit ${killed.status}, wanted 137`);
+  } finally {
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the launcher passes SIGTERM, SIGINT and SIGHUP to the child and exits with the code the child chose", async () => {
+  const fx = launcherFixture();
+  try {
+    for (const [signal, code] of [
+      ["SIGTERM", 10],
+      ["SIGINT", 11],
+      ["SIGHUP", 12],
+    ] as const) {
+      writeFileSync(fx.optionsFile, JSON.stringify({ args: [LAUNCHER_SPEC, "--notes", "/n", "--exclude", ""], npxCli: fx.fake }));
+      const launcherProcess = spawn(process.execPath, [fx.driver, fx.optionsFile], {
+        env: { ...process.env, FAKE_MODE: "wait" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      launcherProcess.stdout.on("data", (d: Buffer) => (stdout += d.toString("utf8")));
+      launcherProcess.stderr.on("data", (d: Buffer) => (stderr += d.toString("utf8")));
+      const closed = new Promise<number | null>((ok) => launcherProcess.once("close", (c) => ok(c)));
+      let childPid = 0;
+      try {
+        const started = Date.now();
+        while (!/^READY (\d+)\n/.test(stdout)) {
+          assert(Date.now() - started < 10_000, `the child never said READY: ${stdout}${stderr}`);
+          await new Promise<void>((ok) => setTimeout(ok, 20));
+        }
+        childPid = Number(/^READY (\d+)\n/.exec(stdout)![1]);
+        launcherProcess.kill(signal);
+        const exit = await Promise.race([closed, new Promise<string>((ok) => setTimeout(() => ok("timeout"), 10_000))]);
+        assert(exit === code, `${signal}: the launcher exited ${exit}, wanted ${code} (the child's code); stdout ${JSON.stringify(stdout)} stderr ${JSON.stringify(stderr)}`);
+        assert(stdout === `READY ${childPid}\nGOT ${signal}\n`, `${signal}: stdout is ${JSON.stringify(stdout)}`);
+        assert(stderr === "", `${signal}: the launcher wrote to stderr: ${JSON.stringify(stderr)}`);
+      } finally {
+        launcherProcess.kill("SIGKILL");
+        if (childPid !== 0) {
+          try {
+            process.kill(childPid, "SIGKILL");
+          } catch {
+            // already gone
+          }
+        }
+      }
+    }
+  } finally {
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the launcher writes only to stderr when it refuses, and exits 1 for a bad value and 2 for bad usage", () => {
+  const entry = join(LAUNCHER_DIR, "launch.mjs");
+  for (const [args, status, says] of [
+    [[LAUNCHER_SPEC, "--notes", "rel/notes", "--exclude", ""], 1, "/plugin configure chamber@chamber"],
+    [[LAUNCHER_SPEC, "--notes", "", "--exclude", ""], 1, "no notes folder is set"],
+    [[LAUNCHER_SPEC, "--notes", "/n", "--exclude", "-x"], 1, 'starts with "-"'],
+    [[], 2, "usage: launch.mjs"],
+    [[LAUNCHER_SPEC, "--nope", "x"], 2, "usage: launch.mjs"],
+    [[LAUNCHER_SPEC, "--notes"], 1, "no notes folder is set"],
+    [["--notes", "/n"], 2, "usage: launch.mjs"],
+  ] as const) {
+    const r = spawnSync(process.execPath, [entry, ...args], { encoding: "utf8", timeout: 30_000 });
+    assert(r.status === status, `${JSON.stringify(args)}: exit ${r.status}, wanted ${status}: ${r.stderr}`);
+    assert(r.stdout === "", `${JSON.stringify(args)}: wrote to stdout: ${JSON.stringify(r.stdout)}`);
+    assert(r.stderr.includes(says), `${JSON.stringify(args)}: stderr lacks ${says}: ${r.stderr}`);
+  }
+  const fx = launcherFixture();
+  try {
+    const args = [LAUNCHER_SPEC, "--notes", "/n", "--exclude", ""];
+    const noNpm = runLauncher(fx, { args, execPath: "/nonexistent/prefix/bin/node", platform: "darwin" }, "argv");
+    assert(noNpm.status === 1 && noNpm.stdout === "", `no npm: exit ${noNpm.status}, stdout ${JSON.stringify(noNpm.stdout)}`);
+    assert(noNpm.stderr.includes("npm is not installed next to this node") && noNpm.stderr.includes("/nonexistent/prefix/lib/node_modules/npm/bin/npx-cli.js"), noNpm.stderr);
+    const noNode = runLauncher(fx, { args, execPath: "/nonexistent/prefix/bin/node", npxCli: fx.fake }, "argv");
+    assert(noNode.status === 1 && noNode.stdout === "", `no node: exit ${noNode.status}, stdout ${JSON.stringify(noNode.stdout)}`);
+    assert(noNode.stderr.includes("could not start npx") && noNode.stderr.includes("ENOENT"), noNode.stderr);
+    // A spec that starts with "-" would be read by npx as one of its own options, so it is a usage error. Through the driver, with the fake: the real entry would go on to run npx.
+    const dashSpec = runLauncher(fx, { args: ["--package=other", "--notes", "/n", "--exclude", ""], npxCli: fx.fake }, "argv");
+    assert(
+      dashSpec.status === 2 && dashSpec.stdout === "" && dashSpec.stderr.includes("usage: launch.mjs"),
+      `a spec that starts with "-": exit ${dashSpec.status}, stdout ${JSON.stringify(dashSpec.stdout)}, stderr ${JSON.stringify(dashSpec.stderr)}`,
+    );
+  } finally {
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

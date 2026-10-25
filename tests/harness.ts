@@ -13228,11 +13228,12 @@ test("config", "package.json, server.json, the plugin, the served MCP version an
   // NOT_FOUND.
   const plugin = JSON.parse(readFileSync(join(root, "plugin", ".claude-plugin", "plugin.json"), "utf8")) as {
     version: string;
-    mcpServers: Record<string, { args: string[] }>;
+    mcpServers: Record<string, { command: string; args: string[] }>;
   };
-  const pinned = (plugin.mcpServers["chamber"]?.args ?? [])
-    .map((a) => /^@bu7umaid\/chamber@(.+)$/.exec(a)?.[1])
-    .find((v) => v !== undefined);
+  // plugin.json runs `node ${CLAUDE_PLUGIN_ROOT}/launch.mjs <npm spec> ...`: the pin is the argument after the launcher.
+  const server = plugin.mcpServers["chamber"];
+  assert(server?.command === "node" && server.args[0]?.endsWith("/launch.mjs") === true, `the plugin does not run node on launch.mjs: ${JSON.stringify(server)}`);
+  const pinned = /^@bu7umaid\/chamber@(.+)$/.exec(server.args[1] ?? "")?.[1];
   // The skill gives the line for running the server outside Claude Code, with its own copy of the pin.
   const skillPins = [
     ...new Set(
@@ -17684,6 +17685,67 @@ test("config", "the launcher writes only to stderr when it refuses, and exits 1 
       dashSpec.status === 2 && dashSpec.stdout === "" && dashSpec.stderr.includes("usage: launch.mjs"),
       `a spec that starts with "-": exit ${dashSpec.status}, stdout ${JSON.stringify(dashSpec.stdout)}, stderr ${JSON.stringify(dashSpec.stderr)}`,
     );
+  } finally {
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+// ─── plugin.json starts Chamber through the launcher ────────────────────────
+
+interface PluginManifest {
+  version: string;
+  userConfig: Record<string, { type?: string; title?: string; required?: boolean; multiple?: boolean }>;
+  mcpServers: Record<string, { command: string; args: string[] }>;
+}
+
+function readPluginManifest(): PluginManifest {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  return JSON.parse(readFileSync(join(root, "plugin", ".claude-plugin", "plugin.json"), "utf8")) as PluginManifest;
+}
+
+test("config", "plugin.json asks for the notes folder and the folders to skip, and runs node on the launcher, not npx", () => {
+  const plugin = readPluginManifest();
+  const notes = plugin.userConfig["notes"];
+  assert(notes?.type === "directory" && notes.required === true, `userConfig.notes: ${JSON.stringify(notes)}`);
+  const exclude = plugin.userConfig["exclude"];
+  assert(
+    exclude?.type === "string" && exclude.multiple === true && exclude.required === false && exclude.title === "Folders to skip",
+    `userConfig.exclude: ${JSON.stringify(exclude)}`,
+  );
+  const server = plugin.mcpServers["chamber"];
+  assert(server?.command === "node", `the server command is ${server?.command}: a bare npx is an npx.cmd shim on native Windows, which Claude Code cannot start`);
+  const spec = server.args[1] ?? "";
+  assert(/^@bu7umaid\/chamber@\d+\.\d+\.\d+$/.test(spec), `the second argument is not a pinned npm spec: ${spec}`);
+  assert(
+    JSON.stringify(server.args) === JSON.stringify(["${CLAUDE_PLUGIN_ROOT}/launch.mjs", spec, "--notes", "${user_config.notes}", "--exclude", "${user_config.exclude}"]),
+    `the server arguments are not the launcher's contract: ${JSON.stringify(server.args)}`,
+  );
+});
+
+test("config", "the arguments plugin.json spells reach Chamber whole: a path with spaces, an unset list as an empty string, a list comma-joined", () => {
+  const plugin = readPluginManifest();
+  const server = plugin.mcpServers["chamber"];
+  assert(server !== undefined, "plugin.json has no chamber server");
+  const fx = launcherFixture();
+  try {
+    // Claude Code 2.1.310 substitutes an unset optional string with "" (argv
+    // recorded by a probe plugin), joins a `multiple` list with "," into one
+    // argument, and passes a path with spaces as one argument.
+    for (const [notes, exclude, flags] of [
+      ["/tmp/my notes/vault", "", []],
+      ["~/Notes", "a b,c", ["--exclude", "a b", "--exclude", "c"]],
+    ] as const) {
+      const args = server.args.map((a) =>
+        a
+          .replace("${CLAUDE_PLUGIN_ROOT}", () => LAUNCHER_DIR.replace(/\/$/, ""))
+          .replace("${user_config.notes}", () => notes)
+          .replace("${user_config.exclude}", () => exclude),
+      );
+      assert(args[0] === join(LAUNCHER_DIR, "launch.mjs") && existsSync(args[0]), `the launcher plugin.json names is not a file: ${args[0]}`);
+      const r = runLauncher(fx, { args: args.slice(1), npxCli: fx.fake }, "argv");
+      const want = `FAKE-NPX ${JSON.stringify([fx.fake, "-y", args[1], "mcp", "--notes", notes, ...flags])}\n`;
+      assert(r.status === 0 && r.stdout === want, `exit ${r.status}, stdout ${JSON.stringify(r.stdout)}, wanted ${JSON.stringify(want)}: ${r.stderr}`);
+    }
   } finally {
     rmSync(fx.dir, { recursive: true, force: true });
   }

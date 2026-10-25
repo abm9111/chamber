@@ -46,7 +46,17 @@ reading the note yourself and calling it verified.
 - If the user has not installed it (Claude Code 2.1.275 or later):
   `/plugin install chamber --marketplace abm9111/chamber`
 - If the plugin is installed, its server failed to start. Common causes: Node
-  older than 22.5 (Chamber needs `node:sqlite`), or no notes folder set; run
-  `/plugin configure chamber@chamber`. `/mcp` shows the server's error.
+  older than 22.5 (Chamber needs `node:sqlite`), no notes folder set, or a notes
+  folder that is not an absolute path (the plugin's launcher refuses it with a
+  line that names the fix); run `/plugin configure chamber@chamber`. `/mcp`
+  shows the server's error.
+- If `chamber_check` is listed twice, a server added by hand with
+  `claude mcp add chamber` is running beside the plugin's. Use the plugin's, and
+  tell the user to run `claude mcp remove chamber`.
+- A plugin from a third-party marketplace is not updated by itself. To get a
+  newer Chamber, the user turns on auto-update for the chamber marketplace in
+  `/plugin`, or runs `claude plugin update chamber@chamber`.
 - Outside Claude Code, any MCP host:
   `npx -y @bu7umaid/chamber@0.2.2 mcp --notes /absolute/path/to/Notes`
+  In Codex:
+  `codex mcp add chamber -- npx -y @bu7umaid/chamber@0.2.2 mcp --notes /absolute/path/to/Notes`

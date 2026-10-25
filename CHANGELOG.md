@@ -8,12 +8,21 @@ history and the GitHub releases.
 ### Added
 
 - **Claude Code plugin.** `/plugin install chamber --marketplace abm9111/chamber`
-  asks for the notes folder, then adds the MCP server and a `chamber-check`
-  skill. The plugin lives in `plugin/`, so an install copies that folder, not
-  the repo. It runs the npm package at the version its args pin, 0.2.2; 0.1.9
-  drops `--notes` without a word and every check comes back NOT_FOUND. The
-  version test now covers `plugin/.claude-plugin/plugin.json` and the pin. The
-  skill is also what `npx skills add abm9111/chamber` installs.
+  asks for the notes folder and, if you want, folders to skip (a comma-separated
+  list), then adds the MCP server and a `chamber-check` skill. The plugin lives
+  in `plugin/`, so an install copies that folder, not the repo. It runs the npm
+  package at the version its args pin, 0.2.2; 0.1.9 drops `--notes` without a
+  word and every check comes back NOT_FOUND. It starts the package through
+  `plugin/launch.mjs`, not a bare `npx`, which on native Windows is a `.cmd`
+  file Claude Code cannot start: the launcher runs npm's own `npx-cli.js` with
+  the same `node`, with no shell, so a folder name with a space, a quote or a
+  `%` reaches Chamber whole. It refuses an empty or relative notes folder with a
+  line that names `/plugin configure chamber@chamber`, passes the host's
+  signals to the server, and writes only to stderr, because stdout is the MCP
+  stream. The version test covers `plugin/.claude-plugin/plugin.json`, the pin
+  and the skill's pin, and a `windows-latest` CI job installs the plugin into
+  Claude Code and requires the server to connect. The skill is also what
+  `npx skills add abm9111/chamber` installs.
 
 ## 0.2.2 — 2026-10-25
 

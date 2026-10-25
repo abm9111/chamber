@@ -17751,6 +17751,39 @@ test("config", "the arguments plugin.json spells reach Chamber whole: a path wit
   }
 });
 
+// ─── the docs say how the plugin updates, what a second server means, and how Codex is set up ──
+
+test("config", "README, the skill and the CHANGELOG explain updates, the duplicate server, the launcher and Codex", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const readme = readFileSync(join(root, "README.md"), "utf8");
+  const skill = readFileSync(join(root, "plugin", "skills", "chamber-check", "SKILL.md"), "utf8");
+  const changelog = readFileSync(join(root, "CHANGELOG.md"), "utf8");
+  for (const [file, text, needles] of [
+    [
+      "README.md",
+      readme,
+      [
+        "claude plugin update chamber@chamber",
+        "Enable auto-update",
+        "claude mcp remove chamber",
+        "codex mcp add chamber",
+        "[mcp_servers.chamber]",
+        "startup_timeout_sec = 60",
+        "https://developers.openai.com/codex/mcp",
+        "/plugin configure chamber@chamber",
+      ],
+    ],
+    ["the skill", skill, ["claude mcp remove chamber", "claude plugin update chamber@chamber", "codex mcp add chamber"]],
+  ] as const) {
+    for (const needle of needles) assert(text.includes(needle), `${file} does not say: ${needle}`);
+  }
+  assert(!readme.includes("no `--exclude`"), "README.md still says the plugin takes no --exclude");
+  const unreleased = /^## Unreleased\n([\s\S]*?)^## /m.exec(changelog)?.[1] ?? "";
+  for (const needle of ["plugin/launch.mjs", "windows-latest", "/plugin configure chamber@chamber", "folders to skip"]) {
+    assert(unreleased.includes(needle), `CHANGELOG.md Unreleased does not mention: ${needle}`);
+  }
+});
+
 // ─── cli process smoke tests ────────────────────────────────────────────────
 
 // `src/cli.ts` calls `main()` at module scope, so importing it (as every

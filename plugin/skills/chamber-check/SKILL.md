@@ -49,4 +49,4 @@ reading the note yourself and calling it verified.
   older than 22.5 (Chamber needs `node:sqlite`), or no notes folder set; run
   `/plugin configure chamber@chamber`. `/mcp` shows the server's error.
 - Outside Claude Code, any MCP host:
-  `npx -y @bu7umaid/chamber@0.2.1 mcp --notes /absolute/path/to/Notes`
+  `npx -y @bu7umaid/chamber@0.2.2 mcp --notes /absolute/path/to/Notes`

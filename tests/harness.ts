@@ -13232,6 +13232,12 @@ test("config", "package.json, server.json, the plugin, the served MCP version an
   const pinned = (plugin.mcpServers["chamber"]?.args ?? [])
     .map((a) => /^@bu7umaid\/chamber@(.+)$/.exec(a)?.[1])
     .find((v) => v !== undefined);
+  // The skill gives the line for running the server outside Claude Code, with its own copy of the pin.
+  const skillPins = [
+    ...new Set(
+      [...readFileSync(join(root, "plugin", "skills", "chamber-check", "SKILL.md"), "utf8").matchAll(/@bu7umaid\/chamber@(\d+\.\d+\.\d+)/g)].map((m) => m[1]),
+    ),
+  ].join(",");
   const registry = JSON.parse(readFileSync(join(root, "server.json"), "utf8")) as {
     version: string;
     packages: { version: string }[];
@@ -13272,6 +13278,7 @@ test("config", "package.json, server.json, the plugin, the served MCP version an
       "CHANGELOG.md first released heading": released[1],
       "plugin/.claude-plugin/plugin.json version": plugin.version,
       "plugin/.claude-plugin/plugin.json npx pin": pinned,
+      "plugin/skills/chamber-check/SKILL.md npx pin": skillPins,
       "mcp_server serverInfo.version": reply.result?.serverInfo?.version,
     };
     assert(new Set(Object.values(seen)).size === 1, `the version sites disagree: ${JSON.stringify(seen, null, 2)}`);

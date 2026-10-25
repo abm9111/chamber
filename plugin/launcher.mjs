@@ -10,7 +10,7 @@
 // goes to stderr, and the child inherits both.
 import { spawn } from "node:child_process";
 import { statSync } from "node:fs";
-import { constants as osConstants } from "node:os";
+import { homedir, constants as osConstants } from "node:os";
 import { posix, win32 } from "node:path";
 
 const CONFIGURE = "/plugin configure chamber@chamber";
@@ -154,7 +154,7 @@ function fail(message, code) {
  * Start Chamber and become it: same stdio, same exit code. The options exist
  * for a test that imports this file; the file plugin.json runs passes none.
  *
- * @param {{ args?: string[], execPath?: string, platform?: string, npxCli?: string }} [options]
+ * @param {{ args?: string[], execPath?: string, platform?: string, npxCli?: string, cwd?: string }} [options]
  * @returns {void}
  */
 export function main(options = {}) {
@@ -167,7 +167,15 @@ export function main(options = {}) {
   const npx = options.npxCli !== undefined ? { path: options.npxCli } : findNpxCli({ execPath, platform, isFile });
   if ("refuse" in npx) return fail(npx.refuse, 1);
 
-  const child = spawn(execPath, [npx.path, "-y", parsed.spec, ...built.argv], { stdio: "inherit", windowsHide: true });
+  // From the home folder, not the session's working directory: inside a clone of
+  // Chamber (or any folder whose package.json is @bu7umaid/chamber), npx runs that
+  // local copy instead of the pinned version. The notes folder is absolute, so the
+  // working directory changes nothing else.
+  const child = spawn(execPath, [npx.path, "-y", parsed.spec, ...built.argv], {
+    stdio: "inherit",
+    windowsHide: true,
+    cwd: options.cwd ?? homedir(),
+  });
   child.once("error", (error) => {
     fail(`chamber: could not start npx with ${shown(execPath)}: ${error.message}`, 1);
     process.exit();

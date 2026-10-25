@@ -19,7 +19,9 @@ history and the GitHub releases.
   `%` reaches Chamber whole. It refuses an empty or relative notes folder with a
   line that names `/plugin configure chamber@chamber`, passes the host's
   signals to the server, and writes only to stderr, because stdout is the MCP
-  stream. The version test covers `plugin/.claude-plugin/plugin.json`, the pin
+  stream. It starts the server from the home folder, so a session opened inside
+  a clone of Chamber still runs the pinned version and not the local copy. The
+  version test covers `plugin/.claude-plugin/plugin.json`, the pin
   and the skill's pin, and a `windows-latest` CI job installs the plugin into
   Claude Code and requires the server to connect. The skill is also what
   `npx skills add abm9111/chamber` installs.

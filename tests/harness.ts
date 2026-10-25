@@ -17480,6 +17480,8 @@ const say = (stream, text, then) => stream.write(text, then);
 if (mode === "argv") {
   say(process.stderr, "fake-npx execPath " + process.execPath + "\\n");
   say(process.stdout, "FAKE-NPX " + JSON.stringify(process.argv.slice(1)) + "\\n");
+} else if (mode === "cwd") {
+  say(process.stdout, "CWD " + process.cwd() + "\\n");
 } else if (mode === "exit3") {
   process.exit(3);
 } else if (mode === "sigkill") {
@@ -17589,6 +17591,29 @@ test("config", "the launcher runs npx-cli.js with the node that runs it, hands o
     const viaWrapper = runLauncher(fx, { args: [LAUNCHER_SPEC, "--notes", notes, "--exclude", ""], npxCli: fx.fake, execPath: wrapper }, "argv");
     assert(viaWrapper.status === 0, `exit ${viaWrapper.status}: ${viaWrapper.stderr}`);
     assert(existsSync(marker), "the launcher did not spawn the execPath it was given");
+  } finally {
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the launcher starts Chamber from the home folder, so a Chamber clone it is run inside cannot supply the local copy", () => {
+  const fx = launcherFixture();
+  try {
+    // The session's working directory is a folder whose package.json is Chamber's, as a clone's is.
+    const clone = join(fx.dir, "a chamber clone");
+    mkdirSync(clone);
+    writeFileSync(join(clone, "package.json"), JSON.stringify({ name: "@bu7umaid/chamber", version: "0.0.0-local" }));
+    writeFileSync(fx.optionsFile, JSON.stringify({ args: [LAUNCHER_SPEC, "--notes", "/n", "--exclude", ""], npxCli: fx.fake }));
+    const r = spawnSync(process.execPath, [fx.driver, fx.optionsFile], {
+      encoding: "utf8",
+      timeout: 30_000,
+      cwd: clone,
+      env: { ...process.env, FAKE_MODE: "cwd" },
+    });
+    assert(r.error === undefined && r.status === 0, `exit ${r.status}: ${r.error} ${r.stderr}`);
+    const seen = r.stdout.replace(/^CWD /, "").trim();
+    assert(realpathSync(seen) === realpathSync(homedir()), `npx ran in ${seen}, wanted the home folder ${homedir()}`);
+    assert(realpathSync(seen) !== realpathSync(clone), "npx ran in the session's working directory");
   } finally {
     rmSync(fx.dir, { recursive: true, force: true });
   }

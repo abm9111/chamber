@@ -102,6 +102,7 @@ import {
 // What fix wave 5 adds is reached through a namespace, so that an export that is
 // missing fails the one test that needs it instead of stopping the whole run.
 import * as pinApi from "../src/release_pin.ts";
+import * as launcher from "../plugin/launcher.mjs";
 import * as commitApi from "../src/commit_belief.ts";
 import {
   minilmAvailable,
@@ -13218,9 +13219,27 @@ test("release", "chamber pin refuses a flag-shaped tag before touching HOME", ()
   }
 });
 
-test("config", "package.json, server.json, the served MCP version and the changelog name one version", () => {
+test("config", "package.json, server.json, the plugin, the served MCP version and the changelog name one version", () => {
   const root = join(dirname(fileURLToPath(import.meta.url)), "..");
   const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version: string };
+  // The plugin runs the npm package at the version its args pin. A pin behind
+  // package.json installs a published release that predates the flags the
+  // args pass: 0.1.9 dropped --notes without a word and every check came back
+  // NOT_FOUND.
+  const plugin = JSON.parse(readFileSync(join(root, "plugin", ".claude-plugin", "plugin.json"), "utf8")) as {
+    version: string;
+    mcpServers: Record<string, { command: string; args: string[] }>;
+  };
+  // plugin.json runs `node ${CLAUDE_PLUGIN_ROOT}/launch.mjs <npm spec> ...`: the pin is the argument after the launcher.
+  const server = plugin.mcpServers["chamber"];
+  assert(server?.command === "node" && server.args[0]?.endsWith("/launch.mjs") === true, `the plugin does not run node on launch.mjs: ${JSON.stringify(server)}`);
+  const pinned = /^@bu7umaid\/chamber@(.+)$/.exec(server.args[1] ?? "")?.[1];
+  // The skill gives the line for running the server outside Claude Code, with its own copy of the pin.
+  const skillPins = [
+    ...new Set(
+      [...readFileSync(join(root, "plugin", "skills", "chamber-check", "SKILL.md"), "utf8").matchAll(/@bu7umaid\/chamber@(\d+\.\d+\.\d+)/g)].map((m) => m[1]),
+    ),
+  ].join(",");
   const registry = JSON.parse(readFileSync(join(root, "server.json"), "utf8")) as {
     version: string;
     packages: { version: string }[];
@@ -13259,6 +13278,9 @@ test("config", "package.json, server.json, the served MCP version and the change
       "server.json version": registry.version,
       "server.json packages[0].version": registry.packages[0]?.version,
       "CHANGELOG.md first released heading": released[1],
+      "plugin/.claude-plugin/plugin.json version": plugin.version,
+      "plugin/.claude-plugin/plugin.json npx pin": pinned,
+      "plugin/skills/chamber-check/SKILL.md npx pin": skillPins,
       "mcp_server serverInfo.version": reply.result?.serverInfo?.version,
     };
     assert(new Set(Object.values(seen)).size === 1, `the version sites disagree: ${JSON.stringify(seen, null, 2)}`);
@@ -13422,7 +13444,7 @@ function fakePackage(version: string | Buffer | null): { root: string; script: s
 const EMBED_SCRIPT = fileURLToPath(new URL("../scripts/embed_minilm.py", import.meta.url));
 
 /**
- * Run the script with python3. `dir` is CHAMBER_MINILM_DIR (null: unset, so the
+ * Run the script with embedPython(). `dir` is CHAMBER_MINILM_DIR (null: unset, so the
  * shipped model); `script` is another copy of the script, as fakePackage makes.
  */
 function runEmbedScript(
@@ -13435,13 +13457,13 @@ function runEmbedScript(
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (dir === null) delete env.CHAMBER_MINILM_DIR;
   else env.CHAMBER_MINILM_DIR = dir;
-  const r = spawnSync("python3", [...pythonFlags, script, ...args], {
+  const r = spawnSync(embedPython(), [...pythonFlags, script, ...args], {
     encoding: "utf8",
     input,
     timeout: 120_000,
     env,
   });
-  assert(r.error === undefined, `python3 did not run: ${r.error}`);
+  assert(r.error === undefined, `${embedPython()} did not run: ${r.error}`);
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
@@ -13583,7 +13605,7 @@ test("config", "the real model directory passes the weights check", () => {
       assert(r.status === 0, `exit ${r.status}: ${r.stderr}`);
       assert((JSON.parse(r.stdout) as number[]).length === 384, "expected a 384-dimension vector");
     }
-    const plain = spawnSync("python3", [EMBED_SCRIPT, "a sentence"], { encoding: "utf8", timeout: 120_000 });
+    const plain = spawnSync(embedPython(), [EMBED_SCRIPT, "a sentence"], { encoding: "utf8", timeout: 120_000 });
     assert(plain.status !== 3, `the default model directory was refused: ${plain.stderr}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -17307,6 +17329,524 @@ test("config", "the 0.2.2 changelog has an entry for each of the four audit fixe
     assert(changed.slice(changed.indexOf(healthcheck)).includes(word), `the healthcheck entry does not mention ${word}`);
   }
   assert(!section.includes("waits 3 s as it does after an error"), "the Telegram entry above still says the loop waits a fixed 3 s");
+});
+
+// ─── the embed-script spawns in the harness use the interpreter the suite was told to use ──
+
+test("config", "runEmbedScript runs CHAMBER_PYTHON, not whatever python3 the PATH offers", () => {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-fakepy-"));
+  const saved = process.env.CHAMBER_PYTHON;
+  try {
+    const fake = join(dir, "fake-python");
+    writeFileSync(fake, '#!/bin/sh\necho "fake-python $*"\nexit 0\n');
+    chmodSync(fake, 0o755);
+    process.env.CHAMBER_PYTHON = fake;
+    const r = runEmbedScript(null, ["a sentence"]);
+    assert(r.stdout.startsWith("fake-python "), `runEmbedScript did not run CHAMBER_PYTHON (exit ${r.status}): ${r.stdout}${r.stderr}`);
+    assert(r.status === 0, `the fake interpreter exited ${r.status}: ${r.stderr}`);
+  } finally {
+    if (saved === undefined) delete process.env.CHAMBER_PYTHON;
+    else process.env.CHAMBER_PYTHON = saved;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "no spawn in the harness names a bare python3", () => {
+  const source = readFileSync(fileURLToPath(import.meta.url), "utf8");
+  // Built from two pieces so this test's own text does not match it.
+  const bare = new RegExp('spawn(?:Sync)?\\(\\s*"python' + '3"', "g");
+  const lines = [...source.matchAll(bare)].map((m) => source.slice(0, m.index).split("\n").length);
+  assert(lines.length === 0, `harness.ts spawns a bare python3 at line(s) ${lines.join(", ")}: use embedPython()`);
+});
+
+// ─── the plugin's launcher builds Chamber's arguments ───────────────────────
+
+function launcherArgv(notes: string, exclude: string, platform: string): string[] {
+  const built = launcher.buildArgs({ notes, exclude, platform });
+  assert("argv" in built, `buildArgs refused ${JSON.stringify(notes)} on ${platform}: ${"refuse" in built ? built.refuse : ""}`);
+  return built.argv;
+}
+
+function launcherRefusal(notes: string, exclude: string, platform: string): string {
+  const built = launcher.buildArgs({ notes, exclude, platform });
+  assert("refuse" in built, `buildArgs accepted ${JSON.stringify(notes)} / ${JSON.stringify(exclude)} on ${platform}: ${JSON.stringify(built)}`);
+  assert(built.refuse.startsWith("chamber: "), `a refusal does not start with "chamber: ": ${built.refuse}`);
+  assert(built.refuse.includes("/plugin configure chamber@chamber"), `a refusal does not name /plugin configure chamber@chamber: ${built.refuse}`);
+  return built.refuse;
+}
+
+test("config", "the launcher passes a notes folder on macOS and Linux as one argument, whatever characters it has", () => {
+  for (const platform of ["darwin", "linux"]) {
+    for (const [what, notes] of [
+      ["a space", "/Users/a b/Notes x"],
+      ["quotes", `/Users/o'brien/"q"`],
+      ["percent and dollar signs", "/tmp/100%/$HOME/%PATH%"],
+      ["unicode", "/Users/ü ñ/笔记/\u{1f4d3}"],
+      ["a backslash", "/tmp/a\\b"],
+      ["a home folder", "~"],
+      ["a folder under home", "~/My Notes"],
+    ] as const) {
+      const argv = launcherArgv(notes, "", platform);
+      assert(JSON.stringify(argv) === JSON.stringify(["mcp", "--notes", notes]), `${what} on ${platform}: ${JSON.stringify(argv)}`);
+    }
+  }
+});
+
+test("config", "the launcher passes a notes folder on Windows as one argument, whatever characters it has", () => {
+  for (const [what, notes] of [
+    ["a space", "C:\\Users\\a b\\Notes x"],
+    ["quotes", `C:\\Users\\o'brien\\"q"`],
+    ["percent and dollar signs", "D:\\100%\\%PATH%\\$x"],
+    ["forward slashes", "C:/Users/forward slash/notes"],
+    ["a UNC share", "\\\\srv\\share\\a b"],
+    ["unicode", "C:\\Users\\ü ñ\\笔记"],
+    ["a home folder", "~"],
+    ["a folder under home", "~/My Notes"],
+  ] as const) {
+    const argv = launcherArgv(notes, "", "win32");
+    assert(JSON.stringify(argv) === JSON.stringify(["mcp", "--notes", notes]), `${what}: ${JSON.stringify(argv)}`);
+  }
+});
+
+test("config", "the launcher turns the comma list into one --exclude per folder, trimmed, with empty items dropped", () => {
+  for (const platform of ["darwin", "win32"]) {
+    const notes = platform === "win32" ? "C:\\n" : "/n";
+    for (const [exclude, items] of [
+      ["", []],
+      ["   ", []],
+      [",,,", []],
+      ["a", ["a"]],
+      ["a b,c", ["a b", "c"]],
+      [" .obsidian , *sync-conflict* ,, attachments ", [".obsidian", "*sync-conflict*", "attachments"]],
+      ["ü ñ,笔记", ["ü ñ", "笔记"]],
+      [`a"b,%PATH%`, [`a"b`, "%PATH%"]],
+    ] as const) {
+      const want = ["mcp", "--notes", notes, ...items.flatMap((item) => ["--exclude", item])];
+      const argv = launcherArgv(notes, exclude, platform);
+      assert(JSON.stringify(argv) === JSON.stringify(want), `${JSON.stringify(exclude)} on ${platform}: ${JSON.stringify(argv)}, wanted ${JSON.stringify(want)}`);
+    }
+  }
+});
+
+test("config", "the launcher refuses a notes folder Chamber would resolve against the wrong directory, and names /plugin configure", () => {
+  for (const notes of ["", "   "]) {
+    for (const platform of ["darwin", "win32"]) {
+      assert(launcherRefusal(notes, "", platform).includes("no notes folder is set"), `${JSON.stringify(notes)} on ${platform}: the refusal does not say no folder is set`);
+    }
+  }
+  for (const [notes, platform] of [
+    ["rel/notes", "darwin"],
+    ["./notes", "linux"],
+    ["../notes", "darwin"],
+    ["notes", "darwin"],
+    ["~bob/notes", "darwin"],
+    ["C:\\Users\\x", "darwin"],
+    ["rel\\notes", "win32"],
+    ["C:notes", "win32"],
+    ["notes", "win32"],
+    ["~bob\\notes", "win32"],
+    ["-x", "darwin"],
+  ] as const) {
+    const refusal = launcherRefusal(notes, "", platform);
+    assert(refusal.includes("is not an absolute path") && refusal.includes(JSON.stringify(notes)), `${notes} on ${platform}: ${refusal}`);
+  }
+  for (const exclude of ["-x", "a,-b", " -c"]) {
+    assert(launcherRefusal("/n", exclude, "darwin").includes('starts with "-"'), `${JSON.stringify(exclude)} was not refused for its leading "-"`);
+  }
+});
+
+test("config", "tsc and eslint both cover the plugin's JavaScript", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const tsconfig = JSON.parse(readFileSync(join(root, "tsconfig.json"), "utf8")) as {
+    include: string[];
+    compilerOptions: { allowJs?: boolean; checkJs?: boolean };
+  };
+  assert(tsconfig.include.includes("plugin/**/*.mjs"), "tsconfig.json does not include plugin/**/*.mjs");
+  assert(tsconfig.compilerOptions.allowJs === true && tsconfig.compilerOptions.checkJs === true, "tsconfig.json does not type-check JavaScript");
+  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { scripts: Record<string, string> };
+  assert(/^eslint\b.*\bplugin\b/.test(pkg.scripts["lint"] ?? ""), `the lint script does not lint plugin/: ${pkg.scripts["lint"]}`);
+});
+
+// ─── the plugin's launcher finds npm, starts Chamber and hands over stdio ───
+
+const LAUNCHER_DIR = fileURLToPath(new URL("../plugin/", import.meta.url));
+const LAUNCHER_SPEC = "@bu7umaid/chamber@0.2.2";
+
+// Stands in for npm's npx-cli.js. It prints what it was run with and does what
+// FAKE_MODE says, so the launcher's own behaviour is the only variable.
+const FAKE_NPX_CLI = `
+const mode = process.env.FAKE_MODE ?? "argv";
+const say = (stream, text, then) => stream.write(text, then);
+if (mode === "argv") {
+  say(process.stderr, "fake-npx execPath " + process.execPath + "\\n");
+  say(process.stdout, "FAKE-NPX " + JSON.stringify(process.argv.slice(1)) + "\\n");
+} else if (mode === "cwd") {
+  say(process.stdout, "CWD " + process.cwd() + "\\n");
+} else if (mode === "exit3") {
+  process.exit(3);
+} else if (mode === "sigkill") {
+  process.kill(process.pid, "SIGKILL");
+} else if (mode === "wait") {
+  for (const [name, code] of [["SIGTERM", 10], ["SIGINT", 11], ["SIGHUP", 12]]) {
+    process.on(name, () => say(process.stdout, "GOT " + name + "\\n", () => process.exit(code)));
+  }
+  say(process.stdout, "READY " + process.pid + "\\n");
+  setTimeout(() => process.exit(99), 15000);
+}
+`;
+
+interface LauncherFixture {
+  dir: string;
+  fake: string;
+  driver: string;
+  optionsFile: string;
+}
+
+/**
+ * A fake npx-cli.js, and a driver that imports launcher.mjs and calls main()
+ * with the options in a JSON file. main()'s options exist for this: the file
+ * plugin.json runs passes none, and nothing in the environment can set them.
+ */
+function launcherFixture(): LauncherFixture {
+  const dir = mkdtempSync(join(tmpdir(), "chamber-launcher-"));
+  const fake = join(dir, "fake npx-cli.js");
+  writeFileSync(fake, FAKE_NPX_CLI);
+  const driver = join(dir, "driver.mjs");
+  writeFileSync(
+    driver,
+    [
+      'import { readFileSync } from "node:fs";',
+      `import { main } from ${JSON.stringify(pathToFileURL(join(LAUNCHER_DIR, "launcher.mjs")).href)};`,
+      'main(JSON.parse(readFileSync(process.argv[2], "utf8")));',
+      "",
+    ].join("\n"),
+  );
+  return { dir, fake, driver, optionsFile: join(dir, "options.json") };
+}
+
+function runLauncher(fx: LauncherFixture, options: object, mode: string): { status: number | null; stdout: string; stderr: string } {
+  writeFileSync(fx.optionsFile, JSON.stringify(options));
+  const r = spawnSync(process.execPath, [fx.driver, fx.optionsFile], {
+    encoding: "utf8",
+    timeout: 30_000,
+    env: { ...process.env, FAKE_MODE: mode },
+  });
+  assert(r.error === undefined, `the launcher did not run: ${r.error}`);
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
+
+test("config", "the launcher finds npx-cli.js in each Node layout, and refuses with every place it looked when it is not there", () => {
+  const present = (want: string) => (path: string): boolean => path === want;
+  for (const [what, platform, execPath, want] of [
+    ["the nodejs.org tarball, nvm and fnm", "linux", "/home/me/.nvm/versions/node/v24.22.1/bin/node", "/home/me/.nvm/versions/node/v24.22.1/lib/node_modules/npm/bin/npx-cli.js"],
+    ["the macOS installer", "darwin", "/usr/local/bin/node", "/usr/local/lib/node_modules/npm/bin/npx-cli.js"],
+    ["Homebrew, which keeps npm in libexec", "darwin", "/opt/homebrew/Cellar/node/26.12.1/bin/node", "/opt/homebrew/Cellar/node/26.12.1/libexec/lib/node_modules/npm/bin/npx-cli.js"],
+    ["the Windows installer", "win32", "C:\\Program Files\\nodejs\\node.exe", "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npx-cli.js"],
+    ["the Windows zip", "win32", "D:\\tools\\node-v24.22.1-win-x64\\node.exe", "D:\\tools\\node-v24.22.1-win-x64\\node_modules\\npm\\bin\\npx-cli.js"],
+  ] as const) {
+    const found = launcher.findNpxCli({ execPath, platform, isFile: present(want) });
+    assert("path" in found && found.path === want, `${what}: ${JSON.stringify(found)}, wanted ${want}`);
+    const missing = launcher.findNpxCli({ execPath, platform, isFile: () => false });
+    assert("refuse" in missing, `${what}: found a file that is not there`);
+    for (const candidate of launcher.npxCliCandidates(execPath, platform)) {
+      assert(missing.refuse.includes(candidate), `${what}: the refusal does not name ${candidate}: ${missing.refuse}`);
+    }
+  }
+  // The other platform's layout is not looked at.
+  const wrong = launcher.findNpxCli({ execPath: "C:\\Program Files\\nodejs\\node.exe", platform: "win32", isFile: present("C:\\Program Files\\lib\\node_modules\\npm\\bin\\npx-cli.js") });
+  assert("refuse" in wrong, "a Windows node was matched to the lib/node_modules layout");
+});
+
+test("config", "npm is where the launcher looks for the node that runs this harness", () => {
+  const found = launcher.findNpxCli({ execPath: process.execPath, platform: process.platform, isFile: existsSync });
+  assert("path" in found, `${"refuse" in found ? found.refuse : ""}`);
+});
+
+test("config", "the launcher runs npx-cli.js with the node that runs it, hands over stdout untouched, and passes each argument whole", () => {
+  const fx = launcherFixture();
+  try {
+    const wrapper = join(fx.dir, "node wrapper");
+    const marker = join(fx.dir, "wrapper-ran");
+    writeFileSync(wrapper, `#!/bin/sh\necho ran >> '${marker}'\nexec '${process.execPath}' "$@"\n`);
+    chmodSync(wrapper, 0o755);
+    const notes = `/tmp/x y/"q" 100%/ü 笔记`;
+    for (const [exclude, flags] of [
+      ["a b,c", ["--exclude", "a b", "--exclude", "c"]],
+      ["", []],
+    ] as const) {
+      const args = [LAUNCHER_SPEC, "--notes", notes, "--exclude", exclude];
+      const want = `FAKE-NPX ${JSON.stringify([fx.fake, "-y", LAUNCHER_SPEC, "mcp", "--notes", notes, ...flags])}\n`;
+      const r = runLauncher(fx, { args, npxCli: fx.fake }, "argv");
+      assert(r.status === 0, `exit ${r.status}: ${r.stderr}`);
+      assert(r.stdout === want, `stdout is not exactly the child's:\n${r.stdout}\nwanted:\n${want}`);
+      assert(r.stderr === `fake-npx execPath ${process.execPath}\n`, `stderr is not exactly the child's: ${JSON.stringify(r.stderr)}`);
+    }
+    // A host that left out the argument for an unset list leaves `--exclude` last with nothing after it: no flag, not an error.
+    const dangling = runLauncher(fx, { args: [LAUNCHER_SPEC, "--notes", notes, "--exclude"], npxCli: fx.fake }, "argv");
+    assert(
+      dangling.status === 0 && dangling.stdout === `FAKE-NPX ${JSON.stringify([fx.fake, "-y", LAUNCHER_SPEC, "mcp", "--notes", notes])}\n`,
+      `a trailing --exclude with no value: exit ${dangling.status}, stdout ${JSON.stringify(dangling.stdout)}: ${dangling.stderr}`,
+    );
+    // execPath is spawned, not whatever `node` the PATH offers.
+    const viaWrapper = runLauncher(fx, { args: [LAUNCHER_SPEC, "--notes", notes, "--exclude", ""], npxCli: fx.fake, execPath: wrapper }, "argv");
+    assert(viaWrapper.status === 0, `exit ${viaWrapper.status}: ${viaWrapper.stderr}`);
+    assert(existsSync(marker), "the launcher did not spawn the execPath it was given");
+  } finally {
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the launcher starts Chamber from the home folder, so a Chamber clone it is run inside cannot supply the local copy", () => {
+  const fx = launcherFixture();
+  try {
+    // The session's working directory is a folder whose package.json is Chamber's, as a clone's is.
+    const clone = join(fx.dir, "a chamber clone");
+    mkdirSync(clone);
+    writeFileSync(join(clone, "package.json"), JSON.stringify({ name: "@bu7umaid/chamber", version: "0.0.0-local" }));
+    writeFileSync(fx.optionsFile, JSON.stringify({ args: [LAUNCHER_SPEC, "--notes", "/n", "--exclude", ""], npxCli: fx.fake }));
+    const r = spawnSync(process.execPath, [fx.driver, fx.optionsFile], {
+      encoding: "utf8",
+      timeout: 30_000,
+      cwd: clone,
+      env: { ...process.env, FAKE_MODE: "cwd" },
+    });
+    assert(r.error === undefined && r.status === 0, `exit ${r.status}: ${r.error} ${r.stderr}`);
+    const seen = r.stdout.replace(/^CWD /, "").trim();
+    assert(realpathSync(seen) === realpathSync(homedir()), `npx ran in ${seen}, wanted the home folder ${homedir()}`);
+    assert(realpathSync(seen) !== realpathSync(clone), "npx ran in the session's working directory");
+    // A home folder that is gone: Node blames the executable, so the launcher names the folder.
+    const gone = join(fx.dir, "no such home");
+    const missing = runLauncher(fx, { args: [LAUNCHER_SPEC, "--notes", "/n", "--exclude", ""], npxCli: fx.fake, cwd: gone }, "cwd");
+    assert(missing.status === 1 && missing.stdout === "", `a missing start folder: exit ${missing.status}, stdout ${JSON.stringify(missing.stdout)}`);
+    assert(missing.stderr.includes(JSON.stringify(gone)), `the error does not name the folder: ${missing.stderr}`);
+  } finally {
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the launcher exits with the child's code, and 128 plus the signal when the child is killed", () => {
+  const fx = launcherFixture();
+  try {
+    const args = [LAUNCHER_SPEC, "--notes", "/n", "--exclude", ""];
+    const three = runLauncher(fx, { args, npxCli: fx.fake }, "exit3");
+    assert(three.status === 3 && three.stdout === "", `exit ${three.status}, stdout ${JSON.stringify(three.stdout)}`);
+    const killed = runLauncher(fx, { args, npxCli: fx.fake }, "sigkill");
+    assert(killed.status === 137 && killed.stdout === "", `a child killed by SIGKILL: exit ${killed.status}, wanted 137`);
+  } finally {
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the launcher passes SIGTERM and SIGINT to the child, a SIGHUP as SIGTERM, and exits with the code the child chose", async () => {
+  const fx = launcherFixture();
+  try {
+    // npm forwards only SIGINT and SIGTERM to the package it runs, so a hangup must reach npx as SIGTERM.
+    for (const [signal, code, seen] of [
+      ["SIGTERM", 10, "SIGTERM"],
+      ["SIGINT", 11, "SIGINT"],
+      ["SIGHUP", 10, "SIGTERM"],
+    ] as const) {
+      writeFileSync(fx.optionsFile, JSON.stringify({ args: [LAUNCHER_SPEC, "--notes", "/n", "--exclude", ""], npxCli: fx.fake }));
+      const launcherProcess = spawn(process.execPath, [fx.driver, fx.optionsFile], {
+        env: { ...process.env, FAKE_MODE: "wait" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      launcherProcess.stdout.on("data", (d: Buffer) => (stdout += d.toString("utf8")));
+      launcherProcess.stderr.on("data", (d: Buffer) => (stderr += d.toString("utf8")));
+      const closed = new Promise<number | null>((ok) => launcherProcess.once("close", (c) => ok(c)));
+      let childPid = 0;
+      try {
+        const started = Date.now();
+        while (!/^READY (\d+)\n/.test(stdout)) {
+          assert(Date.now() - started < 10_000, `the child never said READY: ${stdout}${stderr}`);
+          await new Promise<void>((ok) => setTimeout(ok, 20));
+        }
+        childPid = Number(/^READY (\d+)\n/.exec(stdout)![1]);
+        launcherProcess.kill(signal);
+        const exit = await Promise.race([closed, new Promise<string>((ok) => setTimeout(() => ok("timeout"), 10_000))]);
+        assert(exit === code, `${signal}: the launcher exited ${exit}, wanted ${code} (the child's code); stdout ${JSON.stringify(stdout)} stderr ${JSON.stringify(stderr)}`);
+        assert(stdout === `READY ${childPid}\nGOT ${seen}\n`, `${signal}: stdout is ${JSON.stringify(stdout)}`);
+        assert(stderr === "", `${signal}: the launcher wrote to stderr: ${JSON.stringify(stderr)}`);
+      } finally {
+        launcherProcess.kill("SIGKILL");
+        if (childPid !== 0) {
+          try {
+            process.kill(childPid, "SIGKILL");
+          } catch {
+            // already gone
+          }
+        }
+      }
+    }
+  } finally {
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+test("config", "the launcher writes only to stderr when it refuses, and exits 1 for a bad value and 2 for bad usage", () => {
+  const entry = join(LAUNCHER_DIR, "launch.mjs");
+  for (const [args, status, says] of [
+    [[LAUNCHER_SPEC, "--notes", "rel/notes", "--exclude", ""], 1, "/plugin configure chamber@chamber"],
+    [[LAUNCHER_SPEC, "--notes", "", "--exclude", ""], 1, "no notes folder is set"],
+    [[LAUNCHER_SPEC, "--notes", "/n", "--exclude", "-x"], 1, 'starts with "-"'],
+    [[], 2, "usage: launch.mjs"],
+    [[LAUNCHER_SPEC, "--nope", "x"], 2, "usage: launch.mjs"],
+    [[LAUNCHER_SPEC, "--notes"], 1, "no notes folder is set"],
+    [["--notes", "/n"], 2, "usage: launch.mjs"],
+  ] as const) {
+    const r = spawnSync(process.execPath, [entry, ...args], { encoding: "utf8", timeout: 30_000 });
+    assert(r.status === status, `${JSON.stringify(args)}: exit ${r.status}, wanted ${status}: ${r.stderr}`);
+    assert(r.stdout === "", `${JSON.stringify(args)}: wrote to stdout: ${JSON.stringify(r.stdout)}`);
+    assert(r.stderr.includes(says), `${JSON.stringify(args)}: stderr lacks ${says}: ${r.stderr}`);
+  }
+  const fx = launcherFixture();
+  try {
+    const args = [LAUNCHER_SPEC, "--notes", "/n", "--exclude", ""];
+    const noNpm = runLauncher(fx, { args, execPath: "/nonexistent/prefix/bin/node", platform: "darwin" }, "argv");
+    assert(noNpm.status === 1 && noNpm.stdout === "", `no npm: exit ${noNpm.status}, stdout ${JSON.stringify(noNpm.stdout)}`);
+    assert(noNpm.stderr.includes("npm is not installed next to this node") && noNpm.stderr.includes("/nonexistent/prefix/lib/node_modules/npm/bin/npx-cli.js"), noNpm.stderr);
+    const noNode = runLauncher(fx, { args, execPath: "/nonexistent/prefix/bin/node", npxCli: fx.fake }, "argv");
+    assert(noNode.status === 1 && noNode.stdout === "", `no node: exit ${noNode.status}, stdout ${JSON.stringify(noNode.stdout)}`);
+    assert(noNode.stderr.includes("could not start npx") && noNode.stderr.includes("ENOENT"), noNode.stderr);
+    // A spec that starts with "-" would be read by npx as one of its own options, so it is a usage error. Through the driver, with the fake: the real entry would go on to run npx.
+    const dashSpec = runLauncher(fx, { args: ["--package=other", "--notes", "/n", "--exclude", ""], npxCli: fx.fake }, "argv");
+    assert(
+      dashSpec.status === 2 && dashSpec.stdout === "" && dashSpec.stderr.includes("usage: launch.mjs"),
+      `a spec that starts with "-": exit ${dashSpec.status}, stdout ${JSON.stringify(dashSpec.stdout)}, stderr ${JSON.stringify(dashSpec.stderr)}`,
+    );
+  } finally {
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+// ─── plugin.json starts Chamber through the launcher ────────────────────────
+
+interface PluginManifest {
+  version: string;
+  userConfig: Record<string, { type?: string; title?: string; required?: boolean; multiple?: boolean }>;
+  mcpServers: Record<string, { command: string; args: string[] }>;
+}
+
+function readPluginManifest(): PluginManifest {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  return JSON.parse(readFileSync(join(root, "plugin", ".claude-plugin", "plugin.json"), "utf8")) as PluginManifest;
+}
+
+test("config", "plugin.json asks for the notes folder and the folders to skip, and runs node on the launcher, not npx", () => {
+  const plugin = readPluginManifest();
+  const notes = plugin.userConfig["notes"];
+  assert(notes?.type === "directory" && notes.required === true, `userConfig.notes: ${JSON.stringify(notes)}`);
+  const exclude = plugin.userConfig["exclude"];
+  assert(
+    exclude?.type === "string" && exclude.multiple === true && exclude.required === false && exclude.title === "Folders to skip",
+    `userConfig.exclude: ${JSON.stringify(exclude)}`,
+  );
+  const server = plugin.mcpServers["chamber"];
+  assert(server?.command === "node", `the server command is ${server?.command}: a bare npx is an npx.cmd shim on native Windows, which Claude Code cannot start`);
+  const spec = server.args[1] ?? "";
+  assert(/^@bu7umaid\/chamber@\d+\.\d+\.\d+$/.test(spec), `the second argument is not a pinned npm spec: ${spec}`);
+  assert(
+    JSON.stringify(server.args) === JSON.stringify(["${CLAUDE_PLUGIN_ROOT}/launch.mjs", spec, "--notes", "${user_config.notes}", "--exclude", "${user_config.exclude}"]),
+    `the server arguments are not the launcher's contract: ${JSON.stringify(server.args)}`,
+  );
+});
+
+test("config", "the arguments plugin.json spells reach Chamber whole: a path with spaces, an unset list as an empty string, a list comma-joined", () => {
+  const plugin = readPluginManifest();
+  const server = plugin.mcpServers["chamber"];
+  assert(server !== undefined, "plugin.json has no chamber server");
+  const fx = launcherFixture();
+  try {
+    // Claude Code 2.1.310 substitutes an unset optional string with "" (argv
+    // recorded by a probe plugin), joins a `multiple` list with "," into one
+    // argument, and passes a path with spaces as one argument.
+    for (const [notes, exclude, flags] of [
+      ["/tmp/my notes/vault", "", []],
+      ["~/Notes", "a b,c", ["--exclude", "a b", "--exclude", "c"]],
+    ] as const) {
+      const args = server.args.map((a) =>
+        a
+          .replace("${CLAUDE_PLUGIN_ROOT}", () => LAUNCHER_DIR.replace(/\/$/, ""))
+          .replace("${user_config.notes}", () => notes)
+          .replace("${user_config.exclude}", () => exclude),
+      );
+      assert(args[0] === join(LAUNCHER_DIR, "launch.mjs") && existsSync(args[0]), `the launcher plugin.json names is not a file: ${args[0]}`);
+      const r = runLauncher(fx, { args: args.slice(1), npxCli: fx.fake }, "argv");
+      const want = `FAKE-NPX ${JSON.stringify([fx.fake, "-y", args[1], "mcp", "--notes", notes, ...flags])}\n`;
+      assert(r.status === 0 && r.stdout === want, `exit ${r.status}, stdout ${JSON.stringify(r.stdout)}, wanted ${JSON.stringify(want)}: ${r.stderr}`);
+    }
+  } finally {
+    rmSync(fx.dir, { recursive: true, force: true });
+  }
+});
+
+// ─── the docs say how the plugin updates, what a second server means, and how Codex is set up ──
+
+test("config", "README, the skill and the CHANGELOG explain updates, the duplicate server, the launcher and Codex", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const readme = readFileSync(join(root, "README.md"), "utf8");
+  const skill = readFileSync(join(root, "plugin", "skills", "chamber-check", "SKILL.md"), "utf8");
+  const changelog = readFileSync(join(root, "CHANGELOG.md"), "utf8");
+  for (const [file, text, needles] of [
+    [
+      "README.md",
+      readme,
+      [
+        "claude plugin update chamber@chamber",
+        "Enable auto-update",
+        "claude mcp remove chamber",
+        "codex mcp add chamber",
+        "[mcp_servers.chamber]",
+        "startup_timeout_sec = 60",
+        "https://developers.openai.com/codex/mcp",
+        "/plugin configure chamber@chamber",
+      ],
+    ],
+    ["the skill", skill, ["claude mcp remove chamber", "claude plugin update chamber@chamber", "codex mcp add chamber"]],
+  ] as const) {
+    for (const needle of needles) assert(text.includes(needle), `${file} does not say: ${needle}`);
+  }
+  assert(!readme.includes("no `--exclude`"), "README.md still says the plugin takes no --exclude");
+  const unreleased = /^## Unreleased\n([\s\S]*?)^## /m.exec(changelog)?.[1] ?? "";
+  for (const needle of ["plugin/launch.mjs", "windows-latest", "/plugin configure chamber@chamber", "folders to skip"]) {
+    assert(unreleased.includes(needle), `CHANGELOG.md Unreleased does not mention: ${needle}`);
+  }
+});
+
+// ─── CI starts the plugin in Claude Code on Windows ─────────────────────────
+
+test("config", "CI starts the plugin in Claude Code on windows-latest, from fresh npm directories, outside the checkout", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const lines = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8").split("\n");
+  const start = lines.indexOf("  plugin-windows:");
+  assert(start >= 0, "the workflow has no plugin-windows job");
+  let end = start + 1;
+  while (end < lines.length && !/^ {0,2}\S/.test(lines[end] ?? "")) end += 1;
+  const job = lines.slice(start, end).join("\n");
+  for (const [what, needle] of [
+    ["runs on Windows", "runs-on: windows-latest"],
+    ["a fresh npm prefix", "NPM_CONFIG_PREFIX="],
+    ["a fresh npm cache", "NPM_CONFIG_CACHE="],
+    ["a fresh npm user config", "NPM_CONFIG_USERCONFIG="],
+    ["a fresh Claude Code config", "CLAUDE_CONFIG_DIR="],
+    ["the marketplace added from the checkout", 'claude plugin marketplace add "$GITHUB_WORKSPACE"'],
+    ["the plugin installed", "claude plugin install chamber@chamber"],
+    ["the plugin configured", "claude plugin configure chamber@chamber --values-stdin"],
+    ["a notes folder with a space in its name", 'notes="$RUNNER_TEMP/my notes"'],
+    ["the server listed", "claude mcp list"],
+    ["the launcher named in the list", "*launch.mjs*Connected)"],
+    ["the pin read out of plugin.json", "mcpServers.chamber.args[1]"],
+    ["the unpacked package checked for a link", "stat.isSymbolicLink()"],
+    ["the unpacked package compared with the pin", "if (got !== want)"],
+  ] as const) {
+    assert(job.includes(needle), `the plugin-windows job lacks ${what}: ${needle}`);
+  }
+  assert(/^\s+- run: npm install -g .*@anthropic-ai\/claude-code@\d+\.\d+\.\d+\s*$/m.test(job), "Claude Code is not installed at an exact version");
+  assert(!/continue-on-error|^\s+if:/m.test(job), "the plugin-windows job can pass when a step fails (continue-on-error or if:)");
+  const dirs = [...job.matchAll(/working-directory:\s*(.+)$/gm)].map((m) => m[1]);
+  assert(dirs.length >= 2 && dirs.every((d) => d === "${{ runner.temp }}/work"), `Claude Code must run outside the checkout, got working-directory ${JSON.stringify(dirs)}`);
 });
 
 // ─── cli process smoke tests ────────────────────────────────────────────────
@@ -22746,7 +23286,7 @@ test("embedder", "stdin groups stay in order and an oversized text throws before
 
 test("embedder", "a long embedder argument is refused before the model is imported", () => {
   const script = fileURLToPath(new URL("../scripts/embed_minilm.py", import.meta.url));
-  const run = spawnSync("python3", [script, "x".repeat(2049)], { encoding: "utf8" });
+  const run = spawnSync(embedPython(), [script, "x".repeat(2049)], { encoding: "utf8" });
   assert(run.status === 2, `status ${run.status} stderr ${run.stderr}`);
   assert(
     (run.stderr || "").trim() ===
@@ -22757,12 +23297,12 @@ test("embedder", "a long embedder argument is refused before the model is import
 
 test("embedder", "--serve refuses a long argument before importing the model", () => {
   const script = fileURLToPath(new URL("../scripts/embed_minilm.py", import.meta.url));
-  const bare = spawnSync("python3", [script], { encoding: "utf8" });
+  const bare = spawnSync(embedPython(), [script], { encoding: "utf8" });
   assert(bare.status === 2, `status ${bare.status} stderr ${bare.stderr}`);
   assert((bare.stderr || "").includes("--serve"), bare.stderr);
 
   const run = spawnSync(
-    "python3",
+    embedPython(),
     ["-X", "importtime", script, "--serve", "x".repeat(2049)],
     { encoding: "utf8" },
   );

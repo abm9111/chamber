@@ -19,6 +19,30 @@ The note says `$240k`. The agent wrote `$420k`. Edit the note afterwards and
 the same check judges the new text, and the result adds `index is behind this
 file`, because the index still holds the old copy.
 
+In Claude Code, as a plugin. It asks for your notes folder and adds the
+server and a `chamber-check` skill:
+
+```
+/plugin install chamber --marketplace abm9111/chamber
+```
+
+On Claude Code before 2.1.275, run `/plugin marketplace add abm9111/chamber`
+first, then `/plugin install chamber@chamber`. The plugin takes one folder, as
+an absolute path or one that starts with `~/`, and a comma-separated list of
+folders to skip (`.obsidian,*sync-conflict*`; a name cannot contain a comma).
+Change either with `/plugin configure chamber@chamber`. It runs the Chamber
+release its version pins, through a small launcher (`plugin/launch.mjs`) that
+starts npm's `npx` without a shell. A bare `npx` does not start on native
+Windows.
+
+Claude Code does not update a third-party marketplace by itself. To get a newer
+pin, turn on auto-update (`/plugin`, the **Marketplaces** tab, chamber,
+**Enable auto-update**) or run `claude plugin update chamber@chamber`. If you
+also added the server by hand with `claude mcp add`, `chamber_check` is listed
+twice: keep the plugin's and run `claude mcp remove chamber`.
+
+Or the server alone, in any MCP host:
+
 ```bash
 claude mcp add -s user chamber -- npx -y @bu7umaid/chamber mcp --notes ~/Notes
 ```
@@ -33,6 +57,29 @@ claude mcp add -s user chamber -- npx -y @bu7umaid/chamber mcp --notes ~/Notes
   }
 }
 ```
+
+In Codex, the CLI, the IDE extension and the desktop app read one
+`~/.codex/config.toml`. Add the server with the CLI:
+
+```bash
+codex mcp add chamber -- npx -y @bu7umaid/chamber mcp --notes /absolute/path/to/Notes
+```
+
+or by hand in that file. The first run downloads the package, which can take
+longer than the ten seconds Codex gives a server to start, so the table sets
+more:
+
+```toml
+[mcp_servers.chamber]
+command = "npx"
+args = ["-y", "@bu7umaid/chamber", "mcp", "--notes", "/absolute/path/to/Notes"]
+startup_timeout_sec = 60
+```
+
+The format is from [OpenAI's Codex MCP page](https://developers.openai.com/codex/mcp):
+`codex mcp add`, the `[mcp_servers.<name>]` table with `command` and `args`, and
+`startup_timeout_sec`, which defaults to 10. Chamber has not been tested in
+Codex.
 
 No model, no account, no network: the check is deterministic string matching
 over `node:sqlite` and files on your disk. It checks numbers, capitalised

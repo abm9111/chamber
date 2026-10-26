@@ -1,0 +1,49 @@
+{
+  "name": "chamber",
+  "description": "Checks that the numbers, capitalised names, and file names in a claim occur in the indexed note. Local, no model. It does not judge meaning.",
+  "version": "0.2.2",
+  "author": {
+    "name": "abm9111",
+    "url": "https://github.com/abm9111"
+  },
+  "homepage": "https://github.com/abm9111/chamber#readme",
+  "repository": "https://github.com/abm9111/chamber",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "notes",
+    "obsidian",
+    "citations",
+    "grounding",
+    "verification",
+    "local-first"
+  ],
+  "userConfig": {
+    "notes": {
+      "type": "directory",
+      "title": "Notes folder",
+      "description": "The folder of notes Chamber checks claims against, such as your Obsidian vault.",
+      "required": true
+    },
+    "exclude": {
+      "type": "string",
+      "title": "Folders to skip",
+      "description": "Names or patterns to leave out, such as .obsidian or *sync-conflict*. A name cannot contain a comma.",
+      "multiple": true,
+      "required": false
+    }
+  },
+  "mcpServers": {
+    "chamber": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/launch.mjs",
+        "@bu7umaid/chamber@0.2.2",
+        "--notes",
+        "${user_config.notes}",
+        "--exclude",
+        "${user_config.exclude}"
+      ]
+    }
+  }
+}

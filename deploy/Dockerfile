@@ -1,5 +1,5 @@
 # Minimal Chamber runtime image
-FROM node:24-bookworm-slim
+FROM node:26-bookworm-slim
 
 # The base's own packages carry security fixes the published tag predates.
 # Without this, trivy reports 6 HIGH vulnerabilities with fixes available
